@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 — Activity Lifecycle Deep Dive — AOSP Internals, State Machine & Corner Cases</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a class="active" href="01-activity-lifecycle.html">01 Activity Lifecycle</a>
+  <a href="02-fragment-lifecycle.html">02 Fragment Lifecycle</a>
+  <a href="03-config-change-process-death.html">03 Config &amp; Process Death</a>
+  <a href="04-back-stack-tasks.html">04 Back Stack &amp; Tasks</a>
+  <a href="05-multi-window-pip.html">05 Multi-Window &amp; PiP</a>
+  <a href="06-lifecycle-aware-components.html">06 Lifecycle-Aware</a>
+  <a href="07-navigation-component.html">07 Navigation Component</a>
+  <a href="08-navigation-compose.html">08 Navigation Compose</a>
+  <a href="09-interview-qa.html">09 Interview Q&amp;A</a>
+</div>
+
+<h1>01 — Activity Lifecycle Deep Dive</h1>
+<p class="subtitle">AOSP internals of how AMS drives lifecycle transitions, the ClientTransaction mechanism, ActivityRecord states, launch sequences, and staff-level corner cases</p>
+
+<!-- ============================================================ -->
+<h2>1. The Lifecycle State Machine</h2>
+
+<p>An Activity has 7 lifecycle callbacks, but the <em>system</em> thinks in terms of <strong>states</strong>, not callbacks. Callbacks are the <em>edges</em> between states. Understanding this distinction is critical at L6.</p>
+
+<div class="diagram-container">
+<pre><code>                    Activity Lifecycle State Machine
+
+                          ┌─────────────┐
+                          │ DOES NOT    │
+                          │ EXIST       │
+                          └──────┬──────┘
+                                 │ onCreate()
+                                 ▼
+                          ┌─────────────┐
+               ┌─────────│  CREATED     │◄──────────┐
+               │          └──────┬──────┘           │
+               │                 │ onStart()        │ onStop()
+               │                 ▼                  │
+               │          ┌─────────────┐           │
+               │  ┌──────▶│  STARTED    │───────────┘
+               │  │       └──────┬──────┘
+               │  │              │ onResume()    ▲
+               │  │              ▼              │ onPause()
+               │  │       ┌─────────────┐      │
+               │  │       │  RESUMED    │──────┘
+               │  │       └─────────────┘
+               │  │
+               │  │ onRestart()
+               │  │       ┌─────────────┐
+               │  └───────│  STOPPED    │
+               │          └─────────────┘
+               │
+               │ onDestroy()
+               ▼
+        ┌─────────────┐
+        │  DESTROYED   │
+        └─────────────┘</code></pre>
+</div>
+
+<h3>What Each Callback Means — From the System's Perspective</h3>
+
+<table>
+<tr><th>Callback</th><th>System Meaning</th><th>What Juniors Miss</th></tr>
+<tr><td><code>onCreate()</code></td><td>The Activity object has been instantiated via <code>Instrumentation.newActivity()</code>. The <code>PhoneWindow</code> is created but no view hierarchy is attached to WMS yet.</td><td>The window does not exist in SurfaceFlinger at this point. No pixels are drawn.</td></tr>
+<tr><td><code>onStart()</code></td><td>The Activity is becoming <em>visible</em> but is not yet in the foreground. The window may be partially visible (e.g., behind a transparent Activity).</td><td>Visibility ≠ interactability. The Activity can be visible but not receive input.</td></tr>
+<tr><td><code>onResume()</code></td><td>The Activity is in the foreground and <em>eligible</em> to receive input. <code>mResumedActivity</code> in the Task now points to this Activity.</td><td><code>onResume()</code> does NOT mean the first frame has been drawn. The window becomes visible only after <code>ViewRootImpl.performTraversals()</code> completes.</td></tr>
+<tr><td><code>onPause()</code></td><td>Another Activity is being launched or the device is going to sleep. The system needs this Activity to yield the foreground. The <code>mResumedActivity</code> pointer is cleared.</td><td>AMS waits up to 500ms for <code>onPause()</code> to complete before force-proceeding. Blocking here delays the next Activity's launch.</td></tr>
+<tr><td><code>onStop()</code></td><td>The Activity is no longer visible. Its window surface may be destroyed. The system considers this Activity a candidate for reclamation under memory pressure.</td><td><code>onStop()</code> is posted as an <code>IdleHandler</code> message — it runs only when the main thread's MessageQueue is idle. This is why there's a visible delay between <code>onPause()</code> and <code>onStop()</code>.</td></tr>
+<tr><td><code>onDestroy()</code></td><td>The Activity is being permanently torn down — either <code>finish()</code> was called or the system is reclaiming resources. The window is removed from WMS.</td><td>If the process is killed by LMK, <code>onDestroy()</code> is <strong>never called</strong>. You cannot rely on it for cleanup.</td></tr>
+<tr><td><code>onRestart()</code></td><td>The Activity is transitioning from STOPPED back to STARTED. This only happens when navigating back to a stopped Activity (e.g., pressing Back from Activity B to Activity A).</td><td>This is the <em>only</em> callback that distinguishes a fresh start from a re-start. Useful for refreshing stale data.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>2. AOSP Internals — How AMS Drives the Lifecycle</h2>
+
+<h3>ActivityRecord — The System's View of Your Activity</h3>
+
+<p>Every Activity instance in your app has a corresponding <code>ActivityRecord</code> object in <code>system_server</code>. This is the authoritative source of truth for the Activity's state.</p>
+
+<pre><code>// frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java
+
+// Key fields in ActivityRecord:
+// - mState: State        → current lifecycle state (INITIALIZING, RESUMED, etc.)
+// - app: WindowProcessController → the process hosting this Activity
+// - task: Task           → the Task (back stack) this Activity belongs to
+// - resultTo: ActivityRecord → who to deliver onActivityResult() to
+// - info: ActivityInfo   → parsed manifest metadata
+// - mVisibleRequested    → whether the system wants this Activity visible
+// - finishing: boolean   → true after finish() is called
+// - mLaunchMode          → standard, singleTop, singleTask, singleInstance</code></pre>
+
+<h3>ClientTransaction — The Batched Lifecycle Mechanism</h3>
+
+<p>Since Android P (API 28), lifecycle transitions are delivered as <strong>batched transactions</strong> via the <code>ClientTransaction</code> framework. This replaced the older individual Binder calls like <code>schedulePauseActivity()</code>.</p>
+
+<pre><code>// The transaction model:
+//
+// system_server (AMS)                          app process
+// ─────────────────                          ───────────
+//
+// 1. AMS builds a ClientTransaction:
+//    ClientTransaction t = ClientTransaction.obtain(appThread, activityToken)
+//    t.addCallback(LaunchActivityItem)        ← "execute this action"
+//    t.setLifecycleStateRequest(ResumeActivityItem)  ← "end in this state"
+//
+// 2. AMS sends it via Binder:
+//    t.schedule()
+//      → IApplicationThread.scheduleTransaction(t)
+//      → Binder call to app process
+//
+// 3. App process receives it:
+//    ActivityThread.ApplicationThread.scheduleTransaction(t)
+//      → sendMessage(EXECUTE_TRANSACTION, t)
+//      → posted to main thread's Handler
+//
+// 4. Main thread processes it:
+//    TransactionExecutor.execute(t)
+//      → executeCallbacks(t)    ← run LaunchActivityItem
+//      → executeLifecycleState(t) ← transition to RESUMED state
+
+// ClientTransactionItem subtypes:
+// ┌──────────────────────────┬──────────────────────────────────┐
+// │ Callback Items           │ Lifecycle State Items            │
+// ├──────────────────────────┼──────────────────────────────────┤
+// │ LaunchActivityItem       │ ResumeActivityItem (ON_RESUME)   │
+// │ NewIntentItem            │ PauseActivityItem  (ON_PAUSE)    │
+// │ ActivityResultItem       │ StopActivityItem   (ON_STOP)     │
+// │ ActivityConfigurationChangeItem │ DestroyActivityItem (ON_DESTROY)│
+// │ TopResumedActivityChangeItem    │                          │
+// └──────────────────────────┴──────────────────────────────────┘</code></pre>
+
+<h3>TransactionExecutor — Lifecycle Path Resolution</h3>
+
+<p>The most subtle part of the system: <code>TransactionExecutor</code> determines which <strong>intermediate callbacks</strong> to invoke when transitioning between non-adjacent states.</p>
+
+<pre><code>// frameworks/base/core/java/android/app/servertransaction/TransactionExecutor.java
+
+// executeLifecycleState() does this:
+// 1. Get current state of the Activity (e.g., ON_START)
+// 2. Get target state from the transaction (e.g., ON_RESUME)
+// 3. Compute the path: ON_START → ON_RESUME
+// 4. Execute each intermediate callback
+
+// The lifecycle path array (cycleToPath):
+//   ON_CREATE → ON_START → ON_RESUME → ON_PAUSE → ON_STOP → ON_DESTROY
+//
+// Example paths:
+//   Current: ON_CREATE, Target: ON_RESUME
+//     → calls: onStart(), onResume()
+//
+//   Current: ON_RESUME, Target: ON_STOP
+//     → calls: onPause(), onStop()
+//
+//   Current: ON_STOP, Target: ON_RESUME
+//     → calls: onRestart(), onStart(), onResume()
+//
+// This is WHY you never see onPause() without onStop() following
+// (unless another Activity becomes visible before onStop is dispatched)</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff-Level Insight — The IdleHandler Trick for onStop</div>
+<p><code>onStop()</code> is not dispatched immediately after <code>onPause()</code>. AMS schedules it as an <code>IdleHandler</code> on the app's main thread via <code>StopActivityItem</code>. The <code>IdleHandler</code> fires only when the <code>MessageQueue</code> has no more pending messages — this allows the <em>new</em> Activity's <code>onResume()</code> and first frame to complete before the old Activity is stopped. If the main thread never goes idle (e.g., heavy animation), AMS has a 10-second timeout (<code>STOP_TIMEOUT</code>) after which it force-stops the Activity. This is why you can observe <code>onPause()</code> → [new Activity onResume + first frame] → <code>onStop()</code> with a noticeable gap. In a Systrace, you'll see the stop message sitting in the queue behind rendering messages.</p>
+</div>
+
+<h3>Full Binder Call Flow</h3>
+
+<div class="diagram-container">
+<pre><code>  AMS (system_server)                    App Process
+  ──────────────────                    ───────────
+  ActivityTaskManagerService
+    │
+    ▼
+  ActivityTaskSupervisor
+  .startSpecificActivity()
+    │
+    ▼
+  RootWindowContainer                   IApplicationThread (Binder proxy)
+  .resumeFocusedTasksTopActivities()        │
+    │                                       │
+    ▼                                       │
+  Task.resumeTopActivity()                  │
+    │                                       │
+    ▼                                       │
+  ActivityRecord                            │
+  .makeActiveIfNeeded()                     │
+    │                                       │
+    ▼                                       │
+  ClientLifecycleManager                    │
+  .scheduleTransaction(                     │
+    clientTransaction)                      │
+    │                                       │
+    ├──── Binder IPC ─────────────────────▶ │
+    │                                       ▼
+    │                              ActivityThread
+    │                              .ApplicationThread
+    │                              .scheduleTransaction()
+    │                                       │
+    │                                       ▼
+    │                              sendMessage(EXECUTE_TRANSACTION)
+    │                                       │
+    │                                       ▼  (main thread Handler)
+    │                              TransactionExecutor
+    │                              .execute(transaction)
+    │                                       │
+    │                              ┌────────┴────────┐
+    │                              ▼                 ▼
+    │                      executeCallbacks()  executeLifecycleState()
+    │                              │                 │
+    │                              ▼                 ▼
+    │                      LaunchActivityItem  → onResume()
+    │                      .execute()          (via path resolution)
+    │                              │
+    │                              ▼
+    │                      ActivityThread
+    │                      .handleLaunchActivity()
+    │                              │
+    │                              ▼
+    │                      Instrumentation.callActivityOnCreate()
+    │                              │
+    │                              ▼
+    │                      Activity.onCreate()</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. ActivityRecord States in AOSP</h2>
+
+<p>The system tracks Activity states with finer granularity than the 7 callbacks expose. <code>ActivityRecord.mState</code> uses these values:</p>
+
+<table>
+<tr><th>State</th><th>Meaning</th></tr>
+<tr><td><code>INITIALIZING</code></td><td>ActivityRecord created in system_server, but no lifecycle transaction sent yet</td></tr>
+<tr><td><code>STARTED</code></td><td>onStart() completed — visible but not in foreground</td></tr>
+<tr><td><code>RESUMED</code></td><td>onResume() completed — foreground, receiving input</td></tr>
+<tr><td><code>PAUSING</code></td><td>PauseActivityItem sent, waiting for app to acknowledge</td></tr>
+<tr><td><code>PAUSED</code></td><td>App confirmed onPause() completed</td></tr>
+<tr><td><code>STOPPING</code></td><td>StopActivityItem sent, waiting for app to acknowledge</td></tr>
+<tr><td><code>STOPPED</code></td><td>App confirmed onStop() completed</td></tr>
+<tr><td><code>FINISHING</code></td><td>finish() was called — Activity is winding down</td></tr>
+<tr><td><code>DESTROYING</code></td><td>DestroyActivityItem sent</td></tr>
+<tr><td><code>DESTROYED</code></td><td>Activity is fully torn down</td></tr>
+</table>
+
+<pre><code>// The mResumedActivity pointer:
+//
+// Each Task maintains a single mResumedActivity reference.
+// Only ONE Activity per Task can be in RESUMED state at a time.
+//
+// Task (back stack)
+// ├── ActivityRecord A  [STOPPED]
+// ├── ActivityRecord B  [STOPPED]
+// └── ActivityRecord C  [RESUMED]  ← mResumedActivity points here
+//
+// Exception: Multi-resume mode (Android 10+, freeform/split-screen)
+// In multi-resume, Activities in DIFFERENT Tasks can be simultaneously
+// RESUMED. But within a single Task, the invariant still holds.
+//
+// The system uses this pointer to:
+// 1. Know which Activity to pause when launching a new one
+// 2. Deliver input events to the correct Activity
+// 3. Determine the "top" Activity for recents/screenshots</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. Activity Launch Sequence — Step by Step</h2>
+
+<p>From <code>startActivity()</code> to the first visible frame — every step that matters.</p>
+
+<pre><code>// Step 1: App calls startActivity(intent)
+//   → Activity.startActivity()
+//   → Instrumentation.execStartActivity()
+//   → ActivityTaskManager.getService().startActivity()
+//   → Binder IPC to system_server
+
+// Step 2: Intent Resolution (system_server)
+//   → ActivityTaskManagerService.startActivity()
+//   → ActivityStarter.execute()
+//     → resolveIntent() — PackageManagerService resolves the target
+//     → resolveActivity() — finds the ActivityInfo
+//     → startActivityUnchecked()
+//       → Determines Task: create new or reuse existing
+//       → Applies launch flags (FLAG_ACTIVITY_NEW_TASK, etc.)
+//       → Creates ActivityRecord for the new Activity
+
+// Step 3: Pause the Current Activity
+//   → Task.startPausingLocked()
+//   → Sends PauseActivityItem to the current foreground app
+//   → Waits up to 500ms (PAUSE_TIMEOUT) for acknowledgment
+//   → Current Activity: onPause() executes
+
+// Step 4: Process Resolution
+//   → ActivityTaskSupervisor.startSpecificActivity()
+//   → Is the target app's process running?
+//     YES → proceed to Step 5
+//     NO  → AMS.startProcessLocked()
+//           → Zygote.forkAndSpecialize()
+//           → New process calls ActivityThread.main()
+//           → ActivityThread.attach() → binds to AMS
+//           → AMS.attachApplicationLocked() → proceed to Step 5
+
+// Step 5: Launch the Activity
+//   → ClientLifecycleManager.scheduleTransaction(
+//       LaunchActivityItem + ResumeActivityItem)
+//   → Binder IPC to app process
+
+// Step 6: App Process Handles Launch
+//   → TransactionExecutor.execute()
+//   → ActivityThread.handleLaunchActivity()
+//     → Instrumentation.newActivity() — reflective instantiation
+//     → Activity.attach() — creates PhoneWindow, sets base context
+//     → Instrumentation.callActivityOnCreate()
+//       → Activity.onCreate() — YOUR CODE RUNS HERE
+//       → setContentView() → LayoutInflater inflates XML → View tree created
+//     → Activity.onStart()
+//   → ActivityThread.handleResumeActivity()
+//     → Activity.onResume()
+//     → WindowManager.addView(decorView)
+//       → ViewRootImpl created
+//       → ViewRootImpl.setView(decorView)
+//         → Session.addToDisplayAsUser() → WMS adds the window
+//         → requestLayout() → schedules first traversal
+
+// Step 7: First Frame
+//   → Choreographer.postCallback(CALLBACK_TRAVERSAL)
+//   → On next VSYNC:
+//     → ViewRootImpl.performTraversals()
+//       → performMeasure() → View tree measured
+//       → performLayout()  → View tree laid out
+//       → performDraw()    → View tree drawn to Surface
+//     → RenderThread submits frame to SurfaceFlinger
+//   → Window becomes visible to the user</code></pre>
+
+<div class="callout warn">
+<div class="callout-label">Warning — The Visibility Gap</div>
+<p>There is a gap between <code>onResume()</code> and the window actually becoming visible. During this gap, the Activity is "resumed" but the user still sees the previous Activity (or a blank window). This is why <code>reportFullyDrawn()</code> exists — it lets you signal when your content is actually ready, not just when the lifecycle says you're "resumed".</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Activity Finish & Destruction</h2>
+
+<h3>The finish() Path</h3>
+
+<pre><code>// Activity.finish()
+//   → ActivityClient.getInstance().finishActivity(mToken, resultCode, resultData)
+//   → Binder IPC to system_server
+//
+// In system_server:
+//   → ActivityRecord.finishIfPossible()
+//     → Sets finishing = true
+//     → If Activity is RESUMED:
+//       → startPausingLocked() — pause first, then proceed
+//     → If Activity is PAUSED/STOPPED:
+//       → finishCurrentActivityLocked()
+//         → Sends DestroyActivityItem to app process
+//
+// In app process:
+//   → TransactionExecutor resolves path to ON_DESTROY
+//   → ActivityThread.handleDestroyActivity()
+//     → Activity.onDestroy()
+//     → WindowManager.removeView() — removes from WMS
+//     → ActivityClient.activityDestroyed(token) — notifies AMS</code></pre>
+
+<h3>User-Initiated vs System-Initiated Destruction</h3>
+
+<table>
+<tr><th>Scenario</th><th><code>isFinishing()</code></th><th><code>isChangingConfigurations()</code></th><th><code>onDestroy()</code> called?</th></tr>
+<tr><td>User presses Back</td><td><code>true</code></td><td><code>false</code></td><td>Yes</td></tr>
+<tr><td><code>finish()</code> called</td><td><code>true</code></td><td><code>false</code></td><td>Yes</td></tr>
+<tr><td>Config change (rotation)</td><td><code>false</code></td><td><code>true</code></td><td>Yes</td></tr>
+<tr><td>System kills Activity (low mem)</td><td><code>false</code></td><td><code>false</code></td><td>Yes (if process alive)</td></tr>
+<tr><td>LMK kills entire process</td><td>N/A</td><td>N/A</td><td><strong>No</strong></td></tr>
+</table>
+
+<pre><code>// The critical distinction in onDestroy():
+override fun onDestroy() {
+    super.onDestroy()
+
+    if (isFinishing) {
+        // Permanent teardown — release everything
+        // Cancel all coroutines, close DB connections, unregister receivers
+        releaseAllResources()
+    } else if (isChangingConfigurations) {
+        // Config change — Activity will be recreated immediately
+        // DON'T release ViewModel-managed resources
+        // DON'T cancel ongoing network requests held by ViewModel
+    } else {
+        // System reclamation — save state in onSaveInstanceState (already called)
+        // This path is rare when the process is still alive
+    }
+}</code></pre>
+
+<div class="callout danger">
+<div class="callout-label">Danger — Never Rely on onDestroy for Critical Cleanup</div>
+<p>When LMK kills the process, no lifecycle callbacks fire. If you need to persist data, do it in <code>onStop()</code> or <code>onSaveInstanceState()</code>. The only reliable signal for process death after the fact is <code>ApplicationExitInfo</code> (API 30+), which you can query on next launch.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. onNewIntent() and onActivityResult() Timing</h2>
+
+<h3>onNewIntent()</h3>
+
+<pre><code>// onNewIntent() is called when an existing Activity instance is reused
+// instead of creating a new one. This happens with:
+//
+// 1. launchMode="singleTop" + Activity is at top of stack
+// 2. launchMode="singleTask" — always reuses existing instance
+// 3. launchMode="singleInstance" — always reuses existing instance
+// 4. FLAG_ACTIVITY_SINGLE_TOP on the Intent
+//
+// The callback ordering depends on the Activity's current state:
+//
+// Case A: Activity is RESUMED (already in foreground)
+//   onPause() → onNewIntent() → onResume()
+//
+// Case B: Activity is STOPPED (in background)
+//   onNewIntent() → onRestart() → onStart() → onResume()
+//
+// IMPORTANT: The Intent returned by getIntent() is NOT updated automatically.
+// You must call setIntent(intent) in onNewIntent() if you want getIntent()
+// to return the new Intent in subsequent lifecycle callbacks.
+
+override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    setIntent(intent) // Critical — without this, getIntent() returns the OLD intent
+    handleDeepLink(intent)
+}
+
+// In AOSP, this is delivered via NewIntentItem in the ClientTransaction:
+// ClientTransaction {
+//   callbacks: [NewIntentItem(intent)]
+//   lifecycleState: ResumeActivityItem
+// }
+// TransactionExecutor runs NewIntentItem.execute() first, then resolves
+// the lifecycle path to ON_RESUME.</code></pre>
+
+<h3>onActivityResult() and the Modern Activity Result API</h3>
+
+<pre><code>// Legacy: onActivityResult() timing
+//   Activity B finishes → Activity A receives:
+//   onActivityResult() → onRestart() → onStart() → onResume()
+//
+// The result is delivered BEFORE onResume(), which means you can
+// use the result data to update UI in onStart().
+
+// Modern: registerForActivityResult() — the lifecycle-safe replacement
+// Why it's better:
+// 1. Decouples result handling from the Activity class
+// 2. Survives configuration changes (registered in onCreate, not overridden)
+// 3. Type-safe contracts (ActivityResultContracts)
+
+class MyActivity : AppCompatActivity() {
+
+    // MUST be registered before STARTED state (onCreate or class init)
+    private val pickImage = registerForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        uri?.let { displayImage(it) }
+    }
+
+    // Under the hood:
+    // - ActivityResultRegistry stores the callback keyed by a unique string
+    // - On config change, the Activity is recreated, registerForActivityResult()
+    //   re-registers with the SAME key, so the pending result is matched
+    // - The callback is lifecycle-aware: it's only invoked when the Activity
+    //   is at least STARTED (uses LifecycleEventObserver internally)
+
+    fun onPickImageClick() {
+        pickImage.launch("image/*")
+    }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2>7. Staff-Level Corner Cases</h2>
+
+<h3>The "Pause-Then-Launch" Race</h3>
+
+<pre><code>// When Activity B is launched while Activity A is in foreground:
+//
+// 1. AMS sends PauseActivityItem to Activity A
+// 2. AMS waits for A to acknowledge pause (up to 500ms)
+// 3. ONLY THEN does AMS send LaunchActivityItem for Activity B
+//
+// But what if A's onPause() takes too long?
+//   → After PAUSE_TIMEOUT (500ms), AMS proceeds anyway
+//   → Activity B is launched even though A hasn't finished pausing
+//   → A's onPause() eventually completes asynchronously
+//
+// This means: if you do heavy work in onPause(), the user sees a
+// delayed transition. AMS logs: "Activity pause timeout for ActivityRecord{...}"
+//
+// In multi-window mode, the race is more complex because both
+// Activities can be RESUMED simultaneously (multi-resume).</code></pre>
+
+<h3>moveTaskToBack() vs Home Button</h3>
+
+<pre><code>// Home button press:
+//   → Launches the Home Activity (launcher) with FLAG_ACTIVITY_NEW_TASK
+//   → Current Activity: onPause() → onStop()
+//   → The Task is moved to background by the launcher taking focus
+//
+// moveTaskToBack(true):
+//   → Directly tells AMS to move the entire Task behind all others
+//   → Current Activity: onPause() → onStop()
+//   → No new Activity is launched — the previous Task's top Activity resumes
+//
+// Key difference: moveTaskToBack doesn't create a new Task entry.
+// If the user presses Recents, the Task is still there.
+// But the lifecycle callbacks are identical: onPause() → onStop().</code></pre>
+
+<h3>Visible but Not RESUMED</h3>
+
+<pre><code>// An Activity can be STARTED (visible) but NOT RESUMED in these cases:
+//
+// 1. Transparent Activity on top:
+//    Activity A [STARTED, visible] ← partially visible behind B
+//    Activity B [RESUMED, transparent theme]
+//    → A receives onPause() but NOT onStop() because it's still visible
+//
+// 2. Dialog-themed Activity:
+//    Activity A [STARTED, visible] ← visible around the dialog
+//    Activity B [RESUMED, Theme.Dialog]
+//    → Same as above: A is paused but not stopped
+//
+// 3. Multi-window (split-screen):
+//    Activity A [STARTED or RESUMED] ← in one split
+//    Activity B [RESUMED]            ← in the other split
+//    → Pre-Android 10: only the focused Activity is RESUMED
+//    → Android 10+: both can be RESUMED (multi-resume)
+//
+// 4. Picture-in-Picture:
+//    Activity A [PAUSED] ← in PiP window (visible but not interactive)
+//    Activity B [RESUMED] ← full-screen
+//    → PiP Activity is paused because it doesn't receive input
+//    → Android 12+ changed this: PiP Activities can be STARTED</code></pre>
+
+<h3>android:noHistory and android:excludeFromRecents</h3>
+
+<pre><code>// android:noHistory="true"
+//   → Activity is finished automatically when the user navigates away
+//   → Specifically: when another Activity comes to the foreground
+//   → onDestroy() IS called (unlike LMK kill)
+//   → Use case: splash screens, payment confirmation screens
+//   → Gotcha: the Activity is also destroyed when the user presses Home,
+//     so returning from Recents creates a NEW instance
+
+// android:excludeFromRecents="true"
+//   → Activity's Task is not shown in the Recents screen
+//   → The Activity still exists and follows normal lifecycle
+//   → Use case: authentication screens, notification trampolines
+//   → Can also be set dynamically via FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS</code></pre>
+
+<h3>Trampoline Activities and Android 12 Restrictions</h3>
+
+<pre><code>// The "trampoline" pattern:
+//   Activity A (invisible) → startActivity(B) → finish()
+//   Used for: notification click routing, deep link resolution, auth gates
+//
+// Android 12 (API 31) restriction:
+//   Apps targeting API 31+ cannot start Activities from Services or
+//   BroadcastReceivers that are in the background, UNLESS they have
+//   a visible window or fall under specific exemptions.
+//
+//   This broke the common pattern of:
+//   NotificationReceiver.onReceive() → startActivity(TrampolineActivity)
+//
+//   Fix: use PendingIntent that directly targets the destination Activity
+//   instead of routing through a trampoline.
+//
+// The trampoline Activity itself still works when launched from the
+// foreground — the restriction is about background Activity starts.
+
+// Modern replacement for notification trampolines:
+val pendingIntent = PendingIntent.getActivity(
+    context,
+    requestCode,
+    Intent(context, DestinationActivity::class.java).apply {
+        putExtra("deepLinkData", data)
+    },
+    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+)
+
+val notification = NotificationCompat.Builder(context, channelId)
+    .setContentIntent(pendingIntent) // Direct to destination, no trampoline
+    .build()</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff-Level Insight — ClientTransaction Batching and Lifecycle Coalescing</div>
+<p>AMS can batch multiple lifecycle transitions into a single <code>ClientTransaction</code>. For example, when an Activity is launched and the current one needs to be stopped, AMS may send a single transaction with <code>PauseActivityItem</code> as a callback and <code>StopActivityItem</code> as the lifecycle state request. <code>TransactionExecutor</code> then resolves the full path: ON_RESUME → ON_PAUSE (from callback) → ON_STOP (from lifecycle state). This batching is why you sometimes see <code>onPause()</code> and <code>onStop()</code> fire in rapid succession with no interleaving messages — they're part of the same transaction execution. Understanding this is critical for debugging lifecycle-related race conditions: if you post a <code>Runnable</code> to the main Handler in <code>onPause()</code>, it will NOT execute before <code>onStop()</code> if they're in the same transaction, because the <code>TransactionExecutor</code> runs synchronously through the entire path.</p>
+</div>
+
+<div class="callout warn">
+<div class="callout-label">Warning — ActivityThread Handler Methods</div>
+<p>Each lifecycle stage has a corresponding <code>ActivityThread.handle*</code> method: <code>handleLaunchActivity()</code>, <code>handleResumeActivity()</code>, <code>handlePauseActivity()</code>, <code>handleStopActivity()</code>, <code>handleDestroyActivity()</code>. These are where the actual work happens — creating the Activity object, attaching the window, calling your callbacks. If you're reading AOSP traces or debugging with breakpoints, these are the methods to watch. They're invoked by the corresponding <code>ClientTransactionItem.execute()</code> methods, not directly by the Handler.</p>
+</div>
+
+<h2>8. AMS vs ATMS Split (Android 10)</h2>
+
+<p>Before Android 10, <code>ActivityManagerService</code> (AMS) handled everything: Activity lifecycle, process management, broadcast dispatch, and content providers. In Android 10, Google split Activity-related logic into <code>ActivityTaskManagerService</code> (ATMS) while AMS retained process/broadcast/provider management. Key implications:</p>
+
+<pre><code>// Pre-Android 10:
+//   AMS.startActivity() → AMS.startActivityAsUser() → ActivityStarter
+//
+// Android 10+:
+//   ATMS.startActivity() → ATMS.startActivityAsUser() → ActivityStarter
+//   AMS still handles: getRunningAppProcesses(), forceStopPackage(), etc.
+//
+// The split was motivated by:
+// 1. Separation of concerns (Activity management vs process management)
+// 2. Multi-display support (ATMS manages per-display task stacks)
+// 3. Code maintainability (AMS was 20,000+ lines)
+//
+// Both services run in system_server. ATMS holds the ActivityTaskManagerInternal
+// interface that AMS uses when it needs Activity information.</code></pre>
+
+<h2>9. Activity Lifecycle and Bound Services</h2>
+
+<p>When an Activity binds to a Service, the binding lifecycle must be carefully managed relative to Activity lifecycle:</p>
+
+<pre><code>// WRONG — binding in onCreate, unbinding in onDestroy
+// Problem: during config change, onDestroy is called → unbind → Service may stop
+// if this was the last binding. Then onCreate → bind again → Service restarts.
+// This causes unnecessary Service restarts on every rotation.
+
+// CORRECT — bind/unbind aligned with visibility:
+override fun onStart() {
+    super.onStart()
+    bindService(serviceIntent, connection, Context.BIND_AUTO_CREATE)
+}
+
+override fun onStop() {
+    super.onStop()
+    unbindService(connection)
+}
+
+// Or for config-change-safe binding, use ViewModel + ServiceConnection:
+class MyViewModel : ViewModel() {
+    private val binder = MutableLiveData&lt;IMyService?&gt;()
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, service: IBinder) {
+            binder.value = IMyService.Stub.asInterface(service)
+        }
+        override fun onServiceDisconnected(name: ComponentName) {
+            binder.value = null
+        }
+    }
+    // ViewModel survives config change → ServiceConnection survives
+    // But: ViewModel does NOT survive process death → must rebind
+}</code></pre>
+
+<h2>10. Testing Activity Lifecycle</h2>
+
+<pre><code>// ActivityScenario — the standard testing API for lifecycle
+@Test
+fun activityRecreation_preservesState() {
+    val scenario = ActivityScenario.launch(MyActivity::class.java)
+
+    // Move to specific state
+    scenario.moveToState(Lifecycle.State.CREATED)
+
+    // Simulate config change (destroy + recreate)
+    scenario.recreate()
+
+    // Verify state was restored
+    scenario.onActivity { activity ->
+        assertEquals("expected", activity.restoredValue)
+    }
+}
+
+// Testing specific lifecycle transitions:
+@Test
+fun onStop_releasesResources() {
+    val scenario = ActivityScenario.launch(MyActivity::class.java)
+    scenario.moveToState(Lifecycle.State.CREATED) // triggers onStop
+    scenario.onActivity { activity ->
+        assertFalse(activity.isResourceHeld)
+    }
+}
+
+// Key distinction: ActivityScenario.recreate() simulates config change
+// (ViewModel survives), NOT process death (ViewModel lost).
+// For process death, use StateRestorationTester (Compose) or
+// manual Bundle save/restore in unit tests.</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff-Level Insight — Activity Leak Patterns</div>
+<p>The most insidious Activity leaks at L6 scale: (1) <strong>Anonymous inner class in static field</strong>: an <code>OnClickListener</code> lambda capturing <code>this</code> stored in a companion object. (2) <strong>Handler/Runnable leak</strong>: a delayed <code>Runnable</code> posted to a Handler holds a reference to the Activity via the enclosing class; if the Activity is destroyed before the Runnable fires, it's leaked until the message is processed. Fix: use <code>WeakReference</code> or <code>lifecycleScope.launch { delay(...) }</code>. (3) <strong>InputMethodManager leak</strong>: a known framework bug where IMM holds a reference to the focused View's root, which chains back to the Activity. Workaround: clear focus in <code>onDestroy()</code>. (4) <strong>Registered but unregistered callbacks</strong>: <code>registerReceiver()</code> without <code>unregisterReceiver()</code>, <code>SensorManager.registerListener()</code> without unregister. Always pair registration with lifecycle-aware unregistration.</p>
+</div>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  <a href="02-fragment-lifecycle.html">02 — Fragment Lifecycle →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,1104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 — Multi-Window & Picture-in-Picture — Architecture, Lifecycle, PiP Internals & Foldables</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-activity-lifecycle.html">01 Activity Lifecycle</a>
+  <a href="02-fragment-lifecycle.html">02 Fragment Lifecycle</a>
+  <a href="03-config-change-process-death.html">03 Config &amp; Process Death</a>
+  <a href="04-back-stack-tasks.html">04 Back Stack &amp; Tasks</a>
+  <a class="active" href="05-multi-window-pip.html">05 Multi-Window &amp; PiP</a>
+  <a href="06-lifecycle-aware-components.html">06 Lifecycle-Aware</a>
+  <a href="07-navigation-component.html">07 Navigation Component</a>
+  <a href="08-navigation-compose.html">08 Navigation Compose</a>
+  <a href="09-interview-qa.html">09 Interview Q&amp;A</a>
+</div>
+
+<h1>05 — Multi-Window &amp; Picture-in-Picture</h1>
+<p class="subtitle">WindowingMode internals, multi-resume semantics, PiP task management via PinnedTaskController, foldable display areas, and staff-level resource contention patterns</p>
+
+<!-- ============================================================ -->
+<h2>1. Multi-Window Architecture</h2>
+
+<p>Multi-window isn't a UI feature bolted on top — it's a fundamental reorganization of how <code>WindowManagerService</code> assigns <code>Task</code> objects to screen regions. Understanding the hierarchy is essential.</p>
+
+<div class="diagram-container">
+<pre><code>                    Display & Task Hierarchy (AOSP)
+
+    DisplayContent (physical or virtual display)
+    └── RootDisplayArea
+        └── TaskDisplayArea (DEFAULT_TASK_DISPLAY_AREA)
+            ├── TaskDisplayArea (split-left)    ← SplitScreen primary
+            │   └── Task (stack)
+            │       └── ActivityRecord [RESUMED]
+            │
+            ├── TaskDisplayArea (split-right)   ← SplitScreen secondary
+            │   └── Task (stack)
+            │       └── ActivityRecord [RESUMED]  (multi-resume, API 29+)
+            │
+            ├── Task (freeform)                 ← Floating window
+            │   └── ActivityRecord [RESUMED]
+            │
+            └── Task (pinned)                   ← PiP window
+                └── ActivityRecord [PAUSED/STARTED]</code></pre>
+</div>
+
+<h3>WindowingMode — The System's View</h3>
+
+<p>Every <code>Task</code> in the system has a <code>windowingMode</code> that determines how it's positioned and sized. This is set on the <code>Task</code>'s <code>Configuration</code> object and propagated to all child <code>ActivityRecord</code>s.</p>
+
+<table>
+<tr><th>WindowingMode</th><th>Value</th><th>Behavior</th></tr>
+<tr><td><code>WINDOWING_MODE_FULLSCREEN</code></td><td>1</td><td>Task fills the entire <code>TaskDisplayArea</code>. Default mode.</td></tr>
+<tr><td><code>WINDOWING_MODE_PINNED</code></td><td>2</td><td>PiP — small overlay window, always on top, separate task stack.</td></tr>
+<tr><td><code>WINDOWING_MODE_FREEFORM</code></td><td>5</td><td>Desktop-style floating window. User can drag/resize. Common on tablets, ChromeOS, Samsung DeX.</td></tr>
+<tr><td><code>WINDOWING_MODE_MULTI_WINDOW</code></td><td>6</td><td>Generic parent mode for split-screen. The actual split is managed by <code>SplitScreenController</code>.</td></tr>
+</table>
+
+<pre><code>// How the system assigns windowing mode to a Task:
+//
+// frameworks/base/services/core/java/com/android/server/wm/Task.java
+//
+// When entering split-screen:
+//   1. User triggers split (long-press Recents, or drag from taskbar)
+//   2. SplitScreenController.splitPrimaryTask() is called
+//   3. The selected Task's windowingMode is set to MULTI_WINDOW
+//   4. A SplitLayout divider is created between the two TaskDisplayAreas
+//   5. The second Task is placed in the other TaskDisplayArea
+//
+// The Task's bounds are set by the parent TaskDisplayArea:
+//   task.setBounds(displayArea.getBounds())
+//
+// On resize (user drags the divider):
+//   → SplitLayout recalculates bounds for both TaskDisplayAreas
+//   → Each Task receives a new Configuration with updated bounds
+//   → This triggers onConfigurationChanged() in the Activity</code></pre>
+
+<h3>Manifest Declarations</h3>
+
+<pre><code>// android:resizeableActivity — controls multi-window support
+//
+// Default: true for targetSdkVersion >= 24 (Android 7.0)
+//
+// If set to false:
+//   → Activity cannot enter split-screen or freeform mode
+//   → On large screens (Android 12L+), the system may IGNORE this flag
+//     and show the Activity in compatibility mode (letterboxed)
+//   → The Activity still receives size-appropriate Configuration
+//
+// android:supportsPictureInPicture — enables PiP
+//   → Must be true to call enterPictureInPictureMode()
+//   → Requires android:resizeableActivity="true" (or default true)
+//   → Only Activities with this flag can enter PINNED windowing mode
+
+&lt;activity
+    android:name=".VideoPlayerActivity"
+    android:resizeableActivity="true"
+    android:supportsPictureInPicture="true"
+    android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation" /&gt;
+
+// The configChanges declaration is critical:
+// Without it, entering multi-window or PiP triggers Activity recreation.
+// With it, you get onConfigurationChanged() instead — much smoother.</code></pre>
+
+<!-- ============================================================ -->
+<h2>2. Multi-Resume (Android 10+)</h2>
+
+<p>Before Android 10, the system enforced a strict invariant: <strong>exactly one Activity in the entire system could be in RESUMED state</strong>. In split-screen, the unfocused Activity was PAUSED — visible but not resumed. Android 10 changed this fundamentally.</p>
+
+<h3>The Old Model (API &lt; 29)</h3>
+
+<div class="diagram-container">
+<pre><code>    Split-Screen — Pre-Android 10
+
+    ┌─────────────────────┬─────────────────────┐
+    │                     │                     │
+    │   Activity A        │   Activity B        │
+    │   [PAUSED]          │   [RESUMED]         │  ← User tapped B last
+    │                     │                     │
+    │   Visible but NOT   │   Foreground,       │
+    │   receiving input   │   receiving input   │
+    │   focus             │   focus             │
+    │                     │                     │
+    └─────────────────────┴─────────────────────┘
+
+    Only B is RESUMED. A is PAUSED even though it's fully visible.
+    If A is playing video with lifecycle-aware playback → video PAUSES.</code></pre>
+</div>
+
+<h3>The New Model (API 29+, Multi-Resume)</h3>
+
+<pre><code>// Android 10 introduced multi-resume:
+// ALL visible Activities in multi-window can be RESUMED simultaneously.
+//
+// The system still tracks which Activity is "top resumed" — the one
+// that last received user interaction. This matters for exclusive
+// resources like camera and audio focus.
+//
+// New callback added in API 29:
+//   onTopResumedActivityChanged(isTopResumed: Boolean)
+//
+// This fires when the Activity gains or loses "top resumed" status.
+// It does NOT affect the RESUMED lifecycle state — both Activities
+// remain RESUMED regardless of which is "top."
+
+override fun onTopResumedActivityChanged(isTopResumed: Boolean) {
+    super.onTopResumedActivityChanged(isTopResumed)
+    if (isTopResumed) {
+        // We are the top-most resumed Activity — we have priority
+        // for exclusive resources (camera, audio focus)
+        acquireCamera()
+    } else {
+        // Another Activity became top-resumed
+        // We should gracefully yield exclusive resources
+        // but we're still RESUMED — don't stop video decoding
+    }
+}</code></pre>
+
+<h3>Resource Contention in Multi-Resume</h3>
+
+<pre><code>// Camera access is the canonical contention example.
+// Only ONE app can hold the camera at a time.
+//
+// In multi-resume, both Activities are RESUMED, so both may try
+// to open the camera. The system resolves this:
+//
+// 1. The top-resumed Activity gets priority
+// 2. If Activity B opens the camera while A holds it:
+//    → CameraDevice.StateCallback.onDisconnected() fires on A
+//    → A must handle this gracefully (show placeholder, retry later)
+//
+// Correct pattern:
+
+class CameraActivity : AppCompatActivity() {
+    private var cameraDevice: CameraDevice? = null
+
+    private val stateCallback = object : CameraDevice.StateCallback() {
+        override fun onOpened(camera: CameraDevice) {
+            cameraDevice = camera
+            startPreview()
+        }
+
+        override fun onDisconnected(camera: CameraDevice) {
+            // Another Activity took the camera — this is NORMAL in multi-window
+            camera.close()
+            cameraDevice = null
+            showCameraUnavailablePlaceholder()
+        }
+
+        override fun onError(camera: CameraDevice, error: Int) {
+            camera.close()
+            cameraDevice = null
+        }
+    }
+
+    override fun onTopResumedActivityChanged(isTopResumed: Boolean) {
+        super.onTopResumedActivityChanged(isTopResumed)
+        if (isTopResumed) {
+            tryOpenCamera()
+        }
+        // Don't release camera when losing top-resumed — wait for onDisconnected
+        // The other Activity might not even need the camera
+    }
+}</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff-Level Insight — Multi-Resume and OEM Fragmentation</div>
+<p>Multi-resume is technically optional for OEMs. The system property <code>ro.android.multiwindow.multiresume</code> controls whether the device supports it. On devices where it's disabled (some Android 10 phones), the old single-resume behavior persists even on API 29+. Your code must handle both paths: check <code>isInMultiWindowMode()</code> and test on devices with and without multi-resume. Samsung, for instance, enabled multi-resume early on their flagships but some budget devices still use single-resume. At L6, you're expected to know that multi-resume isn't a guaranteed API contract — it's a device capability. The <code>PackageManager.FEATURE_PICTURE_IN_PICTURE</code> feature flag is similarly device-dependent.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Lifecycle in Multi-Window</h2>
+
+<h3>Entering Split-Screen — Lifecycle Sequence</h3>
+
+<pre><code>// User drags Activity A into split-screen from Recents:
+//
+// 1. Activity A is already running fullscreen [RESUMED]
+// 2. System changes A's Task windowingMode to MULTI_WINDOW
+// 3. A's bounds change → triggers config change
+//
+// If A does NOT handle configChanges:
+//   onPause() → onStop() → onSaveInstanceState() → onDestroy()
+//   → onCreate(savedState) → onStart() → onResume()
+//   → onMultiWindowModeChanged(true, newConfig)
+//
+// If A DOES handle configChanges (screenSize|screenLayout|smallestScreenSize):
+//   onConfigurationChanged(newConfig)
+//   → onMultiWindowModeChanged(true, newConfig)
+//   → Activity stays alive, no recreation
+//
+// Then user picks Activity B for the other split:
+//   Activity B launches in the second TaskDisplayArea
+//   B: onCreate() → onStart() → onResume()
+//
+// Pre-Android 10: A transitions to PAUSED (B has focus)
+// Android 10+:    A stays RESUMED (multi-resume)</code></pre>
+
+<h3>Exiting Split-Screen</h3>
+
+<pre><code>// User drags the divider all the way to dismiss one side:
+//
+// Activity being dismissed (B):
+//   onPause() → onStop() → onDestroy()
+//   (Task is removed from the split TaskDisplayArea)
+//
+// Activity remaining (A):
+//   Bounds change back to fullscreen → config change
+//   onConfigurationChanged(newConfig)  (if handling configChanges)
+//   → onMultiWindowModeChanged(false, newConfig)
+//
+// OR if not handling configChanges:
+//   Full recreation cycle: destroy → create with new config</code></pre>
+
+<h3>Detecting Multi-Window State</h3>
+
+<pre><code>// Runtime detection methods on Activity:
+
+fun checkMultiWindowState() {
+    // Are we currently in any multi-window mode? (split, freeform, PiP)
+    val inMultiWindow: Boolean = isInMultiWindowMode
+
+    // Are we specifically in PiP?
+    val inPiP: Boolean = isInPictureInPictureMode
+
+    // Callback-based detection (preferred — reacts to changes):
+    // override fun onMultiWindowModeChanged(isInMultiWindowMode: Boolean, newConfig: Configuration)
+    // override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration)
+}
+
+// In Compose, observe via LocalConfiguration:
+@Composable
+fun MultiWindowAwareContent() {
+    val configuration = LocalConfiguration.current
+    val screenWidth = configuration.screenWidthDp
+
+    // Adaptive layout based on available width
+    if (screenWidth < 600) {
+        CompactLayout()
+    } else {
+        ExpandedLayout()
+    }
+}</code></pre>
+
+<div class="callout warn">
+<div class="callout-label">Warning — The "Visible but Paused" Trap (Pre-Android 10)</div>
+<p>On devices without multi-resume, an Activity in split-screen that doesn't have focus is in <code>PAUSED</code> state despite being fully visible. If your video player pauses in <code>onPause()</code> (the standard pattern), the video freezes when the user taps the other split. The fix: check <code>isInMultiWindowMode</code> in <code>onPause()</code> and only pause playback if you're <em>not</em> in multi-window. Better yet, use <code>onStop()</code> for pausing playback — the Activity is only stopped when it's truly not visible.</p>
+</div>
+
+<pre><code>// Correct video playback lifecycle handling:
+
+class VideoPlayerActivity : AppCompatActivity() {
+    private lateinit var player: ExoPlayer
+
+    override fun onStart() {
+        super.onStart()
+        // API 24+: initialize player in onStart for multi-window compatibility
+        initializePlayer()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // API < 24: initialize here (no multi-window)
+        // API 24+: player already initialized in onStart
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // Pre-API 24: release player here
+        // API 24+: do NOT release — we may be visible in multi-window
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // API 24+: release player here — we're truly not visible
+        releasePlayer()
+    }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. Picture-in-Picture Deep Dive</h2>
+
+<h3>PiP Lifecycle Transitions</h3>
+
+<div class="diagram-container">
+<pre><code>    PiP Lifecycle Flow
+
+    ┌──────────────┐     enterPictureInPictureMode()     ┌──────────────┐
+    │  RESUMED     │ ──────────────────────────────────▶  │  PiP MODE    │
+    │  (fullscreen)│                                      │              │
+    └──────────────┘                                      │  Pre-10:     │
+                                                          │   PAUSED     │
+    Config change: bounds shrink to PiP size              │              │
+    onPictureInPictureModeChanged(true)                   │  10+:        │
+    UI elements hidden (controls, text)                   │   RESUMED    │
+                                                          └──────┬───────┘
+                                                                 │
+                                        ┌────────────────────────┼──────────────┐
+                                        │                        │              │
+                                        ▼                        ▼              ▼
+                                  User taps PiP          User swipes      System removes
+                                  to expand              PiP away         (low memory)
+                                        │                        │              │
+                                        ▼                        ▼              ▼
+                                  RESUMED               onStop()          onStop()
+                                  (fullscreen)          onDestroy()       onDestroy()
+                                  onPictureInPicture
+                                  ModeChanged(false)</code></pre>
+</div>
+
+<h3>Entering PiP — The API</h3>
+
+<pre><code>// Basic PiP entry:
+val pipParams = PictureInPictureParams.Builder()
+    .setAspectRatio(Rational(16, 9))  // Must be between 1:2.39 and 2.39:1
+    .build()
+
+enterPictureInPictureMode(pipParams)
+
+// Full-featured PiP params (Android 12+):
+val pipParams = PictureInPictureParams.Builder()
+    .setAspectRatio(Rational(16, 9))
+    .setSourceRectHint(playerView.getGlobalVisibleRect())  // Animation origin
+    .setAutoEnterEnabled(true)       // API 31+: auto-enter on home press
+    .setSeamlessResizeEnabled(true)  // API 31+: smooth resize animation
+    .setActions(listOf(playAction, nextAction))  // Remote actions
+    .build()
+
+// Set params early so the system knows about PiP configuration:
+setPictureInPictureParams(pipParams)
+
+// When to call enterPictureInPictureMode():
+//   → In onUserLeaveHint() — user pressed Home
+//   → In response to a "minimize" button in your UI
+//   → NEVER in onPause() or onStop() — too late, the Activity is already transitioning</code></pre>
+
+<h3>Auto-Enter PiP (Android 12+)</h3>
+
+<pre><code>// Before Android 12, entering PiP on home press required:
+//   1. Override onUserLeaveHint()
+//   2. Call enterPictureInPictureMode() there
+//   3. Handle the race condition where onUserLeaveHint fires for non-home actions
+//
+// Android 12 simplified this with setAutoEnterEnabled(true):
+//   → The system automatically enters PiP when the user navigates away
+//   → No need to override onUserLeaveHint()
+//   → The transition is smoother because the system handles the animation
+//   → The Activity's window surface is reused (no flicker)
+
+class VideoPlayerActivity : AppCompatActivity() {
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Set PiP params as early as possible
+        updatePipParams(isPlaying = false)
+    }
+
+    fun updatePipParams(isPlaying: Boolean) {
+        val actions = if (isPlaying) {
+            listOf(createPauseAction())
+        } else {
+            listOf(createPlayAction())
+        }
+
+        val params = PictureInPictureParams.Builder()
+            .setAspectRatio(Rational(16, 9))
+            .setAutoEnterEnabled(isPlaying)  // Only auto-enter if video is playing
+            .setActions(actions)
+            .build()
+
+        setPictureInPictureParams(params)
+    }
+
+    // Update params whenever playback state changes
+    fun onPlaybackStateChanged(isPlaying: Boolean) {
+        updatePipParams(isPlaying)
+    }
+}</code></pre>
+
+<h3>Custom Actions in PiP</h3>
+
+<pre><code>// PiP windows can show up to 3 custom action buttons.
+// These are RemoteAction objects backed by PendingIntents.
+
+private fun createPlayAction(): RemoteAction {
+    val intent = PendingIntent.getBroadcast(
+        this,
+        REQUEST_PLAY,
+        Intent(ACTION_MEDIA_CONTROL).putExtra(EXTRA_CONTROL_TYPE, CONTROL_PLAY),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+    )
+
+    return RemoteAction(
+        Icon.createWithResource(this, R.drawable.ic_play),
+        "Play",           // Title (accessibility)
+        "Resume playback", // Description (accessibility)
+        intent
+    )
+}
+
+// Register a BroadcastReceiver to handle PiP actions:
+private val pipActionReceiver = object : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == ACTION_MEDIA_CONTROL) {
+            when (intent.getIntExtra(EXTRA_CONTROL_TYPE, 0)) {
+                CONTROL_PLAY -> player.play()
+                CONTROL_PAUSE -> player.pause()
+                CONTROL_NEXT -> player.seekToNext()
+            }
+        }
+    }
+}
+
+override fun onStart() {
+    super.onStart()
+    registerReceiver(pipActionReceiver, IntentFilter(ACTION_MEDIA_CONTROL),
+        RECEIVER_NOT_EXPORTED)
+}
+
+override fun onStop() {
+    super.onStop()
+    unregisterReceiver(pipActionReceiver)
+}</code></pre>
+
+<h3>UI Adjustments for PiP</h3>
+
+<pre><code>// When entering PiP, the window shrinks dramatically.
+// Most UI elements become unreadable/untappable.
+// Hide everything except the core content (e.g., video surface).
+
+override fun onPictureInPictureModeChanged(
+    isInPictureInPictureMode: Boolean,
+    newConfig: Configuration
+) {
+    super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+
+    if (isInPictureInPictureMode) {
+        // Hide all controls — only the video surface should be visible
+        binding.playerControls.isVisible = false
+        binding.toolbar.isVisible = false
+        binding.description.isVisible = false
+    } else {
+        // Restore full UI
+        binding.playerControls.isVisible = true
+        binding.toolbar.isVisible = true
+        binding.description.isVisible = true
+    }
+}
+
+// In Compose:
+@Composable
+fun VideoScreen(isInPiP: Boolean) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        VideoSurface()  // Always visible
+
+        if (!isInPiP) {
+            PlayerControls()
+            TopBar()
+            VideoDescription()
+        }
+    }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2>5. PiP Internals</h2>
+
+<h3>PinnedTaskController &amp; PipTaskOrganizer</h3>
+
+<pre><code>// The PiP system is managed by several cooperating components in system_server:
+//
+// PinnedTaskController (frameworks/base/services/core/.../wm/)
+//   → Manages the lifecycle of the pinned Task
+//   → Enforces that only ONE Task can be in PINNED mode at a time
+//   → Handles bounds calculation (min/max size, aspect ratio constraints)
+//
+// PipTaskOrganizer (frameworks/base/libs/WindowManager/Shell/)
+//   → Implements TaskOrganizer for PINNED windowing mode
+//   → Receives callbacks when Tasks enter/exit PiP
+//   → Manages the PiP animation and window positioning
+//   → Uses SurfaceControl transactions for efficient window manipulation
+//
+// PipMotionHelper
+//   → Handles PiP window physics: fling, snap-to-edge, dismiss gesture
+//   → Calculates snap targets (corners, edges)
+//   → Manages the dismiss target at bottom of screen
+
+// Architecture:
+//
+// App Process                    system_server (WMS)              SystemUI (Shell)
+// ───────────                    ──────────────────              ────────────────
+// enterPictureInPictureMode()
+//   → Binder IPC ──────────────▶ ActivityRecord
+//                                .setWindowingMode(PINNED)
+//                                    │
+//                                    ▼
+//                                Task.setWindowingMode()
+//                                    │
+//                                    ▼
+//                                PinnedTaskController
+//                                .onTaskAppeared()
+//                                    │
+//                                    ├──── TaskOrganizer IPC ──▶ PipTaskOrganizer
+//                                    │                           .onTaskAppeared()
+//                                    │                               │
+//                                    │                               ▼
+//                                    │                           Calculate PiP bounds
+//                                    │                           Apply SurfaceControl
+//                                    │                           transaction (position,
+//                                    │                           size, corner radius)
+//                                    │                               │
+//                                    │                               ▼
+//                                    │                           PipMotionHelper
+//                                    │                           (snap, fling, dismiss)
+//                                    │
+//                                    ▼
+//                                Send config change to app
+//                                (new bounds = PiP size)</code></pre>
+
+<h3>SurfaceControl Transactions for PiP</h3>
+
+<pre><code>// PiP window manipulation uses SurfaceControl.Transaction for efficiency.
+// Instead of going through the full WMS relayout path, PipTaskOrganizer
+// directly manipulates the Task's surface:
+//
+// SurfaceControl.Transaction()
+//   .setPosition(taskSurface, x, y)       // Move PiP window
+//   .setWindowCrop(taskSurface, rect)      // Resize visible area
+//   .setCornerRadius(taskSurface, 16f)     // Rounded corners
+//   .setAlpha(taskSurface, 0.9f)           // During dismiss gesture
+//   .apply()                                // Atomic commit
+//
+// This is why PiP animations are smooth even under load:
+// the app process is NOT involved in the window movement.
+// The surface is manipulated directly by SystemUI's Shell process.
+//
+// The app only receives onConfigurationChanged() AFTER the animation
+// settles — not during every frame of the drag.</code></pre>
+
+<h3>PiP and the Back Stack</h3>
+
+<pre><code>// A PiP Activity lives in its own Task with PINNED windowing mode.
+// This Task is separate from the normal back stack.
+//
+// When Activity enters PiP:
+//   1. If it's the only Activity in its Task:
+//      → The entire Task becomes PINNED
+//   2. If there are other Activities below it in the Task:
+//      → The Activity is reparented to a NEW Task in PINNED mode
+//      → The original Task remains in its previous windowing mode
+//
+// When PiP is dismissed (user swipes away):
+//   → The PINNED Task is removed
+//   → The Activity receives onStop() → onDestroy()
+//   → It is NOT returned to the original Task
+//
+// When PiP is expanded (user taps to fullscreen):
+//   → The Task's windowingMode changes from PINNED to FULLSCREEN
+//   → The Activity receives onPictureInPictureModeChanged(false)
+//   → It becomes the foreground Task
+
+// Process priority for PiP:
+//
+// oom_adj values (lower = higher priority, less likely to be killed):
+//   FOREGROUND_APP_ADJ     =    0   (current foreground Activity)
+//   VISIBLE_APP_ADJ        =  100   (visible but not foreground)
+//   PERCEPTIBLE_APP_ADJ    =  200   (PiP Activity lives here)
+//   BACKUP_APP_ADJ         =  300
+//   CACHED_APP_MIN_ADJ     =  900
+//
+// PiP gets PERCEPTIBLE_APP_ADJ — higher priority than cached/background
+// apps but lower than the foreground Activity. This means PiP survives
+// moderate memory pressure but can be killed under severe pressure.</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff-Level Insight — PiP Process Priority and State Restoration</div>
+<p>PiP Activities receive <code>PERCEPTIBLE_APP_ADJ</code> (200), which means they're more killable than visible Activities (100) but safer than background apps (900+). Under memory pressure, the system can kill the PiP process. When this happens, the PiP window disappears with no user-visible error. If the user later taps where the PiP was, nothing happens — the Activity is gone. This is why <code>onSaveInstanceState()</code> is critical for PiP Activities: if the process is killed and the user re-launches the app, you need to restore playback position, video URL, and other state. The tricky part: the PiP window is tiny, so <code>onSaveInstanceState()</code> fires with a Configuration that has very small screen dimensions. If your state-saving logic depends on visible UI elements (e.g., RecyclerView scroll position), it may save incorrect state. Always save domain-level state (playback position in milliseconds) rather than UI-level state.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Display Areas and Foldables</h2>
+
+<h3>DisplayContent and TaskDisplayArea</h3>
+
+<pre><code>// The display hierarchy in AOSP:
+//
+// DisplayContent
+//   → Represents a physical or virtual display
+//   → Contains one or more RootDisplayAreas
+//   → Each RootDisplayArea contains TaskDisplayAreas
+//
+// TaskDisplayArea
+//   → A region of the screen that can host Tasks
+//   → In split-screen, there are TWO TaskDisplayAreas
+//   → Each TaskDisplayArea independently manages its Tasks
+//
+// On foldable devices, the system may have:
+//   → One DisplayContent for the inner (unfolded) display
+//   → One DisplayContent for the outer (cover) display
+//   → When folding/unfolding, Activities migrate between DisplayContents
+
+// Detecting display changes:
+//
+// Fold/unfold triggers a Configuration change with:
+//   → New screenWidthDp / screenHeightDp
+//   → New smallestScreenWidthDp
+//   → Possibly new orientation
+//   → New DisplayMetrics (density may change between displays)
+//
+// If you don't handle these in configChanges, the Activity is recreated.
+// If you do handle them, you get onConfigurationChanged().</code></pre>
+
+<h3>Jetpack WindowManager for Foldables</h3>
+
+<pre><code>// The Jetpack WindowManager library provides a stable API for
+// foldable-specific features that the platform API doesn't cover well.
+
+// build.gradle.kts
+// implementation("androidx.window:window:1.2.0")
+
+class FoldableActivity : AppCompatActivity() {
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        lifecycleScope.launch {
+            lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                WindowInfoTracker.getOrCreate(this@FoldableActivity)
+                    .windowLayoutInfo(this@FoldableActivity)
+                    .collect { layoutInfo ->
+                        handleLayoutInfo(layoutInfo)
+                    }
+            }
+        }
+    }
+
+    private fun handleLayoutInfo(layoutInfo: WindowLayoutInfo) {
+        val foldingFeature = layoutInfo.displayFeatures
+            .filterIsInstance&lt;FoldingFeature&gt;()
+            .firstOrNull()
+
+        if (foldingFeature != null) {
+            when {
+                foldingFeature.state == FoldingFeature.State.HALF_OPENED
+                    &amp;&amp; foldingFeature.orientation == FoldingFeature.Orientation.HORIZONTAL -> {
+                    // "Tabletop" posture — top half shows content, bottom half shows controls
+                    enterTabletopMode(foldingFeature.bounds)
+                }
+                foldingFeature.state == FoldingFeature.State.HALF_OPENED
+                    &amp;&amp; foldingFeature.orientation == FoldingFeature.Orientation.VERTICAL -> {
+                    // "Book" posture — side-by-side layout
+                    enterBookMode(foldingFeature.bounds)
+                }
+                foldingFeature.state == FoldingFeature.State.FLAT -> {
+                    // Fully unfolded — use full screen
+                    enterFullScreenMode()
+                }
+            }
+        }
+    }
+}
+
+// In Compose:
+@Composable
+fun AdaptiveLayout() {
+    val windowSizeClass = currentWindowAdaptiveInfo().windowSizeClass
+
+    when {
+        windowSizeClass.windowWidthSizeClass == WindowWidthSizeClass.EXPANDED ->
+            TwoPaneLayout()
+        windowSizeClass.windowWidthSizeClass == WindowWidthSizeClass.MEDIUM ->
+            ListDetailLayout()
+        else ->
+            SinglePaneLayout()
+    }
+}</code></pre>
+
+<h3>WindowMetrics — Getting the Correct Size</h3>
+
+<pre><code>// In multi-window, the Activity's window is smaller than the display.
+// Using Display.getSize() or DisplayMetrics gives the WRONG answer.
+//
+// Correct approach — WindowMetricsCalculator:
+
+val windowMetrics = WindowMetricsCalculator.getOrCreate()
+    .computeCurrentWindowMetrics(this)
+
+val bounds = windowMetrics.bounds  // The actual window bounds
+val width = bounds.width()
+val height = bounds.height()
+
+// For the maximum possible window size (if the Activity went fullscreen):
+val maxMetrics = WindowMetricsCalculator.getOrCreate()
+    .computeMaximumWindowMetrics(this)
+
+// Platform API (API 30+):
+val currentMetrics = windowManager.currentWindowMetrics
+val maxMetrics = windowManager.maximumWindowMetrics
+
+// Handling insets in multi-window:
+val insets = currentMetrics.windowInsets
+    .getInsetsIgnoringVisibility(WindowInsets.Type.systemBars())
+val usableWidth = bounds.width() - insets.left - insets.right
+val usableHeight = bounds.height() - insets.top - insets.bottom</code></pre>
+
+<h3>Display Cutouts in Multi-Window</h3>
+
+<pre><code>// In multi-window, the Activity may or may not overlap with the display cutout.
+// The cutout behavior depends on which split the Activity is in.
+//
+// layoutInDisplayCutoutMode options:
+//   DEFAULT         — system decides (usually avoids cutout)
+//   SHORT_EDGES     — content extends into cutout on short edges
+//   NEVER           — content never extends into cutout
+//   ALWAYS (API 30) — content always extends into cutout
+//
+// In split-screen, the Activity in the cutout-side split receives
+// cutout insets; the other Activity does not.
+//
+// Correct handling:
+
+window.attributes.layoutInDisplayCutoutMode =
+    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+
+ViewCompat.setOnApplyWindowInsetsListener(binding.root) { view, insets ->
+    val cutout = insets.displayCutout
+    if (cutout != null) {
+        view.setPadding(
+            cutout.safeInsetLeft,
+            cutout.safeInsetTop,
+            cutout.safeInsetRight,
+            cutout.safeInsetBottom
+        )
+    }
+    insets
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2>7. Staff-Level Corner Cases</h2>
+
+<h3>Video Playback in Split-Screen Pre-Android 10</h3>
+
+<pre><code>// Problem: User has YouTube in one split, Chrome in the other.
+// User taps Chrome → YouTube's Activity goes to PAUSED.
+// If YouTube pauses video in onPause() → video freezes.
+//
+// This was such a common issue that Google added multi-resume in Android 10.
+//
+// Pre-10 workaround:
+
+override fun onPause() {
+    super.onPause()
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N || !isInMultiWindowMode) {
+        // Not in multi-window, or pre-Nougat: pause is real
+        player.pause()
+    }
+    // In multi-window pre-10: do NOT pause — we're still visible
+}
+
+override fun onStop() {
+    super.onStop()
+    // Always pause here — we're truly not visible
+    player.pause()
+}</code></pre>
+
+<h3>Camera Contention in Multi-Resume</h3>
+
+<pre><code>// Two camera apps side-by-side, both RESUMED, both want the camera.
+// The system disconnects the camera from the non-top-resumed Activity.
+//
+// Race condition: both Activities call openCamera() in onResume().
+// The second one wins, the first gets onDisconnected().
+// But the first may retry in onDisconnected(), causing a loop.
+//
+// Solution: use onTopResumedActivityChanged as the camera lifecycle signal,
+// not onResume/onPause.
+
+private var hasTopResumedPriority = false
+
+override fun onTopResumedActivityChanged(isTopResumed: Boolean) {
+    super.onTopResumedActivityChanged(isTopResumed)
+    hasTopResumedPriority = isTopResumed
+    if (isTopResumed) {
+        tryOpenCamera()
+    }
+    // Don't proactively close — let onDisconnected handle it
+}
+
+// In onDisconnected:
+override fun onDisconnected(camera: CameraDevice) {
+    camera.close()
+    cameraDevice = null
+    if (hasTopResumedPriority) {
+        // We should have the camera — retry after a short delay
+        handler.postDelayed(::tryOpenCamera, 500)
+    } else {
+        showPlaceholder()
+    }
+}</code></pre>
+
+<h3>PiP + onConfigurationChanged() for Tiny Size Changes</h3>
+
+<pre><code>// When the PiP window is resized (user pinch-to-resize on Android 12+),
+// the Activity receives onConfigurationChanged() for every size change.
+// This can fire rapidly during the resize gesture.
+//
+// Problem: if your onConfigurationChanged() does expensive work
+// (re-measuring layouts, reloading images), this causes jank.
+//
+// Solution: debounce configuration changes in PiP mode.
+
+private var configChangeJob: Job? = null
+
+override fun onConfigurationChanged(newConfig: Configuration) {
+    super.onConfigurationChanged(newConfig)
+
+    if (isInPictureInPictureMode) {
+        // Debounce — only react after resize gesture settles
+        configChangeJob?.cancel()
+        configChangeJob = lifecycleScope.launch {
+            delay(300)
+            applyPipConfiguration(newConfig)
+        }
+    } else {
+        applyFullScreenConfiguration(newConfig)
+    }
+}</code></pre>
+
+<h3>resizeableActivity="false" on Large Screens</h3>
+
+<pre><code>// Starting with Android 12L (API 32), the system may IGNORE
+// android:resizeableActivity="false" on large screens (tablets, foldables).
+//
+// The Activity is shown in "compatibility mode":
+//   → Letterboxed within the display area
+//   → The Activity still receives its requested orientation
+//   → But the window may be smaller than the display
+//
+// On Android 13+ (API 33), the user can override this and force
+// the app into split-screen via the taskbar.
+//
+// Implications:
+//   → Your Activity WILL receive multi-window config changes
+//     even if you declared resizeableActivity="false"
+//   → You MUST handle arbitrary window sizes gracefully
+//   → The "I don't support multi-window" escape hatch no longer works
+//
+// Google's guidance: always support resizable Activities.
+// The manifest flag is effectively deprecated for large screens.</code></pre>
+
+<h3>FLAG_ACTIVITY_LAUNCH_ADJACENT</h3>
+
+<pre><code>// Launches an Activity into the adjacent split in multi-window mode.
+// If not in multi-window, this flag is ignored.
+
+val intent = Intent(this, DetailActivity::class.java).apply {
+    addFlags(Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT or Intent.FLAG_ACTIVITY_NEW_TASK)
+    // FLAG_ACTIVITY_NEW_TASK is required — the Activity must be in a different Task
+    // to appear in the other split
+}
+startActivity(intent)
+
+// How it works internally:
+//   1. ActivityStarter checks for FLAG_ACTIVITY_LAUNCH_ADJACENT
+//   2. If the launching Activity is in a split TaskDisplayArea,
+//      the new Task is placed in the OTHER TaskDisplayArea
+//   3. If not in split-screen, the flag is ignored and normal launch occurs
+//
+// Use case: email app in split — tap an email to open it in the other pane
+// This is the foundation of the "list-detail" pattern on tablets.</code></pre>
+
+<h3>Foldable Fold/Unfold — Rapid Config Changes</h3>
+
+<pre><code>// Folding/unfolding a device triggers a config change.
+// On some devices, this can happen rapidly (user fidgeting with the hinge).
+// Each fold/unfold = potential Activity recreation.
+//
+// Problem: rapid fold/unfold can cause:
+//   → Multiple Activity recreations in quick succession
+//   → Network requests fired and cancelled repeatedly
+//   → ViewModel.onCleared() and re-initialization thrashing
+//
+// Solution 1: handle configChanges in manifest
+//   android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation"
+//   → You get onConfigurationChanged() instead of recreation
+//   → You must manually update your layout
+//
+// Solution 2: debounce in ViewModel
+
+class AdaptiveViewModel : ViewModel() {
+    private val _windowSize = MutableStateFlow(WindowSize.COMPACT)
+    val windowSize = _windowSize
+        .debounce(200)  // Ignore rapid changes
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), WindowSize.COMPACT)
+
+    fun onConfigurationChanged(newConfig: Configuration) {
+        _windowSize.value = classifyWindowSize(newConfig)
+    }
+}
+
+// Solution 3: use Jetpack WindowManager's WindowLayoutInfo flow
+// It already handles debouncing internally and only emits
+// stable posture changes.</code></pre>
+
+<div class="callout danger">
+<div class="callout-label">Danger — PiP + Process Death State Restoration</div>
+<p>When a PiP Activity's process is killed by LMK and the user later returns to the app, the Activity is recreated from <code>savedInstanceState</code>. But the saved state was captured when the window was in PiP size (e.g., 240x135 dp). If your <code>onSaveInstanceState()</code> saves layout-dependent state (scroll positions, visible item ranges), that state is meaningless for the fullscreen recreation. Always save <strong>semantic state</strong> (video timestamp, content ID, playback speed) rather than UI state. For RecyclerView-based screens, save the data position (item index) not the pixel offset.</p>
+</div>
+
+<h3>Multi-Window + Drag and Drop</h3>
+
+<pre><code>// Multi-window enables cross-app drag and drop.
+// This is a powerful but underused feature.
+//
+// The source Activity starts a drag:
+val clipData = ClipData.newPlainText("label", "shared text")
+val shadow = View.DragShadowBuilder(view)
+view.startDragAndDrop(clipData, shadow, null,
+    View.DRAG_FLAG_GLOBAL or View.DRAG_FLAG_GLOBAL_URI_READ)
+//
+// DRAG_FLAG_GLOBAL: allows the drag to cross Activity/process boundaries
+// DRAG_FLAG_GLOBAL_URI_READ: grants temporary URI read permission
+//
+// The target Activity receives drag events:
+targetView.setOnDragListener { _, event ->
+    when (event.action) {
+        DragEvent.ACTION_DRAG_STARTED -> {
+            // Can we accept this data type?
+            event.clipDescription.hasMimeType(ClipDescription.MIMETYPE_TEXT_PLAIN)
+        }
+        DragEvent.ACTION_DROP -> {
+            val text = event.clipData.getItemAt(0).text
+            handleDroppedContent(text)
+            true
+        }
+        else -> true
+    }
+}
+//
+// Under the hood, the drag crosses process boundaries via:
+//   → DragState in WMS tracks the drag across windows
+//   → Input events are redirected to the window under the drag point
+//   → ClipData is transferred via Binder when the drop occurs
+//   → URI permissions are granted temporarily via the drag flags</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff-Level Insight — TaskOrganizer and the Shell Architecture</div>
+<p>Since Android 12, multi-window management (split-screen, PiP, freeform) moved from <code>WindowManagerService</code> into the <strong>Shell</strong> library in SystemUI. The Shell registers <code>TaskOrganizer</code> instances for each windowing mode. When a Task enters a windowing mode, WMS calls <code>TaskOrganizer.onTaskAppeared()</code>, handing the Task's <code>SurfaceControl</code> to the Shell. The Shell then owns the Task's visual presentation — it can move, resize, animate, and crop the surface without going through WMS. This is why PiP animations are 60fps even when the app is janking: the Shell manipulates the surface directly via <code>SurfaceControl.Transaction</code>, which is a direct SurfaceFlinger operation. Understanding this architecture is critical for L6 because it explains why multi-window behavior varies across OEMs — they customize the Shell, not WMS. Samsung's split-screen, for instance, uses a completely custom Shell implementation with different snap targets, divider behavior, and animation curves.</p>
+</div>
+
+<h2>8. PiP Constraints and Edge Cases</h2>
+
+<pre><code>// PiP aspect ratio limits: 1:2.39 to 2.39:1
+// Attempting to set an aspect ratio outside this range → IllegalArgumentException
+val params = PictureInPictureParams.Builder()
+    .setAspectRatio(Rational(16, 9))  // OK: 1.78
+    // .setAspectRatio(Rational(3, 1))  // CRASH: 3.0 > 2.39
+    .build()
+
+// Only ONE PiP window at a time system-wide
+// If App A is in PiP and App B enters PiP:
+//   → App A's PiP is dismissed (moved to background)
+//   → App B takes the PiP slot
+// This is enforced by PinnedTaskController
+
+// PiP + singleTask: if PiP Activity has launchMode="singleTask"
+// and user taps its Recents entry:
+//   → PiP is expanded back to fullscreen
+//   → onNewIntent() is called (not a new instance)
+
+// PiP + moveTaskToBack(): calling moveTaskToBack(true) while in PiP
+// dismisses the PiP window entirely — the Activity goes to STOPPED
+
+// PiP + finishAndRemoveTask(): removes the PiP window and the task
+// from Recents. The Activity receives onDestroy().</code></pre>
+
+<h2>9. Audio Focus in Multi-Window</h2>
+
+<pre><code>// In split-screen, both Activities may be RESUMED (Android 10+)
+// but audio focus is still exclusive — only one app should play audio
+
+// Correct pattern: request audio focus on onTopResumedActivityChanged
+override fun onTopResumedActivityChanged(isTopResumed: Boolean) {
+    if (isTopResumed) {
+        val result = audioManager.requestAudioFocus(focusRequest)
+        if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            player.play()
+        }
+    } else {
+        // Lost top-resumed: pause but DON'T abandon focus yet
+        // (user may tap back on this Activity)
+        player.pause()
+    }
+}
+
+// AudioFocusRequest for multi-window:
+val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+    .setOnAudioFocusChangeListener { focusChange ->
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_LOSS -> player.stop()
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> player.pause()
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> player.setVolume(0.2f)
+            AudioManager.AUDIOFOCUS_GAIN -> player.play()
+        }
+    }
+    .build()</code></pre>
+
+<h2>10. Multi-Window API Version Timeline</h2>
+
+<table>
+<tr><th>API</th><th>Version</th><th>Key Change</th></tr>
+<tr><td>24</td><td>Android 7</td><td>Multi-window introduced; <code>resizeableActivity</code> default true for targetSdk 24+</td></tr>
+<tr><td>26</td><td>Android 8</td><td>PiP introduced; freeform mode (OEM-enabled)</td></tr>
+<tr><td>28</td><td>Android 9</td><td>PiP improvements; <code>RemoteAction</code> for PiP buttons</td></tr>
+<tr><td>29</td><td>Android 10</td><td>Multi-resume; <code>onTopResumedActivityChanged()</code></td></tr>
+<tr><td>31</td><td>Android 12</td><td>Auto-enter PiP; <code>setSeamlessResizeEnabled()</code>; <code>setAutoEnterEnabled()</code></td></tr>
+<tr><td>32</td><td>Android 12L</td><td><code>resizeableActivity="false"</code> ignored on large screens; TaskFragment</td></tr>
+<tr><td>33</td><td>Android 13</td><td>User can force split-screen via taskbar; per-app language config changes</td></tr>
+<tr><td>34</td><td>Android 14</td><td>Predictive back in PiP; improved foldable continuity</td></tr>
+</table>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  <a href="04-back-stack-tasks.html">← 04 — Back Stack &amp; Tasks</a> &nbsp;|&nbsp;
+  <a href="06-lifecycle-aware-components.html">06 — Lifecycle-Aware Components →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

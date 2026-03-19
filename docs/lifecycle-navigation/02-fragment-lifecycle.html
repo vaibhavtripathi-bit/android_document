@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 — Fragment Lifecycle Deep Dive — Dual Lifecycles, FragmentManager Internals & State Machines</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-activity-lifecycle.html">01 Activity Lifecycle</a>
+  <a class="active" href="02-fragment-lifecycle.html">02 Fragment Lifecycle</a>
+  <a href="03-config-change-process-death.html">03 Config & Process Death</a>
+  <a href="04-back-stack-tasks.html">04 Back Stack & Tasks</a>
+  <a href="05-multi-window-pip.html">05 Multi-Window & PiP</a>
+  <a href="06-lifecycle-aware-components.html">06 Lifecycle-Aware</a>
+  <a href="07-navigation-component.html">07 Navigation Component</a>
+  <a href="08-navigation-compose.html">08 Navigation Compose</a>
+  <a href="09-interview-qa.html">09 Interview Q&A</a>
+</div>
+
+<h1>02 — Fragment Lifecycle Deep Dive</h1>
+<p class="subtitle">Dual lifecycles, FragmentManager state machines, BackStackRecord internals, SpecialEffectsController, and every corner case that trips up L6 candidates</p>
+
+<!-- ============================================================ -->
+<h2>1. The Dual Lifecycle — Fragment vs Fragment View</h2>
+
+<p>The single most important concept in Fragment internals: <strong>a Fragment has TWO independent lifecycles</strong>. The Fragment object lifecycle and the Fragment View lifecycle are decoupled. When a Fragment is placed on the back stack, its View is destroyed but the Fragment object remains in <code>CREATED</code> state.</p>
+
+<div class="diagram-container">
+<pre><code>  Fragment Object Lifecycle          Fragment View Lifecycle
+  ═══════════════════════           ═══════════════════════
+                                    
+  onAttach()                        
+       │                            
+  onCreate()                        
+       │                            
+       ├──── onCreateView() ──────► View CREATED
+       │                                  │
+       │     onViewCreated()              │
+       │                                  │
+       │     onViewStateRestored()        │
+       │                                  │
+  onStart() ─────────────────────► View STARTED
+       │                                  │
+  onResume() ────────────────────► View RESUMED
+       │                                  │
+  onPause() ─────────────────────► View paused
+       │                                  │
+  onStop() ──────────────────────► View stopped
+       │                                  │
+       ├──── onDestroyView() ────► View DESTROYED  ◄── View lifecycle ENDS here
+       │                            
+       │  ┌─────────────────────────────────────────────────────┐
+       │  │  Fragment on BACK STACK: object alive, View gone    │
+       │  │  Fragment.mView = null, viewLifecycleOwner = null   │
+       │  │  State = CREATED (not DESTROYED)                    │
+       │  └─────────────────────────────────────────────────────┘
+       │                            
+       │  (popped from back stack or removed without addToBackStack)
+       │                            
+  onDestroy()                       
+       │                            
+  onDetach()                        </code></pre>
+</div>
+
+<h3>All Fragment Callbacks — Ordered</h3>
+
+<table>
+<tr><th>Callback</th><th>Fragment State After</th><th>View Exists?</th><th>Key Responsibility</th></tr>
+<tr><td><code>onAttach(context)</code></td><td>ATTACHED</td><td>No</td><td>Host Activity reference available; validate interfaces</td></tr>
+<tr><td><code>onCreate(savedState)</code></td><td>CREATED</td><td>No</td><td>Non-UI initialization; restore saved state; arguments available</td></tr>
+<tr><td><code>onCreateView(inflater, container, savedState)</code></td><td>CREATED</td><td>Yes (just inflated)</td><td>Inflate/create the View hierarchy; return root View</td></tr>
+<tr><td><code>onViewCreated(view, savedState)</code></td><td>VIEW_CREATED</td><td>Yes</td><td>Bind views, set up observers, RecyclerView adapters</td></tr>
+<tr><td><code>onViewStateRestored(savedState)</code></td><td>VIEW_CREATED</td><td>Yes</td><td>All view state restored (EditText text, scroll positions)</td></tr>
+<tr><td><code>onStart()</code></td><td>STARTED</td><td>Yes</td><td>Fragment visible; safe to start animations</td></tr>
+<tr><td><code>onResume()</code></td><td>RESUMED</td><td>Yes</td><td>Fragment interactive; start camera, sensors</td></tr>
+<tr><td><code>onPause()</code></td><td>STARTED</td><td>Yes</td><td>Losing focus; commit lightweight saves</td></tr>
+<tr><td><code>onStop()</code></td><td>CREATED</td><td>Yes</td><td>No longer visible; release heavy resources</td></tr>
+<tr><td><code>onDestroyView()</code></td><td>CREATED</td><td>No (destroyed)</td><td>Clean up View references, cancel view-scoped coroutines</td></tr>
+<tr><td><code>onDestroy()</code></td><td>ATTACHED</td><td>No</td><td>Final cleanup of non-view resources</td></tr>
+<tr><td><code>onDetach()</code></td><td>INITIALIZING</td><td>No</td><td>Detached from Activity; null out host references</td></tr>
+</table>
+
+<div class="callout staff">
+<div class="callout-label">Staff-Level Insight — The ViewBinding Leak</div>
+<p>The most common Fragment memory leak at scale: holding a <code>ViewBinding</code> reference as a class field. When the Fragment goes on the back stack, <code>onDestroyView()</code> fires but the Fragment object stays alive. If you hold <code>private var binding: MyBinding? = myBinding</code> without nulling it in <code>onDestroyView()</code>, the entire View tree is retained by the living Fragment object. The fix is either null the binding in <code>onDestroyView()</code> or use a delegate that auto-clears. Google's own architecture samples use the null-in-onDestroyView pattern. For Flow collection, always use <code>viewLifecycleOwner.lifecycleScope</code> — never the Fragment's own <code>lifecycleScope</code> — to ensure collection stops when the View is destroyed.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. FragmentManager Internals</h2>
+
+<h3>Architecture Overview</h3>
+
+<div class="diagram-container">
+<pre><code>  FragmentManager (FragmentManagerImpl)
+  ├── FragmentStore
+  │   ├── mAdded: ArrayList&lt;Fragment&gt;         ← currently added fragments
+  │   ├── mActive: HashMap&lt;String, FragmentStateManager&gt;  ← all active (incl. back stack)
+  │   └── mSavedState: HashMap&lt;String, Bundle&gt;  ← saved state for removed fragments
+  │
+  ├── mBackStack: ArrayList&lt;BackStackRecord&gt;  ← back stack entries
+  │
+  ├── FragmentLifecycleCallbacksDispatcher    ← observer pattern for lifecycle events
+  │
+  ├── SpecialEffectsController                ← animation/transition orchestration
+  │
+  └── mHost: FragmentHostCallback             ← bridge to Activity/other host
+      └── provides: Context, Handler, LoaderManager, ViewModelStore</code></pre>
+</div>
+
+<h3>FragmentStateManager — Per-Fragment State Machine</h3>
+
+<p>Each active Fragment has a <code>FragmentStateManager</code> that tracks its current state and drives transitions. The states form an ordered enum:</p>
+
+<pre><code>// From FragmentStateManager / Fragment.java (AOSP)
+// These are integer constants — ordering matters for moveToState()
+
+static final int INITIALIZING = -1;  // not yet attached
+static final int ATTACHED = 0;       // onAttach() called
+static final int CREATED = 1;        // onCreate() called
+static final int VIEW_CREATED = 2;   // onCreateView + onViewCreated done
+static final int AWAITING_EXIT_EFFECTS = 3;  // waiting for exit animation
+static final int STARTED = 4;        // onStart() called
+static final int RESUMED = 5;        // onResume() called
+static final int AWAITING_ENTER_EFFECTS = 6; // waiting for enter animation
+
+// The state machine moves UP (attach→resume) or DOWN (resume→destroy)
+// moveToState() compares current state vs target state and calls
+// the appropriate callbacks in sequence</code></pre>
+
+<h3>moveToState() — The Core Engine</h3>
+
+<p><code>FragmentStateManager.moveToState()</code> is the single method that drives all Fragment lifecycle transitions. FragmentManager calls it for each Fragment whenever the host Activity's state changes or a transaction executes.</p>
+
+<pre><code>// Simplified flow of FragmentManager.moveToExpectedState()
+// Called after every transaction execution and on Activity lifecycle changes
+
+fun moveFragmentToExpectedState(f: Fragment) {
+    val stateManager = mActive[f.mWho] ?: return
+    
+    // Target state = min(FragmentManager's max state, fragment's own max)
+    // setMaxLifecycle() can cap a fragment below the FM's state
+    val targetState = min(
+        computeExpectedState(),       // from host Activity state
+        f.mMaxState.ordinal           // from setMaxLifecycle()
+    )
+    
+    if (f.mState < targetState) {
+        // Moving UP: INITIALIZING → ATTACHED → CREATED → VIEW_CREATED → STARTED → RESUMED
+        stateManager.moveToExpectedState()
+    } else if (f.mState > targetState) {
+        // Moving DOWN: RESUMED → STARTED → CREATED → VIEW_CREATED(destroy) → DESTROYED
+        stateManager.moveToExpectedState()
+    }
+}
+
+// Inside FragmentStateManager.moveToExpectedState():
+// Each step checks current state, calls the next callback, updates mState
+// Example: CREATED → VIEW_CREATED triggers:
+//   1. ensureInflatedView() or onCreateView()
+//   2. onViewCreated()
+//   3. onViewStateRestored()
+//   4. mState = VIEW_CREATED</code></pre>
+
+<h3>executePendingTransactions() — Batching</h3>
+
+<pre><code>// FragmentManager maintains a queue of pending operations:
+//   mPendingActions: ArrayList&lt;OpGenerator&gt;
+
+// commit() posts to the Handler → async execution on next message loop
+// commitNow() → executes immediately, synchronously
+
+// executePendingTransactions() flow:
+fun executePendingTransactions(): Boolean {
+    // Guard against re-entrant execution
+    if (mExecutingActions) {
+        throw IllegalStateException(
+            "FragmentManager is already executing transactions"
+        )
+    }
+    
+    mExecutingActions = true
+    try {
+        // 1. Generate BackStackRecords from pending actions
+        //    (each commit() added an OpGenerator to mPendingActions)
+        generateOpsForPendingActions(mTmpRecords, mTmpIsPop)
+        
+        // 2. Optimize: merge redundant operations
+        //    e.g., add(A) + remove(A) in same batch → no-op
+        optimizeAndExecuteOps(mTmpRecords, mTmpIsPop)
+        
+        // 3. For each record: executeOps() → modifies FragmentStore
+        // 4. moveToState() for all affected fragments
+        // 5. Fire onBackStackChanged listeners
+    } finally {
+        mExecutingActions = false
+    }
+}</code></pre>
+
+<h3>commit() vs commitNow() vs commitAllowingStateLoss()</h3>
+
+<table>
+<tr><th>Method</th><th>Execution</th><th>State-Loss Safe?</th><th>Back Stack?</th><th>Internals</th></tr>
+<tr><td><code>commit()</code></td><td>Async (posted to Handler)</td><td>No — throws after onSaveInstanceState</td><td>Yes</td><td>Adds OpGenerator to mPendingActions, posts MSG_EXEC to Handler</td></tr>
+<tr><td><code>commitNow()</code></td><td>Synchronous</td><td>No</td><td>No (throws if addToBackStack used)</td><td>Calls executePendingTransactions() inline; disallows back stack to prevent ordering issues</td></tr>
+<tr><td><code>commitAllowingStateLoss()</code></td><td>Async</td><td>Yes — silently drops state</td><td>Yes</td><td>Same as commit() but sets <code>mAllowStateLoss = true</code>, skipping the state check</td></tr>
+<tr><td><code>commitNowAllowingStateLoss()</code></td><td>Synchronous</td><td>Yes</td><td>No</td><td>Combination: immediate + no state check</td></tr>
+</table>
+
+<div class="callout warn">
+<div class="callout-label">Warning — commitNow() and Back Stack</div>
+<p><code>commitNow()</code> throws <code>IllegalStateException</code> if you call <code>addToBackStack()</code> on the same transaction. The reason: synchronous execution would interleave with async commits already in the queue, making back stack ordering unpredictable. If you need both sync execution and back stack, use <code>commit()</code> followed by <code>executePendingTransactions()</code>.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Fragment Transactions — BackStackRecord</h2>
+
+<h3>BackStackRecord Internals</h3>
+
+<pre><code>// FragmentTransaction is abstract. The concrete implementation is BackStackRecord.
+// Each BackStackRecord holds a list of Op objects:
+
+class BackStackRecord : FragmentTransaction(), BackStackEntry {
+    val mOps = ArrayList&lt;Op&gt;()
+    var mAddToBackStack = false
+    var mName: String? = null  // optional back stack name for popBackStack(name)
+    
+    class Op {
+        var mCmd: Int = 0          // ADD, REMOVE, REPLACE, HIDE, SHOW, etc.
+        var mFragment: Fragment? = null
+        var mEnterAnim: Int = 0
+        var mExitAnim: Int = 0
+        var mPopEnterAnim: Int = 0
+        var mPopExitAnim: Int = 0
+    }
+}
+
+// Operation constants:
+// OP_NULL = 0, OP_ADD = 1, OP_REPLACE = 2, OP_REMOVE = 3,
+// OP_HIDE = 4, OP_SHOW = 5, OP_DETACH = 6, OP_ATTACH = 7,
+// OP_SET_PRIMARY_NAV = 8, OP_UNSET_PRIMARY_NAV = 9,
+// OP_SET_MAX_LIFECYCLE = 10</code></pre>
+
+<h3>How REPLACE Works Internally</h3>
+
+<pre><code>// replace(containerViewId, fragment) is NOT atomic — it expands to:
+//   1. REMOVE every existing fragment in that container
+//   2. ADD the new fragment
+
+// From BackStackRecord.executeOps():
+fun replace(containerViewId: Int, fragment: Fragment): FragmentTransaction {
+    // Internally, the FragmentManager iterates mAdded:
+    //   for (f in fragmentStore.mAdded) {
+    //       if (f.mContainerId == containerViewId) {
+    //           addOp(Op(OP_REMOVE, f))  // remove each existing
+    //       }
+    //   }
+    //   addOp(Op(OP_ADD, fragment))       // then add new one
+    
+    // When addToBackStack() is set, popping reverses this:
+    //   REMOVE the new fragment, then RE-ADD all the old ones
+    //   Old fragments' saved state is restored from FragmentStore.mSavedState
+    return this
+}</code></pre>
+
+<h3>addToBackStack() — What Gets Saved</h3>
+
+<pre><code>// When addToBackStack() is called:
+// 1. The BackStackRecord is pushed onto FragmentManager.mBackStack
+// 2. For each REMOVED fragment, its state is saved:
+//    - Fragment.SavedState (view hierarchy state)
+//    - Fragment.mSavedFragmentState (Bundle from onSaveInstanceState)
+//    - Arguments bundle reference (preserved, not copied)
+//    - The fragment's mWho identifier (UUID string)
+// 3. The fragment is moved to CREATED state (view destroyed)
+//    but kept in FragmentStore.mActive
+
+// On popBackStack():
+// 1. The BackStackRecord operations are REVERSED
+// 2. Removed fragments are re-instantiated from saved state
+// 3. Added fragments are removed
+// 4. View hierarchy is recreated via onCreateView()</code></pre>
+
+<h3>popBackStack() — Async vs Sync</h3>
+
+<pre><code>// popBackStack() is ASYNCHRONOUS — posts to Handler like commit()
+// popBackStackImmediate() is SYNCHRONOUS — executes inline
+
+// Both support name and flags:
+fragmentManager.popBackStack("detail", FragmentManager.POP_BACK_STACK_INCLUSIVE)
+// Pops everything up to AND including the entry named "detail"
+
+// Without INCLUSIVE flag: pops up to but NOT including the named entry
+
+// popBackStack(null, POP_BACK_STACK_INCLUSIVE) → clears entire back stack
+
+// The pop operation:
+// 1. Finds the target BackStackRecord in mBackStack
+// 2. Generates reverse operations (add↔remove, show↔hide)
+// 3. Executes them through the same moveToState() pipeline</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. SpecialEffectsController — Animation Orchestration</h2>
+
+<p>Fragment animations and transitions are not simple view animations — they are deeply integrated with the lifecycle state machine through <code>SpecialEffectsController</code>.</p>
+
+<div class="diagram-container">
+<pre><code>  Transaction executes REPLACE(A → B)
+  ┌──────────────────────────────────────────────────────────────┐
+  │                                                              │
+  │  Fragment A (exiting)              Fragment B (entering)     │
+  │  ─────────────────                 ──────────────────        │
+  │  State: STARTED                    State: CREATED            │
+  │       │                                  │                   │
+  │  moveToState(CREATED)              moveToState(STARTED)      │
+  │       │                                  │                   │
+  │       ▼                                  ▼                   │
+  │  AWAITING_EXIT_EFFECTS ◄──┐    ┌──► AWAITING_ENTER_EFFECTS  │
+  │       │                   │    │         │                   │
+  │       │    SpecialEffectsController      │                   │
+  │       │    orchestrates both together    │                   │
+  │       │         │                        │                   │
+  │       │    ┌────┴────┐                   │                   │
+  │       │    │ Runs:   │                   │                   │
+  │       │    │ - Exit animation for A      │                   │
+  │       │    │ - Enter animation for B     │                   │
+  │       │    │ - Shared element transitions │                  │
+  │       │    └────┬────┘                   │                   │
+  │       │         │ (all complete)         │                   │
+  │       ▼         ▼                        ▼                   │
+  │  onDestroyView()               onStart() / onResume()       │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘</code></pre>
+</div>
+
+<pre><code>// SpecialEffectsController manages Operation objects:
+
+class SpecialEffectsController {
+    // Each fragment transition creates an Operation:
+    class Operation(
+        val fragment: Fragment,
+        val lifecycleImpact: LifecycleImpact,  // ADDING, REMOVING, NONE
+        val effects: List&lt;Effect&gt;               // animations, transitions
+    ) {
+        // The Operation holds a Signal that blocks lifecycle progression
+        // Until ALL effects complete, the fragment stays in AWAITING_* state
+        
+        fun complete() {
+            // Called when all animations/transitions finish
+            // Unblocks the fragment's lifecycle to proceed to final state
+        }
+    }
+    
+    // Three types of Effect run per Operation:
+    // 1. AnimationEffect — old-style view animations (R.anim.*)
+    // 2. TransitionEffect — AndroidX Transition framework
+    // 3. SharedElementEffect — shared element transitions
+    
+    // All three must complete before Operation.complete() fires
+}</code></pre>
+
+<h3>setMaxLifecycle() — External Lifecycle Control</h3>
+
+<pre><code>// setMaxLifecycle() caps a fragment's lifecycle state from outside.
+// Primary consumer: ViewPager2's FragmentStateAdapter
+
+// ViewPager2 uses BEHAVIOR_RESUME_ONLY_CURRENT_FRAGMENT:
+class FragmentStateAdapter(fm: FragmentManager, lifecycle: Lifecycle) {
+    // For the CURRENT page:
+    transaction.setMaxLifecycle(fragment, Lifecycle.State.RESUMED)
+    
+    // For OFF-SCREEN pages:
+    transaction.setMaxLifecycle(fragment, Lifecycle.State.STARTED)
+    
+    // This means off-screen fragments are STARTED but never RESUMED
+    // Their views exist (for smooth swiping) but they don't get onResume()
+}
+
+// Internally, setMaxLifecycle() stores the cap in Fragment.mMaxState
+// moveToState() checks: targetState = min(hostState, mMaxState)
+// The fragment simply won't advance past the cap</code></pre>
+
+<!-- ============================================================ -->
+<h2>5. Fragment View Lifecycle — Deep Dive</h2>
+
+<h3>getViewLifecycleOwner() vs this (Fragment as LifecycleOwner)</h3>
+
+<pre><code>// Fragment implements LifecycleOwner TWICE:
+// 1. Fragment itself:       getLifecycle()          → tracks CREATED..DESTROYED
+// 2. Fragment's View:       getViewLifecycleOwner() → tracks VIEW_CREATED..VIEW_DESTROYED
+
+// CRITICAL: For UI-related observation, ALWAYS use viewLifecycleOwner
+
+// WRONG — leaks observation across back stack navigation:
+class MyFragment : Fragment() {
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        // This observer survives onDestroyView() because Fragment lifecycle
+        // is still CREATED on the back stack. When the fragment returns,
+        // a SECOND observer is registered → duplicate updates
+        viewModel.data.observe(this) { updateUI(it) }
+    }
+}
+
+// CORRECT — observation scoped to View lifetime:
+class MyFragment : Fragment() {
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        viewModel.data.observe(viewLifecycleOwner) { updateUI(it) }
+    }
+}
+
+// For Flow collection:
+override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+    viewLifecycleOwner.lifecycleScope.launch {
+        viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            viewModel.uiState.collect { state -> render(state) }
+        }
+    }
+    // Collection automatically cancels in onDestroyView()
+    // Re-starts when fragment returns from back stack and gets a new View
+}</code></pre>
+
+<h3>onViewStateRestored() and SavedStateRegistry</h3>
+
+<pre><code>// onViewStateRestored() fires AFTER onViewCreated() and AFTER the framework
+// has restored all View state (EditText text, ScrollView position, etc.)
+
+// The restoration flow:
+// 1. onCreateView() → inflate views
+// 2. onViewCreated() → bind views, set up listeners
+// 3. Framework calls view.onRestoreInstanceState() for each View with an ID
+// 4. onViewStateRestored() → all view state is now restored
+//    Safe to read EditText.text, RecyclerView scroll position, etc.
+
+// SavedStateRegistry integration:
+// Fragment's SavedStateRegistryController creates a registry scoped to
+// the Fragment. SavedStateHandle (in ViewModel) uses this registry.
+// The registry is restored in onCreate(), but View-related state
+// is restored in onViewStateRestored().
+
+// This is why SavedStateHandle works across process death:
+// ViewModel.SavedStateHandle → Fragment.SavedStateRegistry → 
+//   Activity.SavedStateRegistry → Activity.onSaveInstanceState() Bundle</code></pre>
+
+<!-- ============================================================ -->
+<h2>6. Child Fragments and Nested FragmentManagers</h2>
+
+<h3>The FragmentManager Hierarchy</h3>
+
+<div class="diagram-container">
+<pre><code>  Activity
+  └── supportFragmentManager (Activity-level)
+      ├── FragmentA
+      │   └── childFragmentManager (FragmentA-level)
+      │       ├── ChildFragment1
+      │       └── ChildFragment2
+      │           └── childFragmentManager (ChildFragment2-level)
+      │               └── GrandchildFragment
+      └── FragmentB
+          └── childFragmentManager (FragmentB-level)
+              └── ChildFragment3
+
+  Key relationships:
+  ─────────────────
+  FragmentA.parentFragmentManager  == Activity.supportFragmentManager
+  ChildFragment1.parentFragmentManager == FragmentA.childFragmentManager
+  FragmentA.childFragmentManager   != FragmentA.parentFragmentManager</code></pre>
+</div>
+
+<pre><code>// Lifecycle dispatch order: ALWAYS parent before child (top-down)
+// 
+// Activity.onStart()
+//   → FragmentManager dispatches onStart() to FragmentA
+//     → FragmentA.childFragmentManager dispatches onStart() to ChildFragment1
+//     → FragmentA.childFragmentManager dispatches onStart() to ChildFragment2
+//       → ChildFragment2.childFragmentManager dispatches onStart() to Grandchild
+//   → FragmentManager dispatches onStart() to FragmentB
+//     → FragmentB.childFragmentManager dispatches onStart() to ChildFragment3
+//
+// Destruction is REVERSE: child before parent (bottom-up)
+// GrandchildFragment.onStop() → ChildFragment2.onStop() → FragmentA.onStop()</code></pre>
+
+<h3>setPrimaryNavigationFragment()</h3>
+
+<pre><code>// The primary navigation fragment receives back button events first.
+// Only ONE fragment per FragmentManager can be primary.
+
+// When the user presses Back:
+// 1. Activity.onBackPressed() → FragmentManager.popBackStackImmediate()
+// 2. FM checks: is there a primaryNavigationFragment?
+// 3. If yes → delegate to that fragment's childFragmentManager first
+// 4. If child FM handled it (had back stack entries) → done
+// 5. If not → FM pops its own back stack
+// 6. If FM has nothing to pop → Activity finishes
+
+// NavHostFragment sets itself as primaryNavigationFragment
+// This is how Navigation Component intercepts back presses
+
+// In a transaction:
+transaction.setPrimaryNavigationFragment(navHostFragment)
+// Internally sets OP_SET_PRIMARY_NAV operation</code></pre>
+
+<div class="callout danger">
+<div class="callout-label">Danger — Wrong FragmentManager</div>
+<p>Using <code>parentFragmentManager</code> from inside a child fragment to show a <code>DialogFragment</code> will attach the dialog to the parent's FragmentManager. If the parent fragment is destroyed, the dialog leaks or crashes. Always use <code>childFragmentManager</code> for fragments that should be scoped to the current fragment's lifetime. Conversely, using <code>childFragmentManager</code> when you intend to navigate away from the parent will cause the child transaction to be lost.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Fragment Factory and Constructor Arguments</h2>
+
+<h3>The No-Arg Constructor Requirement</h3>
+
+<pre><code>// When Android recreates a Fragment (config change, process death),
+// it uses reflection:
+//   fragment = fragmentClass.getConstructor().newInstance()
+//
+// If there's no no-arg constructor → InstantiationException
+//
+// The arguments Bundle survives recreation:
+//   1. Fragment.setArguments(bundle) stores in Fragment.mArguments
+//   2. On save: mArguments is written to the saved state Bundle
+//   3. On recreate: new instance created, then mArguments is restored
+//   4. arguments is available in onAttach() and later
+
+// WRONG — will crash on recreation:
+class UserFragment(private val userId: String) : Fragment()
+
+// CORRECT — use companion factory + arguments:
+class UserFragment : Fragment() {
+    companion object {
+        fun newInstance(userId: String) = UserFragment().apply {
+            arguments = bundleOf("userId" to userId)
+        }
+    }
+    
+    private val userId: String by lazy {
+        requireArguments().getString("userId")!!
+    }
+}</code></pre>
+
+<h3>FragmentFactory — Custom Instantiation</h3>
+
+<pre><code>// FragmentFactory replaces the default reflection-based instantiation.
+// Registered on FragmentManager before any fragments are created.
+
+class MyFragmentFactory(
+    private val repository: UserRepository
+) : FragmentFactory() {
+    
+    override fun instantiate(classLoader: ClassLoader, className: String): Fragment {
+        return when (loadFragmentClass(classLoader, className)) {
+            UserFragment::class.java -> UserFragment(repository)
+            else -> super.instantiate(classLoader, className)
+        }
+    }
+}
+
+// Register BEFORE super.onCreate() in Activity:
+class MyActivity : AppCompatActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        supportFragmentManager.fragmentFactory = MyFragmentFactory(repo)
+        super.onCreate(savedInstanceState)  // fragments may be recreated here
+    }
+}
+
+// How it works internally:
+// FragmentManager.instantiate() → calls fragmentFactory.instantiate()
+// instead of Class.newInstance(). The factory is also propagated to
+// child FragmentManagers.</code></pre>
+
+<h3>Hilt @AndroidEntryPoint and Fragment Recreation</h3>
+
+<pre><code>// Hilt generates a superclass that installs a custom FragmentFactory:
+//
+// @AndroidEntryPoint
+// class MyFragment : Fragment()
+//
+// Generates: Hilt_MyFragment extends Fragment
+// MyFragment actually extends Hilt_MyFragment
+//
+// Hilt's generated code:
+// 1. In the Activity's FragmentManager, registers a FragmentFactory
+//    that can inject dependencies into Fragment constructors
+// 2. On recreation, the factory creates the fragment with injected deps
+// 3. The @Inject constructor parameters are satisfied by the Hilt component
+//
+// This is why @AndroidEntryPoint Activity is required for @AndroidEntryPoint Fragment:
+// The Activity must install the Hilt FragmentFactory before fragments are recreated</code></pre>
+
+<!-- ============================================================ -->
+<h2>8. Staff-Level Corner Cases</h2>
+
+<h3>Committing After onSaveInstanceState</h3>
+
+<pre><code>// After Activity.onSaveInstanceState(), the framework has captured state.
+// Any fragment transaction committed now would be LOST on process death.
+
+// commit() → throws IllegalStateException("Can not perform this action
+//             after onSaveInstanceState")
+// commitAllowingStateLoss() → silently proceeds, state may be lost
+
+// When is commitAllowingStateLoss() acceptable?
+// 1. UI updates that don't need to survive process death
+//    (e.g., showing a transient error banner fragment)
+// 2. Analytics/logging fragments that don't hold user state
+// 3. NEVER for navigation that the user expects to persist
+
+// What "state loss" actually means:
+// The transaction executes and the UI updates, but if the process is killed
+// before the next onSaveInstanceState(), the transaction is not in the
+// saved state. On restoration, the fragment won't be there.</code></pre>
+
+<h3>setRetainInstance() — Deprecated, Use ViewModel</h3>
+
+<pre><code>// setRetainInstance(true) kept the Fragment object alive across config changes.
+// The Fragment was detached from the old Activity and re-attached to the new one.
+// Callbacks skipped: onDestroy() and onCreate() — went directly from
+// onDestroyView() → onCreateView()
+
+// DEPRECATED in AndroidX Fragment 1.3.0 because:
+// 1. Retained fragments bypass the normal save/restore mechanism
+// 2. They hold references to the old Activity's View hierarchy (leak-prone)
+// 3. ViewModel provides the same benefit without the lifecycle complexity
+// 4. Retained fragments don't work with Navigation Component
+
+// Migration: move retained data to ViewModel
+// ViewModel survives config change via ViewModelStore held by
+// the Activity's NonConfigurationInstances (same mechanism, cleaner API)</code></pre>
+
+<h3>DialogFragment Lifecycle Quirks</h3>
+
+<pre><code>// DialogFragment has additional lifecycle complexity:
+// 1. It creates a Dialog in onCreateDialog() OR a View in onCreateView()
+// 2. The Dialog has its own Window and DecorView
+// 3. dismiss() triggers a fragment transaction (remove)
+
+// Dangerous pattern — dismiss during onSaveInstanceState:
+class MyDialog : DialogFragment() {
+    fun safeDismiss() {
+        // WRONG: dismiss() calls commitInternal() which may throw
+        // if called after onSaveInstanceState
+        // dismiss()
+        
+        // CORRECT: use dismissAllowingStateLoss()
+        dismissAllowingStateLoss()
+    }
+}
+
+// Another quirk: DialogFragment.show(fm, tag) internally calls:
+//   fm.beginTransaction().add(this, tag).commit()
+// There's no container view — the fragment is added without a container ID.
+// The Dialog's window is separate from the Activity's view hierarchy.
+
+// showNow() variant uses commitNow() — synchronous but no back stack</code></pre>
+
+<h3>postponeEnterTransition() — Shared Element Timing</h3>
+
+<pre><code>// Shared element transitions need the target View to be laid out
+// before the transition can calculate start/end bounds.
+// Problem: RecyclerView items aren't laid out when the fragment starts.
+
+class DetailFragment : Fragment() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Tell the framework: DON'T start the enter transition yet
+        postponeEnterTransition()
+        
+        // Safety timeout — if we forget to start, don't block forever
+        postponeEnterTransition(2000, TimeUnit.MILLISECONDS)
+    }
+    
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        val imageView = view.findViewById&lt;ImageView&gt;(R.id.hero_image)
+        imageView.transitionName = "hero_${args.itemId}"
+        
+        // Load image, then start transition when ready
+        Glide.with(this)
+            .load(args.imageUrl)
+            .listener(object : RequestListener&lt;Drawable&gt; {
+                override fun onResourceReady(...): Boolean {
+                    // Image loaded — View is ready for transition
+                    startPostponedEnterTransition()
+                    return false
+                }
+                override fun onLoadFailed(...): Boolean {
+                    // Still start transition on failure to avoid blocking
+                    startPostponedEnterTransition()
+                    return false
+                }
+            })
+            .into(imageView)
+    }
+}
+
+// Internally:
+// postponeEnterTransition() sets Fragment.mPostponedAlpha to 0 (invisible)
+// The SpecialEffectsController sees the postpone flag and waits
+// startPostponedEnterTransition() clears the flag → effects proceed
+// If timeout fires first, the transition starts with whatever state exists</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff-Level Insight — Fragment State Restoration Ordering</div>
+<p>When the system recreates fragments after process death, the ordering is subtle and frequently misunderstood. The Activity's <code>onCreate(savedInstanceState)</code> calls <code>super.onCreate()</code> which triggers <code>FragmentManager.restoreSaveState()</code>. This recreates all fragments <strong>synchronously</strong> during <code>super.onCreate()</code> — before your Activity's <code>onCreate()</code> body runs. This means: (1) <code>FragmentFactory</code> must be set <em>before</em> <code>super.onCreate()</code>, (2) any data the fragment needs from the Activity must come through <code>arguments</code> or <code>SavedStateHandle</code>, not Activity fields that are initialized after <code>super.onCreate()</code>, and (3) <code>findFragmentById()</code> returns the recreated fragment immediately after <code>super.onCreate()</code> — you should check for an existing fragment before adding a new one to avoid duplicates.</p>
+</div>
+
+<h3>Fragment in ViewPager2 — BEHAVIOR_RESUME_ONLY_CURRENT_FRAGMENT</h3>
+
+<pre><code>// ViewPager2's FragmentStateAdapter manages fragment lifecycle via setMaxLifecycle():
+//
+// Page 0 (current):  setMaxLifecycle(RESUMED)   → fully interactive
+// Page 1 (adjacent): setMaxLifecycle(STARTED)   → view exists, not resumed
+// Page 3 (far off):  fragment destroyed entirely → recycled
+//
+// This replaced the old ViewPager's setUserVisibleHint() hack.
+//
+// The adapter also handles:
+// - Fragment recreation after config change (via FragmentManager saved state)
+// - Stable IDs for correct fragment-to-position mapping
+// - containsItem() / getItemId() for dynamic dataset changes
+//
+// Common bug: not implementing getItemId()/containsItem() when the dataset
+// changes → stale fragments shown for wrong positions</code></pre>
+
+<h3>Fragment Added to Destroyed Activity</h3>
+
+<pre><code>// If you hold a reference to FragmentManager and commit after the Activity
+// is destroyed (e.g., in an async callback):
+
+viewModel.result.observe(this) { result ->
+    // If Activity is finishing/destroyed when this fires:
+    if (!isAdded || isDetached) return@observe
+    
+    // Even with the check, parentFragmentManager may throw:
+    // "FragmentManager has been destroyed"
+    
+    // Defensive pattern:
+    if (parentFragmentManager.isDestroyed) return@observe
+    
+    parentFragmentManager.commit {
+        replace(R.id.container, ResultFragment.newInstance(result))
+    }
+}
+
+// The root cause: FragmentManager.mDestroyed is set to true in
+// Activity.onDestroy(). Any commit after that throws.
+// isStateSaved checks are separate from isDestroyed checks.</code></pre>
+
+<h2>9. Fragment Result API</h2>
+
+<p>The modern replacement for <code>setTargetFragment()</code> (deprecated) and <code>onActivityResult()</code>:</p>
+
+<pre><code>// Receiving fragment — registers a listener
+override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    parentFragmentManager.setFragmentResultListener("requestKey", this) { key, bundle ->
+        val result = bundle.getString("resultValue")
+        // Handle result — this callback is lifecycle-aware
+        // It only fires when this Fragment is at least STARTED
+    }
+}
+
+// Sending fragment — sets the result
+parentFragmentManager.setFragmentResult("requestKey", bundleOf("resultValue" to "data"))
+
+// Key behaviors:
+// - Result is stored in FragmentManager until consumed
+// - Survives config change (stored in FragmentManager's saved state)
+// - Only ONE listener per requestKey per FragmentManager
+// - For child → parent communication, use parentFragmentManager
+// - For parent → child, use childFragmentManager
+// - The listener is automatically removed when the Fragment reaches DESTROYED</code></pre>
+
+<h2>10. Testing Fragments</h2>
+
+<pre><code>// FragmentScenario — isolated Fragment testing
+@Test
+fun fragmentDisplaysData() {
+    val args = bundleOf("userId" to "123")
+    launchFragmentInContainer&lt;ProfileFragment&gt;(args).use { scenario ->
+        // Fragment is launched in a blank Activity
+        scenario.onFragment { fragment ->
+            assertNotNull(fragment.view)
+        }
+        // Move to specific state
+        scenario.moveToState(Lifecycle.State.CREATED)
+    }
+}
+
+// Testing with custom FragmentFactory (for DI):
+@Test
+fun fragmentWithDependency() {
+    val factory = object : FragmentFactory() {
+        override fun instantiate(classLoader: ClassLoader, className: String): Fragment {
+            return when (className) {
+                ProfileFragment::class.java.name -> ProfileFragment(mockRepository)
+                else -> super.instantiate(classLoader, className)
+            }
+        }
+    }
+    launchFragmentInContainer&lt;ProfileFragment&gt;(factory = factory)
+}
+
+// Testing Fragment Result API:
+@Test
+fun fragmentSendsResult() {
+    launchFragmentInContainer&lt;EditFragment&gt;().onFragment { fragment ->
+        var receivedResult: String? = null
+        fragment.parentFragmentManager.setFragmentResultListener("edit", fragment) { _, bundle ->
+            receivedResult = bundle.getString("value")
+        }
+        // Trigger the action that sets the result
+        fragment.saveAndReturn()
+        assertEquals("updated", receivedResult)
+    }
+}</code></pre>
+
+<h2>11. ComposeView in Fragments</h2>
+
+<pre><code>// When hosting Compose inside a Fragment, ViewCompositionStrategy is critical:
+override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
+    return ComposeView(requireContext()).apply {
+        // DEFAULT: DisposeOnDetachedFromWindow — WRONG for Fragments!
+        // Fragment view can be detached/reattached (e.g., ViewPager2)
+
+        // CORRECT for Fragments:
+        setViewCompositionStrategy(
+            ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed
+        )
+        setContent {
+            MyTheme {
+                MyScreen(viewModel = viewModel())
+            }
+        }
+    }
+}
+
+// Why DisposeOnViewTreeLifecycleDestroyed?
+// - Disposes composition when the Fragment's VIEW lifecycle is destroyed
+// - NOT when the Fragment itself is destroyed (it may be on back stack)
+// - Matches Fragment's dual lifecycle model perfectly
+// - Without this, Compose may be disposed prematurely when Fragment
+//   is added to back stack, losing all state</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff-Level Insight — FragmentManagerViewModel</div>
+<p><code>FragmentManagerViewModel</code> is an internal ViewModel that <code>FragmentManager</code> uses to retain non-configuration state across config changes. It stores: (1) child <code>FragmentManager</code> non-config state, (2) child <code>ViewModelStore</code> instances, and (3) retained Fragment instances (legacy <code>setRetainInstance</code>). It's scoped to the parent's <code>ViewModelStore</code> — for the top-level FragmentManager, that's the Activity's ViewModelStore. This is why Fragment ViewModels survive config changes: they're stored in the Fragment's own ViewModelStore, which is held by <code>FragmentManagerViewModel</code>, which is in the Activity's ViewModelStore, which survives via <code>NonConfigurationInstances</code>. Understanding this chain is essential for debugging ViewModel scoping issues.</p>
+</div>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  <a href="01-activity-lifecycle.html">← 01 — Activity Lifecycle</a> &nbsp;|&nbsp;
+  <a href="03-config-change-process-death.html">03 — Config Change & Process Death →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

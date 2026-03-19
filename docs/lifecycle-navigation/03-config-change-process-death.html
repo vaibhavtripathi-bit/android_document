@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 — Configuration Changes & Process Death — Internals, SavedState, ViewModel Retention</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  h4 { font-size: 1rem; margin: 1rem 0 0.5rem; color: var(--yellow); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+  .tag { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+  .tag.internal { background: rgba(108,158,255,0.15); color: var(--accent); }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-activity-lifecycle.html">01 Activity Lifecycle</a>
+  <a href="02-fragment-lifecycle.html">02 Fragment Lifecycle</a>
+  <a class="active" href="03-config-change-process-death.html">03 Config & Process Death</a>
+  <a href="04-back-stack-tasks.html">04 Back Stack & Tasks</a>
+  <a href="05-multi-window-pip.html">05 Multi-Window & PiP</a>
+  <a href="06-lifecycle-aware-components.html">06 Lifecycle-Aware</a>
+  <a href="07-navigation-component.html">07 Navigation Component</a>
+  <a href="08-navigation-compose.html">08 Navigation Compose</a>
+  <a href="09-interview-qa.html">09 Interview Q&A</a>
+</div>
+
+<h1>03 — Configuration Changes & Process Death</h1>
+<p class="subtitle">The two destruction events every Android engineer must master — what triggers them, what survives each, and how the system restores your app from the ashes</p>
+
+<!-- ============================================================ -->
+<h2>1. Configuration Change Internals</h2>
+
+<h3>What Triggers a Configuration Change</h3>
+
+<p>A configuration change occurs whenever the device's <code>Configuration</code> object changes in a way that affects the current Activity's resources. The system must recreate the Activity so it can re-inflate layouts and reload resources matching the new configuration.</p>
+
+<table>
+<tr><th>Trigger</th><th>Config Flag</th><th>Common Cause</th></tr>
+<tr><td>Screen rotation</td><td><code>orientation</code>, <code>screenSize</code></td><td>User rotates device</td></tr>
+<tr><td>Locale change</td><td><code>locale</code></td><td>Settings → Language</td></tr>
+<tr><td>Font scale</td><td><code>fontScale</code></td><td>Accessibility settings</td></tr>
+<tr><td>Dark mode</td><td><code>uiMode</code></td><td>System theme toggle</td></tr>
+<tr><td>Screen density</td><td><code>density</code></td><td>Display size setting, foldable unfold</td></tr>
+<tr><td>Keyboard availability</td><td><code>keyboard</code>, <code>keyboardHidden</code></td><td>Hardware keyboard attached/detached</td></tr>
+<tr><td>Screen size class</td><td><code>screenSize</code>, <code>smallestScreenSize</code></td><td>Foldable fold/unfold, multi-window resize</td></tr>
+<tr><td>Layout direction</td><td><code>layoutDirection</code></td><td>RTL ↔ LTR locale switch</td></tr>
+<tr><td>Grammatical gender</td><td><code>grammaticalGender</code></td><td>API 34+ per-app language</td></tr>
+</table>
+
+<h3>The Configuration Object and AMS Detection</h3>
+
+<p>In <code>system_server</code>, <code>ActivityTaskManagerService</code> (ATMS) maintains the global <code>Configuration</code>. When a system event changes it, the flow is:</p>
+
+<div class="diagram-container">
+<pre><code>  System Event (e.g., rotation sensor)
+       │
+       ▼
+  WindowManagerService.updateRotation()
+       │
+       ▼
+  DisplayContent.updateDisplayInfo()
+       │
+       ▼
+  ActivityTaskManagerService.updateGlobalConfigurationLocked()
+       │  ← computes new Configuration, diffs against current
+       ▼
+  For each ActivityRecord in the affected Task:
+       │
+       ├── Does manifest declare android:configChanges matching ALL changed bits?
+       │     YES → deliver onConfigurationChanged() — no recreate
+       │     NO  → schedule Activity destroy + recreate
+       │
+       ▼
+  ActivityRecord.ensureActivityConfiguration()
+       │
+       ▼
+  relaunchActivityLocked() → sends RELAUNCH_ACTIVITY transaction to app process</code></pre>
+</div>
+
+<p>The key AOSP class is <code>ActivityRecord.ensureActivityConfiguration()</code>. It computes the diff between the Activity's current <code>Configuration</code> and the new global one using <code>Configuration.diff()</code>, which returns a bitmask of changed fields. If the Activity's <code>android:configChanges</code> manifest attribute covers <strong>all</strong> changed bits, the system skips recreation.</p>
+
+<h3>android:configChanges — What It Actually Does</h3>
+
+<p>Declaring <code>android:configChanges="orientation|screenSize"</code> does <strong>not</strong> prevent the configuration from changing. It tells the system: "I'll handle this myself — don't destroy and recreate me." The Activity receives <code>onConfigurationChanged(newConfig)</code> instead.</p>
+
+<div class="callout warn">
+<div class="callout-label">⚠ Common L6 Trap</div>
+<p>Declaring <code>android:configChanges="orientation|screenSize"</code> is almost always wrong for production apps. It means <strong>you</strong> are responsible for reloading every resource — layouts, drawables, strings, dimensions — that might differ for the new configuration. You'll also miss <code>density</code>, <code>locale</code>, <code>uiMode</code> (dark mode), and <code>fontScale</code> changes. The system's recreate mechanism exists precisely because manual handling is error-prone at scale.</p>
+</div>
+
+<h3>The Full Recreate Sequence</h3>
+
+<div class="diagram-container">
+<pre><code>  Config Change Detected — Activity Recreate Sequence
+  ═══════════════════════════════════════════════════
+
+  OLD Activity instance                    NEW Activity instance
+  ──────────────────                       ──────────────────
+  onPause()
+  onStop()
+  onSaveInstanceState(outState)  ──────┐
+  onDestroy()                          │
+                                       │  Bundle travels via
+                                       │  ActivityRecord in
+                                       │  system_server
+                                       │
+                                       └──▶ onCreate(savedInstanceState)
+                                            onStart()
+                                            onRestoreInstanceState(savedInstanceState)
+                                            onResume()
+
+  Timeline: ──────────────────────────────────────────────────▶
+            Old instance torn down    New instance created
+
+  Key: onSaveInstanceState is called BEFORE onDestroy because the
+       system needs the state Bundle before it can schedule recreation.
+       The Bundle is stored in ActivityRecord (system_server side).</code></pre>
+</div>
+
+<p>Why is <code>onSaveInstanceState()</code> called before <code>onDestroy()</code>? Because the saved state Bundle is passed through the <code>ActivityClientRecord</code> in the app process and mirrored in <code>ActivityRecord</code> in <code>system_server</code>. The system needs this data <em>before</em> it can schedule the relaunch transaction. During config change, <code>isChangingConfigurations()</code> returns <code>true</code> — you can use this to skip expensive cleanup in <code>onDestroy()</code>.</p>
+
+<!-- ============================================================ -->
+<h2>2. onSaveInstanceState Deep Dive</h2>
+
+<h3>When It's Called</h3>
+
+<table>
+<tr><th>API Level</th><th>Timing</th><th>Rationale</th></tr>
+<tr><td>Pre-28 (before P)</td><td>Before <code>onStop()</code>, after <code>onPause()</code></td><td>Historical behavior; no guarantee of order relative to <code>onStop()</code></td></tr>
+<tr><td>28+ (P and later)</td><td>After <code>onStop()</code></td><td>Guarantees the Activity is no longer visible when state is saved, preventing state loss from user interactions during the save window</td></tr>
+</table>
+
+<p>The change in API 28 is significant: it means <code>FragmentTransaction.commit()</code> is safe to call in <code>onStop()</code> on API 28+ (the state hasn't been saved yet), but would cause state loss on pre-28 devices.</p>
+
+<h3>The Bundle Mechanism — Three Layers of Saving</h3>
+
+<p>When the system calls <code>Activity.onSaveInstanceState(outState)</code>, three distinct save operations happen:</p>
+
+<pre><code>// Layer 1: View hierarchy auto-save
+// Activity.onSaveInstanceState() calls:
+//   window.saveHierarchyState(outState)
+//     → iterates all Views with android:id
+//     → calls View.onSaveInstanceState() on each
+//     → stores in a SparseArray&lt;Parcelable&gt; keyed by view ID
+
+// Layer 2: Fragment state save
+// FragmentController.saveAllState() is called
+//   → each Fragment's onSaveInstanceState() is invoked
+//   → Fragment arguments, back stack, and view state are bundled
+
+// Layer 3: Your custom state
+// Whatever you put in the Bundle in your override:
+override fun onSaveInstanceState(outState: Bundle) {
+    super.onSaveInstanceState(outState) // triggers Layer 1 + 2
+    outState.putInt("selectedTab", currentTabIndex)
+    outState.putString("searchQuery", searchBar.text.toString())
+}</code></pre>
+
+<h3>What's Auto-Saved (and What's Not)</h3>
+
+<p>The View hierarchy auto-save only works for Views with an <code>android:id</code>. Each View type saves specific state:</p>
+
+<table>
+<tr><th>View</th><th>Auto-Saved State</th><th>Requires <code>android:id</code></th></tr>
+<tr><td><code>EditText</code></td><td>Text content, cursor position</td><td>Yes</td></tr>
+<tr><td><code>ScrollView</code></td><td>Scroll position</td><td>Yes</td></tr>
+<tr><td><code>CheckBox</code> / <code>Switch</code></td><td>Checked state</td><td>Yes</td></tr>
+<tr><td><code>RecyclerView</code></td><td>Scroll position (via LayoutManager)</td><td>Yes</td></tr>
+<tr><td><code>TabLayout</code></td><td>Selected tab index</td><td>Yes</td></tr>
+<tr><td><code>TextView</code></td><td>Nothing (text is static)</td><td>—</td></tr>
+<tr><td><code>ImageView</code></td><td>Nothing (image source is static)</td><td>—</td></tr>
+</table>
+
+<h3>Bundle Size Limits — TransactionTooLargeException</h3>
+
+<p>The saved state Bundle is transmitted via Binder IPC to <code>system_server</code>. Binder has a <strong>1 MB per-process transaction buffer</strong> shared across all concurrent transactions. If the Bundle (plus any other in-flight Binder data) exceeds this, you get <code>TransactionTooLargeException</code>.</p>
+
+<div class="callout danger">
+<div class="callout-label">🔴 TransactionTooLargeException</div>
+<p>This crash is <strong>not thrown at save time</strong> — it's thrown when the system tries to write the Bundle to the Binder buffer, which may happen asynchronously. On API 24+ it crashes immediately; on older versions the data is silently dropped and the Activity restores with a <code>null</code> savedInstanceState. The worst kind of bug: silent data loss.</p>
+</div>
+
+<pre><code>// What should NOT go in savedInstanceState:
+// ✗ Large bitmaps or byte arrays
+// ✗ Full API response objects
+// ✗ Lists of complex Parcelable objects (e.g., 500 items)
+// ✗ Fragment arguments with large payloads
+
+// What SHOULD go in savedInstanceState:
+// ✓ IDs, keys, positions (Int, Long, String)
+// ✓ Small enum/state values
+// ✓ Search queries, filter selections
+// ✓ Scroll positions, selected tab indices</code></pre>
+
+<h3>Parcelable vs Serializable</h3>
+
+<table>
+<tr><th>Aspect</th><th><code>Parcelable</code></th><th><code>Serializable</code></th></tr>
+<tr><td>Speed</td><td>~10x faster</td><td>Uses reflection, creates temp objects</td></tr>
+<tr><td>Allocation</td><td>Writes directly to <code>Parcel</code> (native memory)</td><td>Creates <code>ObjectOutputStream</code>, intermediate byte arrays</td></tr>
+<tr><td>Bundle support</td><td>Native — <code>Bundle.putParcelable()</code></td><td>Supported but slower — <code>Bundle.putSerializable()</code></td></tr>
+<tr><td>Kotlin</td><td><code>@Parcelize</code> generates boilerplate</td><td>Just implement <code>Serializable</code></td></tr>
+<tr><td>Recommendation</td><td><strong>Always use for Bundles</strong></td><td>Only for disk persistence or legacy code</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>3. SavedStateRegistry (Jetpack)</h2>
+
+<h3>Architecture</h3>
+
+<p>The Jetpack <code>SavedStateRegistry</code> is an abstraction over the platform Bundle mechanism that allows <strong>any component</strong> — not just Activities and Fragments — to participate in state saving and restoration.</p>
+
+<div class="diagram-container">
+<pre><code>  SavedStateRegistry Architecture
+  ════════════════════════════════
+
+  ┌─────────────────────────────────────────────────────┐
+  │  ComponentActivity / Fragment                        │
+  │  implements SavedStateRegistryOwner                  │
+  │                                                      │
+  │  ┌───────────────────────────────────────────────┐  │
+  │  │  SavedStateRegistryController                  │  │
+  │  │  ├── performSave(outBundle)   ← called from    │  │
+  │  │  │                              onSaveInstance  │  │
+  │  │  └── performRestore(bundle)   ← called from    │  │
+  │  │                                 onCreate        │  │
+  │  │                                                 │  │
+  │  │  ┌─────────────────────────────────────────┐   │  │
+  │  │  │  SavedStateRegistry                      │   │  │
+  │  │  │                                          │   │  │
+  │  │  │  providers: Map&lt;String, SavedStateProvider&gt; │  │
+  │  │  │                                          │   │  │
+  │  │  │  ┌──────────────┐  ┌──────────────┐     │   │  │
+  │  │  │  │ Provider "vm" │  │ Provider "nav"│     │   │  │
+  │  │  │  │ (ViewModel    │  │ (NavController│     │   │  │
+  │  │  │  │  SavedState)  │  │  back stack)  │     │   │  │
+  │  │  │  └──────────────┘  └──────────────┘     │   │  │
+  │  │  └─────────────────────────────────────────┘   │  │
+  │  └───────────────────────────────────────────────┘  │
+  └─────────────────────────────────────────────────────┘</code></pre>
+</div>
+
+<h3>How It Wraps the Platform Bundle</h3>
+
+<p>During <code>onSaveInstanceState()</code>, <code>SavedStateRegistryController.performSave(outBundle)</code> iterates all registered <code>SavedStateProvider</code> instances, calls <code>saveState()</code> on each, and writes the results into the platform Bundle under a reserved key (<code>"androidx.lifecycle.BundlableSavedStateRegistry.key"</code>).</p>
+
+<pre><code>// Registering a custom SavedStateProvider
+class MyCustomComponent(registry: SavedStateRegistry) {
+
+    init {
+        registry.registerSavedStateProvider("my_component") {
+            bundleOf(
+                "scroll_position" to currentScrollY,
+                "expanded_ids" to expandedItemIds.toIntArray()
+            )
+        }
+    }
+
+    fun restore(registry: SavedStateRegistry) {
+        val bundle = registry.consumeRestoredStateForKey("my_component")
+        bundle?.let {
+            currentScrollY = it.getInt("scroll_position")
+            expandedItemIds = it.getIntArray("expanded_ids")?.toSet() ?: emptySet()
+        }
+    }
+}</code></pre>
+
+<h3>Integration with SavedStateHandle</h3>
+
+<p><code>SavedStateHandle</code> is the ViewModel-facing API built on top of <code>SavedStateRegistry</code>. When a ViewModel is created via <code>SavedStateViewModelFactory</code>, the factory registers a <code>SavedStateProvider</code> with the registry. The <code>SavedStateHandle</code> acts as a key-value map that automatically participates in the save/restore cycle.</p>
+
+<pre><code>class SearchViewModel(private val savedStateHandle: SavedStateHandle) : ViewModel() {
+
+    // Survives both config change AND process death
+    val query: StateFlow&lt;String&gt; = savedStateHandle.getStateFlow("query", "")
+
+    fun updateQuery(newQuery: String) {
+        savedStateHandle["query"] = newQuery
+    }
+
+    // Survives config change only (regular ViewModel field)
+    private val _results = MutableStateFlow&lt;List&lt;Result&gt;&gt;(emptyList())
+    val results: StateFlow&lt;List&lt;Result&gt;&gt; = _results
+
+    fun search() {
+        viewModelScope.launch {
+            _results.value = repository.search(query.value)
+        }
+    }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. ViewModel Retention Across Config Changes</h2>
+
+<h3>The Underlying Mechanism: NonConfigurationInstances</h3>
+
+<p>ViewModel survival across config changes is <strong>not magic</strong> — it relies on a platform mechanism that predates Jetpack: <code>Activity.onRetainNonConfigurationInstance()</code>.</p>
+
+<div class="diagram-container">
+<pre><code>  ViewModel Retention During Config Change
+  ═════════════════════════════════════════
+
+  OLD Activity                              NEW Activity
+  ────────────                              ────────────
+  onPause()
+  onStop()
+  onSaveInstanceState()
+  onRetainNonConfigurationInstance()
+    │  returns ViewModelStore ──────┐
+  onDestroy()                       │
+                                    │  ViewModelStore held by
+                                    │  ActivityClientRecord
+                                    │  in the app process
+                                    │  (NOT sent to system_server)
+                                    │
+                                    └──▶ getLastNonConfigurationInstance()
+                                         │
+                                         ▼
+                                    onCreate()
+                                      ViewModelProvider checks for
+                                      existing ViewModelStore
+                                      → finds retained VMs
+                                      → skips creation</code></pre>
+</div>
+
+<p>The critical detail: <code>ViewModelStore</code> is retained in the <strong>app process memory</strong> via <code>ActivityClientRecord.lastNonConfigurationInstances</code>. It never crosses a Binder boundary. This is why ViewModels can hold large objects (unlike Bundles) — they're just Java objects on the heap.</p>
+
+<div class="callout staff">
+<div class="callout-label">🟣 Staff-Level Insight — Why ViewModels Don't Survive Process Death</div>
+<p><code>NonConfigurationInstances</code> are stored in the app process's <code>ActivityThread.mActivities</code> map. When the process dies, all heap memory is gone — including the <code>ViewModelStore</code>. The <code>ActivityRecord</code> in <code>system_server</code> survives (it's in a different process), and it holds the saved state Bundle, but it has no reference to the <code>ViewModelStore</code>. This is the fundamental architectural reason ViewModels survive config changes but not process death — they live in different processes.</p>
+</div>
+
+<h3>ViewModelProvider and Factory</h3>
+
+<pre><code>// Modern ViewModel creation with CreationExtras (Lifecycle 2.5+)
+class MyViewModel(
+    private val repository: Repository,
+    private val savedStateHandle: SavedStateHandle
+) : ViewModel() {
+
+    companion object {
+        val Factory: ViewModelProvider.Factory = viewModelFactory {
+            initializer {
+                val app = this[APPLICATION_KEY] as MyApplication
+                val savedStateHandle = createSavedStateHandle()
+                MyViewModel(app.repository, savedStateHandle)
+            }
+        }
+    }
+}
+
+// In Activity:
+val viewModel: MyViewModel by viewModels { MyViewModel.Factory }
+
+// What happens internally:
+// 1. viewModels {} checks ViewModelStoreOwner (the Activity)
+// 2. ViewModelProvider looks in ViewModelStore for existing "MyViewModel" key
+// 3. If found → return existing instance (config change case)
+// 4. If not → call Factory.create() with CreationExtras
+// 5. CreationExtras includes: APPLICATION_KEY, SAVED_STATE_REGISTRY_OWNER_KEY,
+//    VIEW_MODEL_STORE_OWNER_KEY, DEFAULT_ARGS_KEY</code></pre>
+
+<h3>CreationExtras — The Modern Factory Pattern</h3>
+
+<p><code>CreationExtras</code> (introduced in Lifecycle 2.5) replaces the older pattern of passing constructor parameters through custom <code>ViewModelProvider.Factory</code> implementations. The extras are a type-safe map populated by the <code>ViewModelStoreOwner</code>:</p>
+
+<pre><code>// ComponentActivity populates these extras automatically:
+// CreationExtras contains:
+//   APPLICATION_KEY          → Application instance
+//   SAVED_STATE_REGISTRY_OWNER_KEY → the Activity/Fragment
+//   VIEW_MODEL_STORE_OWNER_KEY     → the Activity/Fragment
+//   DEFAULT_ARGS_KEY         → Activity intent extras / Fragment arguments
+
+// createSavedStateHandle() is an extension on CreationExtras
+// that extracts the registry owner and default args to build a SavedStateHandle</code></pre>
+
+<!-- ============================================================ -->
+<h2>5. Process Death — The Critical Distinction</h2>
+
+<h3>Config Change vs Process Death — Survival Matrix</h3>
+
+<table>
+<tr><th>State Location</th><th>Config Change</th><th>Process Death</th></tr>
+<tr><td>ViewModel fields</td><td style="color: var(--green);">✓ Survives</td><td style="color: var(--red);">✗ Lost</td></tr>
+<tr><td><code>SavedStateHandle</code></td><td style="color: var(--green);">✓ Survives</td><td style="color: var(--green);">✓ Survives</td></tr>
+<tr><td><code>onSaveInstanceState</code> Bundle</td><td style="color: var(--green);">✓ Survives</td><td style="color: var(--green);">✓ Survives</td></tr>
+<tr><td>Static fields / singletons</td><td style="color: var(--green);">✓ Survives</td><td style="color: var(--red);">✗ Lost</td></tr>
+<tr><td>Global object graph (DI)</td><td style="color: var(--green);">✓ Survives</td><td style="color: var(--red);">✗ Lost</td></tr>
+<tr><td>Room / DataStore / SharedPrefs</td><td style="color: var(--green);">✓ Survives</td><td style="color: var(--green);">✓ Survives</td></tr>
+<tr><td>In-memory caches</td><td style="color: var(--green);">✓ Survives</td><td style="color: var(--red);">✗ Lost</td></tr>
+<tr><td>Running coroutines (viewModelScope)</td><td style="color: var(--green);">✓ Survives</td><td style="color: var(--red);">✗ Lost</td></tr>
+</table>
+
+<h3>How Process Death Works Internally</h3>
+
+<div class="diagram-container">
+<pre><code>  Process Death and Restoration
+  ═════════════════════════════
+
+  BEFORE DEATH                          AFTER RESTORATION
+  ────────────                          ─────────────────
+
+  App Process (pid 12345)               App Process (pid 67890)
+  ┌─────────────────────┐               ┌─────────────────────┐
+  │ ActivityThread       │               │ ActivityThread       │
+  │ ├── Application obj  │               │ ├── Application obj  │ ← NEW instance
+  │ ├── ViewModelStore   │  ✗ GONE       │ ├── ViewModelStore   │ ← empty
+  │ ├── Static fields    │  ✗ GONE       │ ├── Static fields    │ ← default values
+  │ └── DI graph         │  ✗ GONE       │ └── DI graph         │ ← re-initialized
+  └─────────────────────┘               └─────────────────────┘
+
+  system_server (pid 1000) — SURVIVES ACROSS PROCESS DEATH
+  ┌─────────────────────────────────────────────────────────┐
+  │ ActivityTaskManagerService                               │
+  │ ├── TaskRecord                                           │
+  │ │   ├── ActivityRecord (MainActivity)                    │
+  │ │   │   ├── savedState: Bundle ──────────────────────┐  │
+  │ │   │   ├── intent: Intent                           │  │
+  │ │   │   └── persistentState: PersistableBundle       │  │
+  │ │   └── ActivityRecord (DetailActivity)              │  │
+  │ │       └── savedState: Bundle ──────────────────┐   │  │
+  │ └───────────────────────────────────────────────│───│──┘
+  └─────────────────────────────────────────────────│───│────┘
+                                                    │   │
+  Restoration:                                      │   │
+  Zygote.fork() → new process                       │   │
+    → Application.onCreate()                        │   │
+    → ContentProviders initialized  ← BEFORE Activity!
+    → Activity.onCreate(savedInstanceState) ◄───────┘   │
+         └── if user navigates back:                    │
+             DetailActivity.onCreate(savedState) ◄──────┘</code></pre>
+</div>
+
+<div class="callout staff">
+<div class="callout-label">🟣 Staff-Level Insight — ContentProvider Initialization Trap</div>
+<p>After process death, <code>ContentProvider.onCreate()</code> runs <strong>before</strong> <code>Activity.onCreate()</code> and even before <code>Application.onCreate()</code> completes (ContentProviders are initialized during <code>Application.attachBaseContext()</code> → <code>installContentProviders()</code>). If your ContentProvider depends on DI initialization that happens in <code>Application.onCreate()</code>, you'll crash on process restoration. This is a common production bug. Libraries like Firebase and WorkManager use ContentProviders for auto-initialization, which is why they work without explicit <code>Application.onCreate()</code> calls — but it also means they run before your DI setup. The App Startup library (<code>androidx.startup</code>) was created specifically to solve initialization ordering.</p>
+</div>
+
+<h3>How to Test Process Death</h3>
+
+<pre><code>// Method 1: adb command (most reliable)
+// Put app in background first, then:
+adb shell am kill com.example.myapp
+
+// Method 2: Developer Options → "Don't keep activities"
+// Destroys every Activity as soon as it loses focus
+// NOT identical to process death (process stays alive, statics survive)
+// But good for testing savedInstanceState paths
+
+// Method 3: Android Studio → "Terminate Application" button
+// Kills the process immediately — equivalent to OOM kill
+
+// Method 4: Programmatic (for automated tests)
+// ActivityScenario handles this:
+val scenario = launchActivity&lt;MainActivity&gt;()
+scenario.recreate()  // simulates config change, NOT process death
+
+// For actual process death simulation in tests:
+// Use SavedStateRegistry directly:
+val registry = activity.savedStateRegistry
+val bundle = Bundle()
+registry.performSave(bundle)
+// ... create new Activity with this bundle ...</code></pre>
+
+<h3>Process Recreation Sequence</h3>
+
+<ol>
+<li><strong>Zygote fork</strong> — new process with preloaded framework classes (COW pages)</li>
+<li><strong><code>Application.attachBaseContext()</code></strong> — earliest app code execution</li>
+<li><strong><code>ContentProvider.onCreate()</code></strong> — all declared providers initialized</li>
+<li><strong><code>Application.onCreate()</code></strong> — your DI setup, crash reporting init, etc.</li>
+<li><strong><code>Activity.onCreate(savedInstanceState)</code></strong> — the Bundle from <code>ActivityRecord</code> is passed in</li>
+<li><strong><code>Activity.onStart()</code> → <code>onRestoreInstanceState()</code> → <code>onResume()</code></strong></li>
+</ol>
+
+<!-- ============================================================ -->
+<h2>6. Saved State Strategies at Scale</h2>
+
+<h3>The State Restoration Pyramid</h3>
+
+<div class="diagram-container">
+<pre><code>  State Restoration Pyramid — What Goes Where
+  ════════════════════════════════════════════
+
+              ┌───────────────┐
+              │  Persistent   │  Room, DataStore, SharedPrefs
+              │   Storage     │  User data, cached API responses
+              │               │  Survives: everything (even uninstall for backup)
+              ├───────────────┤
+              │ SavedState    │  SavedStateHandle, onSaveInstanceState
+              │  Handle /     │  UI state: scroll pos, search query, selected tab
+              │  Bundle       │  Survives: config change + process death
+              ├───────────────┤
+              │  ViewModel    │  In-memory business state
+              │  (in-memory)  │  API results, computed data, running operations
+              │               │  Survives: config change only
+              ├───────────────┤
+              │  View /       │  Transient interaction state
+              │  Compose      │  Animation progress, touch state, focus
+              │  State        │  Survives: nothing (or config change via remember)
+              └───────────────┘
+
+  Rule of thumb: store the MINIMUM needed to reconstruct the screen.
+  Save IDs and queries, not full data objects.</code></pre>
+</div>
+
+<h3>What Goes Where — Concrete Examples</h3>
+
+<table>
+<tr><th>State</th><th>Where</th><th>Why</th></tr>
+<tr><td>Search query text</td><td><code>SavedStateHandle</code></td><td>Small string, needed to re-fetch results after process death</td></tr>
+<tr><td>Search results list</td><td>ViewModel field</td><td>Re-fetchable from query; too large for Bundle</td></tr>
+<tr><td>Selected filter chips</td><td><code>SavedStateHandle</code></td><td>Small set of IDs, needed to reconstruct UI</td></tr>
+<tr><td>RecyclerView scroll position</td><td>Auto-saved (View ID)</td><td>Platform handles this via <code>LayoutManager.onSaveInstanceState()</code></td></tr>
+<tr><td>User profile data</td><td>Room + ViewModel cache</td><td>Persistent; ViewModel caches to avoid re-query</td></tr>
+<tr><td>Auth token</td><td>EncryptedSharedPrefs</td><td>Must survive process death and app restart</td></tr>
+<tr><td>Draft message text</td><td>Room (auto-save) or <code>SavedStateHandle</code></td><td>Depends on whether you want cross-session persistence</td></tr>
+</table>
+
+<h3>Compose rememberSaveable</h3>
+
+<p><code>rememberSaveable</code> hooks into <code>SavedStateRegistry</code> under the hood. It uses the composition's <code>SaveableStateRegistry</code> (which delegates to the platform <code>SavedStateRegistry</code>) to persist values across both config changes and process death.</p>
+
+<pre><code>@Composable
+fun SearchScreen(viewModel: SearchViewModel = viewModel()) {
+    // Survives config change + process death (via SavedStateRegistry)
+    var query by rememberSaveable { mutableStateOf("") }
+
+    // Survives config change only (via ViewModel retention)
+    val results by viewModel.results.collectAsStateWithLifecycle()
+
+    // Survives nothing — reset on any recreation
+    var isAnimating by remember { mutableStateOf(false) }
+
+    // Best practice: use SavedStateHandle in ViewModel instead of
+    // rememberSaveable for state that drives business logic
+    // Use rememberSaveable for purely UI-level state
+}</code></pre>
+
+<h3>State Restoration in Single-Activity Architecture</h3>
+
+<p>In a single-Activity app with multiple Fragments (or Compose destinations), each Fragment/destination has its own <code>SavedStateRegistry</code> scoped to its lifecycle. The key insight: the Activity's saved state Bundle contains a nested structure:</p>
+
+<pre><code>// Activity's saved state Bundle structure:
+// {
+//   "android:viewHierarchyState" → SparseArray (View states)
+//   "android:fragments" → FragmentManagerState (all Fragment states)
+//   "androidx.lifecycle.BundlableSavedStateRegistry.key" → {
+//     "vm_key:SearchViewModel" → Bundle (SavedStateHandle data)
+//     "nav_controller_state" → Bundle (NavController back stack)
+//   }
+// }
+//
+// Each Fragment also has its own nested Bundle:
+// Fragment.mSavedFragmentState → {
+//   "android:view_state" → SparseArray (Fragment's View states)
+//   "androidx.lifecycle.BundlableSavedStateRegistry.key" → {
+//     "vm_key:DetailViewModel" → Bundle (Fragment-scoped ViewModel)
+//   }
+// }</code></pre>
+
+<!-- ============================================================ -->
+<h2>7. Staff-Level Corner Cases</h2>
+
+<h3>Diagnosing TransactionTooLargeException</h3>
+
+<pre><code>// The TooLargeTool approach — log Bundle sizes in debug builds
+class DebugActivity : ComponentActivity() {
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        if (BuildConfig.DEBUG) {
+            logBundleSize(outState, "Activity")
+        }
+    }
+
+    private fun logBundleSize(bundle: Bundle, tag: String) {
+        val parcel = android.os.Parcel.obtain()
+        try {
+            parcel.writeBundle(bundle)
+            val sizeKb = parcel.dataSize() / 1024
+            Log.d("BundleSize", "$tag: ${sizeKb}KB")
+            if (sizeKb > 500) {
+                Log.w("BundleSize", "$tag approaching limit! Keys:")
+                bundle.keySet().forEach { key ->
+                    val value = bundle.get(key)
+                    val valueParcel = android.os.Parcel.obtain()
+                    try {
+                        valueParcel.writeValue(value)
+                        Log.w("BundleSize",
+                            "  $key: ${valueParcel.dataSize() / 1024}KB")
+                    } finally {
+                        valueParcel.recycle()
+                    }
+                }
+            }
+        } finally {
+            parcel.recycle()
+        }
+    }
+}
+
+// Common culprits:
+// 1. Fragment arguments with large Parcelable lists
+// 2. NavController saving entire back stack with large args
+// 3. RecyclerView adapter saving state for thousands of items
+// 4. WebView saving full page state</code></pre>
+
+<h3>State Loss with commitAllowingStateLoss()</h3>
+
+<pre><code>// The problem: committing a FragmentTransaction after onSaveInstanceState()
+// Normal commit() throws IllegalStateException — "Can not perform this action
+// after onSaveInstanceState"
+//
+// commitAllowingStateLoss() suppresses the exception but the transaction
+// IS NOT included in the saved state. After process death:
+//   - The Fragment from the lost transaction won't exist
+//   - The back stack entry won't exist
+//   - The user sees unexpected UI state
+//
+// When is commitAllowingStateLoss() acceptable?
+// Only for Fragments that are purely visual and don't affect navigation:
+//   - Showing a transient error banner
+//   - Updating a non-critical UI element
+// NEVER for navigation-critical transactions.</code></pre>
+
+<h3>ViewModel + SavedStateHandle During Background Work</h3>
+
+<pre><code>class UploadViewModel(private val savedStateHandle: SavedStateHandle) : ViewModel() {
+
+    // What happens when process dies during upload?
+    // 1. viewModelScope is cancelled → coroutine is cancelled
+    // 2. ViewModel is garbage collected
+    // 3. SavedStateHandle data survives in the Bundle
+    // 4. On restoration: ViewModel is recreated, SavedStateHandle has old state
+    // 5. But the upload is LOST — no coroutine is running
+
+    // Solution: use WorkManager for work that must complete
+    val uploadState: StateFlow&lt;UploadState&gt; =
+        savedStateHandle.getStateFlow("upload_state", UploadState.IDLE)
+
+    fun startUpload(fileUri: Uri) {
+        savedStateHandle["upload_state"] = UploadState.IN_PROGRESS
+        savedStateHandle["pending_uri"] = fileUri.toString()
+
+        // Delegate to WorkManager for process-death-safe execution
+        val request = OneTimeWorkRequestBuilder&lt;UploadWorker&gt;()
+            .setInputData(workDataOf("uri" to fileUri.toString()))
+            .build()
+        WorkManager.getInstance(app).enqueue(request)
+    }
+
+    // On restoration, check WorkManager status instead of restarting
+    fun checkPendingUpload() {
+        val pendingUri = savedStateHandle.get&lt;String&gt;("pending_uri") ?: return
+        // Observe WorkManager for the existing work status
+    }
+}</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">🟣 Staff-Level Insight — The isChangingConfigurations() Optimization</div>
+<p>In <code>onDestroy()</code>, <code>isChangingConfigurations()</code> returns <code>true</code> if the Activity is being destroyed for a config change (and will be immediately recreated). Use this to avoid expensive cleanup that's pointless during recreation — closing database connections, unregistering system-level listeners, or releasing resources that the new Activity instance will immediately re-acquire. Conversely, if <code>isFinishing()</code> is true, the Activity is genuinely going away (user pressed back, <code>finish()</code> was called). The combination of these two flags gives you a complete picture: <code>isFinishing()</code> = user-initiated destruction, <code>isChangingConfigurations()</code> = system-initiated temporary destruction, neither = system killing the Activity for resources (process death path).</p>
+</div>
+
+<h3>Multi-Process Apps</h3>
+
+<pre><code>// If you declare android:process=":background" on a Service or Activity,
+// it runs in a SEPARATE process. Each process:
+//   - Has its own Application.onCreate() call
+//   - Has its own static fields and singletons
+//   - Has its own DI graph
+//   - Has its own ViewModelStore (if it has Activities)
+//
+// Process death affects processes independently:
+//   - Main process can die while :background lives on
+//   - Each process has its own OOM adj score
+//   - Saved state Bundles are in system_server, unaffected by either process
+//
+// Common trap: assuming a singleton initialized in the main process
+// is available in the :background process. It's not — it's a different
+// JVM instance with its own class loader.</code></pre>
+
+<h3>The ViewModel Leak Anti-Pattern</h3>
+
+<pre><code>// ✗ WRONG — ViewModel outlives Activity during config change
+class BadViewModel(private val context: Activity) : ViewModel() {
+    // The OLD Activity instance is retained, preventing GC
+    // The NEW Activity has a different reference
+    // Result: memory leak of the old Activity + its entire View tree
+}
+
+// ✗ ALSO WRONG — implicit reference via inner class
+class BadViewModel : ViewModel() {
+    // Anonymous inner class captures outer Activity reference
+    val callback = object : SomeCallback {
+        override fun onResult(data: Data) {
+            // 'this@Activity' is captured — leaked
+        }
+    }
+}
+
+// ✓ CORRECT — use Application context or no context
+class GoodViewModel(application: Application) : AndroidViewModel(application) {
+    // Application context is process-scoped, same lifetime as ViewModel
+}
+
+// ✓ BETTER — no context at all, inject what you need
+class BetterViewModel(private val repository: Repository) : ViewModel() {
+    // Repository holds Application context internally if needed
+}</code></pre>
+
+<h3>Testing Saved State</h3>
+
+<pre><code>// ActivityScenario — config change simulation
+@Test
+fun viewModel_survives_configChange() {
+    val scenario = launchActivity&lt;SearchActivity&gt;()
+
+    scenario.onActivity { activity ->
+        activity.viewModel.updateQuery("test")
+    }
+
+    scenario.recreate() // triggers full destroy → create cycle
+
+    scenario.onActivity { activity ->
+        assertEquals("test", activity.viewModel.query.value)
+    }
+}
+
+// Testing saved state restoration (simulates process death)
+@Test
+fun savedState_restored_after_processDeathSimulation() {
+    val scenario = launchActivity&lt;SearchActivity&gt;()
+
+    scenario.onActivity { activity ->
+        // Set some state
+        activity.viewModel.updateQuery("kotlin coroutines")
+    }
+
+    // moveToState(CREATED) doesn't simulate process death,
+    // but we can test the Bundle mechanism:
+    scenario.recreate()
+
+    scenario.onActivity { activity ->
+        // SavedStateHandle should have persisted the query
+        assertEquals("kotlin coroutines", activity.viewModel.query.value)
+    }
+}
+
+// For true process death testing, use:
+// 1. Instrumented tests with UiAutomator to kill and relaunch
+// 2. Manual testing with "adb shell am kill"
+// 3. StateRestorationTester for Compose:
+@Test
+fun compose_savedState_restored() {
+    val restorationTester = StateRestorationTester(composeTestRule)
+    restorationTester.setContent {
+        SearchScreen()
+    }
+
+    // Interact with UI...
+    composeTestRule.onNodeWithTag("search_input")
+        .performTextInput("test query")
+
+    // Simulate process death + restoration
+    restorationTester.emulateSavedInstanceStateRestore()
+
+    // Verify state was restored
+    composeTestRule.onNodeWithTag("search_input")
+        .assertTextEquals("test query")
+}</code></pre>
+
+<div class="callout warn">
+<div class="callout-label">⚠ Don't Keep Activities ≠ Process Death</div>
+<p>The "Don't keep activities" developer option destroys Activities when they go to the background, but the <strong>process stays alive</strong>. This means static fields, singletons, and in-memory caches survive. It's useful for testing <code>onSaveInstanceState</code>/<code>onRestoreInstanceState</code> paths, but it does <strong>not</strong> test the full process death scenario. For true process death testing, use <code>adb shell am kill</code> after backgrounding the app.</p>
+</div>
+
+<h2>9. Configuration.diff() and Granular Change Detection</h2>
+
+<pre><code>// When handling config changes manually, you can detect WHICH config changed:
+override fun onConfigurationChanged(newConfig: Configuration) {
+    super.onConfigurationChanged(newConfig)
+
+    // Configuration.diff() returns a bitmask of what changed
+    // (internal API, but the concept matters for L6)
+    //
+    // In practice, check specific fields:
+    val isNightMode = newConfig.uiMode and Configuration.UI_MODE_NIGHT_MASK ==
+        Configuration.UI_MODE_NIGHT_YES
+
+    val isLandscape = newConfig.orientation == Configuration.ORIENTATION_LANDSCAPE
+
+    // Per-app language (Android 13+):
+    val currentLocale = newConfig.locales[0]
+}
+
+// android:configChanges gotcha — you must handle ALL declared configs:
+// If you declare android:configChanges="orientation|screenSize"
+// you STILL get destroyed for: locale, fontScale, uiMode (dark mode),
+// density, keyboard, layoutDirection, etc.
+//
+// Common mistake: declaring orientation|screenSize and assuming
+// the Activity never recreates. Then a user changes dark mode
+// and the Activity recreates without proper handling.
+
+// Per-app language (API 33) triggers a config change:
+// LocaleManager.setApplicationLocales(LocaleList.forLanguageTags("fr"))
+// → triggers onConfigurationChanged if declared, else destroy/recreate</code></pre>
+
+<h2>10. PersistableBundle and Persistent Saved State</h2>
+
+<pre><code>// Activities can opt into persistent saved state that survives REBOOTS:
+// AndroidManifest.xml: android:persistableMode="persistAcrossReboots"
+
+// This gives you a second callback:
+override fun onSaveInstanceState(outState: Bundle, outPersistentState: PersistableBundle) {
+    super.onSaveInstanceState(outState, outPersistentState)
+    outPersistentState.putString("lastDocument", currentDocId)
+}
+
+override fun onCreate(savedInstanceState: Bundle?, persistentState: PersistableBundle?) {
+    super.onCreate(savedInstanceState, persistentState)
+    // persistentState survives device reboot
+    // savedInstanceState survives process death but NOT reboot
+    val lastDoc = persistentState?.getString("lastDocument")
+}
+
+// Limitations:
+// - PersistableBundle only supports primitive types (no Parcelable)
+// - Written to disk by system_server (XML in /data/system/recent_tasks/)
+// - Rarely used in practice — DataStore/SharedPreferences are more flexible
+// - But it's an L6 interview topic because it reveals understanding of
+//   the state persistence hierarchy</code></pre>
+
+<h2>11. Activity.recreate() vs Config Change</h2>
+
+<pre><code>// Activity.recreate() programmatically triggers a destroy-recreate cycle
+// It follows the SAME path as a config change:
+// onPause → onStop → onSaveInstanceState → onDestroy → onCreate → ...
+
+// Key difference from actual config change:
+// - isChangingConfigurations() returns FALSE
+// - ViewModel IS still retained (NonConfigurationInstances is preserved)
+// - This is because recreate() internally uses the same
+//   ActivityClientController.activityRelaunch() path
+
+// Use case: applying a theme change at runtime
+fun applyTheme(isDark: Boolean) {
+    AppCompatDelegate.setDefaultNightMode(
+        if (isDark) AppCompatDelegate.MODE_NIGHT_YES
+        else AppCompatDelegate.MODE_NIGHT_NO
+    )
+    // This triggers recreate() on all visible Activities
+}
+
+// Gotcha: calling recreate() in onCreate() causes an infinite loop
+// Guard with a flag or check if the state is already correct</code></pre>
+
+<!-- ============================================================ -->
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  <a href="02-fragment-lifecycle.html">← 02 — Fragment Lifecycle</a> &nbsp;|&nbsp;
+  <a href="04-back-stack-tasks.html">04 — Back Stack & Tasks →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

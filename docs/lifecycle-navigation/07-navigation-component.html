@@ -1,0 +1,1009 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 — Navigation Component (Fragment-Based) — NavController Internals, Back Stack Management & Deep Links</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-activity-lifecycle.html">01 Activity Lifecycle</a>
+  <a href="02-fragment-lifecycle.html">02 Fragment Lifecycle</a>
+  <a href="03-config-change-process-death.html">03 Config &amp; Process Death</a>
+  <a href="04-back-stack-tasks.html">04 Back Stack &amp; Tasks</a>
+  <a href="05-multi-window-pip.html">05 Multi-Window &amp; PiP</a>
+  <a href="06-lifecycle-aware-components.html">06 Lifecycle-Aware</a>
+  <a class="active" href="07-navigation-component.html">07 Navigation Component</a>
+  <a href="08-navigation-compose.html">08 Navigation Compose</a>
+  <a href="09-interview-qa.html">09 Interview Q&amp;A</a>
+</div>
+
+<h1>07 — Navigation Component (Fragment-Based)</h1>
+<p class="subtitle">NavController internals, NavBackStackEntry lifecycle ownership, Navigator abstraction, multiple back stacks, deep link handling, ViewModel scoping, and staff-level pitfalls</p>
+
+<!-- ============================================================ -->
+<h2>1. Navigation Architecture</h2>
+
+<p>The Navigation Component is an opinionated framework that manages Fragment transactions, back stack, argument passing, deep links, and ViewModel scoping through a single <code>NavController</code>. Understanding the layered architecture is essential — the library is not a thin wrapper over <code>FragmentManager</code>; it introduces its own back stack model that <em>delegates</em> to <code>FragmentManager</code> under the hood.</p>
+
+<div class="diagram-container">
+<pre><code>                    Navigation Component Architecture
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                        Activity                             │
+  │  ┌───────────────────────────────────────────────────────┐  │
+  │  │              NavHostFragment                          │  │
+  │  │  ┌─────────────────────────────────────────────────┐  │  │
+  │  │  │            NavController                        │  │  │
+  │  │  │  ┌───────────────────────────────────────────┐  │  │  │
+  │  │  │  │            NavGraph                       │  │  │  │
+  │  │  │  │  ┌─────────┐ ┌─────────┐ ┌─────────┐     │  │  │  │
+  │  │  │  │  │ Dest A  │ │ Dest B  │ │ Dest C  │     │  │  │  │
+  │  │  │  │  │(Fragment)│ │(Fragment)│ │(Dialog) │     │  │  │  │
+  │  │  │  │  └─────────┘ └─────────┘ └─────────┘     │  │  │  │
+  │  │  │  │  ┌──────────────────────────┐             │  │  │  │
+  │  │  │  │  │  Nested NavGraph         │             │  │  │  │
+  │  │  │  │  │  ┌───────┐ ┌───────┐    │             │  │  │  │
+  │  │  │  │  │  │Dest D │ │Dest E │    │             │  │  │  │
+  │  │  │  │  │  └───────┘ └───────┘    │             │  │  │  │
+  │  │  │  │  └──────────────────────────┘             │  │  │  │
+  │  │  │  └───────────────────────────────────────────┘  │  │  │
+  │  │  │                                                 │  │  │
+  │  │  │  Back Stack: [NavBackStackEntry]                │  │  │
+  │  │  │  ┌─────┐ ┌─────┐ ┌─────┐                       │  │  │
+  │  │  │  │ A   │ │ B   │ │ D   │ ← current             │  │  │
+  │  │  │  └─────┘ └─────┘ └─────┘                       │  │  │
+  │  │  │                                                 │  │  │
+  │  │  │  Navigators:                                    │  │  │
+  │  │  │  ├── FragmentNavigator                          │  │  │
+  │  │  │  ├── DialogFragmentNavigator                    │  │  │
+  │  │  │  └── ActivityNavigator                          │  │  │
+  │  │  └─────────────────────────────────────────────────┘  │  │
+  │  └───────────────────────────────────────────────────────┘  │
+  └─────────────────────────────────────────────────────────────┘</code></pre>
+</div>
+
+<h3>Core Components</h3>
+
+<table>
+<tr><th>Component</th><th>Role</th><th>Key Detail</th></tr>
+<tr><td><code>NavController</code></td><td>Orchestrates all navigation — resolves destinations, manages back stack, handles deep links</td><td>Maintains its own <code>List&lt;NavBackStackEntry&gt;</code> independent of <code>FragmentManager</code>'s back stack</td></tr>
+<tr><td><code>NavHost</code></td><td>Container interface — provides the area where destinations are swapped</td><td><code>NavHostFragment</code> is the Fragment-based implementation; Compose has its own</td></tr>
+<tr><td><code>NavGraph</code></td><td>Collection of <code>NavDestination</code> nodes with a designated start destination</td><td>Is itself a <code>NavDestination</code> — graphs can be nested</td></tr>
+<tr><td><code>NavDestination</code></td><td>A node in the graph — represents a screen, dialog, or activity</td><td>Each type is managed by a specific <code>Navigator</code></td></tr>
+<tr><td><code>NavBackStackEntry</code></td><td>A single entry on the back stack — wraps a destination + arguments + state</td><td>Implements <code>LifecycleOwner</code>, <code>ViewModelStoreOwner</code>, <code>SavedStateRegistryOwner</code></td></tr>
+<tr><td><code>Navigator&lt;D&gt;</code></td><td>Abstraction that knows how to navigate to a specific destination type</td><td><code>FragmentNavigator</code>, <code>DialogFragmentNavigator</code>, <code>ActivityNavigator</code></td></tr>
+</table>
+
+<h3>NavHostFragment Setup</h3>
+
+<pre><code>// In your Activity layout XML:
+&lt;androidx.fragment.app.FragmentContainerView
+    android:id="@+id/nav_host"
+    android:name="androidx.navigation.fragment.NavHostFragment"
+    app:navGraph="@navigation/main_graph"
+    app:defaultNavHost="true"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent" /&gt;
+
+// app:defaultNavHost="true" — intercepts the system Back button
+// NavHostFragment calls childFragmentManager.popBackStack() on back press
+// and delegates to NavController when the Fragment back stack is empty
+
+// Retrieving the NavController:
+val navController = findNavController(R.id.nav_host)
+// Under the hood: walks up the Fragment/View hierarchy looking for a
+// NavController set via Navigation.setViewNavController()</code></pre>
+
+<h3>NavBackStackEntry — Triple Owner</h3>
+
+<p>Each <code>NavBackStackEntry</code> is a self-contained lifecycle scope. This is the key architectural insight — it decouples the destination's lifecycle from the Fragment's lifecycle.</p>
+
+<pre><code>// NavBackStackEntry implements:
+// 1. LifecycleOwner    → its Lifecycle tracks CREATED → STARTED → RESUMED → DESTROYED
+// 2. ViewModelStoreOwner → ViewModels scoped to this entry survive config changes
+// 3. SavedStateRegistryOwner → SavedStateHandle persists across process death
+
+// The lifecycle of a NavBackStackEntry:
+//   navigate(A → B):
+//     Entry A: RESUMED → STARTED (still on back stack, but not visible)
+//     Entry B: CREATED → STARTED → RESUMED
+//
+//   popBackStack() (B popped):
+//     Entry B: STARTED → CREATED → DESTROYED (ViewModelStore cleared)
+//     Entry A: STARTED → RESUMED
+//
+// This is distinct from Fragment lifecycle:
+//   Fragment for A may have its VIEW destroyed (onDestroyView) when B is shown,
+//   but the NavBackStackEntry for A stays in STARTED state.
+//   The Fragment INSTANCE stays alive if FragmentNavigator uses replace + addToBackStack.</code></pre>
+
+<!-- ============================================================ -->
+<h2>2. NavGraph and Destinations</h2>
+
+<h3>XML Nav Graph</h3>
+
+<pre><code>&lt;!-- res/navigation/main_graph.xml --&gt;
+&lt;navigation xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/main_graph"
+    app:startDestination="@id/homeFragment"&gt;
+
+    &lt;fragment
+        android:id="@+id/homeFragment"
+        android:name="com.example.HomeFragment"
+        android:label="Home"&gt;
+        &lt;action
+            android:id="@+id/action_home_to_detail"
+            app:destination="@id/detailFragment"
+            app:enterAnim="@anim/slide_in_right"
+            app:exitAnim="@anim/slide_out_left"
+            app:popEnterAnim="@anim/slide_in_left"
+            app:popExitAnim="@anim/slide_out_right" /&gt;
+    &lt;/fragment&gt;
+
+    &lt;fragment
+        android:id="@+id/detailFragment"
+        android:name="com.example.DetailFragment"
+        android:label="Detail"&gt;
+        &lt;argument
+            android:name="itemId"
+            app:argType="long" /&gt;
+    &lt;/fragment&gt;
+
+    &lt;dialog
+        android:id="@+id/confirmDialog"
+        android:name="com.example.ConfirmDialogFragment" /&gt;
+
+    &lt;!-- Nested graph for auth flow --&gt;
+    &lt;navigation
+        android:id="@+id/auth_graph"
+        app:startDestination="@id/loginFragment"&gt;
+        &lt;fragment android:id="@+id/loginFragment"
+            android:name="com.example.LoginFragment" /&gt;
+        &lt;fragment android:id="@+id/registerFragment"
+            android:name="com.example.RegisterFragment" /&gt;
+    &lt;/navigation&gt;
+&lt;/navigation&gt;</code></pre>
+
+<h3>Kotlin DSL (Programmatic Graph)</h3>
+
+<pre><code>// Building a nav graph programmatically — useful for dynamic/modular navigation
+val navController = findNavController(R.id.nav_host)
+navController.graph = navController.createGraph(
+    startDestination = "home"
+) {
+    fragment&lt;HomeFragment&gt;("home") {
+        label = "Home"
+    }
+    fragment&lt;DetailFragment&gt;("detail/{itemId}") {
+        label = "Detail"
+        argument("itemId") {
+            type = NavType.LongType
+        }
+    }
+    dialog&lt;ConfirmDialogFragment&gt;("confirm")
+    navigation(startDestination = "login", route = "auth") {
+        fragment&lt;LoginFragment&gt;("login")
+        fragment&lt;RegisterFragment&gt;("register")
+    }
+}</code></pre>
+
+<h3>NavDestination Types</h3>
+
+<table>
+<tr><th>Destination Type</th><th>Navigator</th><th>Behavior</th></tr>
+<tr><td><code>&lt;fragment&gt;</code></td><td><code>FragmentNavigator</code></td><td>Replaces Fragment in the <code>NavHostFragment</code>'s container via <code>FragmentTransaction</code></td></tr>
+<tr><td><code>&lt;dialog&gt;</code></td><td><code>DialogFragmentNavigator</code></td><td>Shows a <code>DialogFragment</code> via <code>show()</code> — does NOT replace the current Fragment</td></tr>
+<tr><td><code>&lt;activity&gt;</code></td><td><code>ActivityNavigator</code></td><td>Calls <code>startActivity()</code> — leaves the Navigation back stack (no entry added)</td></tr>
+</table>
+
+<h3>Nested Graphs and <code>&lt;include&gt;</code></h3>
+
+<pre><code>// Nested graphs provide scoping and encapsulation:
+// 1. ViewModels scoped to a nested graph are shared across its destinations
+// 2. Deep links into a nested graph auto-build the correct back stack
+// 3. Nested graphs can be extracted into separate XML files via &lt;include&gt;
+
+// In main_graph.xml:
+&lt;include app:graph="@navigation/settings_graph" /&gt;
+
+// settings_graph.xml is a standalone &lt;navigation&gt; element
+// The included graph's id becomes a destination in the parent graph
+// Navigation into the included graph navigates to its startDestination</code></pre>
+
+<!-- ============================================================ -->
+<h2>3. Navigation Actions and Arguments</h2>
+
+<h3>Safe Args</h3>
+
+<pre><code>// Safe Args gradle plugin generates type-safe Direction and Args classes
+// plugins { id("androidx.navigation.safeargs.kotlin") }
+
+// Generated from the XML above:
+// HomeFragmentDirections.actionHomeToDetail(itemId = 42L)
+// DetailFragmentArgs.fromBundle(arguments).itemId
+
+// Navigating with Safe Args:
+findNavController().navigate(
+    HomeFragmentDirections.actionHomeToDetail(itemId = 42L)
+)
+
+// Receiving arguments:
+class DetailFragment : Fragment() {
+    private val args: DetailFragmentArgs by navArgs()
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        val itemId = args.itemId // type-safe, no string keys
+    }
+}
+
+// Supported argument types:
+// - Primitives: Int, Long, Float, Boolean, String
+// - Parcelable, Serializable, Enum
+// - Arrays of primitives and Parcelable
+// - Resource references (app:argType="reference")
+//
+// Default values: android:defaultValue="0" (or "@null" for nullable types)
+// Nullable: app:nullable="true" (only for String, Parcelable, Serializable)</code></pre>
+
+<h3>Deep Links in Nav Graph</h3>
+
+<pre><code>&lt;fragment
+    android:id="@+id/detailFragment"
+    android:name="com.example.DetailFragment"&gt;
+    &lt;argument android:name="itemId" app:argType="long" /&gt;
+    &lt;deepLink
+        android:id="@+id/detail_deep_link"
+        app:uri="myapp://detail/{itemId}"
+        app:action="android.intent.action.VIEW"
+        app:mimeType="text/plain" /&gt;
+&lt;/fragment&gt;
+
+&lt;!-- In AndroidManifest.xml, add the nav-graph to the Activity: --&gt;
+&lt;activity android:name=".MainActivity"&gt;
+    &lt;nav-graph android:value="@navigation/main_graph" /&gt;
+&lt;/activity&gt;
+&lt;!-- The manifest merger generates the &lt;intent-filter&gt; entries automatically --&gt;</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. NavController Internals</h2>
+
+<p>This section covers what happens inside <code>NavController</code> when you call <code>navigate()</code> and <code>popBackStack()</code>. Understanding these internals is what separates L6 answers from surface-level ones.</p>
+
+<h3>navigate() — Step by Step</h3>
+
+<pre><code>// NavController.navigate(resId, args, navOptions, navigatorExtras)
+//
+// Step 1: Resolve the destination
+//   → findDestination(resId) walks the NavGraph tree
+//   → If resId is an action ID, resolve the action's destination
+//   → If destination is a NavGraph, resolve to its startDestination
+//
+// Step 2: Apply NavOptions (popUpTo, singleTop, etc.)
+//   → If popUpTo is set:
+//     → Pop entries from the back stack up to (and optionally including) the target
+//     → Each popped NavBackStackEntry transitions to DESTROYED
+//     → Its ViewModelStore is cleared
+//   → If launchSingleTop and destination is already at top:
+//     → Don't create a new entry; update the existing entry's arguments
+//     → (Pre-2.4: arguments were NOT updated — see corner cases)
+//
+// Step 3: Create NavBackStackEntry
+//   → new NavBackStackEntry(destination, args, hostLifecycleState, viewModelStore)
+//   → Entry starts in CREATED state
+//
+// Step 4: Delegate to Navigator
+//   → navigator.navigate(entry, navOptions, navigatorExtras)
+//   → FragmentNavigator: creates FragmentTransaction, replace(), addToBackStack()
+//   → DialogFragmentNavigator: calls dialogFragment.show()
+//   → ActivityNavigator: calls startActivity()
+//
+// Step 5: Update back stack
+//   → Push the new NavBackStackEntry onto NavController's internal back stack
+//   → Transition entry lifecycle: CREATED → STARTED → RESUMED
+//   → Previous entry: RESUMED → STARTED (if still on back stack)
+//
+// Step 6: Notify listeners
+//   → OnDestinationChangedListener callbacks fire
+//   → NavigationUI updates toolbar title, bottom nav selection, etc.</code></pre>
+
+<h3>popBackStack() — Step by Step</h3>
+
+<pre><code>// NavController.popBackStack()
+//
+// Step 1: Get the current back stack entry (top of stack)
+// Step 2: Determine the Navigator that owns this destination
+// Step 3: Call navigator.popBackStack(entry, savedState)
+//   → FragmentNavigator: FragmentManager.popBackStack()
+//   → DialogFragmentNavigator: dialogFragment.dismiss()
+// Step 4: Transition the popped entry:
+//   → RESUMED → STARTED → CREATED → DESTROYED
+//   → ViewModelStore.clear() — all ViewModels for this entry are cleared
+// Step 5: Remove entry from NavController's back stack
+// Step 6: The entry below becomes the new top:
+//   → STARTED → RESUMED
+// Step 7: Notify OnDestinationChangedListener</code></pre>
+
+<h3>The Navigator Abstraction</h3>
+
+<pre><code>// Navigator&lt;D : NavDestination&gt; is the SPI that decouples NavController
+// from the actual navigation mechanism.
+
+// Key methods:
+abstract class Navigator&lt;D : NavDestination&gt; {
+    // Create a new destination instance (used by XML inflation)
+    abstract fun createDestination(): D
+
+    // Perform the navigation — return the NavDestination if successful
+    abstract fun navigate(
+        entries: List&lt;NavBackStackEntry&gt;,
+        navOptions: NavOptions?,
+        navigatorExtras: Extras?
+    )
+
+    // Pop the given entry from this navigator's back stack
+    abstract fun popBackStack(popUpTo: NavBackStackEntry, savedState: Boolean)
+}
+
+// FragmentNavigator.navigate() internally does:
+//   val ft = fragmentManager.beginTransaction()
+//   ft.setReorderingAllowed(true)
+//   ft.replace(containerId, fragment)  // NOT add — replace
+//   ft.setPrimaryNavigationFragment(fragment)
+//   ft.addToBackStack(entry.id)
+//   ft.commit()
+//
+// setPrimaryNavigationFragment() is critical — it ensures the child
+// FragmentManager handles back button presses before the parent.</code></pre>
+
+<h3>NavOptions</h3>
+
+<table>
+<tr><th>Option</th><th>Effect</th><th>Gotcha</th></tr>
+<tr><td><code>popUpTo</code></td><td>Pop all entries above the specified destination before navigating</td><td>If the destination isn't on the stack, pops everything</td></tr>
+<tr><td><code>inclusive</code></td><td>Also pop the <code>popUpTo</code> destination itself</td><td>If inclusive pops the start destination, the graph is empty — next back press exits</td></tr>
+<tr><td><code>launchSingleTop</code></td><td>If destination is already at the top, don't create a new instance</td><td>Pre-2.4: didn't update arguments. Post-2.4: creates a new entry but reuses the ViewModel</td></tr>
+<tr><td><code>restoreState</code></td><td>Restore previously saved back stack state for the destination</td><td>Only works with <code>saveState = true</code> on the corresponding <code>popUpTo</code></td></tr>
+<tr><td><code>saveState</code></td><td>Save the back stack state when popping (for multiple back stacks)</td><td>Saved state is keyed by destination ID — only one saved state per destination</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>5. Fragment Back Stack in Navigation</h2>
+
+<h3>How Navigation Uses FragmentTransaction</h3>
+
+<pre><code>// NavController maintains its OWN back stack (List&lt;NavBackStackEntry&gt;)
+// FragmentNavigator ALSO adds entries to FragmentManager's back stack
+//
+// These two back stacks are kept in sync:
+//
+// NavController back stack:     [Entry:Home] [Entry:Detail] [Entry:Settings]
+// FragmentManager back stack:   [Home→Detail] [Detail→Settings]
+//                                (FragmentTransaction records)
+//
+// When NavController.popBackStack() is called:
+//   1. NavController pops its entry
+//   2. FragmentNavigator calls fragmentManager.popBackStack()
+//   3. Both stacks stay in sync
+//
+// The Fragment lifecycle during navigation:
+//   navigate(Home → Detail):
+//     Home Fragment: onPause → onStop → onDestroyView (view destroyed!)
+//     Detail Fragment: onAttach → onCreate → onCreateView → onStart → onResume
+//
+//   popBackStack() (back to Home):
+//     Detail Fragment: onPause → onStop → onDestroyView → onDestroy → onDetach
+//     Home Fragment: onCreateView → onStart → onResume (view RE-created!)
+//
+// Key insight: the Home Fragment INSTANCE stays alive (it's on the back stack),
+// but its VIEW is destroyed. This is why you must inflate views in
+// onCreateView() and not cache view references across view lifecycles.</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff-Level Insight — setPrimaryNavigationFragment and Back Press Dispatch</div>
+<p><code>FragmentNavigator</code> calls <code>setPrimaryNavigationFragment()</code> on every transaction. This is the mechanism that makes the system Back button work correctly with nested navigation. When the user presses Back, <code>FragmentManager.popBackStackImmediate()</code> is called on the <strong>primary navigation fragment's child FragmentManager first</strong>. If the child FM has entries to pop, it handles the back press. Only when the child FM's back stack is empty does the parent FM handle it. Without <code>setPrimaryNavigationFragment()</code>, pressing Back would pop from the wrong FragmentManager, causing the entire NavHostFragment to be removed instead of navigating within it. This is also why <code>setReorderingAllowed(true)</code> is always set — it enables the framework to optimize fragment lifecycle transitions and is required for <code>setPrimaryNavigationFragment()</code> to work correctly with postponed transitions.</p>
+</div>
+
+<h3>Multiple Back Stacks (Navigation 2.4+)</h3>
+
+<pre><code>// The killer feature for bottom navigation: each tab maintains its own back stack.
+//
+// Before 2.4: switching tabs destroyed the previous tab's back stack.
+// After 2.4: FragmentManager.saveBackStack() / restoreBackStack() enable
+//            saving and restoring entire back stack segments.
+//
+// How it works under the hood:
+//
+// Tab A stack: [Home] → [Detail] → [SubDetail]
+// Tab B stack: [Search] → [Results]
+//
+// User switches from Tab A to Tab B:
+//   1. NavController pops Tab A's entries with saveState = true
+//   2. FragmentManager.saveBackStack("tab_a") saves:
+//      - Fragment instances (as SavedState)
+//      - FragmentTransaction records
+//      - ViewModel states (via SavedStateHandle)
+//   3. NavController navigates to Tab B's start destination with restoreState = true
+//   4. FragmentManager.restoreBackStack("tab_b") restores the saved stack
+//
+// User switches back to Tab A:
+//   → Tab A's full stack [Home → Detail → SubDetail] is restored
+//   → Fragment views are recreated, ViewModels are restored
+
+// The NavigationUI helper does this automatically:
+NavigationUI.setupWithNavController(bottomNav, navController)
+
+// Equivalent manual implementation:
+bottomNav.setOnItemSelectedListener { item ->
+    NavigationUI.onNavDestinationSelected(item, navController)
+}
+// This internally calls navigate() with:
+//   popUpTo(graph.startDestinationId) { saveState = true }
+//   launchSingleTop = true
+//   restoreState = true</code></pre>
+
+<h3>Bottom Navigation Pattern</h3>
+
+<pre><code>// The recommended pattern for bottom navigation with multiple back stacks:
+
+// nav_graph.xml — one nested graph per tab
+&lt;navigation android:id="@+id/main_graph"
+    app:startDestination="@id/home_graph"&gt;
+
+    &lt;navigation android:id="@+id/home_graph"
+        app:startDestination="@id/homeFragment"&gt;
+        &lt;fragment android:id="@+id/homeFragment" ... /&gt;
+        &lt;fragment android:id="@+id/detailFragment" ... /&gt;
+    &lt;/navigation&gt;
+
+    &lt;navigation android:id="@+id/search_graph"
+        app:startDestination="@id/searchFragment"&gt;
+        &lt;fragment android:id="@+id/searchFragment" ... /&gt;
+        &lt;fragment android:id="@+id/resultsFragment" ... /&gt;
+    &lt;/navigation&gt;
+
+    &lt;navigation android:id="@+id/profile_graph"
+        app:startDestination="@id/profileFragment"&gt;
+        &lt;fragment android:id="@+id/profileFragment" ... /&gt;
+    &lt;/navigation&gt;
+&lt;/navigation&gt;
+
+// menu/bottom_nav.xml — menu item IDs match nested graph IDs
+&lt;menu&gt;
+    &lt;item android:id="@+id/home_graph" android:title="Home" /&gt;
+    &lt;item android:id="@+id/search_graph" android:title="Search" /&gt;
+    &lt;item android:id="@+id/profile_graph" android:title="Profile" /&gt;
+&lt;/menu&gt;
+
+// Activity setup:
+NavigationUI.setupWithNavController(bottomNavigationView, navController)</code></pre>
+
+<h3>NavigationUI Integration</h3>
+
+<pre><code>// NavigationUI connects NavController with standard UI components:
+
+// Toolbar — updates title, shows Up button
+val appBarConfig = AppBarConfiguration(
+    topLevelDestinations = setOf(R.id.homeFragment, R.id.searchFragment, R.id.profileFragment),
+    drawerLayout = drawerLayout // optional
+)
+setupActionBarWithNavController(navController, appBarConfig)
+
+// Override onSupportNavigateUp to handle Up button:
+override fun onSupportNavigateUp(): Boolean {
+    return navController.navigateUp(appBarConfig) || super.onSupportNavigateUp()
+}
+
+// DrawerLayout — auto-selects drawer items, handles open/close
+NavigationUI.setupWithNavController(navigationView, navController)
+
+// AppBarConfiguration defines which destinations are "top-level":
+// - Top-level destinations show the hamburger icon (drawer) or no Up arrow
+// - Non-top-level destinations show the Up arrow
+// - This is purely a UI concern — it doesn't affect back stack behavior</code></pre>
+
+<!-- ============================================================ -->
+<h2>6. ViewModel Scoping with Navigation</h2>
+
+<h3>Destination-Scoped ViewModel</h3>
+
+<pre><code>// Default: ViewModel scoped to the current NavBackStackEntry
+class DetailFragment : Fragment() {
+    // This ViewModel lives as long as DetailFragment's NavBackStackEntry
+    // is on the back stack. Cleared when the entry is popped.
+    private val viewModel: DetailViewModel by viewModels()
+}
+
+// Under the hood:
+// by viewModels() uses the Fragment as the ViewModelStoreOwner.
+// But the Fragment's ViewModelStore is actually backed by the
+// NavBackStackEntry's ViewModelStore (when using Navigation).
+//
+// Lifecycle:
+//   navigate(Home → Detail): DetailViewModel created
+//   navigate(Detail → SubDetail): DetailViewModel stays alive
+//   popBackStack() to Detail: DetailViewModel still alive
+//   popBackStack() to Home: DetailViewModel.onCleared() called</code></pre>
+
+<h3>Graph-Scoped ViewModel (Shared Across Destinations)</h3>
+
+<pre><code>// ViewModel scoped to a nested navigation graph — shared by all
+// destinations within that graph.
+
+class LoginFragment : Fragment() {
+    // Scoped to the auth_graph — shared with RegisterFragment
+    private val authViewModel: AuthViewModel by navGraphViewModels(R.id.auth_graph)
+}
+
+class RegisterFragment : Fragment() {
+    // Same ViewModel instance as LoginFragment's authViewModel
+    private val authViewModel: AuthViewModel by navGraphViewModels(R.id.auth_graph)
+}
+
+// How it works:
+// navGraphViewModels() finds the NavBackStackEntry for the specified graph ID
+// and uses IT as the ViewModelStoreOwner.
+//
+// NavBackStackEntry for auth_graph exists as long as any destination
+// within auth_graph is on the back stack.
+//
+// When the last destination in auth_graph is popped, the graph's
+// NavBackStackEntry is also popped → AuthViewModel.onCleared()
+
+// Common use cases:
+// 1. Multi-step forms (wizard): share form data across steps
+// 2. Auth flows: share credentials/tokens across login/register/verify
+// 3. Checkout flows: share cart data across address/payment/confirm</code></pre>
+
+<h3>How NavBackStackEntry Acts as ViewModelStoreOwner</h3>
+
+<pre><code>// NavBackStackEntry implements ViewModelStoreOwner:
+class NavBackStackEntry : LifecycleOwner, ViewModelStoreOwner,
+    SavedStateRegistryOwner {
+
+    // Each entry has its own ViewModelStore
+    override val viewModelStore: ViewModelStore
+
+    // The ViewModelStore is created lazily and stored in
+    // NavControllerViewModel — a ViewModel scoped to the Activity.
+    // This is how ViewModel state survives config changes:
+    //
+    // Activity (ViewModelStoreOwner)
+    //   └── NavControllerViewModel (survives config change)
+    //         ├── Entry A → ViewModelStore { DetailViewModel }
+    //         ├── Entry B → ViewModelStore { SettingsViewModel }
+    //         └── Entry auth_graph → ViewModelStore { AuthViewModel }
+    //
+    // On config change:
+    //   Activity is destroyed and recreated
+    //   NavControllerViewModel survives (it's in Activity's ViewModelStore)
+    //   All NavBackStackEntry ViewModelStores survive
+    //   NavController restores its back stack from SavedState
+    //   Each restored entry reconnects to its ViewModelStore
+}
+
+// ViewModel cleared when:
+// 1. NavBackStackEntry is popped from the back stack (user navigates back)
+// 2. NavBackStackEntry is popped via popUpTo with inclusive=true
+// 3. NavController is destroyed (Activity finishes permanently)</code></pre>
+
+<!-- ============================================================ -->
+<h2>7. Deep Links</h2>
+
+<h3>Implicit Deep Links</h3>
+
+<pre><code>// Implicit deep links match incoming Intents by URI, action, or MIME type.
+// Defined in the nav graph, they generate &lt;intent-filter&gt; entries in the manifest.
+
+// URI matching supports:
+// - Exact paths:    "myapp://detail/42"
+// - Placeholders:   "myapp://detail/{itemId}" → extracted as argument
+// - Wildcards:      "myapp://detail/.*" → regex matching
+// - Query params:   "myapp://search?query={query}" → extracted as argument
+// - Optional params: query parameters not in the URI are optional
+
+// Matching priority (when multiple destinations match):
+// 1. Exact URI match
+// 2. URI with fewer placeholders
+// 3. URI + action + MIME type (most specific wins)
+// 4. If still tied, the deepest destination in the graph wins</code></pre>
+
+<h3>Explicit Deep Links — NavDeepLinkBuilder</h3>
+
+<pre><code>// NavDeepLinkBuilder creates a PendingIntent that navigates to a specific
+// destination with a synthetic back stack — used for notifications.
+
+val pendingIntent = NavDeepLinkBuilder(context)
+    .setGraph(R.navigation.main_graph)
+    .setDestination(R.id.detailFragment)
+    .setArguments(bundleOf("itemId" to 42L))
+    .createPendingIntent()
+
+// What happens when the PendingIntent fires:
+// 1. If the app is not running: Activity is launched fresh
+// 2. NavController processes the deep link Intent
+// 3. A synthetic back stack is built:
+//    [startDestination] → [intermediate destinations] → [detailFragment]
+//    The user can press Back through the synthetic stack naturally
+//
+// The synthetic back stack follows the graph structure:
+//   main_graph (startDest = home) → detailFragment
+//   Back stack created: [Home] → [Detail]
+
+// For nested graphs:
+val pendingIntent = NavDeepLinkBuilder(context)
+    .setGraph(R.navigation.main_graph)
+    .setDestination(R.id.registerFragment) // inside auth_graph
+    .createPendingIntent()
+// Back stack: [Home] → [Login] → [Register]
+// (Login is auth_graph's startDestination)</code></pre>
+
+<h3>handleDeepLink() — Intent Processing</h3>
+
+<pre><code>// NavController.handleDeepLink(intent) is called automatically by
+// NavHostFragment in its onCreate(). The flow:
+//
+// 1. Extract the deep link URI from the Intent
+// 2. Match against all NavDeepLink entries in the graph
+// 3. If matched:
+//    a. Pop the entire current back stack
+//    b. Build the synthetic back stack from the graph root to the destination
+//    c. Navigate to each destination in sequence
+//    d. The final destination receives the deep link arguments
+//
+// 4. If the Activity was already running (onNewIntent):
+//    a. The existing back stack is cleared
+//    b. New synthetic stack is built
+//    c. This can be surprising — deep linking destroys existing navigation state
+//
+// Handling deep links in an existing Activity:
+override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    navController.handleDeepLink(intent)
+}
+
+// Process death and deep links:
+// - NavController saves its state in onSaveInstanceState()
+// - On restore, it rebuilds the back stack from saved state
+// - If the app was deep-linked and then process-killed, the restored
+//   state includes the synthetic back stack
+// - SavedStateHandle in ViewModels preserves deep link arguments</code></pre>
+
+<div class="callout warn">
+<div class="callout-label">Warning — Deep Link Clears Existing Back Stack</div>
+<p>When <code>handleDeepLink()</code> processes an incoming Intent, it <strong>clears the entire existing back stack</strong> and builds a new synthetic one. If the user was mid-flow (e.g., filling out a form), that state is lost. For apps that need to preserve existing state on deep link, you must intercept the Intent before it reaches <code>NavController</code> and handle it manually — for example, by navigating to the deep link destination without clearing the stack.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. Staff-Level Corner Cases</h2>
+
+<h3>Double-Navigation Crash</h3>
+
+<pre><code>// The most common Navigation crash: tapping a button twice quickly.
+//
+// What happens:
+//   1. First tap: navigate(HomeFragmentDirections.actionHomeToDetail(42))
+//      → NavController is now at DetailFragment
+//   2. Second tap (before Fragment transaction commits):
+//      → navigate(HomeFragmentDirections.actionHomeToDetail(43))
+//      → NavController tries to find action_home_to_detail from current destination
+//      → Current destination is now DetailFragment, which has no such action
+//      → IllegalArgumentException: "navigation destination is not a direct child
+//         of the current NavGraph"
+
+// Fix 1: Check current destination before navigating
+fun navigateSafe(directions: NavDirections) {
+    val currentDest = findNavController().currentDestination
+    if (currentDest?.id == R.id.homeFragment) {
+        findNavController().navigate(directions)
+    }
+}
+
+// Fix 2: Use navigate with action ID and catch the exception
+// (Not recommended — masks real bugs)
+
+// Fix 3: Debounce clicks at the View level
+button.setOnClickListener {
+    it.isEnabled = false
+    findNavController().navigate(directions)
+    // Re-enable after a delay or in onResume
+}</code></pre>
+
+<h3>launchSingleTop with Arguments</h3>
+
+<pre><code>// Question: If destination A is at the top and you navigate to A with
+// launchSingleTop=true and new arguments, are the arguments updated?
+//
+// Answer: It depends on the Navigation version.
+//
+// Pre-2.4: Arguments were NOT updated. The existing entry kept its old args.
+//   This was a known pain point — no way to "refresh" a singleTop destination.
+//
+// Post-2.4: A NEW NavBackStackEntry is created with the new arguments,
+//   but the ViewModel is REUSED from the old entry.
+//   The old entry is removed, the new entry takes its place.
+//   This means:
+//     - Fragment.arguments will have the new values
+//     - ViewModel survives (same instance)
+//     - SavedStateHandle is recreated with new args
+//     - Lifecycle observers see DESTROYED on old entry, CREATED→RESUMED on new
+//
+// To observe argument changes in the ViewModel:
+class DetailViewModel(savedStateHandle: SavedStateHandle) : ViewModel() {
+    // This LiveData updates when arguments change via singleTop re-navigation
+    val itemId: StateFlow&lt;Long&gt; = savedStateHandle.getStateFlow("itemId", 0L)
+}</code></pre>
+
+<h3>Navigation During Config Change</h3>
+
+<pre><code>// During config change, NavController's state is saved and restored:
+//
+// 1. Activity.onSaveInstanceState()
+//    → NavController.saveState() saves:
+//      - Current back stack (destination IDs + arguments + state)
+//      - Navigator state (FragmentNavigator saves Fragment states)
+//      - Deep link state
+//
+// 2. Activity recreated → NavHostFragment.onCreate()
+//    → NavController.restoreState() rebuilds:
+//      - NavBackStackEntry list from saved state
+//      - Reconnects entries to their ViewModelStores (via NavControllerViewModel)
+//      - FragmentNavigator restores Fragments from FragmentManager's saved state
+//
+// Corner case: what if a navigate() call is in-flight during config change?
+//   → The FragmentTransaction may not have committed yet
+//   → setReorderingAllowed(true) ensures transactions are reordered correctly
+//   → The saved state captures the post-navigation state because
+//     onSaveInstanceState() runs after all pending transactions execute</code></pre>
+
+<h3>Nested Graph Scoping Subtleties</h3>
+
+<pre><code>// Nested graph ViewModel scoping has a subtle lifecycle:
+//
+// Graph: main_graph
+//   ├── homeFragment
+//   └── auth_graph (startDest = loginFragment)
+//         ├── loginFragment
+//         └── registerFragment
+//
+// Scenario:
+//   1. Navigate: home → login (enters auth_graph)
+//      → NavBackStackEntry for auth_graph is created
+//      → NavBackStackEntry for loginFragment is created
+//   2. Navigate: login → register
+//      → NavBackStackEntry for registerFragment is created
+//      → auth_graph entry stays alive
+//   3. Pop: register → login
+//      → registerFragment entry destroyed
+//      → auth_graph entry still alive (loginFragment is still in it)
+//   4. Pop: login → home
+//      → loginFragment entry destroyed
+//      → auth_graph entry ALSO destroyed (no more children)
+//      → Graph-scoped ViewModel is cleared
+//
+// Gotcha: if you popUpTo(auth_graph, inclusive=true), the graph entry
+// AND all its children are destroyed in one operation.</code></pre>
+
+<h3>popUpTo with inclusive=true — Accidentally Emptying the Stack</h3>
+
+<pre><code>// A common mistake with bottom navigation or login flows:
+navController.navigate(R.id.homeFragment, null, navOptions {
+    popUpTo(R.id.homeFragment) { inclusive = true }
+})
+
+// If homeFragment is the start destination and inclusive=true:
+//   → The start destination is popped
+//   → The graph's back stack is now empty
+//   → Navigating to homeFragment creates a new entry
+//   → But pressing Back now EXITS the app (no start destination to fall back to)
+//
+// The correct pattern for "clear stack and go to start":
+navController.navigate(R.id.homeFragment, null, navOptions {
+    popUpTo(navController.graph.startDestinationId) { inclusive = true }
+    launchSingleTop = true
+})</code></pre>
+
+<h3>DialogFragment Navigation Lifecycle</h3>
+
+<pre><code>// DialogFragment destinations have a unique lifecycle interaction:
+//
+// When navigating to a dialog destination:
+//   → The dialog's NavBackStackEntry is pushed onto the back stack
+//   → The dialog Fragment is shown via show()
+//   → The PREVIOUS destination stays RESUMED (not paused!)
+//   → This is different from fragment destinations where the previous
+//     destination moves to STARTED
+//
+// Back stack state:
+//   [Home: RESUMED] [ConfirmDialog: RESUMED]
+//   Both entries are RESUMED simultaneously!
+//
+// When the dialog is dismissed (back press or dismiss()):
+//   → Dialog's NavBackStackEntry is popped
+//   → Dialog's ViewModel is cleared
+//   → Home stays RESUMED (was never paused)
+//
+// Gotcha: if you observe NavController.currentBackStackEntryAsFlow(),
+// the dialog IS the current entry while shown. If you use
+// currentDestination to conditionally navigate, you must account for
+// dialog destinations being "current".</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff-Level Insight — NavControllerViewModel and Config Change Survival</div>
+<p>The entire Navigation back stack's ViewModel state survives configuration changes through a clever indirection: <code>NavControllerViewModel</code> is a <code>ViewModel</code> scoped to the <strong>Activity</strong>. It holds a <code>Map&lt;UUID, ViewModelStore&gt;</code> where each UUID corresponds to a <code>NavBackStackEntry</code>. When the Activity is recreated, <code>NavControllerViewModel</code> survives (it's in the Activity's <code>ViewModelStore</code>). <code>NavController</code> restores its back stack from <code>SavedState</code> (which contains the UUIDs), then reconnects each restored <code>NavBackStackEntry</code> to its <code>ViewModelStore</code> via the UUID lookup. This is why graph-scoped ViewModels survive config changes even though the Fragments are destroyed and recreated — the <code>ViewModelStore</code> is owned by the <code>NavBackStackEntry</code>, not the Fragment, and the entry's store is held by <code>NavControllerViewModel</code>. If you call <code>ViewModelProvider(navBackStackEntry)</code> directly, you're accessing this same store.</p>
+</div>
+
+<h3>Testing Navigation — TestNavHostController</h3>
+
+<pre><code>// TestNavHostController allows testing navigation without a real Activity.
+
+@Test
+fun testNavigateToDetail() {
+    val testNavController = TestNavHostController(ApplicationProvider.getApplicationContext())
+
+    // Must set graph on the main thread
+    testNavController.setGraph(R.navigation.main_graph)
+
+    // Verify start destination
+    assertEquals(R.id.homeFragment, testNavController.currentDestination?.id)
+
+    // Simulate navigation
+    testNavController.navigate(R.id.action_home_to_detail)
+    assertEquals(R.id.detailFragment, testNavController.currentDestination?.id)
+
+    // Verify back stack depth
+    assertEquals(2, testNavController.backStack.size) // graph entry + 2 destinations
+}
+
+// For Fragment tests with Navigation:
+@Test
+fun testFragmentNavigation() {
+    val testNavController = TestNavHostController(ApplicationProvider.getApplicationContext())
+    testNavController.setGraph(R.navigation.main_graph)
+
+    launchFragmentInContainer&lt;HomeFragment&gt;().onFragment { fragment ->
+        Navigation.setViewNavController(fragment.requireView(), testNavController)
+    }
+
+    // Click the button that triggers navigation
+    onView(withId(R.id.detailButton)).perform(click())
+
+    // Verify navigation occurred
+    assertEquals(R.id.detailFragment, testNavController.currentDestination?.id)
+}
+
+// TestNavHostController differences from real NavController:
+// - Does not actually perform Fragment transactions
+// - Does not create real Fragments
+// - Back stack entries are created but Fragments are not instantiated
+// - Useful for verifying navigation logic, not Fragment rendering</code></pre>
+
+<div class="callout danger">
+<div class="callout-label">Danger — Fragment Leaks with Navigation</div>
+<p>A subtle leak pattern: holding a reference to a Fragment's View in the Fragment class field after <code>onDestroyView()</code>. When Navigation replaces Fragment A with Fragment B, A's view is destroyed but A's instance stays alive on the back stack. If A holds a reference to its binding or a view, that entire view hierarchy is leaked until A is popped. Always null out view references in <code>onDestroyView()</code>, or use <code>viewLifecycleOwner</code>-scoped observers that auto-clean up.</p>
+</div>
+
+<h2>9. Deep Link Edge Cases</h2>
+
+<pre><code>// Ambiguous deep links — multiple destinations match the same URI:
+// NavController matches in order: explicit URI > implicit URI > MIME type
+// If two destinations have the same URI pattern, the FIRST one in the
+// nav graph XML wins. This is a common source of bugs in large apps.
+
+// Deep link + existing back stack:
+// handleDeepLink() CLEARS the existing back stack by default
+// This means if user has A → B → C and a deep link arrives for D:
+//   Result: startDestination → D (A, B, C are gone)
+//
+// To preserve existing state, DON'T use handleDeepLink().
+// Instead, manually navigate:
+intent.data?.let { uri ->
+    val matched = navController.graph.matchDeepLink(
+        NavDeepLinkRequest.Builder.fromUri(uri).build()
+    )
+    if (matched != null) {
+        navController.navigate(matched.destination.id, matched.matchingArgs)
+    }
+}
+
+// Deep link + process death:
+// If the app is killed while displaying a deep-linked destination:
+// 1. NavController saves its back stack to savedInstanceState
+// 2. On restore, the synthetic back stack is recreated
+// 3. Arguments are preserved in the NavBackStackEntry's SavedStateHandle
+// 4. But any in-memory state (ViewModel without SavedStateHandle) is LOST</code></pre>
+
+<h2>10. Back Stack Corruption Recovery</h2>
+
+<pre><code>// FragmentManager and NavController back stacks can diverge in edge cases:
+// - Rapid navigation during config change
+// - commitAllowingStateLoss after onSaveInstanceState
+// - Manual FragmentTransaction alongside NavController
+
+// Detection: NavController throws IllegalStateException with
+// "FragmentManager is already executing transactions"
+
+// Prevention:
+// 1. NEVER mix manual FragmentTransactions with NavController
+// 2. Use navController.navigate() exclusively
+// 3. Guard navigation with lifecycle checks:
+fun safeNavigate(navController: NavController, directions: NavDirections) {
+    val currentDest = navController.currentDestination
+    if (currentDest != null) {
+        // Only navigate if the action exists on the current destination
+        val action = currentDest.getAction(directions.actionId)
+        if (action != null) {
+            navController.navigate(directions)
+        }
+    }
+}
+
+// Recovery: if the back stack IS corrupted, the nuclear option:
+navController.popBackStack(navController.graph.startDestinationId, false)
+// This pops everything back to the start destination</code></pre>
+
+<h2>11. Accessibility in Navigation</h2>
+
+<pre><code>// TalkBack and navigation:
+// When navigating to a new destination, TalkBack should announce it
+// NavigationUI handles this automatically for Toolbar titles
+// For custom announcements:
+navController.addOnDestinationChangedListener { _, destination, _ ->
+    val label = destination.label ?: return@addOnDestinationChangedListener
+    // Announce the new screen to accessibility services
+    window.decorView.announceForAccessibility(label)
+}
+
+// Focus management:
+// After navigation, focus should move to the new content
+// FragmentNavigator handles this by requesting focus on the new Fragment's root view
+// For custom behavior:
+override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+    super.onViewCreated(view, savedInstanceState)
+    // Request focus for TalkBack to start reading from the top
+    view.requestFocus()
+    // Or send accessibility event:
+    view.sendAccessibilityEvent(AccessibilityEvent.TYPE_VIEW_FOCUSED)
+}</code></pre>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  <a href="06-lifecycle-aware-components.html">← 06 — Lifecycle-Aware Components</a> &nbsp;|&nbsp;
+  <a href="08-navigation-compose.html">08 — Navigation Compose →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>
