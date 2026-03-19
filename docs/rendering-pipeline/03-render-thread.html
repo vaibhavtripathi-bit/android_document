@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 — RenderThread — DisplayList Replay, GPU Commands, Frame Pipelining, Sync</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-vsync-choreographer.html">01 VSYNC</a>
+  <a href="02-measure-layout-draw.html">02 Measure/Layout/Draw</a>
+  <a class="active" href="03-render-thread.html">03 RenderThread</a>
+  <a href="04-surface-flinger.html">04 SurfaceFlinger</a>
+  <a href="05-skia-gpu.html">05 Skia & GPU</a>
+  <a href="06-jank-diagnosis.html">06 Jank Diagnosis</a>
+  <a href="07-compose-rendering.html">07 Compose Rendering</a>
+  <a href="08-interview-qa.html">08 Interview Q&A</a>
+</div>
+
+<h1>The RenderThread</h1>
+<p class="subtitle">Android's dedicated GPU thread — DisplayList replay, RenderNode tree, GPU command submission, UI thread sync, frame pipelining, and RenderThread animations</p>
+
+<!-- ============================================================ -->
+<h2>1. Why a Separate Thread?</h2>
+
+<p>Before Android 5.0, all rendering happened on the UI thread. If the UI thread was busy (GC, layout, network on main thread), frames were dropped. The <strong>RenderThread</strong> (introduced in Android 5.0) decouples GPU work from the UI thread:</p>
+
+<ul>
+  <li><strong>UI Thread:</strong> Records drawing commands into DisplayLists (fast — just appending to a list)</li>
+  <li><strong>RenderThread:</strong> Replays DisplayLists on the GPU, submits the frame to SurfaceFlinger</li>
+  <li>They run in <strong>parallel</strong> — while RenderThread renders Frame N, UI Thread prepares Frame N+1</li>
+</ul>
+
+<div class="diagram-container">
+<svg viewBox="0 0 800 200" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+  <text x="400" y="20" fill="#c084fc" font-size="13" text-anchor="middle" font-weight="700">UI Thread ↔ RenderThread Pipeline</text>
+
+  <!-- UI Thread -->
+  <text x="40" y="55" fill="#6c9eff" font-size="10" font-weight="600">UI Thread</text>
+  <rect x="120" y="40" width="200" height="35" rx="4" fill="rgba(108,158,255,0.15)" stroke="#6c9eff"/>
+  <text x="220" y="55" fill="#6c9eff" font-size="9" text-anchor="middle">Frame N: measure/layout/draw</text>
+  <text x="220" y="68" fill="#8b8fa3" font-size="7" text-anchor="middle">(record DisplayList)</text>
+
+  <rect x="400" y="40" width="200" height="35" rx="4" fill="rgba(108,158,255,0.15)" stroke="#6c9eff"/>
+  <text x="500" y="55" fill="#6c9eff" font-size="9" text-anchor="middle">Frame N+1: measure/layout/draw</text>
+  <text x="500" y="68" fill="#8b8fa3" font-size="7" text-anchor="middle">(record DisplayList)</text>
+
+  <!-- Sync point -->
+  <line x1="320" y1="75" x2="320" y2="100" stroke="#fbbf24" stroke-width="2" stroke-dasharray="4"/>
+  <text x="335" y="93" fill="#fbbf24" font-size="7">sync</text>
+
+  <line x1="600" y1="75" x2="600" y2="100" stroke="#fbbf24" stroke-width="2" stroke-dasharray="4"/>
+  <text x="615" y="93" fill="#fbbf24" font-size="7">sync</text>
+
+  <!-- RenderThread -->
+  <text x="40" y="120" fill="#4ade80" font-size="10" font-weight="600">RenderThread</text>
+  <rect x="325" y="105" width="180" height="35" rx="4" fill="rgba(74,222,128,0.15)" stroke="#4ade80"/>
+  <text x="415" y="120" fill="#4ade80" font-size="9" text-anchor="middle">Frame N: GPU render</text>
+  <text x="415" y="133" fill="#8b8fa3" font-size="7" text-anchor="middle">(replay DisplayList → GPU)</text>
+
+  <rect x="605" y="105" width="180" height="35" rx="4" fill="rgba(74,222,128,0.15)" stroke="#4ade80"/>
+  <text x="695" y="120" fill="#4ade80" font-size="9" text-anchor="middle">Frame N+1: GPU render</text>
+
+  <!-- Submit -->
+  <line x1="505" y1="140" x2="505" y2="165" stroke="#c084fc" stroke-width="1.5" marker-end="url(#aRT1)"/>
+  <text x="505" y="180" fill="#c084fc" font-size="8" text-anchor="middle">Submit to SurfaceFlinger</text>
+
+  <defs>
+    <marker id="aRT1" markerWidth="8" markerHeight="6" refX="3" refY="8" orient="auto"><path d="M0,0 L3,8 L6,0" fill="#c084fc"/></marker>
+  </defs>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. The Sync Phase</h2>
+
+<p>Between UI Thread recording and RenderThread rendering, there's a <strong>sync</strong> phase where the RenderThread copies the latest DisplayList data from the UI Thread:</p>
+
+<pre><code>// Sync phase (simplified from AOSP hwui/):
+// 1. UI Thread finishes recording DisplayLists
+// 2. UI Thread signals RenderThread: "frame ready"
+// 3. RenderThread acquires a lock
+// 4. RenderThread copies/swaps the DisplayList data from UI Thread's RenderNodes
+//    - This is a shallow copy — display list commands reference shared GPU resources
+//    - Render properties (translation, alpha, etc.) are copied by value
+// 5. RenderThread releases the lock
+// 6. UI Thread is now FREE to start the next frame
+// 7. RenderThread processes the DisplayList → GPU commands
+
+// The sync is typically < 1ms.
+// If RenderThread is still busy with the previous frame when UI Thread
+// finishes recording, the UI Thread BLOCKS until sync can happen.
+// This is visible in Systrace as "DrawFrame" on the UI Thread.</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Sync Stalls</div>
+  <p>The most common RenderThread-related jank: the UI thread blocks during sync because the RenderThread is still processing the previous frame. In Systrace, this appears as a long "DrawFrame" section on the UI thread. Causes: (1) GPU-heavy content (complex shaders, large bitmaps), (2) too many RenderNodes (deep view hierarchy), (3) overdraw (drawing the same pixel multiple times). The fix is usually to reduce GPU workload: flatten the hierarchy, reduce overdraw, use hardware layers for complex static content, or simplify custom drawing.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. DisplayList and RenderNode Tree</h2>
+
+<pre><code>// Each View has a RenderNode. The RenderNode tree mirrors the View tree:
+// DecorView.renderNode
+//   ├── ActionBar.renderNode
+//   ├── ContentFrameLayout.renderNode
+//   │   ├── LinearLayout.renderNode
+//   │   │   ├── TextView.renderNode (DisplayList: drawText command)
+//   │   │   └── ImageView.renderNode (DisplayList: drawBitmap command)
+//   │   └── Button.renderNode (DisplayList: drawRoundRect + drawText)
+//   └── NavigationBar.renderNode
+
+// A DisplayList contains:
+// - Drawing commands (drawRect, drawText, drawBitmap, drawRenderNode, etc.)
+// - Clip operations (clipRect, clipPath)
+// - Save/restore operations
+// - References to child RenderNodes (drawRenderNode)
+
+// When a child View is invalidated:
+// 1. Only that View's DisplayList is re-recorded
+// 2. Parent's DisplayList still has "drawRenderNode(child)" — no change needed
+// 3. RenderThread replays from root, but child's updated DisplayList is used
+// This is why invalidate() is cheap — only the dirty view re-records</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. RenderThread Animations</h2>
+
+<pre><code>// Some animations run ENTIRELY on the RenderThread, bypassing the UI Thread:
+
+// 1. RippleDrawable — the touch ripple effect
+//    Runs on RenderThread using a hardware-accelerated shader
+//    UI Thread is not involved after the initial touch event
+
+// 2. CircularReveal animation
+//    Uses a clip path that animates on RenderThread
+
+// 3. ViewPropertyAnimator with hardware layer
+view.animate()
+    .translationX(100f)
+    .alpha(0.5f)
+    .setDuration(300)
+    .withLayer() // Creates a hardware layer for the duration
+    .start()
+// The animation updates RenderNode properties directly on RenderThread
+// UI Thread is only notified on completion
+
+// 4. Window animations (activity transitions)
+//    Managed by WindowManager, animated on RenderThread/SurfaceFlinger</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Hardware Layers</div>
+  <p>A <strong>hardware layer</strong> (<code>View.LAYER_TYPE_HARDWARE</code>) renders the view's DisplayList into an off-screen GPU texture. Subsequent frames reuse the texture instead of re-rendering the DisplayList. This is beneficial when: (1) the view's content doesn't change but its render properties do (e.g., alpha animation), (2) the view is complex and expensive to re-render. The cost: GPU memory for the texture, and the texture must be re-created when the view's content changes. Always remove the layer after the animation: <code>.withEndAction { view.setLayerType(LAYER_TYPE_NONE, null) }</code>. Leaving hardware layers on static views wastes GPU memory.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Frame Completion — Fence Signaling</h2>
+
+<pre><code>// After RenderThread finishes GPU commands:
+// 1. GPU commands are submitted to the GPU driver
+// 2. A GPU fence is created — signals when the GPU actually finishes
+// 3. The buffer (with the rendered frame) is queued to the BufferQueue
+// 4. SurfaceFlinger is notified that a new buffer is available
+// 5. SurfaceFlinger waits for the GPU fence to signal
+// 6. SurfaceFlinger composites the buffer with other layers
+// 7. The composited frame is sent to the display
+
+// The GPU fence is critical:
+// - It allows the buffer to be queued BEFORE the GPU finishes
+// - SurfaceFlinger can start planning composition while GPU is still rendering
+// - The fence ensures SurfaceFlinger doesn't read incomplete data
+// - This is how the pipeline stays full without synchronization stalls</code></pre>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  ← <a href="02-measure-layout-draw.html">02 — Measure / Layout / Draw</a> &nbsp;|&nbsp;
+  <a href="04-surface-flinger.html">04 — SurfaceFlinger →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

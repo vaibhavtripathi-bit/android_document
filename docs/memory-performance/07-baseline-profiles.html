@@ -1,0 +1,914 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 — Baseline Profiles & ART Compilation — AOT, JIT, Profile-Guided Optimization, Cloud Profiles</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-memory-model.html">01 Memory Model</a>
+  <a href="02-gc-internals.html">02 GC Internals</a>
+  <a href="03-memory-leaks.html">03 Memory Leaks</a>
+  <a href="04-anr-deep-dive.html">04 ANR Deep Dive</a>
+  <a href="05-oom-lmk.html">05 OOM &amp; LMK</a>
+  <a href="06-app-startup.html">06 App Startup</a>
+  <a class="active" href="07-baseline-profiles.html">07 Baseline Profiles</a>
+  <a href="08-interview-qa.html">08 Interview Q&amp;A</a>
+</div>
+
+<h1>07 — Baseline Profiles &amp; ART Compilation</h1>
+<p class="subtitle">AOT vs JIT vs interpreted execution, profile-guided optimization, Baseline Profiles, Startup Profiles, Cloud Profiles, dex layout optimization, and Macrobenchmark generation</p>
+
+<!-- ============================================================ -->
+<h2>1. ART Compilation Modes — The Full Picture</h2>
+
+<p>ART (Android Runtime) supports three execution modes, each with different trade-offs. Understanding these is essential because Baseline Profiles exist to solve the fundamental tension between them.</p>
+
+<h3>Interpreted Execution</h3>
+<p>The ART interpreter reads DEX bytecode instruction by instruction and executes it on the CPU. No machine code is generated. This is the <strong>slowest</strong> execution mode — roughly 10-100x slower than compiled code — but it requires zero compilation time and zero additional storage. Every method starts here on a fresh install.</p>
+
+<h3>JIT (Just-In-Time) Compilation</h3>
+<p>When ART detects a method is "hot" (executed frequently or in a loop), the JIT compiler compiles it to native machine code <strong>at runtime</strong>. The compiled code is stored in a per-process <strong>JIT code cache</strong> (~2MB by default, configurable via <code>dalvik.vm.jit.codecachesize</code>). JIT compilation happens on a background thread but still consumes CPU and causes brief pauses when the compiled code is installed.</p>
+
+<pre><code>// JIT code cache lifecycle:
+// 1. Method invoked → interpreter executes bytecode
+// 2. Method hits "hot" threshold (~10,000 invocations or loop iterations)
+// 3. JIT compiler thread compiles method → native code
+// 4. Next invocation uses compiled code (10-100x faster)
+// 5. Process dies → JIT cache is lost (volatile, per-process)</code></pre>
+
+<h3>AOT (Ahead-Of-Time) Compilation</h3>
+<p>The <code>dex2oat</code> tool compiles DEX bytecode to native machine code <strong>before execution</strong> — either at install time or during idle maintenance. The result is an <code>.odex</code> (optimized DEX) file stored on disk. AOT code is the fastest execution path: no interpretation overhead, no JIT compilation pauses.</p>
+
+<h3>Profile-Guided Compilation (PGO)</h3>
+<p>The key insight: most apps use only 10-20% of their code in any given session. Full AOT compilation wastes storage and install time compiling dead code. Profile-guided compilation compiles <strong>only the methods that are actually used</strong> — the best of both worlds.</p>
+
+<table>
+  <tr>
+    <th>Mode</th>
+    <th>Execution Speed</th>
+    <th>Install Time</th>
+    <th>Storage</th>
+    <th>Startup Impact</th>
+  </tr>
+  <tr>
+    <td><strong>Interpreted</strong></td>
+    <td>Slowest (1x baseline)</td>
+    <td>None</td>
+    <td>None</td>
+    <td>Slow — every method interpreted</td>
+  </tr>
+  <tr>
+    <td><strong>JIT</strong></td>
+    <td>Fast after warmup (50-100x)</td>
+    <td>None</td>
+    <td>~2MB code cache (volatile)</td>
+    <td>Slow first launch, improves over time</td>
+  </tr>
+  <tr>
+    <td><strong>Full AOT</strong></td>
+    <td>Fastest (50-100x)</td>
+    <td>Very long (minutes)</td>
+    <td>Large (.odex can be 2-5x DEX size)</td>
+    <td>Fast — all code pre-compiled</td>
+  </tr>
+  <tr>
+    <td><strong>Profile-guided AOT</strong></td>
+    <td>Fast for hot paths (50-100x)</td>
+    <td>Moderate (seconds)</td>
+    <td>Small (only hot methods)</td>
+    <td>Fast for profiled paths</td>
+  </tr>
+</table>
+
+<h3>ART Compilation History</h3>
+
+<div class="diagram-container">
+<svg viewBox="0 0 800 260" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+  <text x="400" y="20" fill="#c084fc" font-size="13" text-anchor="middle" font-weight="700">ART Compilation Strategy Evolution</text>
+
+  <!-- Android 5-6: Full AOT -->
+  <rect x="30" y="50" width="160" height="70" rx="6" fill="rgba(248,113,113,0.12)" stroke="#f87171"/>
+  <text x="110" y="70" fill="#f87171" font-size="11" text-anchor="middle" font-weight="600">Android 5-6 (Lollipop)</text>
+  <text x="110" y="88" fill="#e2e4ed" font-size="9" text-anchor="middle">Full AOT at install</text>
+  <text x="110" y="102" fill="#8b8fa3" font-size="8" text-anchor="middle">3-10 min installs, huge .odex</text>
+  <text x="110" y="114" fill="#8b8fa3" font-size="8" text-anchor="middle">Fast runtime, terrible UX</text>
+
+  <!-- Arrow -->
+  <line x1="195" y1="85" x2="225" y2="85" stroke="#8b8fa3" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Android 7-11: JIT + Profile AOT -->
+  <rect x="230" y="50" width="170" height="70" rx="6" fill="rgba(108,158,255,0.12)" stroke="#6c9eff"/>
+  <text x="315" y="70" fill="#6c9eff" font-size="11" text-anchor="middle" font-weight="600">Android 7-11 (Nougat+)</text>
+  <text x="315" y="88" fill="#e2e4ed" font-size="9" text-anchor="middle">JIT + profile-guided AOT</text>
+  <text x="315" y="102" fill="#8b8fa3" font-size="8" text-anchor="middle">Fast install, bg-dexopt later</text>
+  <text x="315" y="114" fill="#8b8fa3" font-size="8" text-anchor="middle">Slow first launch (no profile)</text>
+
+  <!-- Arrow -->
+  <line x1="405" y1="85" x2="435" y2="85" stroke="#8b8fa3" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Android 12+: Cloud Profiles -->
+  <rect x="440" y="50" width="170" height="70" rx="6" fill="rgba(74,222,128,0.12)" stroke="#4ade80"/>
+  <text x="525" y="70" fill="#4ade80" font-size="11" text-anchor="middle" font-weight="600">Android 12+ (S)</text>
+  <text x="525" y="88" fill="#e2e4ed" font-size="9" text-anchor="middle">Cloud Profiles + Baseline</text>
+  <text x="525" y="102" fill="#8b8fa3" font-size="8" text-anchor="middle">Play delivers profiles at install</text>
+  <text x="525" y="114" fill="#8b8fa3" font-size="8" text-anchor="middle">Fast first launch for most users</text>
+
+  <!-- Baseline Profiles (Android 7+) -->
+  <rect x="640" y="50" width="140" height="70" rx="6" fill="rgba(192,132,252,0.12)" stroke="#c084fc"/>
+  <text x="710" y="70" fill="#c084fc" font-size="11" text-anchor="middle" font-weight="600">Baseline Profiles</text>
+  <text x="710" y="88" fill="#e2e4ed" font-size="9" text-anchor="middle">Ship profile with APK</text>
+  <text x="710" y="102" fill="#8b8fa3" font-size="8" text-anchor="middle">Works on Android 7+</text>
+  <text x="710" y="114" fill="#8b8fa3" font-size="8" text-anchor="middle">Developer-controlled</text>
+
+  <!-- Timeline -->
+  <line x1="30" y1="160" x2="780" y2="160" stroke="#2e3345" stroke-width="2"/>
+  <circle cx="110" cy="160" r="5" fill="#f87171"/>
+  <text x="110" y="180" fill="#f87171" font-size="9" text-anchor="middle">2014</text>
+  <text x="110" y="193" fill="#8b8fa3" font-size="8" text-anchor="middle">API 21</text>
+  <circle cx="315" cy="160" r="5" fill="#6c9eff"/>
+  <text x="315" y="180" fill="#6c9eff" font-size="9" text-anchor="middle">2016</text>
+  <text x="315" y="193" fill="#8b8fa3" font-size="8" text-anchor="middle">API 24</text>
+  <circle cx="525" cy="160" r="5" fill="#4ade80"/>
+  <text x="525" y="180" fill="#4ade80" font-size="9" text-anchor="middle">2021</text>
+  <text x="525" y="193" fill="#8b8fa3" font-size="8" text-anchor="middle">API 31</text>
+  <circle cx="710" cy="160" r="5" fill="#c084fc"/>
+  <text x="710" y="180" fill="#c084fc" font-size="9" text-anchor="middle">2022</text>
+  <text x="710" y="193" fill="#8b8fa3" font-size="8" text-anchor="middle">Jetpack</text>
+
+  <!-- Key takeaway -->
+  <text x="400" y="230" fill="#fbbf24" font-size="10" text-anchor="middle" font-weight="600">Key shift: from "compile everything" to "compile what matters, as early as possible"</text>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8b8fa3"/>
+    </marker>
+  </defs>
+</svg>
+</div>
+
+<div class="callout warn">
+  <div class="callout-label">Why Full AOT Was Abandoned</div>
+  <p>Android 5-6's full AOT approach caused 3-10 minute install times and consumed 2-5x the DEX file size in storage. System updates triggered re-compilation of <em>every</em> app, sometimes taking 30+ minutes. Users saw "Optimizing apps..." for extended periods after OTA updates. The shift to JIT + profile-guided AOT in Android 7 was a direct response to these UX disasters.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. How Profile-Guided Compilation Works</h2>
+
+<p>Profile-guided compilation is the mechanism that makes Baseline Profiles possible. Understanding the pipeline is critical for knowing what Baseline Profiles actually do at install time.</p>
+
+<div class="diagram-container">
+<svg viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+  <text x="400" y="20" fill="#c084fc" font-size="13" text-anchor="middle" font-weight="700">Profile-Guided Compilation Pipeline</text>
+
+  <!-- Step 1: JIT records -->
+  <rect x="30" y="50" width="150" height="55" rx="6" fill="rgba(108,158,255,0.12)" stroke="#6c9eff"/>
+  <text x="105" y="72" fill="#6c9eff" font-size="10" text-anchor="middle" font-weight="600">1. JIT Records</text>
+  <text x="105" y="88" fill="#e2e4ed" font-size="8.5" text-anchor="middle">Hot methods tracked</text>
+  <text x="105" y="100" fill="#8b8fa3" font-size="8" text-anchor="middle">in-memory profiling data</text>
+
+  <line x1="185" y1="77" x2="210" y2="77" stroke="#8b8fa3" stroke-width="1.5" marker-end="url(#arrow2)"/>
+
+  <!-- Step 2: Profile saved -->
+  <rect x="215" y="50" width="150" height="55" rx="6" fill="rgba(251,191,36,0.12)" stroke="#fbbf24"/>
+  <text x="290" y="72" fill="#fbbf24" font-size="10" text-anchor="middle" font-weight="600">2. Profile Saved</text>
+  <text x="290" y="88" fill="#e2e4ed" font-size="8.5" text-anchor="middle">primary.prof written</text>
+  <text x="290" y="100" fill="#8b8fa3" font-size="8" text-anchor="middle">on app backgrounded</text>
+
+  <line x1="370" y1="77" x2="395" y2="77" stroke="#8b8fa3" stroke-width="1.5" marker-end="url(#arrow2)"/>
+
+  <!-- Step 3: bg-dexopt -->
+  <rect x="400" y="50" width="150" height="55" rx="6" fill="rgba(74,222,128,0.12)" stroke="#4ade80"/>
+  <text x="475" y="72" fill="#4ade80" font-size="10" text-anchor="middle" font-weight="600">3. bg-dexopt</text>
+  <text x="475" y="88" fill="#e2e4ed" font-size="8.5" text-anchor="middle">Idle + charging trigger</text>
+  <text x="475" y="100" fill="#8b8fa3" font-size="8" text-anchor="middle">dex2oat reads profile</text>
+
+  <line x1="555" y1="77" x2="580" y2="77" stroke="#8b8fa3" stroke-width="1.5" marker-end="url(#arrow2)"/>
+
+  <!-- Step 4: .odex -->
+  <rect x="585" y="50" width="180" height="55" rx="6" fill="rgba(192,132,252,0.12)" stroke="#c084fc"/>
+  <text x="675" y="72" fill="#c084fc" font-size="10" text-anchor="middle" font-weight="600">4. Optimized .odex</text>
+  <text x="675" y="88" fill="#e2e4ed" font-size="8.5" text-anchor="middle">Only hot methods compiled</text>
+  <text x="675" y="100" fill="#8b8fa3" font-size="8" text-anchor="middle">Cold methods stay interpreted</text>
+
+  <!-- Profile path -->
+  <rect x="140" y="140" width="520" height="30" rx="4" fill="rgba(251,191,36,0.08)" stroke="#fbbf24" stroke-dasharray="4"/>
+  <text x="400" y="160" fill="#fbbf24" font-size="9" text-anchor="middle" font-family="JetBrains Mono, monospace">/data/misc/profiles/cur/0/&lt;package&gt;/primary.prof</text>
+
+  <!-- Result path -->
+  <rect x="140" y="180" width="520" height="30" rx="4" fill="rgba(192,132,252,0.08)" stroke="#c084fc" stroke-dasharray="4"/>
+  <text x="400" y="200" fill="#c084fc" font-size="9" text-anchor="middle" font-family="JetBrains Mono, monospace">/data/app/~~hash/&lt;package&gt;/oat/arm64/base.odex</text>
+
+  <!-- Timeline note -->
+  <text x="400" y="240" fill="#8b8fa3" font-size="9" text-anchor="middle">This cycle takes days: use app → profile builds → idle dexopt → faster next launch</text>
+  <text x="400" y="258" fill="#f87171" font-size="10" text-anchor="middle" font-weight="600">Problem: first launch has NO profile → everything is interpreted/JIT</text>
+
+  <defs>
+    <marker id="arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8b8fa3"/>
+    </marker>
+  </defs>
+</svg>
+</div>
+
+<p>The JIT compiler tracks method execution in a <strong>profile info</strong> structure. When a method is invoked enough times (or contains a hot loop), it's marked as "hot". The runtime periodically flushes this profile to disk:</p>
+
+<pre><code>// Profile file location (per-user, per-package):
+// /data/misc/profiles/cur/0/com.example.app/primary.prof
+
+// Inspect a profile (requires root or debuggable build):
+adb shell cmd package dump-profiles com.example.app
+
+// Profile contains:
+// - Hot methods (frequently executed)
+// - Startup methods (executed during app startup)
+// - Post-startup methods (executed after startup completes)
+// - Classes used during startup (for dex layout optimization)</code></pre>
+
+<p>The <strong>bg-dexopt</strong> (background dex optimization) job runs when the device is idle and charging. It reads the profile and invokes <code>dex2oat</code> with the <code>speed-profile</code> compiler filter — compiling only the profiled methods to native code. Cold methods remain as DEX bytecode, interpreted or JIT-compiled on demand.</p>
+
+<pre><code>// dex2oat compiler filters (from least to most aggressive):
+// verify        — only verify DEX bytecode, no compilation
+// quicken       — verify + minor optimizations (inline checks)
+// speed-profile — compile only profiled methods (default for bg-dexopt)
+// speed         — compile everything (used for system apps)
+// everything    — compile + optimize everything (debug/testing only)
+
+// Check current compilation state:
+adb shell dumpsys package com.example.app | grep -A5 "Dexopt state"
+// Output: [status=speed-profile, reason=bg-dexopt]</code></pre>
+
+<!-- ============================================================ -->
+<h2>3. The First-Launch Problem</h2>
+
+<p>This is the core problem that Baseline Profiles solve. On a fresh install, the profile-guided pipeline hasn't run yet:</p>
+
+<ol>
+  <li><strong>Fresh install</strong> — no <code>primary.prof</code> exists. The <code>.odex</code> file contains only verified bytecode (compiler filter: <code>verify</code> or <code>quicken</code>).</li>
+  <li><strong>First launch</strong> — every method is interpreted. The JIT kicks in for hot methods, but compilation takes time and CPU.</li>
+  <li><strong>After several sessions</strong> — the profile accumulates hot methods. But bg-dexopt hasn't run yet.</li>
+  <li><strong>After idle + charging</strong> — bg-dexopt compiles profiled methods. The app is now fast.</li>
+  <li><strong>Day 3-5</strong> — the app finally reaches peak performance.</li>
+</ol>
+
+<div class="diagram-container">
+<svg viewBox="0 0 800 200" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+  <text x="400" y="20" fill="#c084fc" font-size="13" text-anchor="middle" font-weight="700">Cold Start Performance Over Time (Without Baseline Profile)</text>
+
+  <!-- Axes -->
+  <line x1="80" y1="50" x2="80" y2="170" stroke="#2e3345" stroke-width="1.5"/>
+  <line x1="80" y1="170" x2="750" y2="170" stroke="#2e3345" stroke-width="1.5"/>
+  <text x="40" y="55" fill="#8b8fa3" font-size="8" text-anchor="middle">Slow</text>
+  <text x="40" y="170" fill="#8b8fa3" font-size="8" text-anchor="middle">Fast</text>
+  <text x="75" y="110" fill="#8b8fa3" font-size="8" text-anchor="end" transform="rotate(-90, 40, 110)">Startup Time</text>
+
+  <!-- Performance curve -->
+  <path d="M 80 60 L 200 62 L 280 65 L 350 80 L 420 120 L 500 150 L 600 155 L 750 158" fill="none" stroke="#f87171" stroke-width="2.5"/>
+
+  <!-- Annotations -->
+  <circle cx="80" cy="60" r="4" fill="#f87171"/>
+  <text x="85" y="48" fill="#f87171" font-size="8">Install: all interpreted</text>
+
+  <circle cx="350" cy="80" r="4" fill="#fbbf24"/>
+  <text x="355" y="72" fill="#fbbf24" font-size="8">JIT warming up</text>
+
+  <circle cx="500" cy="150" r="4" fill="#4ade80"/>
+  <text x="505" y="143" fill="#4ade80" font-size="8">bg-dexopt runs</text>
+
+  <circle cx="700" cy="157" r="4" fill="#6c9eff"/>
+  <text x="650" y="148" fill="#6c9eff" font-size="8">Peak perf</text>
+
+  <!-- Time labels -->
+  <text x="80" y="188" fill="#8b8fa3" font-size="8" text-anchor="middle">Day 0</text>
+  <text x="280" y="188" fill="#8b8fa3" font-size="8" text-anchor="middle">Day 1</text>
+  <text x="500" y="188" fill="#8b8fa3" font-size="8" text-anchor="middle">Day 2-3</text>
+  <text x="700" y="188" fill="#8b8fa3" font-size="8" text-anchor="middle">Day 5+</text>
+</svg>
+</div>
+
+<div class="callout danger">
+  <div class="callout-label">The Business Problem</div>
+  <p>Users judge your app by the <strong>first launch</strong>, not the 10th. App store ratings, retention, and conversion are all measured in the first session. A 500ms cold start that becomes 200ms after a week doesn't help — the user already formed their opinion (or uninstalled). Google's data shows that <strong>every 100ms of startup latency costs measurable retention</strong>. Baseline Profiles exist to make the first launch as fast as the 100th.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Baseline Profiles — Solving the First-Launch Problem</h2>
+
+<p>A Baseline Profile is a pre-built method profile that ships <strong>inside your APK/AAB</strong>. Instead of waiting days for the runtime to discover hot methods, you tell the system upfront: "these methods are critical — compile them at install time."</p>
+
+<h3>How It Works End-to-End</h3>
+<ol>
+  <li><strong>Developer generates</strong> a profile by exercising critical user journeys in a Macrobenchmark test</li>
+  <li><strong>Profile is compiled</strong> into a binary format and bundled in the APK at <code>assets/dexopt/baseline.prof</code> (binary) and <code>baseline-prof.txt</code> (human-readable rules in the source)</li>
+  <li><strong>On install</strong>: the Play Store (or <code>ProfileInstaller</code> on first launch) feeds the profile to <code>dex2oat</code></li>
+  <li><strong>dex2oat compiles</strong> the profiled methods AOT — producing an <code>.odex</code> with hot methods pre-compiled</li>
+  <li><strong>First launch</strong>: critical paths execute compiled native code instead of interpreted bytecode</li>
+</ol>
+
+<div class="diagram-container">
+<svg viewBox="0 0 800 240" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+  <text x="400" y="20" fill="#c084fc" font-size="13" text-anchor="middle" font-weight="700">Baseline Profile — Install-Time Flow</text>
+
+  <!-- APK -->
+  <rect x="30" y="50" width="130" height="80" rx="6" fill="rgba(108,158,255,0.12)" stroke="#6c9eff"/>
+  <text x="95" y="72" fill="#6c9eff" font-size="10" text-anchor="middle" font-weight="600">APK / AAB</text>
+  <text x="95" y="90" fill="#e2e4ed" font-size="8.5" text-anchor="middle">classes.dex</text>
+  <text x="95" y="104" fill="#fbbf24" font-size="8.5" text-anchor="middle">baseline.prof</text>
+  <text x="95" y="118" fill="#4ade80" font-size="8.5" text-anchor="middle">startup-prof.txt</text>
+
+  <line x1="165" y1="90" x2="200" y2="90" stroke="#8b8fa3" stroke-width="1.5" marker-end="url(#arrow3)"/>
+
+  <!-- Play Store / Installer -->
+  <rect x="205" y="55" width="150" height="70" rx="6" fill="rgba(74,222,128,0.12)" stroke="#4ade80"/>
+  <text x="280" y="77" fill="#4ade80" font-size="10" text-anchor="middle" font-weight="600">Play Store Install</text>
+  <text x="280" y="95" fill="#e2e4ed" font-size="8.5" text-anchor="middle">Extracts baseline.prof</text>
+  <text x="280" y="109" fill="#8b8fa3" font-size="8" text-anchor="middle">Feeds to dex2oat</text>
+
+  <line x1="360" y1="90" x2="395" y2="90" stroke="#8b8fa3" stroke-width="1.5" marker-end="url(#arrow3)"/>
+
+  <!-- dex2oat -->
+  <rect x="400" y="55" width="140" height="70" rx="6" fill="rgba(192,132,252,0.12)" stroke="#c084fc"/>
+  <text x="470" y="77" fill="#c084fc" font-size="10" text-anchor="middle" font-weight="600">dex2oat</text>
+  <text x="470" y="95" fill="#e2e4ed" font-size="8.5" text-anchor="middle">speed-profile filter</text>
+  <text x="470" y="109" fill="#8b8fa3" font-size="8" text-anchor="middle">Compiles hot methods</text>
+
+  <line x1="545" y1="90" x2="580" y2="90" stroke="#8b8fa3" stroke-width="1.5" marker-end="url(#arrow3)"/>
+
+  <!-- Result -->
+  <rect x="585" y="55" width="180" height="70" rx="6" fill="rgba(251,191,36,0.12)" stroke="#fbbf24"/>
+  <text x="675" y="77" fill="#fbbf24" font-size="10" text-anchor="middle" font-weight="600">First Launch</text>
+  <text x="675" y="95" fill="#e2e4ed" font-size="8.5" text-anchor="middle">Hot methods → native code</text>
+  <text x="675" y="109" fill="#4ade80" font-size="9" text-anchor="middle" font-weight="600">30-50% faster cold start</text>
+
+  <!-- Fallback path -->
+  <text x="400" y="165" fill="#8b8fa3" font-size="9" text-anchor="middle">Fallback (sideload / no Play Store):</text>
+  <rect x="200" y="175" width="400" height="35" rx="4" fill="rgba(248,113,113,0.08)" stroke="#f87171" stroke-dasharray="4"/>
+  <text x="400" y="197" fill="#f87171" font-size="9" text-anchor="middle">ProfileInstaller (Jetpack) installs profile on first app launch via broadcast receiver</text>
+
+  <defs>
+    <marker id="arrow3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8b8fa3"/>
+    </marker>
+  </defs>
+</svg>
+</div>
+
+<h3>Typical Performance Improvements</h3>
+<table>
+  <tr><th>Metric</th><th>Without Baseline Profile</th><th>With Baseline Profile</th><th>Improvement</th></tr>
+  <tr><td>Cold start (first install)</td><td>~800ms</td><td>~450ms</td><td>~40% faster</td></tr>
+  <tr><td>Scroll jank (first session)</td><td>15-20 janky frames/s</td><td>3-5 janky frames/s</td><td>~70% fewer janks</td></tr>
+  <tr><td>Screen transition</td><td>~300ms</td><td>~200ms</td><td>~30% faster</td></tr>
+  <tr><td>JIT compilation pauses</td><td>Frequent in first 30s</td><td>Minimal</td><td>Near-elimination</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>5. Baseline Profile Format</h2>
+
+<p>Baseline Profiles use a human-readable rule format in source (<code>baseline-prof.txt</code>) that gets compiled to a binary format (<code>baseline.prof</code>) during the build.</p>
+
+<h3>Rule Syntax</h3>
+<pre><code>// Each line describes a method or class with flags:
+// Flags: H = Hot, S = Startup, P = Post-startup, L = Library
+
+// Hot method called during startup:
+HSPLcom/example/app/MainActivity;-&gt;onCreate(Landroid/os/Bundle;)V
+
+// Hot startup method in a library:
+HSPLandroidx/compose/runtime/ComposerImpl;-&gt;startGroup(I)V
+
+// Post-startup method (used after initial render):
+HPLcom/example/app/DetailScreen;-&gt;loadData()V
+
+// Class rule (ensures class is in startup dex layout):
+Lcom/example/app/MainActivity;
+
+// Wildcard rules — match all methods in a package:
+HSPLcom/example/app/**;-&gt;**(**)**
+
+// Wildcard — all methods in a specific class:
+HSPLcom/example/app/Repository;-&gt;**(**)**</code></pre>
+
+<h3>Flag Meanings</h3>
+<table>
+  <tr><th>Flag</th><th>Meaning</th><th>Effect</th></tr>
+  <tr><td><code>H</code></td><td>Hot</td><td>Method is AOT-compiled with full optimization</td></tr>
+  <tr><td><code>S</code></td><td>Startup</td><td>Method is needed during app startup — prioritized in compilation and dex layout</td></tr>
+  <tr><td><code>P</code></td><td>Post-startup</td><td>Method is used after startup — compiled but not prioritized for dex layout</td></tr>
+  <tr><td><code>L</code></td><td>Library</td><td>Method belongs to a library (informational, used for profile merging)</td></tr>
+</table>
+
+<div class="callout">
+  <div class="callout-label">Binary vs Text Format</div>
+  <p>The <code>baseline-prof.txt</code> in your source is human-readable rules. During the build, the AGP (Android Gradle Plugin) compiles this into a binary <code>.prof</code> format using <code>profgen</code>. The binary format is what ships in the APK and what <code>dex2oat</code> reads. You never edit the binary format directly. The text format supports wildcards; the binary format resolves them to concrete method references.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Generating Baseline Profiles with Macrobenchmark</h2>
+
+<p>The recommended way to generate Baseline Profiles is using the <strong>Macrobenchmark</strong> library and the <code>androidx.baselineprofile</code> Gradle plugin. This automates the entire pipeline: run instrumented tests on a device, collect the profile, and merge it into your build.</p>
+
+<h3>Project Setup</h3>
+<pre><code>// settings.gradle.kts
+include(":app")
+include(":baselineprofile")  // Separate module for profile generation
+
+// build.gradle.kts (project-level)
+plugins {
+    id("com.android.application") version "8.2.0" apply false
+    id("androidx.baselineprofile") version "1.3.0" apply false
+}
+
+// build.gradle.kts (:baselineprofile module)
+plugins {
+    id("com.android.test")
+    id("androidx.baselineprofile")
+}
+
+android {
+    namespace = "com.example.app.baselineprofile"
+    compileSdk = 34
+    targetProjectPath = ":app"
+
+    defaultConfig {
+        minSdk = 28  // Macrobenchmark requires API 28+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnit4"
+    }
+}
+
+baselineProfile {
+    managedDevices += "pixel6Api34"  // Gradle Managed Device
+    useConnectedDevices = true
+}
+
+dependencies {
+    implementation("androidx.test.ext:junit:1.1.5")
+    implementation("androidx.test.uiautomator:uiautomator:2.3.0")
+    implementation("androidx.benchmark:benchmark-macro-junit4:1.2.3")
+}
+
+// build.gradle.kts (:app module)
+plugins {
+    id("com.android.application")
+    id("androidx.baselineprofile")
+}
+
+dependencies {
+    baselineProfile(project(":baselineprofile"))
+    implementation("androidx.profileinstaller:profileinstaller:1.3.1")
+}</code></pre>
+
+<h3>Profile Generator</h3>
+<pre><code>// baselineprofile/src/main/java/.../BaselineProfileGenerator.kt
+
+@RunWith(AndroidJUnit4::class)
+class BaselineProfileGenerator {
+
+    @get:Rule
+    val rule = BaselineProfileRule()
+
+    @Test
+    fun generateProfile() {
+        rule.collect(
+            packageName = "com.example.app",
+            maxIterations = 15,
+            stableIterations = 3,
+            includeInStartupProfile = true
+        ) {
+            // Critical user journey 1: App startup
+            pressHome()
+            startActivityAndWait()
+
+            // Critical user journey 2: Main list scroll
+            device.wait(Until.hasObject(By.res("main_list")), 10_000)
+            val list = device.findObject(By.res("main_list"))
+            list.setGestureMargin(device.displayWidth / 5)
+            list.fling(Direction.DOWN)
+            list.fling(Direction.UP)
+
+            // Critical user journey 3: Navigate to detail
+            device.findObject(By.res("item_card")).click()
+            device.wait(Until.hasObject(By.res("detail_screen")), 5_000)
+
+            // Critical user journey 4: Search
+            device.pressBack()
+            device.findObject(By.res("search_icon")).click()
+            device.wait(Until.hasObject(By.res("search_field")), 3_000)
+            device.findObject(By.res("search_field")).text = "test query"
+            device.wait(Until.hasObject(By.res("search_results")), 5_000)
+        }
+    }
+}</code></pre>
+
+<h3>Running the Generator</h3>
+<pre><code>// Generate and install the profile:
+./gradlew :app:generateBaselineProfile
+
+// This does:
+// 1. Builds the app and test APKs
+// 2. Installs on device/emulator
+// 3. Runs the test, collecting method traces
+// 4. Extracts the profile
+// 5. Merges into app/src/main/generated/baselineProfiles/baseline-prof.txt
+// 6. Next app build includes the profile in the APK</code></pre>
+
+<h3>Library Profiles</h3>
+<p>Libraries can ship their own Baseline Profiles. When your app depends on a library with a profile, the AGP <strong>automatically merges</strong> the library's profile with your app's profile. Major Jetpack libraries already ship profiles:</p>
+
+<ul>
+  <li><strong>Compose Runtime/UI/Foundation</strong> — profiles for recomposition, layout, drawing</li>
+  <li><strong>Navigation Compose</strong> — profiles for screen transitions</li>
+  <li><strong>RecyclerView</strong> — profiles for scrolling, view recycling</li>
+  <li><strong>Fragment</strong> — profiles for fragment transactions</li>
+  <li><strong>Room</strong> — profiles for database operations</li>
+</ul>
+
+<pre><code>// Library authors: ship a profile in src/main/baseline-prof.txt
+// Example for a networking library:
+HSPLcom/example/networking/HttpClient;-&gt;execute(Lcom/example/networking/Request;)Lcom/example/networking/Response;
+HSPLcom/example/networking/JsonParser;-&gt;parse(Ljava/io/InputStream;Ljava/lang/Class;)Ljava/lang/Object;
+HSPLcom/example/networking/ConnectionPool;-&gt;acquire()Lcom/example/networking/Connection;
+
+// AGP merges all library profiles + app profile → single baseline.prof in APK</code></pre>
+
+<!-- ============================================================ -->
+<h2>7. Startup Profiles (Android 13+)</h2>
+
+<p>Startup Profiles are a <strong>subset</strong> of Baseline Profiles that specifically target methods and classes needed during app startup. They enable a critical optimization that Baseline Profiles alone cannot: <strong>dex layout optimization</strong>.</p>
+
+<h3>What Startup Profiles Add</h3>
+<ul>
+  <li><strong>Class ordering</strong> — classes needed during startup are grouped contiguously in the DEX file</li>
+  <li><strong>Method ordering</strong> — startup methods are placed together for better code locality</li>
+  <li><strong>Reduced page faults</strong> — instead of loading scattered 4KB pages from disk, startup classes are in adjacent pages</li>
+</ul>
+
+<pre><code>// Startup Profile is generated alongside Baseline Profile:
+rule.collect(
+    packageName = "com.example.app",
+    includeInStartupProfile = true  // This flag enables Startup Profile generation
+) {
+    // Only the startup journey contributes to the Startup Profile
+    pressHome()
+    startActivityAndWait()
+    device.wait(Until.hasObject(By.res("main_content")), 10_000)
+}
+
+// Output files:
+// baseline-prof.txt    → all hot methods (startup + post-startup)
+// startup-prof.txt     → only startup methods (subset)</code></pre>
+
+<h3>How Dex Layout Optimization Uses Startup Profiles</h3>
+
+<div class="diagram-container">
+<svg viewBox="0 0 800 220" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+  <text x="400" y="20" fill="#c084fc" font-size="13" text-anchor="middle" font-weight="700">Dex Layout Optimization — Before vs After</text>
+
+  <!-- Before -->
+  <text x="200" y="50" fill="#f87171" font-size="11" text-anchor="middle" font-weight="600">Before (default dex layout)</text>
+  <rect x="40" y="60" width="320" height="40" rx="4" fill="rgba(248,113,113,0.08)" stroke="#2e3345"/>
+  <!-- Scattered classes -->
+  <rect x="50" y="67" width="25" height="26" rx="2" fill="rgba(108,158,255,0.3)" stroke="#6c9eff"/>
+  <rect x="100" y="67" width="25" height="26" rx="2" fill="rgba(74,222,128,0.15)" stroke="#2e3345"/>
+  <rect x="135" y="67" width="25" height="26" rx="2" fill="rgba(108,158,255,0.3)" stroke="#6c9eff"/>
+  <rect x="175" y="67" width="25" height="26" rx="2" fill="rgba(74,222,128,0.15)" stroke="#2e3345"/>
+  <rect x="210" y="67" width="25" height="26" rx="2" fill="rgba(74,222,128,0.15)" stroke="#2e3345"/>
+  <rect x="245" y="67" width="25" height="26" rx="2" fill="rgba(108,158,255,0.3)" stroke="#6c9eff"/>
+  <rect x="280" y="67" width="25" height="26" rx="2" fill="rgba(74,222,128,0.15)" stroke="#2e3345"/>
+  <rect x="315" y="67" width="25" height="26" rx="2" fill="rgba(108,158,255,0.3)" stroke="#6c9eff"/>
+  <text x="200" y="120" fill="#8b8fa3" font-size="8.5" text-anchor="middle">Startup classes (blue) scattered → many page faults</text>
+
+  <!-- After -->
+  <text x="600" y="50" fill="#4ade80" font-size="11" text-anchor="middle" font-weight="600">After (startup profile layout)</text>
+  <rect x="440" y="60" width="320" height="40" rx="4" fill="rgba(74,222,128,0.08)" stroke="#2e3345"/>
+  <!-- Grouped classes -->
+  <rect x="450" y="67" width="25" height="26" rx="2" fill="rgba(108,158,255,0.3)" stroke="#6c9eff"/>
+  <rect x="478" y="67" width="25" height="26" rx="2" fill="rgba(108,158,255,0.3)" stroke="#6c9eff"/>
+  <rect x="506" y="67" width="25" height="26" rx="2" fill="rgba(108,158,255,0.3)" stroke="#6c9eff"/>
+  <rect x="534" y="67" width="25" height="26" rx="2" fill="rgba(108,158,255,0.3)" stroke="#6c9eff"/>
+  <rect x="572" y="67" width="25" height="26" rx="2" fill="rgba(74,222,128,0.15)" stroke="#2e3345"/>
+  <rect x="607" y="67" width="25" height="26" rx="2" fill="rgba(74,222,128,0.15)" stroke="#2e3345"/>
+  <rect x="642" y="67" width="25" height="26" rx="2" fill="rgba(74,222,128,0.15)" stroke="#2e3345"/>
+  <rect x="677" y="67" width="25" height="26" rx="2" fill="rgba(74,222,128,0.15)" stroke="#2e3345"/>
+  <text x="600" y="120" fill="#8b8fa3" font-size="8.5" text-anchor="middle">Startup classes grouped → sequential I/O, fewer page faults</text>
+
+  <!-- Legend -->
+  <rect x="280" y="150" width="12" height="12" rx="2" fill="rgba(108,158,255,0.3)" stroke="#6c9eff"/>
+  <text x="298" y="161" fill="#6c9eff" font-size="9">Startup class</text>
+  <rect x="400" y="150" width="12" height="12" rx="2" fill="rgba(74,222,128,0.15)" stroke="#2e3345"/>
+  <text x="418" y="161" fill="#8b8fa3" font-size="9">Non-startup class</text>
+
+  <text x="400" y="195" fill="#fbbf24" font-size="9" text-anchor="middle" font-weight="600">Each 4KB page fault = ~0.1-1ms on flash storage. 50 scattered classes = 5-50ms of page fault overhead.</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. Cloud Profiles (Android 12+)</h2>
+
+<p>Cloud Profiles are Google Play's server-side solution. Play collects <strong>aggregated, anonymized</strong> runtime profiles from users who have opted in, then distributes these profiles to new installs.</p>
+
+<h3>How Cloud Profiles Work</h3>
+<ol>
+  <li><strong>Collection</strong>: devices upload anonymized profile data to Play servers (methods + classes, no user data)</li>
+  <li><strong>Aggregation</strong>: Play merges profiles from thousands of users, keeping methods that appear in &gt;threshold% of profiles</li>
+  <li><strong>Distribution</strong>: when a new user installs the app, Play downloads the aggregated profile alongside the APK</li>
+  <li><strong>Compilation</strong>: the profile is fed to <code>dex2oat</code> at install time, same as a Baseline Profile</li>
+</ol>
+
+<h3>Cloud Profiles vs Baseline Profiles</h3>
+<table>
+  <tr><th>Aspect</th><th>Cloud Profiles</th><th>Baseline Profiles</th></tr>
+  <tr><td>Source</td><td>Aggregated from real users</td><td>Developer-generated from Macrobenchmark</td></tr>
+  <tr><td>Coverage</td><td>~80% of hot methods</td><td>Covers exactly what you profile</td></tr>
+  <tr><td>Availability</td><td>Days after release (needs user data)</td><td>Immediate (ships with APK)</td></tr>
+  <tr><td>Distribution</td><td>Play Store only</td><td>Any install method</td></tr>
+  <tr><td>Android version</td><td>12+ (API 31+)</td><td>7+ (API 24+) via ProfileInstaller</td></tr>
+  <tr><td>Developer effort</td><td>Zero (automatic)</td><td>Requires Macrobenchmark setup</td></tr>
+  <tr><td>Update latency</td><td>Days to propagate after app update</td><td>Available on same-day install</td></tr>
+</table>
+
+<div class="callout warn">
+  <div class="callout-label">Cloud Profiles Are Not Enough</div>
+  <p>Cloud Profiles have a critical gap: they take <strong>days to aggregate</strong> after a new app version is published. Every user who installs in that window gets no profile. They also don't work for sideloaded apps, enterprise deployments, or pre-Play Store testing. Baseline Profiles fill these gaps — they're available from the moment the APK is built. The recommended strategy: <strong>ship Baseline Profiles AND rely on Cloud Profiles</strong>. They complement each other; Cloud Profiles may cover user journeys you didn't test in Macrobenchmark.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Dex Layout Optimization</h2>
+
+<p>Dex layout optimization reorders classes and methods within the DEX file to improve I/O locality during startup. This is a separate optimization from AOT compilation — it affects how quickly classes can be <em>loaded from disk</em>, not how fast they <em>execute</em>.</p>
+
+<h3>The Page Fault Problem</h3>
+<p>DEX files are memory-mapped (<code>mmap</code>) into the process address space. When a class is first accessed, the kernel loads the 4KB page containing that class from flash storage. If startup classes are scattered across the DEX file, each class load triggers a separate page fault — a random I/O operation on flash.</p>
+
+<pre><code>// Without dex layout optimization:
+// Startup loads classes A, B, C, D (scattered in dex)
+//
+// DEX file on disk:
+// [page 0: class X] [page 1: class A] [page 2: class Y]
+// [page 3: class Z] [page 4: class B] [page 5: class W]
+// [page 6: class C] [page 7: class V] [page 8: class D]
+//
+// Loading A, B, C, D = 4 page faults (random I/O)
+// Each page fault: 0.1-1ms on flash → 0.4-4ms total
+
+// With dex layout optimization (startup classes grouped):
+// DEX file on disk:
+// [page 0: class A] [page 1: class B] [page 2: class C]
+// [page 3: class D] [page 4: class X] [page 5: class Y]
+// [page 6: class Z] [page 7: class W] [page 8: class V]
+//
+// Loading A, B, C, D = 1 sequential read (pages 0-3)
+// Sequential I/O: ~0.1ms total (kernel read-ahead kicks in)</code></pre>
+
+<h3>How It's Applied</h3>
+<p>The <code>dex2oat</code> compiler uses the Startup Profile to determine class ordering. When compiling with a profile that includes class entries (lines starting with <code>L</code>), it reorders the DEX file so startup classes appear first. This happens at install time alongside AOT compilation.</p>
+
+<pre><code>// Startup Profile entries that drive dex layout:
+// Class entries (no method, just the class descriptor):
+Lcom/example/app/App;
+Lcom/example/app/MainActivity;
+Lcom/example/app/MainViewModel;
+Lcom/example/app/data/Repository;
+Lcom/example/app/di/AppModule;
+
+// These classes will be grouped at the beginning of the DEX file
+// Kernel read-ahead (typically 128KB) will prefetch adjacent pages
+// Result: most startup classes loaded in 1-2 I/O operations</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Quantifying Page Faults</div>
+  <p>You can measure page fault impact using <code>adb shell am start -W --start-profiler</code> combined with Perfetto's <code>mm_filemap_add_to_page_cache</code> tracepoint. On a typical app with 500+ classes loaded during startup, dex layout optimization reduces page faults from ~200 to ~30-50, saving 10-50ms on cold start depending on flash speed. On low-end devices with slower NAND, the savings can exceed 100ms. This is why Startup Profiles are a separate concept from Baseline Profiles — they serve a different optimization (I/O locality vs compilation).</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>10. Measuring Impact</h2>
+
+<p>Measuring the impact of Baseline Profiles requires controlled benchmarking with different compilation modes. The Macrobenchmark library provides this out of the box.</p>
+
+<h3>Benchmark with Compilation Modes</h3>
+<pre><code>@RunWith(AndroidJUnit4::class)
+class StartupBenchmark {
+
+    @get:Rule
+    val rule = MacrobenchmarkRule()
+
+    @Test
+    fun startupNoCompilation() {
+        rule.measureRepeated(
+            packageName = "com.example.app",
+            metrics = listOf(StartupTimingMetric()),
+            compilationMode = CompilationMode.None(),  // Interpreted + JIT only
+            startupMode = StartupMode.COLD,
+            iterations = 10
+        ) {
+            pressHome()
+            startActivityAndWait()
+        }
+    }
+
+    @Test
+    fun startupBaselineProfile() {
+        rule.measureRepeated(
+            packageName = "com.example.app",
+            metrics = listOf(StartupTimingMetric()),
+            compilationMode = CompilationMode.Partial(
+                baselineProfileMode = BaselineProfileMode.Require
+            ),
+            startupMode = StartupMode.COLD,
+            iterations = 10
+        ) {
+            pressHome()
+            startActivityAndWait()
+        }
+    }
+
+    @Test
+    fun startupFullCompilation() {
+        rule.measureRepeated(
+            packageName = "com.example.app",
+            metrics = listOf(StartupTimingMetric()),
+            compilationMode = CompilationMode.Full(),  // Full AOT (upper bound)
+            startupMode = StartupMode.COLD,
+            iterations = 10
+        ) {
+            pressHome()
+            startActivityAndWait()
+        }
+    }
+}</code></pre>
+
+<h3>Compilation Modes Explained</h3>
+<table>
+  <tr><th>CompilationMode</th><th>What It Does</th><th>Simulates</th></tr>
+  <tr><td><code>None()</code></td><td>Clears all compiled code, forces interpret + JIT</td><td>First install, no profile</td></tr>
+  <tr><td><code>Partial(Require)</code></td><td>Installs Baseline Profile, compiles profiled methods</td><td>Install with Baseline Profile</td></tr>
+  <tr><td><code>Partial(Suggest)</code></td><td>Uses profile if available, falls back to None</td><td>Real-world install behavior</td></tr>
+  <tr><td><code>Full()</code></td><td>Full AOT compilation of everything</td><td>Upper bound (best possible perf)</td></tr>
+</table>
+
+<h3>Perfetto Trace Analysis</h3>
+<pre><code>// Capture a Perfetto trace during startup:
+// 1. In Macrobenchmark, traces are auto-captured
+// 2. Or manually:
+adb shell perfetto -o /data/misc/perfetto-traces/startup.pb \
+    -c - --txt &lt;&lt;EOF
+buffers: { size_kb: 65536 }
+data_sources: { config { name: "linux.ftrace" ftrace_config {
+    ftrace_events: "sched/sched_switch"
+    ftrace_events: "power/cpu_frequency"
+    atrace_categories: "dalvik"
+    atrace_categories: "am"
+    atrace_categories: "wm"
+    atrace_apps: "com.example.app"
+}}}
+duration_ms: 15000
+EOF
+
+// In the trace, look for:
+// - "JIT compiling" slices → methods being JIT-compiled (bad on startup)
+// - "AOT" in method execution → pre-compiled code (good)
+// - "Class Load" events → page fault indicators
+// - "bindApplication" → total startup time
+// - "activityStart" / "activityResume" → activity lifecycle timing</code></pre>
+
+<h3>Verifying Profile Installation</h3>
+<pre><code>// Check if Baseline Profile was applied:
+adb shell dumpsys package com.example.app | grep -A10 "Dexopt state"
+// Look for: [status=speed-profile, reason=install]
+//   "speed-profile" = profile-guided compilation applied
+//   "verify" = no profile, only verification (bad)
+
+// Check profile contents:
+adb shell cmd package dump-profiles com.example.app
+// Shows number of hot methods, startup methods, classes
+
+// Force profile compilation (testing):
+adb shell cmd package compile -m speed-profile -f com.example.app
+
+// Reset to no compilation (testing):
+adb shell cmd package compile --reset com.example.app</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight</div>
+  <p>At Google, Baseline Profiles are mandatory for all user-facing apps. The 30-50% cold start improvement is the single highest-ROI performance optimization available. If you're not shipping a Baseline Profile, you're leaving performance on the table for every new install and every app update. The cost is minimal — a one-time Macrobenchmark setup and a CI job that regenerates the profile periodically. The Compose team's own Baseline Profile reduced <code>LazyColumn</code> first-scroll jank by 40%. For L6 candidates: be prepared to explain the full pipeline from profile generation → binary compilation → install-time dex2oat → runtime execution, and articulate why Cloud Profiles alone are insufficient.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>11. Putting It All Together</h2>
+
+<div class="diagram-container">
+<svg viewBox="0 0 800 340" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+  <text x="400" y="20" fill="#c084fc" font-size="13" text-anchor="middle" font-weight="700">Complete Profile Optimization Pipeline</text>
+
+  <!-- Developer side -->
+  <rect x="30" y="45" width="230" height="130" rx="8" fill="rgba(108,158,255,0.06)" stroke="#6c9eff" stroke-dasharray="4"/>
+  <text x="145" y="65" fill="#6c9eff" font-size="10" text-anchor="middle" font-weight="700">Developer (Build Time)</text>
+
+  <rect x="45" y="78" width="200" height="25" rx="4" fill="rgba(108,158,255,0.12)" stroke="#6c9eff"/>
+  <text x="145" y="95" fill="#e2e4ed" font-size="8.5" text-anchor="middle">Macrobenchmark generates profile</text>
+
+  <rect x="45" y="110" width="200" height="25" rx="4" fill="rgba(192,132,252,0.12)" stroke="#c084fc"/>
+  <text x="145" y="127" fill="#e2e4ed" font-size="8.5" text-anchor="middle">AGP merges app + library profiles</text>
+
+  <rect x="45" y="142" width="200" height="25" rx="4" fill="rgba(74,222,128,0.12)" stroke="#4ade80"/>
+  <text x="145" y="159" fill="#e2e4ed" font-size="8.5" text-anchor="middle">Binary .prof bundled in APK</text>
+
+  <!-- Arrow to install -->
+  <line x1="265" y1="110" x2="295" y2="110" stroke="#8b8fa3" stroke-width="1.5" marker-end="url(#arrow4)"/>
+
+  <!-- Install time -->
+  <rect x="300" y="45" width="210" height="130" rx="8" fill="rgba(74,222,128,0.06)" stroke="#4ade80" stroke-dasharray="4"/>
+  <text x="405" y="65" fill="#4ade80" font-size="10" text-anchor="middle" font-weight="700">Install Time</text>
+
+  <rect x="315" y="78" width="180" height="25" rx="4" fill="rgba(74,222,128,0.12)" stroke="#4ade80"/>
+  <text x="405" y="95" fill="#e2e4ed" font-size="8.5" text-anchor="middle">Play Store extracts profile</text>
+
+  <rect x="315" y="110" width="180" height="25" rx="4" fill="rgba(251,191,36,0.12)" stroke="#fbbf24"/>
+  <text x="405" y="127" fill="#e2e4ed" font-size="8.5" text-anchor="middle">+ Cloud Profile (if available)</text>
+
+  <rect x="315" y="142" width="180" height="25" rx="4" fill="rgba(192,132,252,0.12)" stroke="#c084fc"/>
+  <text x="405" y="159" fill="#e2e4ed" font-size="8.5" text-anchor="middle">dex2oat: speed-profile compile</text>
+
+  <!-- Arrow to runtime -->
+  <line x1="515" y1="110" x2="545" y2="110" stroke="#8b8fa3" stroke-width="1.5" marker-end="url(#arrow4)"/>
+
+  <!-- Runtime -->
+  <rect x="550" y="45" width="220" height="130" rx="8" fill="rgba(192,132,252,0.06)" stroke="#c084fc" stroke-dasharray="4"/>
+  <text x="660" y="65" fill="#c084fc" font-size="10" text-anchor="middle" font-weight="700">Runtime (First Launch)</text>
+
+  <rect x="565" y="78" width="190" height="25" rx="4" fill="rgba(74,222,128,0.12)" stroke="#4ade80"/>
+  <text x="660" y="95" fill="#e2e4ed" font-size="8.5" text-anchor="middle">Hot methods → native code</text>
+
+  <rect x="565" y="110" width="190" height="25" rx="4" fill="rgba(108,158,255,0.12)" stroke="#6c9eff"/>
+  <text x="660" y="127" fill="#e2e4ed" font-size="8.5" text-anchor="middle">Startup classes → grouped I/O</text>
+
+  <rect x="565" y="142" width="190" height="25" rx="4" fill="rgba(251,191,36,0.12)" stroke="#fbbf24"/>
+  <text x="660" y="159" fill="#e2e4ed" font-size="8.5" text-anchor="middle">Cold methods → JIT on demand</text>
+
+  <!-- Continuous improvement -->
+  <rect x="120" y="210" width="560" height="55" rx="8" fill="rgba(251,191,36,0.06)" stroke="#fbbf24" stroke-dasharray="4"/>
+  <text x="400" y="230" fill="#fbbf24" font-size="10" text-anchor="middle" font-weight="700">Continuous Improvement (Post-Install)</text>
+  <text x="400" y="248" fill="#e2e4ed" font-size="8.5" text-anchor="middle">JIT records new hot methods → profile grows → bg-dexopt compiles more → Cloud Profile updated</text>
+
+  <!-- Feedback loop arrow -->
+  <path d="M 680 265 L 680 300 L 120 300 L 120 265" fill="none" stroke="#fbbf24" stroke-width="1" stroke-dasharray="4" marker-end="url(#arrow4)"/>
+  <text x="400" y="315" fill="#8b8fa3" font-size="8" text-anchor="middle">Profile data feeds back to Play for next user's Cloud Profile</text>
+
+  <defs>
+    <marker id="arrow4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8b8fa3"/>
+    </marker>
+  </defs>
+</svg>
+</div>
+
+<h3>Quick Reference: What to Ship</h3>
+<table>
+  <tr><th>Artifact</th><th>Purpose</th><th>Required?</th></tr>
+  <tr><td><code>baseline-prof.txt</code></td><td>Hot + startup + post-startup methods for AOT compilation</td><td>Yes — highest-ROI optimization</td></tr>
+  <tr><td><code>startup-prof.txt</code></td><td>Startup-only methods/classes for dex layout optimization</td><td>Recommended (generated alongside baseline)</td></tr>
+  <tr><td><code>ProfileInstaller</code> dependency</td><td>Fallback for non-Play installs (sideload, enterprise)</td><td>Yes — ensures profile works everywhere</td></tr>
+  <tr><td>Macrobenchmark CI job</td><td>Regenerate profiles on each release</td><td>Strongly recommended</td></tr>
+</table>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  ← <a href="06-app-startup.html">06 — App Startup</a> &nbsp;|&nbsp;
+  <a href="08-interview-qa.html">08 — Interview Q&amp;A</a> → &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

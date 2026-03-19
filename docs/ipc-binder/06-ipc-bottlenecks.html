@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 — When IPC Becomes a Bottleneck — Thread Pool Exhaustion, Buffer Limits & Optimization</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-binder-architecture.html">01 Binder Architecture</a>
+  <a href="02-binder-call-flow.html">02 Call Flow</a>
+  <a href="03-aidl-internals.html">03 AIDL</a>
+  <a href="04-zygote-process-model.html">04 Zygote</a>
+  <a href="05-system-services.html">05 System Services</a>
+  <a class="active" href="06-ipc-bottlenecks.html">06 IPC Bottlenecks</a>
+  <a href="07-interview-qa.html">07 Interview Q&A</a>
+</div>
+
+<h1>06 — When IPC Becomes a Bottleneck</h1>
+<p class="subtitle">Thread pool exhaustion, transaction buffer limits, serialization costs, ContentProvider overhead, and practical optimization patterns for high-performance Android apps</p>
+
+<!-- ============================================================ -->
+<h2>1. Binder Thread Pool Exhaustion</h2>
+
+<pre><code>// Each app process has a Binder thread pool of 16 threads (15 + 1 main).
+// When ALL threads are busy handling incoming transactions,
+// new transactions BLOCK until a thread becomes free.
+
+// Scenario: Your app hosts a ContentProvider that 5 other apps query.
+// Each query takes 200ms (database + disk I/O).
+// 5 apps × 4 concurrent queries = 20 pending transactions
+// But only 16 threads → 4 transactions wait in the kernel queue.
+// If more pile up → callers experience increasing latency.
+// If callers have timeouts → they get TransactionTooLargeException or ANR.
+
+// Symptoms:
+// - "Binder thread pool exhausted" in logcat
+// - BR_SPAWN_LOOPER but max threads already reached
+// - Callers see unexplained delays on Binder calls
+// - ANR in the calling app (if the call is on the main thread)
+
+// Diagnosis:
+// adb shell dumpsys activity processes | grep "binder"
+// Shows per-process Binder thread state
+
+// adb shell service list
+// Shows all registered Binder services
+
+// Systrace: look for long binder transactions in the "binder" track
+
+// Fixes:
+// 1. Move heavy work OFF Binder threads (dispatch to a worker pool)
+// 2. Use oneway for callbacks (frees the caller's thread immediately)
+// 3. Reduce transaction frequency (batch operations)
+// 4. Cache results client-side (avoid repeated IPC)
+// 5. Use ContentProvider.call() for lightweight operations</code></pre>
+
+<div class="callout danger">
+  <div class="callout-label">Critical — Binder Thread Deadlock</div>
+  <p>Deadlock scenario: App A calls App B (synchronous Binder). App B's handler calls back to App A (synchronous Binder). If App A's Binder threads are all waiting for App B's reply, App B's callback to App A has no free thread to handle it. Both processes are stuck. This is a <strong>distributed deadlock</strong> that's invisible to single-process deadlock detectors. Defense: (1) never make synchronous Binder calls back to the caller, (2) use oneway for callbacks, (3) design unidirectional call graphs.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Transaction Buffer Exhaustion</h2>
+
+<pre><code>// The 1MB mmap buffer is per-process, shared across ALL pending transactions.
+
+// Two ways to exhaust it:
+
+// 1. Single large transaction:
+// Sending a 500KB Parcel in one call → uses half the buffer
+// Sending a 1MB+ Parcel → TransactionTooLargeException immediately
+
+// 2. Many small pending transactions (more insidious):
+// 100 oneway callbacks × 10KB each = 1MB → buffer full
+// This happens when the receiver is slow and oneway calls queue up
+
+// The exception message is misleading:
+// "android.os.TransactionTooLargeException: data parcel size 1048576 bytes"
+// This can mean:
+// a) Your Parcel is literally too large, OR
+// b) The CUMULATIVE pending transactions exceeded the buffer
+
+// Diagnosis:
+// adb shell dumpsys meminfo <pid> | grep "Binder"
+// Shows Binder buffer usage
+
+// Logcat: "!!! FAILED BINDER TRANSACTION !!!"
+// This appears when the kernel can't allocate buffer space
+
+// Common culprits:
+// 1. Passing Bitmaps in Intents/Bundles (use content URIs instead)
+// 2. Large savedInstanceState Bundles (Fragment transactions)
+// 3. ContentProvider returning huge Cursors
+// 4. Rapid oneway callbacks to a slow receiver</code></pre>
+
+<pre><code>// Practical example — savedInstanceState overflow:
+// Each Fragment saves state → Activity bundles all Fragment states
+// 20 Fragments × 50KB each = 1MB → TransactionTooLargeException on config change
+
+// Fix: use ViewModel for transient state, SavedStateHandle for small essentials
+// Rule of thumb: savedInstanceState should be < 50KB total
+
+// Measuring Parcel size:
+fun measureParcelSize(parcelable: Parcelable): Int {
+    val parcel = Parcel.obtain()
+    try {
+        parcelable.writeToParcel(parcel, 0)
+        return parcel.dataSize() // bytes
+    } finally {
+        parcel.recycle()
+    }
+}
+
+// StrictMode detection (Android 11+):
+StrictMode.setVmPolicy(
+    StrictMode.VmPolicy.Builder()
+        .detectAll()
+        .penaltyLog()
+        .build()
+)
+// Logs warnings for large Binder transactions</code></pre>
+
+<!-- ============================================================ -->
+<h2>3. Serialization Cost — Parcel Performance</h2>
+
+<pre><code>// Every Binder call serializes arguments into a Parcel and deserializes on the other side.
+// This has real CPU cost, especially for complex objects.
+
+// Benchmark (approximate, Pixel 6):
+// writeInt / readInt:           ~10 ns
+// writeString / readString:     ~50 ns (short), ~500 ns (1KB string)
+// writeParcelable:              ~500 ns - 5 μs (depends on complexity)
+// writeBundle:                  ~1 μs - 10 μs (depends on contents)
+// writeTypedList (100 items):   ~50 μs
+// writeList (100 Parcelables):  ~200 μs (writes class name per item)
+
+// Key optimization: writeTypedList vs writeList
+// writeTypedList: caller knows the type → no class name per element
+// writeList: writes class name for EACH element → huge overhead
+
+// Example: sending 1000 User objects
+// writeList:      1000 × "com.example.User" class name + fields = ~500KB
+// writeTypedList: 1000 × fields only = ~100KB
+// That's 5x less data and 3x faster serialization
+
+// Bundle overhead:
+// Bundle uses ArrayMap internally (sorted array of key-value pairs)
+// Each put/get involves: key lookup + type checking + boxing
+// For structured data, Parcelable is 2-5x faster than Bundle
+
+// Parcelable vs Serializable:
+// Serializable: uses reflection, creates temporary objects, ~10x slower
+// Parcelable: direct read/write, no reflection, no garbage
+// NEVER use Serializable for Binder IPC</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. ContentProvider IPC — Hidden Overhead</h2>
+
+<pre><code>// ContentProvider is built on Binder but adds layers of overhead:
+
+// query() call flow:
+// 1. App calls contentResolver.query(uri, ...)
+// 2. ContentResolver looks up the provider:
+//    a. Same process? → direct call (no IPC)
+//    b. Different process? → acquireProvider() via AMS
+//       → AMS starts the provider process if needed
+//       → Returns IContentProvider Binder proxy
+// 3. IContentProvider.query() → Binder transaction to provider process
+// 4. Provider executes query, creates a Cursor
+// 5. CursorWindow (shared memory) holds the result data
+//    → Backed by ashmem (anonymous shared memory)
+//    → Default window size: 2MB
+//    → Data is written into the window, fd passed via Binder
+// 6. Client reads from CursorWindow (zero-copy after initial fill)
+
+// Performance implications:
+// - First query to a cold provider: ~100-500ms (process start + query)
+// - Subsequent queries: ~5-50ms (Binder + query execution)
+// - CursorWindow: efficient for large result sets (shared memory)
+// - But: each query() is a synchronous Binder call → blocks caller
+
+// ContentProvider.call() — lightweight alternative:
+// - Single Binder transaction with Bundle in/out
+// - No Cursor overhead
+// - Good for: key-value lookups, simple operations
+// - Bad for: large result sets (no CursorWindow)
+
+// Bulk operations:
+// bulkInsert(): single Binder call for N inserts (vs N separate calls)
+// applyBatch(): single Binder call for N mixed operations
+// These reduce IPC overhead from O(N) to O(1)</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — ContentProvider Startup Cost</div>
+  <p>When an app queries a ContentProvider in another process for the first time, AMS must: (1) start the target process (Zygote fork, ~200ms), (2) instantiate the Application, (3) call <code>ContentProvider.onCreate()</code>, (4) then handle the query. This can take 500ms+. If your app depends on another app's ContentProvider at startup, this is a hidden cold-start penalty. Mitigation: (1) prefetch in a background thread, (2) cache results locally, (3) use <code>ContentResolver.query()</code> with a <code>CancellationSignal</code> and timeout.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Binder Call on Main Thread — ANR Risk</h2>
+
+<pre><code>// EVERY system API call that crosses a process boundary is a Binder call.
+// Many common APIs are synchronous Binder calls that can block the main thread:
+
+// Dangerous on main thread (can cause ANR):
+// - PackageManager.getInstalledPackages()  → PMS Binder call
+// - ContentResolver.query()                → Provider Binder call
+// - ActivityManager.getRunningAppProcesses() → AMS Binder call
+// - ConnectivityManager.getActiveNetworkInfo() → ConnectivityService
+// - LocationManager.getLastKnownLocation() → LocationService
+// - SharedPreferences.commit()             → can trigger ContentProvider
+
+// Why these block:
+// 1. Binder call to system_server
+// 2. system_server's Binder threads might be busy
+// 3. The service might hold a lock (AMS lock, PMS lock)
+// 4. The service might do disk I/O (PMS scanning packages)
+// 5. Round-trip: ~50-100μs best case, ~100ms+ worst case
+
+// Detection:
+StrictMode.setThreadPolicy(
+    StrictMode.ThreadPolicy.Builder()
+        .detectCustomSlowCalls()  // Detects slow Binder calls
+        .penaltyLog()
+        .build()
+)
+
+// Fix patterns:
+// 1. Move to a background coroutine:
+viewModelScope.launch(Dispatchers.IO) {
+    val packages = packageManager.getInstalledPackages(0)
+    // Process on IO, post result to UI
+}
+
+// 2. Use async alternatives when available:
+// SharedPreferences.apply() instead of commit()
+// registerForActivityResult() instead of startActivityForResult()
+
+// 3. Cache results:
+// Don't call getInstalledPackages() every time — cache and refresh periodically</code></pre>
+
+<!-- ============================================================ -->
+<h2>6. IPC Optimization Patterns</h2>
+
+<pre><code>// Pattern 1: BATCH OPERATIONS
+// BAD: 100 separate Binder calls
+for (item in items) {
+    contentResolver.insert(uri, contentValuesOf(item))
+}
+// GOOD: 1 Binder call
+contentResolver.bulkInsert(uri, items.map { contentValuesOf(it) }.toTypedArray())
+
+// Pattern 2: SHARED MEMORY FOR BULK DATA
+// BAD: sending 5MB of data in a Parcel → TransactionTooLargeException
+// GOOD: write to SharedMemory, pass the fd via Binder
+val sharedMemory = SharedMemory.create("bulk_data", dataSize)
+val buffer = sharedMemory.mapReadWrite()
+buffer.put(largeByteArray)
+sharedMemory.setProtect(OsConstants.PROT_READ)
+// Pass sharedMemory via AIDL (it implements Parcelable)
+// Receiver: sharedMemory.mapReadOnly() → zero-copy read
+
+// Pattern 3: CURSOR WINDOW REUSE
+// ContentProvider already uses shared memory (CursorWindow)
+// For custom providers: override getStreamTypes() and openTypedAssetFile()
+// to return a ParcelFileDescriptor for large binary data
+
+// Pattern 4: ONEWAY + CALLBACK
+// Instead of synchronous request-response:
+// BAD: val result = remoteService.heavyComputation(input) // blocks
+// GOOD:
+// remoteService.heavyComputationAsync(input, callback) // oneway, returns immediately
+// callback.onResult(result) // oneway callback when done
+
+// Pattern 5: LOCAL BINDER OPTIMIZATION
+// If client and server are in the same process:
+// Stub.asInterface() returns the Stub directly (no IPC)
+// Design your Service to work both in-process and cross-process
+// Use dependency injection to swap real vs local implementations</code></pre>
+
+<!-- ============================================================ -->
+<h2>7. Profiling Binder Performance</h2>
+
+<pre><code>// Tool 1: Systrace / Perfetto
+// Binder transactions appear in the "binder" track
+// Shows: transaction start/end, thread, target process
+// Look for: long transactions, thread pool saturation
+
+// Tool 2: dumpsys
+// adb shell dumpsys activity service-permissions  → service Binder stats
+// adb shell dumpsys meminfo <pid>                 → Binder buffer usage
+// adb shell cat /proc/binder/stats                → kernel-level stats
+// adb shell cat /proc/binder/transactions         → pending transactions
+// adb shell cat /proc/binder/proc/<pid>           → per-process Binder state
+
+// Tool 3: Binder transaction logging
+// adb shell setprop persist.sys.binder.log 1
+// Logs all Binder transactions (VERY verbose — use briefly)
+
+// Tool 4: Method tracing
+// Debug.startMethodTracing("binder_profile")
+// // ... do work ...
+// Debug.stopMethodTracing()
+// Open in Android Studio Profiler → look for transact() calls
+
+// Key metrics to watch:
+// 1. Transaction count per second (high = chatty IPC)
+// 2. Average transaction latency (>1ms = investigate)
+// 3. Binder thread utilization (>80% = pool pressure)
+// 4. Buffer usage (>500KB = risk of exhaustion)
+// 5. Parcel sizes (>100KB = consider shared memory)</code></pre>
+
+<!-- ============================================================ -->
+<h2>8. Real-World IPC Anti-Patterns</h2>
+
+<table>
+  <tr>
+    <th>Anti-Pattern</th>
+    <th>Problem</th>
+    <th>Fix</th>
+  </tr>
+  <tr>
+    <td>Bitmap in Intent extras</td>
+    <td>500KB+ Parcel, TransactionTooLargeException</td>
+    <td>Use content URI or file path</td>
+  </tr>
+  <tr>
+    <td>Large savedInstanceState</td>
+    <td>All Fragment states bundled → exceeds 1MB</td>
+    <td>ViewModel for transient, SavedStateHandle for essentials</td>
+  </tr>
+  <tr>
+    <td>Synchronous Binder on main thread</td>
+    <td>ANR if system_server is busy</td>
+    <td>Move to Dispatchers.IO coroutine</td>
+  </tr>
+  <tr>
+    <td>Per-item ContentProvider inserts</td>
+    <td>N Binder calls instead of 1</td>
+    <td>bulkInsert() or applyBatch()</td>
+  </tr>
+  <tr>
+    <td>Rapid oneway to slow receiver</td>
+    <td>Buffer exhaustion, silent failure</td>
+    <td>Rate-limit, batch callbacks</td>
+  </tr>
+  <tr>
+    <td>Circular synchronous Binder calls</td>
+    <td>Distributed deadlock</td>
+    <td>Unidirectional calls, oneway callbacks</td>
+  </tr>
+  <tr>
+    <td>Serializable in Binder</td>
+    <td>10x slower than Parcelable, GC pressure</td>
+    <td>Always use Parcelable or @Parcelize</td>
+  </tr>
+  <tr>
+    <td>Not caching getSystemService()</td>
+    <td>Repeated ServiceManager lookups</td>
+    <td>Cache the wrapper object</td>
+  </tr>
+</table>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — IPC at Google Scale</div>
+  <p>At Google, apps like Google Search, Maps, and Play Services communicate heavily via IPC. Play Services alone handles thousands of Binder transactions per second from dozens of client apps. Key lessons: (1) <strong>Connection pooling</strong> — reuse ServiceConnection objects, don't bind/unbind repeatedly. (2) <strong>Async everywhere</strong> — Google Play Services APIs return <code>Task&lt;T&gt;</code> (async) not raw values. (3) <strong>Versioned AIDL</strong> — Play Services uses stable AIDL so old clients work with new servers. (4) <strong>Monitoring</strong> — Binder transaction latency is a key SLI (Service Level Indicator) tracked in production.</p>
+</div>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  ← <a href="05-system-services.html">05 — System Services</a> &nbsp;|&nbsp;
+  <a href="07-interview-qa.html">07 — Interview Q&A →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

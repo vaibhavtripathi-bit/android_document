@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 — Jank Diagnosis & Optimization — Systrace, FrameMetrics, JankStats, Patterns, Optimization</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-vsync-choreographer.html">01 VSYNC</a>
+  <a href="02-measure-layout-draw.html">02 Measure/Layout/Draw</a>
+  <a href="03-render-thread.html">03 RenderThread</a>
+  <a href="04-surface-flinger.html">04 SurfaceFlinger</a>
+  <a href="05-skia-gpu.html">05 Skia & GPU</a>
+  <a class="active" href="06-jank-diagnosis.html">06 Jank Diagnosis</a>
+  <a href="07-compose-rendering.html">07 Compose Rendering</a>
+  <a href="08-interview-qa.html">08 Interview Q&A</a>
+</div>
+
+<h1>Jank Diagnosis & Optimization</h1>
+<p class="subtitle">Systrace/Perfetto, FrameMetrics API, JankStats library, common jank patterns, dropped frame analysis, and optimization strategies</p>
+
+<!-- ============================================================ -->
+<h2>1. What Is Jank</h2>
+
+<p><strong>Jank</strong> is any visible stutter or hitch in the UI — the frame didn't arrive at the display in time. Formally: a frame that <strong>missed the VSYNC deadline</strong>.</p>
+
+<p>When a frame takes longer than the display's refresh interval (16.67ms at 60Hz, 8.33ms at 120Hz), the display shows the previous frame again. The user perceives a stutter — content appears to jump or freeze instead of smooth motion.</p>
+
+<h3>Perception Thresholds</h3>
+<table>
+  <tr><th>Frame duration</th><th>Effect</th></tr>
+  <tr><td>&lt; 16.67ms (60Hz)</td><td>Smooth — no perceived jank</td></tr>
+  <tr><td>16–33ms</td><td>Single dropped frame — subtle hitch, most users notice</td></tr>
+  <tr><td>33–50ms</td><td>2–3 dropped frames — visible stutter</td></tr>
+  <tr><td>&gt; 50ms</td><td>Severe jank — UI feels frozen</td></tr>
+</table>
+
+<p>At 60Hz, each frame is ~16.67ms. If the UI thread takes 25ms for a single frame, the display shows the previous frame for 8ms extra — one dropped frame. If it takes 50ms, three frames are dropped.</p>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Jank vs Jitter</div>
+  <p><strong>Jank</strong> is a missed frame. <strong>Jitter</strong> is variance in frame timing — frames arrive on time but with irregular spacing. Jitter can feel worse than occasional jank because it disrupts the perceived smoothness of animations. For example, 10 frames at 14ms, 18ms, 12ms, 20ms all hit the deadline but feel less smooth than 10 frames at exactly 16.67ms. Production monitoring should track both: jank count (frames &gt; 16.67ms) and frame time variance (e.g., 95th percentile minus median).</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Systrace / Perfetto</h2>
+
+<p><strong>Systrace</strong> is the legacy trace capture tool. <strong>Perfetto</strong> is its successor — same underlying infrastructure, but with a modern UI and better trace analysis. Both capture kernel-level events (scheduling, CPU, GPU) plus app-level instrumentation.</p>
+
+<h3>Capturing a Trace</h3>
+<pre><code>// Command line (Perfetto):
+// 1. Record a trace:
+adb shell perfetto -o /data/misc/perfetto-traces/trace.pb -t 60000 \
+  -c /data/misc/perfetto-traces/config.pbtxt
+
+// Or use the Perfetto UI: https://ui.perfetto.dev
+// Connect device, select "Android", enable tracing categories, start
+
+// 2. Pull trace:
+adb pull /data/misc/perfetto-traces/trace.pb
+
+// 3. Open in trace viewer: https://ui.perfetto.dev
+// Upload trace.pb or open locally
+
+// Legacy systrace:
+python systrace.py -o trace.html -t 5 sched gfx view wm am freq</code></pre>
+
+<h3>Key Trace Sections to Inspect</h3>
+<table>
+  <tr><th>Section</th><th>What it shows</th></tr>
+  <tr><td><code>Choreographer#doFrame</code></td><td>Full frame work on UI thread — input, animation, measure, layout, draw</td></tr>
+  <tr><td><code>Choreographer#doFrame</code> → <code>DrawFrame</code></td><td>Recording DisplayList to RenderThread</td></tr>
+  <tr><td><code>Choreographer#doFrame</code> → <code>traversal</code></td><td>Measure, layout, draw phases</td></tr>
+  <tr><td><code>RenderThread</code></td><td>GPU command recording, sync, flush</td></tr>
+  <tr><td><code>dequeueBuffer</code> / <code>queueBuffer</code></td><td>Buffer queue operations — stalls if GPU is busy</td></tr>
+  <tr><td><code>SurfaceFlinger</code></td><td>Composition — usually not the bottleneck</td></tr>
+</table>
+
+<p>When diagnosing jank: <strong>find the longest slice</strong> inside <code>doFrame</code>. If it's in <code>traversal</code> → measure/layout/draw issue. If it's in <code>DrawFrame</code> → recording or sync. If it's in <code>RenderThread</code> → GPU or shader compilation.</p>
+
+<div class="diagram-container">
+<svg viewBox="0 0 800 220" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+  <text x="400" y="20" fill="#c084fc" font-size="13" text-anchor="middle" font-weight="700">Systrace/Perfetto — Frame Timeline</text>
+  <text x="400" y="40" fill="#8b8fa3" font-size="9" text-anchor="middle">UI Thread (main) — doFrame</text>
+  <rect x="40" y="55" width="120" height="35" rx="4" fill="rgba(248,113,113,0.15)" stroke="#f87171"/>
+  <text x="100" y="72" fill="#f87171" font-size="9" text-anchor="middle">Input</text>
+  <rect x="165" y="55" width="120" height="35" rx="4" fill="rgba(251,191,36,0.15)" stroke="#fbbf24"/>
+  <text x="225" y="72" fill="#fbbf24" font-size="9" text-anchor="middle">Animation</text>
+  <rect x="290" y="55" width="150" height="35" rx="4" fill="rgba(108,158,255,0.15)" stroke="#6c9eff"/>
+  <text x="365" y="72" fill="#6c9eff" font-size="9" text-anchor="middle">Measure/Layout</text>
+  <rect x="445" y="55" width="120" height="35" rx="4" fill="rgba(74,222,128,0.15)" stroke="#4ade80"/>
+  <text x="505" y="72" fill="#4ade80" font-size="9" text-anchor="middle">Draw</text>
+  <rect x="570" y="55" width="120" height="35" rx="4" fill="rgba(192,132,252,0.15)" stroke="#c084fc"/>
+  <text x="630" y="72" fill="#c084fc" font-size="9" text-anchor="middle">Sync</text>
+  <text x="400" y="105" fill="#8b8fa3" font-size="9" text-anchor="middle">RenderThread — DrawFrame</text>
+  <rect x="40" y="115" width="180" height="35" rx="4" fill="rgba(74,222,128,0.15)" stroke="#4ade80"/>
+  <text x="130" y="132" fill="#4ade80" font-size="9" text-anchor="middle">Record DisplayList</text>
+  <rect x="225" y="115" width="180" height="35" rx="4" fill="rgba(192,132,252,0.15)" stroke="#c084fc"/>
+  <text x="315" y="132" fill="#c084fc" font-size="9" text-anchor="middle">Flush GPU commands</text>
+  <rect x="410" y="115" width="180" height="35" rx="4" fill="rgba(251,191,36,0.15)" stroke="#fbbf24"/>
+  <text x="500" y="132" fill="#fbbf24" font-size="9" text-anchor="middle">dequeueBuffer</text>
+  <rect x="595" y="115" width="180" height="35" rx="4" fill="rgba(248,113,113,0.15)" stroke="#f87171"/>
+  <text x="685" y="132" fill="#f87171" font-size="9" text-anchor="middle">queueBuffer</text>
+  <text x="400" y="175" fill="#8b8fa3" font-size="9" text-anchor="middle">Identify the longest slice — that's your bottleneck.</text>
+  <text x="400" y="195" fill="#c084fc" font-size="9" text-anchor="middle">Jank: look for doFrame &gt; 16.67ms or gaps between frames.</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. FrameMetrics API</h2>
+
+<p><code>Window.OnFrameMetricsAvailableListener</code> (API 24) provides per-frame timing breakdowns directly in your app. It's the programmatic way to measure frame performance without external tools.</p>
+
+<h3>Available Metrics</h3>
+<table>
+  <tr><th>Metric</th><th>Description</th></tr>
+  <tr><td><code>TOTAL_DURATION</code></td><td>Total frame time (input to display)</td></tr>
+  <tr><td><code>LAYOUT_MEASURE_DURATION</code></td><td>Measure + layout phase</td></tr>
+  <tr><td><code>DRAW_DURATION</code></td><td>Recording DisplayList to RenderThread</td></tr>
+  <tr><td><code>SYNC_DURATION</code></td><td>Sync with RenderThread (upload bitmaps, etc.)</td></tr>
+  <tr><td><code>COMMAND_ISSUE_DURATION</code></td><td>RenderThread issuing GPU commands</td></tr>
+  <tr><td><code>SWAP_BUFFERS_DURATION</code></td><td>Waiting for GPU to finish, swap buffers</td></tr>
+  <tr><td><code>GPU_DURATION</code></td><td>Actual GPU execution time (API 28+)</td></tr>
+</table>
+
+<pre><code>// Registering FrameMetrics listener (API 24+):
+window.addOnFrameMetricsAvailableListener { window, frameMetrics, dropCount ->
+    val totalDuration = frameMetrics.getMetric(FrameMetrics.TOTAL_DURATION)
+    val layoutMeasure = frameMetrics.getMetric(FrameMetrics.LAYOUT_MEASURE_DURATION)
+    val drawDuration = frameMetrics.getMetric(FrameMetrics.DRAW_DURATION)
+    val syncDuration = frameMetrics.getMetric(FrameMetrics.SYNC_DURATION)
+    val commandIssue = frameMetrics.getMetric(FrameMetrics.COMMAND_ISSUE_DURATION)
+    val swapBuffers = frameMetrics.getMetric(FrameMetrics.SWAP_BUFFERS_DURATION)
+
+    // All values in nanoseconds
+    val totalMs = totalDuration / 1_000_000
+    if (totalMs > 16) {
+        // Jank detected — log which phase dominated
+        val phase = when {
+            layoutMeasure > drawDuration && layoutMeasure > syncDuration -> "Layout"
+            drawDuration > layoutMeasure && drawDuration > syncDuration -> "Draw"
+            syncDuration > layoutMeasure && syncDuration > drawDuration -> "Sync"
+            swapBuffers > commandIssue -> "GPU"
+            else -> "Command"
+        }
+        Log.w("FrameMetrics", "Jank: ${totalMs}ms, dominant phase: $phase")
+    }
+}
+
+// Remove when done
+window.removeOnFrameMetricsAvailableListener(listener)</code></pre>
+
+<div class="callout danger">
+  <div class="callout-label">Production Use</div>
+  <p>FrameMetrics has overhead — ~2–5% CPU on the UI thread when enabled. Use it only in debug builds or behind a feature flag. For production, prefer <code>JankStats</code> which samples frames and aggregates. For one-off diagnosis, Systrace/Perfetto is more accurate and has no app overhead.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. JankStats Library (Jetpack)</h2>
+
+<p><code>JankStats</code> (Jetpack) is the recommended way to track frame performance in production. It samples frames, aggregates jank stats, and integrates with analytics.</p>
+
+<pre><code>// build.gradle
+implementation("androidx.metrics:metrics-performance:1.0.0")
+
+// Create and track JankStats:
+val jankStats = JankStats.createAndTrack(window, frameDataCallback = { frameData ->
+    // FrameData contains: frameDurationUiNanos, frameDurationCpuNanos,
+    // isJankFrame, totalFrameDuration
+    if (frameData.isJankFrame) {
+        Log.w("JankStats", "Jank: ${frameData.totalFrameDuration / 1_000_000}ms")
+    }
+})
+
+// Optional: add state context
+jankStats.addState("Screen", "Home")
+
+// When navigating:
+jankStats.addState("Screen", "Detail")
+
+// Optional: report to analytics (state is included in frameData when available)
+jankStats.addFrameDataListener { frameData ->
+    if (frameData.isJankFrame) {
+        analytics.logEvent("jank", mapOf(
+            "duration_ms" to (frameData.totalFrameDuration / 1_000_000)
+        ))
+    }
+}
+
+// Release when done:
+jankStats.release()</code></pre>
+
+<p><code>JankStats</code> uses <code>FrameMetrics</code> internally but samples frames (e.g., every 100th frame) to reduce overhead. It defines jank as: <code>frameDuration</code> &gt; <code>frameDuration * 1.5</code> or &gt; 700ms (configurable).</p>
+
+<!-- ============================================================ -->
+<h2>5. Common Jank Patterns</h2>
+
+<table>
+  <tr><th>Pattern</th><th>Cause</th><th>Systrace Signature</th><th>Fix</th></tr>
+  <tr>
+    <td><strong>Main thread blocking</strong></td>
+    <td>Network, disk I/O, heavy computation on UI thread</td>
+    <td>Long gaps in <code>doFrame</code>, or <code>doFrame</code> delayed</td>
+    <td>Move to coroutines/Dispatchers.IO, use ViewModel</td>
+  </tr>
+  <tr>
+    <td><strong>Layout thrashing</strong></td>
+    <td><code>requestLayout</code> in <code>onDraw</code>, nested double-measure</td>
+    <td>Multiple <code>traversal</code> / <code>measure</code> / <code>layout</code> inside one frame</td>
+    <td>Never call <code>requestLayout</code> in draw; use <code>postOnAnimation</code></td>
+  </tr>
+  <tr>
+    <td><strong>Bitmap allocation during scroll</strong></td>
+    <td>Decoding large bitmap in <code>onBindViewHolder</code></td>
+    <td>GC pauses, <code>BitmapFactory.decode</code> in frame</td>
+    <td>Use Coil/Glide, preload, decode off main thread</td>
+  </tr>
+  <tr>
+    <td><strong>RecyclerView item inflation jank</strong></td>
+    <td>Complex XML inflation, nested layouts</td>
+    <td>Long <code>inflate</code> or <code>measure</code> in <code>onCreateViewHolder</code></td>
+    <td>ViewStub, <code>setHasFixedSize(true)</code>, <code>prefetch</code>, AsyncLayoutInflater</td>
+  </tr>
+  <tr>
+    <td><strong>Shader compilation jank</strong></td>
+    <td>First frame of new UI (rounded rect, custom draw)</td>
+    <td><code>GrGLProgram</code> or <code>vkCreateGraphicsPipelines</code> on RenderThread</td>
+    <td>Pre-warm shaders off-screen, Baseline Profile, ProfileInstaller</td>
+  </tr>
+  <tr>
+    <td><strong>Sync stall</strong></td>
+    <td>RenderThread busy (GPU upload, sync)</td>
+    <td>Long <code>sync</code> or <code>dequeueBuffer</code> wait</td>
+    <td>Reduce bitmap size, pre-upload textures, avoid large bitmap upload</td>
+  </tr>
+  <tr>
+    <td><strong>Overdraw</strong></td>
+    <td>Same pixel drawn multiple times</td>
+    <td>High GPU fill rate, long <code>DrawFrame</code></td>
+    <td>Remove redundant backgrounds, use clipRect, reduce view hierarchy</td>
+  </tr>
+  <tr>
+    <td><strong>Large bitmap upload</strong></td>
+    <td>Uploading large bitmap to GPU texture</td>
+    <td>Long <code>sync</code> or <code>upload</code></td>
+    <td>Downsample before display, use inSampleSize, BitmapFactory.Options</td>
+  </tr>
+</table>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Layout Thrashing</div>
+  <p>Layout thrashing is one of the most insidious jank causes. The classic mistake: calling <code>requestLayout()</code> or <code>invalidate()</code> during <code>onDraw()</code>. That triggers another layout pass in the same frame — doubling the work. Worse: if a parent's layout depends on a child's size, and the child's size changes during layout, you get nested measure/layout. The fix: use <code>View.post { requestLayout() }</code> or <code>View.postOnAnimation { requestLayout() }</code> to defer to the next frame. Or use <code>ConstraintLayout</code> with flat hierarchy to avoid nested measure.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Optimization Strategies</h2>
+
+<h3>Hierarchy Flattening</h3>
+<p>Deep view hierarchies cause multiple measure/layout passes. Use <code>ConstraintLayout</code> with flat structure, or <code>Merge</code> in XML to avoid redundant layouts.</p>
+
+<h3>ViewStub</h3>
+<pre><code>// Defer inflation of rarely-used views:
+&lt;ViewStub
+    android:id="@+id/stub_details"
+    android:layout="@layout/details_panel"
+    android:inflateId="@+id/details_panel" /&gt;
+
+// Inflate only when needed:
+findViewById&lt;ViewStub&gt;(R.id.stub_details).inflate()</code></pre>
+
+<h3>RecyclerView Optimization</h3>
+<pre><code>// setHasFixedSize — if item size doesn't change, skip layout pass
+recyclerView.setHasFixedSize(true)
+
+// DiffUtil — efficient updates without full rebind
+val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
+    override fun getOldListSize() = oldList.size
+    override fun getNewListSize() = newList.size
+    override fun areItemsTheSame(old: Int, new: Int) = oldList[old].id == newList[new].id
+    override fun areContentsTheSame(old: Int, new: Int) = oldList[old] == newList[new]
+})
+adapter.submitList(newList, diff)
+
+// Prefetch — RecyclerView prefetches items before they're visible
+recyclerView.setItemViewCacheSize(20) // Default: 2</code></pre>
+
+<h3>Async Inflation</h3>
+<pre><code>// AsyncLayoutInflater — inflate on background thread
+AsyncLayoutInflater(context).inflate(R.layout.complex_item, parent) { view, _, _ ->
+    // Use view on main thread
+    runOnUiThread { parent.addView(view) }
+}</code></pre>
+
+<h3>R8 Optimization</h3>
+<p>Enable R8 full mode, shrink resources, and obfuscation. R8 inlines small methods and removes dead code — reduces APK size and can improve JIT warmup.</p>
+
+<!-- ============================================================ -->
+<h2>7. Baseline Profiles</h2>
+
+<p><strong>Baseline Profiles</strong> are Android's solution for eliminating JIT compilation jank. When a user first opens a screen, the JIT compiler compiles hot methods — causing 50–200ms of jank. Baseline Profiles pre-compile these methods at install time.</p>
+
+<h3>How They Work</h3>
+<p>A Baseline Profile is a list of <code>class.method</code> descriptors that should be compiled ahead of time (AOT). At install, the system compiles these methods — so when the user opens the app, the code is already compiled.</p>
+
+<h3>Creating a Baseline Profile</h3>
+<pre><code>// 1. Add Macrobenchmark module (androidTest):
+// androidTest/java/com/example/app/BaselineProfileGenerator.kt
+
+@RunWith(AndroidJUnit4::class)
+class BaselineProfileGenerator {
+    @get:Rule
+    val rule = BaselineProfileRule()
+
+    @Test
+    fun generateBaselineProfile() {
+        rule.collect(
+            packageName = "com.example.app",
+            maxIterations = 10
+        ) {
+            pressHome()
+            startActivityAndWait()
+            device.wait(Until.hasObject(By.text("Home")), 5_000)
+            // Navigate to key screens
+            device.findObject(By.text("Detail")).click()
+            device.wait(Until.hasObject(By.text("Detail")), 5_000)
+            // Scroll
+            device.findObject(By.scrollable(true)).scroll(Direction.DOWN)
+        }
+    }
+}</code></pre>
+
+<pre><code>// 2. Run: ./gradlew :app:generateBaselineProfile
+// 3. Output: app/src/main/baseline-prof.txt
+// 4. Add to build.gradle:
+android {
+    defaultConfig {
+        baselineProfileFile = file("baseline-prof.txt")
+    }
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Baseline Profile vs ProfileInstaller</div>
+  <p><strong>Baseline Profiles</strong> (Android 7+) target app code paths — the methods you exercise during profile generation. <strong>ProfileInstaller</strong> (Jetpack) downloads cloud profiles from Google Play — these profiles are aggregated from real users' usage patterns. The best approach: ship your own Baseline Profile (covers your critical paths) and add ProfileInstaller for cloud profiles (covers paths you might miss). Cloud profiles are updated over time as users use the app. For L6: understand that Baseline Profiles eliminate JIT jank on first launch — but they don't help with shader compilation (that's GPU-side) or layout complexity (that's CPU-side).</p>
+</div>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  ← <a href="05-skia-gpu.html">05 — Skia & GPU</a> &nbsp;|&nbsp;
+  <a href="07-compose-rendering.html">07 — Compose Rendering</a> → &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

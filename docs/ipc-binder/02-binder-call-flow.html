@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 — Binder Call Flow — Proxy, Stub, Parcel, Thread Pools & Death Notifications</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-binder-architecture.html">01 Binder Architecture</a>
+  <a class="active" href="02-binder-call-flow.html">02 Call Flow</a>
+  <a href="03-aidl-internals.html">03 AIDL</a>
+  <a href="04-zygote-process-model.html">04 Zygote</a>
+  <a href="05-system-services.html">05 System Services</a>
+  <a href="06-ipc-bottlenecks.html">06 IPC Bottlenecks</a>
+  <a href="07-interview-qa.html">07 Interview Q&A</a>
+</div>
+
+<h1>02 — Binder Call Flow</h1>
+<p class="subtitle">End-to-end trace of a Binder RPC — from Proxy to Stub, Parcel serialization, thread pool dispatch, synchronous vs oneway semantics, and death notifications</p>
+
+<!-- ============================================================ -->
+<h2>1. The IBinder Hierarchy — Java/Kotlin Layer</h2>
+
+<pre><code>// The Java Binder framework mirrors the kernel structures:
+
+// IBinder (interface)
+//   ├── Binder (local implementation — "BBinder" in native)
+//   │     └── Your AIDL Stub extends this
+//   └── BinderProxy (remote handle — "BpBinder" in native)
+//         └── Your AIDL Proxy wraps this
+
+// Key IBinder methods:
+interface IBinder {
+    fun transact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean
+    fun linkToDeath(recipient: DeathRecipient, flags: Int)
+    fun unlinkToDeath(recipient: DeathRecipient, flags: Int): Boolean
+    fun isBinderAlive(): Boolean
+    fun getInterfaceDescriptor(): String?
+    fun pingBinder(): Boolean
+}
+
+// Binder (local — runs in the server process):
+open class Binder : IBinder {
+    // transact() calls onTransact() — your implementation
+    override fun transact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+        // ... validation ...
+        return onTransact(code, data, reply, flags) // Dispatches to your code
+    }
+
+    // Override this in your Stub:
+    protected open fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean
+}
+
+// BinderProxy (remote — runs in the client process):
+// - Created by the framework when you receive an IBinder from another process
+// - transact() calls into native BpBinder::transact() → ioctl(BINDER_WRITE_READ)
+// - You never create BinderProxy directly; the framework does it</code></pre>
+
+<!-- ============================================================ -->
+<h2>2. End-to-End Call Trace</h2>
+
+<div class="diagram-container">
+<pre><code>  CLIENT PROCESS                          SERVER PROCESS
+  ──────────────                          ──────────────
+  ① App calls proxy.doSomething(arg)
+     │
+  ② Proxy.Stub.Proxy.doSomething():
+     │  val _data = Parcel.obtain()
+     │  _data.writeInterfaceToken(DESCRIPTOR)
+     │  _data.writeString(arg)
+     │  val _reply = Parcel.obtain()
+     │
+  ③ mRemote.transact(TRANSACTION_doSomething, _data, _reply, 0)
+     │  ↓ (BinderProxy.transact)
+     │  ↓ (native BpBinder::transact)
+     │  ↓ (IPCThreadState::transact)
+     │  ↓ (ioctl(fd, BINDER_WRITE_READ, &bwr))
+     │
+     │  ══════════ KERNEL ══════════
+     │  binder_transaction():
+     │    - Find target binder_node
+     │    - Copy caller UID/PID from current->cred
+     │    - Allocate buffer in target's mmap space
+     │    - copy_from_user() — ONE COPY
+     │    - Translate any IBinder objects
+     │    - Enqueue BR_TRANSACTION on target's todo
+     │    - wake_up(target_thread)
+     │    - Caller sleeps (synchronous)
+     │  ══════════════════════════════
+     │                                    │
+     │                                 ④ Binder thread wakes up
+     │                                    IPCThreadState::executeCommand()
+     │                                    │
+     │                                 ⑤ BBinder::transact()
+     │                                    → Binder.execTransact() (JNI)
+     │                                    → Stub.onTransact(code, data, reply, flags)
+     │                                    │
+     │                                 ⑥ Stub dispatches by code:
+     │                                    when (TRANSACTION_doSomething) {
+     │                                      val arg = data.readString()
+     │                                      val result = this.doSomething(arg)
+     │                                      reply.writeNoException()
+     │                                      reply.writeString(result)
+     │                                    }
+     │                                    │
+     │                                 ⑦ Reply: ioctl(BINDER_WRITE_READ) with BC_REPLY
+     │                                    │
+     │  ══════════ KERNEL ══════════
+     │  binder_transaction() (reply=true):
+     │    - Find original caller thread
+     │    - Copy reply into caller's mmap buffer
+     │    - Wake up caller
+     │  ══════════════════════════════
+     │
+  ⑧ Caller wakes up
+     │  _reply.readException()
+     │  val result = _reply.readString()
+     │  _data.recycle()
+     │  _reply.recycle()
+     │  return result</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Parcel — The Serialization Format</h2>
+
+<pre><code>// Parcel is Binder's serialization container. It's NOT a general-purpose
+// serialization format — it's designed specifically for IPC.
+
+// Parcel is a flat buffer of typed data:
+val parcel = Parcel.obtain()
+
+// Primitives (written directly, no overhead):
+parcel.writeInt(42)
+parcel.writeLong(123456789L)
+parcel.writeFloat(3.14f)
+parcel.writeDouble(2.718)
+parcel.writeString("hello")       // UTF-16 encoded, length-prefixed
+parcel.writeByteArray(byteArrayOf(1, 2, 3))
+
+// Parcelable objects (custom serialization):
+parcel.writeParcelable(myObject, 0)
+// Calls myObject.writeToParcel(parcel, flags)
+
+// IBinder references (translated by kernel):
+parcel.writeStrongBinder(myBinder)
+// Kernel translates: local BBinder → binder_node → binder_ref for receiver
+
+// File descriptors (dup'd by kernel):
+parcel.writeFileDescriptor(fd)
+// Kernel dups the fd into the target process
+
+// CRITICAL: Parcel is NOT safe for persistent storage
+// - Format is not versioned
+// - Depends on platform implementation
+// - Use only for IPC, never for disk/network</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Warning — Parcel Size Limits</div>
+  <p>The Binder transaction buffer is ~1MB <em>per process</em>, shared across all concurrent transactions. A single transaction that exceeds the remaining buffer space throws <code>TransactionTooLargeException</code>. In practice, keep individual transactions under 100KB. For large data, use: (1) <code>ashmem</code> / <code>SharedMemory</code> for bulk byte arrays, (2) <code>ContentProvider</code> with a cursor for large result sets, (3) file-based transfer with a content URI.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Binder Thread Pool</h2>
+
+<pre><code>// Each process that uses Binder has a thread pool for handling incoming transactions.
+
+// Pool configuration (native, ProcessState.cpp):
+// - Maximum threads: 15 (BINDER_DEFAULT_MAX_THREADS, set via ioctl)
+//   + 1 main Binder thread = 16 total threads that can handle transactions
+// - Threads are spawned on demand by the kernel (BR_SPAWN_LOOPER)
+// - Once spawned, threads loop in IPCThreadState::joinThreadPool()
+
+// Thread lifecycle:
+// 1. Process starts → main thread calls startThreadPool()
+//    → spawns one thread that calls joinThreadPool()
+// 2. Incoming transaction arrives, no free thread →
+//    kernel sends BR_SPAWN_LOOPER to the process
+// 3. Process spawns a new thread (up to max)
+// 4. Thread enters joinThreadPool() → loops on ioctl(BINDER_WRITE_READ)
+// 5. Thread receives BR_TRANSACTION → executes onTransact()
+// 6. Thread sends BC_REPLY → goes back to waiting
+
+// IMPORTANT: These are NOT your app's worker threads.
+// Binder threads are managed by the framework, separate from:
+// - Main/UI thread (Looper thread)
+// - Coroutine dispatchers
+// - ExecutorService threads
+
+// When a Binder call arrives, it runs on a BINDER THREAD.
+// If you need to touch the UI, you must post to the main thread:
+// Handler(Looper.getMainLooper()).post { updateUI() }</code></pre>
+
+<div class="diagram-container">
+<pre><code>  App Process Thread Pool
+  ┌─────────────────────────────────────────────────┐
+  │                                                   │
+  │  Main Thread (UI)          ← Looper/Handler       │
+  │  ─────────────                                    │
+  │                                                   │
+  │  Binder Thread 1  ← joinThreadPool() ← waiting   │
+  │  Binder Thread 2  ← joinThreadPool() ← handling  │
+  │  Binder Thread 3  ← joinThreadPool() ← waiting   │
+  │  ...                                              │
+  │  Binder Thread 15 ← joinThreadPool() ← waiting   │
+  │  + Main Binder    ← startThreadPool()             │
+  │  ─────────────────                                │
+  │  Total: up to 16 Binder threads                   │
+  │                                                   │
+  │  Worker threads (coroutines, executors) ← yours   │
+  │  ─────────────────────────────────                │
+  │                                                   │
+  └─────────────────────────────────────────────────┘</code></pre>
+</div>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — system_server Thread Pool</div>
+  <p><code>system_server</code> increases its Binder thread pool to 31 (via <code>BinderInternal.setMaxThreads(31)</code>) because it handles transactions from ALL apps simultaneously. Even so, under heavy load (e.g., many apps starting at boot), the pool can be exhausted, causing Binder calls to block. This is one reason cold boot is slow — apps compete for system_server's Binder threads. Android optimizes this with transaction batching and <code>oneway</code> calls where possible.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Synchronous vs Oneway Transactions</h2>
+
+<pre><code>// Synchronous (default):
+// - Client thread BLOCKS until server processes and replies
+// - Client sleeps in kernel (wait_event_interruptible)
+// - Server's onTransact() runs, writes reply, sends BC_REPLY
+// - Client wakes up, reads reply
+// - Guarantees ordering: call A completes before call B starts (per-thread)
+
+// Oneway (FLAG_ONEWAY / IBinder.FLAG_ONEWAY):
+// - Client does NOT block — returns immediately after kernel accepts
+// - No reply Parcel (reply parameter is null)
+// - Server processes asynchronously
+// - Transactions are queued and processed in order (per binder_node)
+// - Used for: callbacks, notifications, fire-and-forget operations
+
+// AIDL syntax:
+// oneway interface ICallback {
+//     void onResult(in String data);  // All methods are oneway
+// }
+// OR per-method:
+// interface IService {
+//     String getData();               // Synchronous
+//     oneway void notifyChange();     // Oneway
+// }
+
+// Oneway gotchas:
+// 1. No return value — can't get a result
+// 2. No exception propagation — server crash is silent
+// 3. Transactions can queue up — if server is slow, buffer fills
+// 4. Ordering is guaranteed per-node, but NOT across different nodes
+// 5. If the target process dies, queued oneway transactions are lost</code></pre>
+
+<table>
+  <tr>
+    <th>Aspect</th>
+    <th>Synchronous</th>
+    <th>Oneway</th>
+  </tr>
+  <tr>
+    <td>Client blocks?</td>
+    <td>Yes — until reply</td>
+    <td>No — returns immediately</td>
+  </tr>
+  <tr>
+    <td>Reply Parcel?</td>
+    <td>Yes</td>
+    <td>No (null)</td>
+  </tr>
+  <tr>
+    <td>Exception propagation?</td>
+    <td>Yes (RemoteException)</td>
+    <td>No</td>
+  </tr>
+  <tr>
+    <td>Ordering guarantee?</td>
+    <td>Sequential per-thread</td>
+    <td>FIFO per-node</td>
+  </tr>
+  <tr>
+    <td>Buffer pressure?</td>
+    <td>Low (one at a time)</td>
+    <td>High (can queue many)</td>
+  </tr>
+  <tr>
+    <td>Use case</td>
+    <td>getData(), query()</td>
+    <td>Callbacks, events</td>
+  </tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>6. Death Notifications — DeathRecipient</h2>
+
+<pre><code>// When a remote process dies, all its binder_nodes are destroyed.
+// Clients holding references get notified via DeathRecipient.
+
+// Registration:
+val deathRecipient = IBinder.DeathRecipient {
+    // Called on a Binder thread (NOT the main thread)
+    Log.w(TAG, "Remote service died — cleaning up")
+    cleanupConnection()
+    scheduleReconnect()
+}
+
+// Link to the remote binder:
+remoteBinder.linkToDeath(deathRecipient, 0)
+
+// Unlink when done (e.g., in onServiceDisconnected or cleanup):
+remoteBinder.unlinkToDeath(deathRecipient, 0)
+
+// How it works internally:
+// 1. linkToDeath() → BC_REQUEST_DEATH_NOTIFICATION to kernel
+// 2. Kernel adds a binder_ref_death to the binder_ref
+// 3. When target process exits → binder_release() frees binder_proc
+// 4. For each binder_node: iterate all refs, find death notifications
+// 5. Send BR_DEAD_BINDER to each registered process
+// 6. Framework calls DeathRecipient.binderDied() on a Binder thread
+
+// ServiceConnection also uses this internally:
+// onServiceDisconnected() is triggered by the death notification
+// But onServiceDisconnected ≠ binderDied:
+// - onServiceDisconnected: called on main thread, after framework cleanup
+// - binderDied: called on Binder thread, immediately when death detected</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Death Race Condition</div>
+  <p>There's a subtle race: you receive an <code>IBinder</code> from <code>onServiceConnected()</code> and call <code>linkToDeath()</code>. But the remote process could have died between the bind and your <code>linkToDeath()</code> call. Defense: always check <code>binder.pingBinder()</code> after linking, or wrap the entire setup in a try-catch for <code>RemoteException</code>. Also, <code>binderDied()</code> is called on a Binder thread — if you update UI or shared state, you need synchronization.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. ServiceManager — The Binder Name Registry</h2>
+
+<pre><code>// ServiceManager is the central registry for system services.
+// It runs as a native daemon (not Java) and holds handle 0.
+
+// Registration (system_server only):
+// ServiceManager.addService("activity", activityManagerService)
+//
+// Internally:
+// 1. system_server calls ServiceManager.addService(name, binder)
+// 2. This calls IServiceManager.Stub.Proxy.addService()
+// 3. Which calls transact() on handle 0 (ServiceManager's BinderProxy)
+// 4. ServiceManager receives BR_TRANSACTION
+// 5. Stores name → IBinder mapping in a flat list
+// 6. SELinux check: only allowed contexts can register specific services
+
+// Lookup (any process):
+// val binder = ServiceManager.getService("activity")
+//
+// Internally:
+// 1. App calls ServiceManager.getService("activity")
+// 2. Transact to handle 0 with the service name
+// 3. ServiceManager looks up the name → returns the IBinder
+// 4. Kernel translates: ServiceManager's binder_ref → new binder_ref for caller
+// 5. Caller gets a BinderProxy wrapping the handle
+
+// ServiceManager.waitForService(name):
+// Blocks until the service is registered (used during boot)
+
+// Caching:
+// ServiceManagerNative caches lookups in a HashMap.
+// SystemServiceRegistry (in the framework) caches even more aggressively:
+// getSystemService("activity") → cached ActivityManager wrapper object
+// The IBinder is fetched once, then the wrapper is reused.</code></pre>
+
+<!-- ============================================================ -->
+<h2>8. Binder Context Propagation</h2>
+
+<pre><code>// When a Binder call arrives, the framework provides context about the caller:
+
+// On the server side (inside onTransact or AIDL implementation):
+val callerUid = Binder.getCallingUid()    // UID of the calling process
+val callerPid = Binder.getCallingPid()    // PID of the calling process
+
+// These are set by the KERNEL (from current->cred) — unforgeable.
+
+// Clearing identity for privileged operations:
+fun handleClientRequest() {
+    val callerUid = Binder.getCallingUid()
+    // Check caller's permission first:
+    enforceCallingPermission("com.example.PERMISSION", "Denied")
+
+    // Now do work on behalf of the caller using OUR privileges:
+    val token = Binder.clearCallingIdentity()
+    try {
+        // getCallingUid() now returns OUR UID (system_server's UID)
+        // This lets us call other system services without the caller's restrictions
+        performPrivilegedWork()
+    } finally {
+        Binder.restoreCallingIdentity(token) // ALWAYS restore in finally
+    }
+}
+
+// How clearCallingIdentity works:
+// - Saves current (caller's) UID/PID in a long (high 32 = PID, low 32 = UID)
+// - Sets calling UID/PID to this process's own UID/PID
+// - restoreCallingIdentity() reverses it
+// - Thread-local storage — only affects the current thread
+
+// CRITICAL: forgetting restoreCallingIdentity is a privilege escalation bug.
+// Subsequent permission checks would use the server's UID instead of the caller's.</code></pre>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  ← <a href="01-binder-architecture.html">01 — Binder Architecture</a> &nbsp;|&nbsp;
+  <a href="03-aidl-internals.html">03 — AIDL Internals →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

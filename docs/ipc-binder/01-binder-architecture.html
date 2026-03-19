@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 — Binder Architecture — The Kernel Foundation of Android IPC</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a class="active" href="01-binder-architecture.html">01 Binder Architecture</a>
+  <a href="02-binder-call-flow.html">02 Call Flow</a>
+  <a href="03-aidl-internals.html">03 AIDL</a>
+  <a href="04-zygote-process-model.html">04 Zygote</a>
+  <a href="05-system-services.html">05 System Services</a>
+  <a href="06-ipc-bottlenecks.html">06 IPC Bottlenecks</a>
+  <a href="07-interview-qa.html">07 Interview Q&A</a>
+</div>
+
+<h1>01 — Binder Architecture</h1>
+<p class="subtitle">The kernel foundation of all Android inter-process communication — why Binder exists, how it works at the driver level, and the one-copy optimization that makes it fast</p>
+
+<!-- ============================================================ -->
+<h2>1. Why Binder? — The Problem It Solves</h2>
+
+<pre><code>// Linux provides several IPC mechanisms:
+// - Pipes / Named Pipes   → unidirectional, no addressing
+// - Sockets (Unix domain) → bidirectional, but TWO copies (sender→kernel, kernel→receiver)
+// - Shared Memory (shmem) → zero-copy, but NO synchronization or security
+// - Signals               → limited data, async only
+// - Message Queues        → limited size, no object references
+
+// None of these provide ALL of:
+// 1. Security (caller identity verified by kernel)
+// 2. Performance (minimal copies)
+// 3. Object references (remote object handles across processes)
+// 4. Synchronous RPC semantics (call-and-wait)
+// 5. Death notification (know when the remote process dies)
+
+// Binder provides ALL FIVE. That's why Android chose it.
+
+// Binder originated from BeOS (as "OpenBinder"), was refined by Palm,
+// then adopted by Android. It's a loadable kernel module (LKM)
+// at drivers/android/binder.c in the Linux kernel.</code></pre>
+
+<!-- ============================================================ -->
+<h2>2. Binder Driver — The Kernel Module</h2>
+
+<pre><code>// The Binder driver is a character device at /dev/binder
+// (also /dev/hwbinder for HAL, /dev/vndbinder for vendor)
+//
+// Source: drivers/android/binder.c (+ binder_alloc.c)
+//
+// Key kernel data structures:
+
+// binder_proc — one per process that opens /dev/binder
+struct binder_proc {
+    struct hlist_node proc_node;    // Global process list
+    struct rb_root threads;         // Red-black tree of binder_thread
+    struct rb_root nodes;           // Red-black tree of binder_node (services this process hosts)
+    struct rb_root refs_by_desc;    // References to remote objects (by descriptor/handle)
+    struct rb_root refs_by_node;    // References to remote objects (by node pointer)
+    struct list_head todo;          // Work queue for this process
+    struct binder_alloc alloc;      // mmap'd buffer allocator
+    // ...
+};
+
+// binder_thread — one per thread that enters the driver
+struct binder_thread {
+    struct binder_proc *proc;       // Owning process
+    struct rb_node rb_node;         // In proc->threads tree
+    struct list_head todo;          // Per-thread work queue
+    struct binder_transaction *transaction_stack; // Current transaction
+    // ...
+};
+
+// binder_node — represents a service object hosted in a process
+struct binder_node {
+    struct binder_proc *proc;       // Process that owns this node
+    struct hlist_head refs;         // List of binder_ref pointing to this node
+    binder_uintptr_t ptr;          // Pointer to the BBinder in userspace
+    binder_uintptr_t cookie;       // Extra data (usually the weak ref)
+    // ...
+};
+
+// binder_ref — a handle to a remote binder_node
+struct binder_ref {
+    struct binder_proc *proc;       // Process that holds this reference
+    struct binder_node *node;       // The target node
+    uint32_t desc;                  // Handle number (0 = ServiceManager)
+    // ...
+};</code></pre>
+
+<div class="diagram-container">
+<pre><code>                    KERNEL SPACE (binder.c)
+    ┌─────────────────────────────────────────────────┐
+    │                                                   │
+    │   binder_proc (App A)     binder_proc (App B)    │
+    │   ┌───────────────┐       ┌───────────────┐      │
+    │   │ threads (rb)  │       │ threads (rb)  │      │
+    │   │ nodes (rb)    │       │ nodes (rb)    │      │
+    │   │ refs (rb)     │◄─────►│ refs (rb)     │      │
+    │   │ todo list     │       │ todo list     │      │
+    │   │ mmap buffer   │       │ mmap buffer   │      │
+    │   └───────┬───────┘       └───────┬───────┘      │
+    │           │                       │               │
+    │     ioctl(BINDER_WRITE_READ)      │               │
+    │           │    binder_transaction  │               │
+    │           └───────────────────────┘               │
+    │                                                   │
+    └─────────────────────────────────────────────────┘
+                         │
+    ─────────────────────┼──────────────────────────────
+                         │
+                  USER SPACE
+    ┌──────────────┐            ┌──────────────┐
+    │   App A      │            │   App B      │
+    │  (client)    │            │  (server)    │
+    │              │            │              │
+    │ BpBinder     │            │ BBinder      │
+    │ (proxy)      │            │ (real obj)   │
+    └──────────────┘            └──────────────┘</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. The mmap Trick — One-Copy Optimization</h2>
+
+<pre><code>// Traditional IPC (e.g., Unix sockets) requires TWO copies:
+// 1. copy_from_user(): sender's buffer → kernel buffer
+// 2. copy_to_user(): kernel buffer → receiver's buffer
+
+// Binder uses only ONE copy. Here's how:
+
+// When a process opens /dev/binder, it calls mmap():
+// fd = open("/dev/binder", O_RDWR);
+// mmap(NULL, BINDER_VM_SIZE, PROT_READ, MAP_PRIVATE, fd, 0);
+//
+// BINDER_VM_SIZE = (1024 * 1024) - (4096 * 2) = 1,040,384 bytes ≈ 1MB
+// (defined in ProcessState.cpp)
+
+// This creates a shared mapping:
+// - The kernel allocates physical pages
+// - These pages are mapped into BOTH:
+//   a) The kernel's virtual address space (for writing)
+//   b) The receiver process's virtual address space (for reading)
+// - The receiver's mapping is READ-ONLY (PROT_READ)
+
+// Transaction flow:
+// 1. Sender calls ioctl(BINDER_WRITE_READ) with data
+// 2. Kernel does copy_from_user() — copies sender's data into the
+//    receiver's mmap'd buffer (which is in kernel-managed physical pages)
+// 3. Receiver reads directly from its mmap'd region — NO second copy!
+
+// This is the "one-copy" optimization:
+// Sender → (copy_from_user) → shared pages ← (mmap, no copy) ← Receiver</code></pre>
+
+<div class="diagram-container">
+<pre><code>  Sender Process                Kernel                  Receiver Process
+  ┌────────────┐    ┌──────────────────────────┐    ┌────────────────┐
+  │            │    │                          │    │                │
+  │  User      │    │   Physical Pages         │    │   User         │
+  │  Buffer    │───►│   ┌──────────────┐       │    │   mmap'd       │
+  │            │    │   │  Transaction │◄──────────►│   Buffer       │
+  │  (write)   │ ①  │   │  Data        │       │    │   (read-only)  │
+  │            │    │   └──────────────┘       │    │                │
+  └────────────┘    │                          │    └────────────────┘
+                    └──────────────────────────┘
+  ① = copy_from_user()     (mapped into both kernel and receiver VAS)
+  No second copy needed — receiver reads directly from mapped pages</code></pre>
+</div>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Why 1MB?</div>
+  <p>The 1MB mmap buffer is per-process, not per-transaction. All concurrent Binder transactions to a process share this buffer. If the buffer fills up (e.g., too many pending async transactions), new transactions fail with <code>FAILED BINDER TRANSACTION</code>. This is a common cause of <code>TransactionTooLargeException</code> — not just from a single large Parcel, but from many small transactions queuing up. The 1MB limit is set in <code>ProcessState::init()</code> and cannot be changed by apps.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. ioctl — The Single System Call</h2>
+
+<pre><code>// ALL Binder communication goes through a single system call:
+// ioctl(fd, BINDER_WRITE_READ, &bwr)
+//
+// binder_write_read struct:
+struct binder_write_read {
+    binder_size_t write_size;       // Bytes to write
+    binder_size_t write_consumed;   // Bytes consumed by driver
+    binder_uintptr_t write_buffer;  // Commands to send
+    binder_size_t read_size;        // Buffer size for reading
+    binder_size_t read_consumed;    // Bytes read from driver
+    binder_uintptr_t read_buffer;   // Commands received
+};
+
+// The write_buffer contains COMMANDS (BC_ = Binder Command):
+// BC_TRANSACTION      — send a transaction to a remote object
+// BC_REPLY            — reply to a received transaction
+// BC_ACQUIRE_RESULT   — result of an acquire operation
+// BC_FREE_BUFFER      — free a transaction buffer
+// BC_INCREFS          — increment weak reference
+// BC_ACQUIRE          — increment strong reference
+// BC_RELEASE          — decrement strong reference
+// BC_DECREFS          — decrement weak reference
+// BC_ENTER_LOOPER     — thread enters the Binder looper
+// BC_EXIT_LOOPER      — thread exits the Binder looper
+// BC_REGISTER_LOOPER  — register a spawned looper thread
+// BC_REQUEST_DEATH_NOTIFICATION — subscribe to death of a remote object
+// BC_DEAD_BINDER_DONE — acknowledge death notification
+
+// The read_buffer receives RETURN commands (BR_ = Binder Return):
+// BR_TRANSACTION      — incoming transaction from a client
+// BR_REPLY            — reply from a remote call
+// BR_DEAD_BINDER      — a remote object has died
+// BR_SPAWN_LOOPER     — driver requests a new thread (pool exhaustion)
+// BR_TRANSACTION_COMPLETE — transaction was accepted by driver
+// BR_NOOP             — no-op (used for alignment)
+// BR_ERROR            — error occurred</code></pre>
+
+<!-- ============================================================ -->
+<h2>5. binder_transaction() — The Core Function</h2>
+
+<pre><code>// When a client sends BC_TRANSACTION, the kernel calls binder_transaction().
+// This is the heart of Binder. Here's what it does:
+
+// static void binder_transaction(struct binder_proc *proc,
+//                                struct binder_thread *thread,
+//                                struct binder_transaction_data *tr,
+//                                int reply, ...)
+
+// Step 1: Find the target
+// - If reply: target = thread->transaction_stack->from (the original caller)
+// - If new transaction: look up target_node from tr->target.handle
+//   - handle 0 = ServiceManager (context_mgr_node)
+//   - handle N = refs_by_desc lookup in sender's binder_proc
+
+// Step 2: Security check
+// - Copy caller's UID/PID from current->cred into the transaction
+//   (This is WHY Binder.getCallingUid() is unforgeable — kernel sets it)
+// - Check SELinux policy: binder_transaction(source, target)
+
+// Step 3: Allocate buffer in target's mmap space
+// - binder_alloc_new_buf(&target_proc->alloc, tr->data_size, tr->offsets_size)
+// - This allocates from the target's 1MB mmap region
+
+// Step 4: Copy data
+// - copy_from_user(target_buffer, tr->data.ptr.buffer, tr->data_size)
+//   (ONE copy: sender userspace → target's mmap'd kernel pages)
+
+// Step 5: Translate Binder objects
+// - Flat binder objects (BINDER_TYPE_BINDER, BINDER_TYPE_HANDLE) in the
+//   transaction data are translated:
+//   - Local BBinder → create/find binder_node, give target a binder_ref
+//   - Remote handle → translate to target's handle namespace
+//   - File descriptors → dup'd into target process
+
+// Step 6: Enqueue work
+// - Create binder_work entry
+// - Add to target thread's todo list (if specific thread) or process todo list
+// - Wake up the target: wake_up_interruptible(&target_wait)
+
+// Step 7: If synchronous (not oneway):
+// - Caller thread sleeps: wait_event_interruptible(thread->wait, ...)
+// - Wakes up when BR_REPLY arrives</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Object Translation</div>
+  <p>When you pass an <code>IBinder</code> inside a Binder transaction, the kernel translates it. If the sender passes a local <code>BBinder</code>, the kernel creates a <code>binder_node</code> for it and gives the receiver a <code>binder_ref</code> (handle). If the sender passes a handle (remote reference), the kernel translates it to the receiver's handle namespace. This is how Binder objects can be passed between processes transparently — the kernel maintains a global graph of nodes and references. This is also why passing a Binder object to a third process works: the kernel creates a new reference for the third process pointing to the same node.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Reference Counting — Preventing Leaks and Use-After-Free</h2>
+
+<pre><code>// Binder uses a two-level reference counting scheme:
+//
+// Strong references (BC_ACQUIRE / BC_RELEASE):
+// - Keep the binder_node alive
+// - When strong refs drop to 0, the node can be destroyed
+//
+// Weak references (BC_INCREFS / BC_DECREFS):
+// - Allow checking if the object is still alive without preventing destruction
+// - Used for death notifications
+//
+// The driver tracks reference counts per binder_ref:
+struct binder_ref {
+    atomic_t strong;    // Strong reference count
+    atomic_t weak;      // Weak reference count
+    // ...
+};
+
+// Lifecycle:
+// 1. First transaction to a BBinder → kernel creates binder_node, strong=1
+// 2. Client acquires reference → strong++
+// 3. Client releases reference → strong--
+// 4. strong reaches 0 → BR_RELEASE sent to owning process
+// 5. Owning process destroys the BBinder
+//
+// Death notification:
+// Client calls BC_REQUEST_DEATH_NOTIFICATION for a binder_ref
+// When the owning process dies (binder_proc is freed):
+// - All binder_nodes owned by that process are marked dead
+// - BR_DEAD_BINDER sent to all processes with death notification registered
+// - This is how DeathRecipient.binderDied() works in Java/Kotlin</code></pre>
+
+<!-- ============================================================ -->
+<h2>7. /dev/binder vs /dev/hwbinder vs /dev/vndbinder</h2>
+
+<pre><code>// Android has THREE Binder domains (since Project Treble, Android 8):
+
+// /dev/binder — Framework Binder
+// - Used by apps and system_server
+// - ServiceManager at handle 0
+// - All app-facing system services (AMS, WMS, PMS, etc.)
+
+// /dev/hwbinder — Hardware Binder
+// - Used by HAL processes and system_server
+// - HwServiceManager at handle 0
+// - HIDL interfaces (legacy HALs)
+// - Separate mmap space, separate thread pool
+
+// /dev/vndbinder — Vendor Binder
+// - Used by vendor processes only
+// - VndServiceManager at handle 0
+// - Vendor-to-vendor IPC (no framework involvement)
+
+// Why three domains?
+// Project Treble separates framework from vendor:
+// - Framework updates shouldn't break vendor HALs
+// - Vendor code can't directly call framework Binder services
+// - Security: SELinux policies enforce domain boundaries
+//
+// Android 11+ migration: HIDL → AIDL HALs
+// New HALs use /dev/binder with AIDL (not /dev/hwbinder with HIDL)
+// The hwbinder domain is being phased out</code></pre>
+
+<!-- ============================================================ -->
+<h2>8. Binder vs Other IPC — Performance Comparison</h2>
+
+<table>
+  <tr>
+    <th>Mechanism</th>
+    <th>Copies</th>
+    <th>Security</th>
+    <th>Object Refs</th>
+    <th>Sync RPC</th>
+    <th>Death Notify</th>
+  </tr>
+  <tr>
+    <td>Unix Socket</td>
+    <td>2</td>
+    <td>UID via SCM_CREDENTIALS (opt-in)</td>
+    <td>No</td>
+    <td>Manual</td>
+    <td>No</td>
+  </tr>
+  <tr>
+    <td>Shared Memory</td>
+    <td>0</td>
+    <td>None</td>
+    <td>No</td>
+    <td>No</td>
+    <td>No</td>
+  </tr>
+  <tr>
+    <td>Pipe</td>
+    <td>2</td>
+    <td>None</td>
+    <td>No</td>
+    <td>No</td>
+    <td>No</td>
+  </tr>
+  <tr>
+    <td><strong>Binder</strong></td>
+    <td><strong>1</strong></td>
+    <td><strong>Kernel-enforced UID/PID</strong></td>
+    <td><strong>Yes</strong></td>
+    <td><strong>Built-in</strong></td>
+    <td><strong>Built-in</strong></td>
+  </tr>
+</table>
+
+<pre><code>// Binder latency (typical):
+// - Simple transaction (small Parcel): ~50-100 μs
+// - Includes: ioctl, context switch, copy, wake target, return
+// - Compare to Unix socket: ~80-150 μs (two copies + poll)
+// - Compare to shared memory: ~1-5 μs (but no sync/security)
+
+// Binder throughput:
+// - Limited by 1MB buffer and 16 threads (default pool)
+// - For bulk data: use ashmem (shared memory) + Binder for signaling
+// - ContentProvider uses this pattern: Binder for metadata, ashmem for data</code></pre>
+
+<!-- ============================================================ -->
+<h2>9. Binder in the Android Boot Sequence</h2>
+
+<pre><code>// 1. Kernel loads binder.ko module (or built-in)
+//    - Creates /dev/binder, /dev/hwbinder, /dev/vndbinder
+//    - Registers binder_open, binder_mmap, binder_ioctl
+
+// 2. init process starts servicemanager (native daemon)
+//    - Opens /dev/binder
+//    - Calls BINDER_SET_CONTEXT_MGR → becomes handle 0
+//    - Enters loop: reads BC_TRANSACTION, handles service registration/lookup
+
+// 3. init starts system_server (via Zygote fork)
+//    - system_server opens /dev/binder
+//    - Registers ~100+ system services with ServiceManager:
+//      ServiceManager.addService("activity", activityManagerService)
+//      ServiceManager.addService("window", windowManagerService)
+//      ServiceManager.addService("package", packageManagerService)
+//      // ... etc.
+
+// 4. App process starts (Zygote fork)
+//    - Inherits /dev/binder fd from Zygote (already mmap'd)
+//    - ProcessState::self() initializes Binder for this process
+//    - Opens thread pool: ProcessState::startThreadPool()
+//    - App calls getSystemService("activity") →
+//      ServiceManager.getService("activity") →
+//      Returns IBinder handle to AMS</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — ServiceManager is Special</div>
+  <p><code>ServiceManager</code> is the only Binder object with a well-known handle (0). Every process knows how to reach it without any prior lookup. It's the "DNS of Android" — you ask it for a service by name, it returns an IBinder handle. ServiceManager itself is a native daemon (<code>frameworks/native/cmds/servicemanager/</code>), not a Java service. It validates that only processes with the right SELinux context can register services (e.g., only <code>system_server</code> can register "activity"). This prevents a malicious app from registering a fake AMS.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>10. ProcessState & IPCThreadState — Native Binder Init</h2>
+
+<pre><code>// Every process that uses Binder initializes through two native singletons:
+
+// ProcessState (one per process):
+// Source: frameworks/native/libs/binder/ProcessState.cpp
+//
+// ProcessState::self() — singleton, first call does:
+//   1. open("/dev/binder", O_RDWR | O_CLOEXEC)
+//   2. ioctl(fd, BINDER_VERSION, &vers)  — negotiate protocol version
+//   3. ioctl(fd, BINDER_SET_MAX_THREADS, &maxThreads)  — default 15
+//   4. mmap(NULL, BINDER_VM_SIZE, PROT_READ, MAP_PRIVATE, fd, 0)
+//      BINDER_VM_SIZE = (1024*1024) - (4096*2) = 1,040,384 bytes
+//   5. Store fd and mmap address
+//
+// ProcessState::startThreadPool() — spawns the main Binder thread
+// ProcessState::giveThreadPoolName() — names threads "Binder:PID_X"
+
+// IPCThreadState (one per thread, thread-local):
+// Source: frameworks/native/libs/binder/IPCThreadState.cpp
+//
+// IPCThreadState::self() — thread-local singleton
+// IPCThreadState::transact(handle, code, data, reply, flags):
+//   1. writeTransactionData(BC_TRANSACTION, flags, handle, code, data)
+//      → writes binder_transaction_data into mOut buffer
+//   2. waitForResponse(reply):
+//      → talkWithDriver() → ioctl(BINDER_WRITE_READ)
+//      → loops reading BR_ commands until BR_REPLY or BR_ERROR
+//   3. Returns status
+//
+// IPCThreadState::joinThreadPool(isMain):
+//   → loop: talkWithDriver() → executeCommand(cmd)
+//   → handles BR_TRANSACTION by calling BBinder::transact()
+//   → sends BC_REPLY back
+
+// Zygote pre-opens /dev/binder via ProcessState.
+// After fork(), the child inherits the fd and mmap.
+// Child calls ProcessState::self() which reuses the existing state.</code></pre>
+
+<!-- ============================================================ -->
+<h2>11. flat_binder_object & binder_transaction_data</h2>
+
+<pre><code>// flat_binder_object — how IBinder and FDs are embedded in Parcels:
+struct flat_binder_object {
+    __u32 hdr_type;     // One of:
+    // BINDER_TYPE_BINDER  — local BBinder (sender owns the object)
+    // BINDER_TYPE_HANDLE  — remote reference (sender has a handle)
+    // BINDER_TYPE_FD      — file descriptor to dup into target
+    // BINDER_TYPE_FDA     — array of file descriptors
+    // BINDER_TYPE_PTR     — raw pointer (for scatter-gather)
+    __u32 flags;
+    union {
+        binder_uintptr_t binder;  // For BINDER_TYPE_BINDER: BBinder ptr
+        __u32 handle;             // For BINDER_TYPE_HANDLE: remote handle
+    };
+    binder_uintptr_t cookie;      // Extra data (weak ref pointer)
+};
+
+// During binder_transaction(), the kernel scans the Parcel's offsets array
+// to find all flat_binder_objects and translates them:
+// - BINDER_TYPE_BINDER → creates binder_node, gives receiver a binder_ref
+//   (translated to BINDER_TYPE_HANDLE in the receiver's copy)
+// - BINDER_TYPE_HANDLE → translates handle to receiver's namespace
+// - BINDER_TYPE_FD → dup() fd into target process
+
+// binder_transaction_data — the transaction header:
+struct binder_transaction_data {
+    union {
+        __u32 handle;              // Target handle (for BC_TRANSACTION)
+        binder_uintptr_t ptr;      // Target BBinder ptr (for BR_TRANSACTION)
+    } target;
+    binder_uintptr_t cookie;       // Extra data
+    __u32 code;                    // Transaction code (FIRST_CALL_TRANSACTION + N)
+    __u32 flags;                   // TF_ONE_WAY, TF_ACCEPT_FDS, TF_CLEAR_BUF
+    // ...
+    binder_size_t data_size;       // Size of Parcel data
+    binder_size_t offsets_size;    // Size of offsets array (for flat_binder_objects)
+    union {
+        struct {
+            binder_uintptr_t buffer;   // Pointer to Parcel data
+            binder_uintptr_t offsets;  // Pointer to offsets of binder objects
+        } ptr;
+    } data;
+};</code></pre>
+
+<!-- ============================================================ -->
+<h2>12. Transaction Nesting & Loop Detection</h2>
+
+<pre><code>// Binder supports nested transactions: while handling a transaction from A,
+// the server can call back to A (or to a third process C).
+
+// The kernel tracks this via transaction_stack:
+// Each binder_thread has a transaction_stack — a linked list of
+// binder_transaction structs representing in-flight transactions.
+
+// Nested call flow:
+// 1. A calls B (synchronous) → A's thread sleeps, B's thread handles
+// 2. B's handler calls back to A → B sends BC_TRANSACTION to A
+// 3. Kernel detects that A has a sleeping thread waiting for B's reply
+// 4. Kernel delivers B's callback to A's SAME sleeping thread
+//    (not a random Binder thread — the specific thread in the call chain)
+// 5. A handles the callback, replies
+// 6. B receives A's reply, continues, replies to original call
+// 7. A wakes up with the final reply
+
+// Why same-thread delivery matters:
+// - Prevents deadlock: A's sleeping thread can handle B's callback
+// - Maintains call-stack semantics (like recursive function calls)
+// - The transaction_stack tracks the chain: A→B→A
+
+// Loop detection:
+// If the nesting depth exceeds a limit, or if the kernel detects a
+// true cycle (A→B→A→B→...), it returns BR_FAILED_REPLY.
+// The caller gets a DeadObjectException / RemoteException.
+
+// Edge case: if A calls B (oneway), then B calls A (synchronous),
+// this is NOT nesting — the oneway returned immediately.
+// B's call to A goes to a random free thread in A's pool.</code></pre>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  <a href="02-binder-call-flow.html">02 — Binder Call Flow →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

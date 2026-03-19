@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 — Recomposition Deep Dive — Scopes, Skipping, Donut-Hole, Smart Recomposition</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-compose-runtime.html">01 Runtime</a>
+  <a class="active" href="02-recomposition-deep-dive.html">02 Recomposition</a>
+  <a href="03-snapshot-system.html">03 Snapshots</a>
+  <a href="04-slot-table.html">04 Slot Table</a>
+  <a href="05-stability-and-performance.html">05 Stability</a>
+  <a href="06-custom-layouts-drawing.html">06 Custom Layouts</a>
+  <a href="07-side-effects-lifecycle.html">07 Side Effects</a>
+  <a href="08-view-interop.html">08 View Interop</a>
+  <a href="09-interview-qa.html">09 Interview Q&A</a>
+</div>
+
+<h1>Recomposition Deep Dive</h1>
+<p class="subtitle">Recomposition scopes, smart recomposition, the $changed bitmask, donut-hole skipping, positional memoization, and why your composable recomposes (or doesn't)</p>
+
+<!-- ============================================================ -->
+<h2>1. What Is a Recomposition Scope?</h2>
+
+<p>A <strong>recomposition scope</strong> is the smallest unit of code that can be independently re-executed. The compiler creates a scope for every @Composable function that:</p>
+
+<ol>
+  <li>Has a non-Unit return type, OR</li>
+  <li>Reads state that might change</li>
+</ol>
+
+<p>When state changes, only the <strong>scopes that read that state</strong> are invalidated and re-executed. Everything else is skipped.</p>
+
+<pre><code>@Composable
+fun ParentScreen() {                    // Scope A
+    var name by remember { mutableStateOf("World") }
+
+    Header()                             // Scope B — does NOT read 'name'
+    Greeting(name)                       // Scope C — reads 'name' via parameter
+    Footer()                             // Scope D — does NOT read 'name'
+}
+
+// When 'name' changes:
+// Scope A is invalidated (it reads 'name' to pass to Greeting)
+// But Header() and Footer() are SKIPPED if their params haven't changed
+// Greeting() re-executes with the new 'name'</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Scope Granularity</div>
+  <p>The recomposition scope is the @Composable function, not individual lines. If a function reads state <strong>anywhere</strong> in its body, the <strong>entire function</strong> re-executes. This is why extracting state-reading code into smaller composables improves performance — it creates more granular scopes. The compiler wraps each @Composable call in <code>startRestartGroup</code>/<code>endRestartGroup</code>, which defines the scope boundary.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Smart Recomposition — The Skipping Mechanism</h2>
+
+<p>When a parent recomposes, it re-invokes all child composables. But the compiler-generated code checks whether parameters have changed <strong>before</strong> executing the body:</p>
+
+<pre><code>// What the compiler generates for a child call:
+fun Greeting(name: String, $composer: Composer, $changed: Int) {
+    $composer.startRestartGroup(0xABCD)
+
+    // The skip check:
+    val nameChanged = $changed and 0b0001 != 0
+    if (nameChanged || !$composer.skipping) {
+        // name changed → execute body
+        Text("Hello, $name", $composer, 0)
+    } else {
+        // name unchanged → skip ENTIRE body
+        $composer.skipToGroupEnd()
+    }
+
+    $composer.endRestartGroup()?.updateScope { c, _ ->
+        Greeting(name, c, $changed or 0b0001)
+    }
+}</code></pre>
+
+<h3>When Can a Composable Be Skipped?</h3>
+
+<table>
+  <tr><th>Condition</th><th>Skippable?</th><th>Why</th></tr>
+  <tr>
+    <td>All parameters are <strong>stable</strong> and <code>equals()</code> returns true</td>
+    <td>Yes</td>
+    <td>Compiler generates skip check using <code>$changed</code> bitmask + <code>equals()</code></td>
+  </tr>
+  <tr>
+    <td>Any parameter is <strong>unstable</strong></td>
+    <td>No (before strong skipping)</td>
+    <td>Compiler can't guarantee <code>equals()</code> is meaningful, so it always re-executes</td>
+  </tr>
+  <tr>
+    <td>Function has <strong>no parameters</strong></td>
+    <td>Yes (always skipped on recomposition)</td>
+    <td>Nothing to compare — body only runs on initial composition</td>
+  </tr>
+  <tr>
+    <td>Function returns <strong>non-Unit</strong></td>
+    <td>No</td>
+    <td>Return value might be needed by parent — must always execute</td>
+  </tr>
+  <tr>
+    <td><strong>Strong skipping mode</strong> (Compose 1.5.4+)</td>
+    <td>Yes, even with unstable params</td>
+    <td>Uses referential equality (<code>===</code>) for unstable params instead of skipping skip-check entirely</td>
+  </tr>
+</table>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Strong Skipping Mode</div>
+  <p>Before strong skipping (default since Compose compiler 1.5.4), any unstable parameter made the entire composable non-skippable. This meant passing a <code>List&lt;T&gt;</code> (unstable because mutable) would force recomposition every time the parent recomposed, even if the list was the same object. Strong skipping mode changes this: unstable parameters are compared with <strong>referential equality</strong> (<code>===</code>) instead of structural equality (<code>equals()</code>). Same object reference → skip. This dramatically reduces unnecessary recompositions in real apps.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Donut-Hole Skipping</h2>
+
+<p>This is the most elegant optimization in Compose and the most frequently asked about in L6 interviews:</p>
+
+<pre><code>@Composable
+fun UserCard(user: User) {                    // Scope A
+    Card {                                     // Scope B (Card's content lambda)
+        Text(user.name)                        // Reads user.name
+        ProfileImage(user.avatarUrl)           // Reads user.avatarUrl
+        StatusBadge(isOnline = user.isOnline)  // Reads user.isOnline
+    }
+}
+
+// If ONLY user.isOnline changes:
+// 1. Scope A (UserCard) is invalidated because 'user' changed
+// 2. UserCard re-executes, calling Card { ... }
+// 3. Card itself is SKIPPED (its params didn't change — it's the same lambda)
+// 4. But INSIDE Card's lambda, StatusBadge is re-invoked with new isOnline
+// 5. Text and ProfileImage are SKIPPED (their params didn't change)
+
+// This is "donut-hole skipping" — the outer composable (Card) is skipped,
+// but the INNER content (the hole) is re-executed selectively</code></pre>
+
+<div class="diagram-container">
+<svg viewBox="0 0 800 200" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+  <text x="400" y="20" fill="#c084fc" font-size="13" text-anchor="middle" font-weight="700">Donut-Hole Skipping</text>
+
+  <!-- Outer ring (Card) — SKIPPED -->
+  <rect x="150" y="40" width="500" height="130" rx="12" fill="rgba(74,222,128,0.05)" stroke="#4ade80" stroke-width="2" stroke-dasharray="6"/>
+  <text x="400" y="60" fill="#4ade80" font-size="11" text-anchor="middle" font-weight="600">Card — SKIPPED (params unchanged)</text>
+
+  <!-- Inner content — selectively re-executed -->
+  <rect x="180" y="75" width="140" height="50" rx="6" fill="rgba(74,222,128,0.1)" stroke="#4ade80"/>
+  <text x="250" y="97" fill="#4ade80" font-size="10" text-anchor="middle" font-weight="600">Text ✓ SKIP</text>
+  <text x="250" y="115" fill="#8b8fa3" font-size="8" text-anchor="middle">name unchanged</text>
+
+  <rect x="340" y="75" width="140" height="50" rx="6" fill="rgba(74,222,128,0.1)" stroke="#4ade80"/>
+  <text x="410" y="97" fill="#4ade80" font-size="10" text-anchor="middle" font-weight="600">ProfileImage ✓ SKIP</text>
+  <text x="410" y="115" fill="#8b8fa3" font-size="8" text-anchor="middle">avatarUrl unchanged</text>
+
+  <rect x="500" y="75" width="140" height="50" rx="6" fill="rgba(248,113,113,0.15)" stroke="#f87171" stroke-width="2"/>
+  <text x="570" y="97" fill="#f87171" font-size="10" text-anchor="middle" font-weight="600">StatusBadge 🔄</text>
+  <text x="570" y="115" fill="#f87171" font-size="8" text-anchor="middle">isOnline CHANGED</text>
+
+  <text x="400" y="185" fill="#8b8fa3" font-size="9" text-anchor="middle">The "donut" (Card) is skipped. The "hole" (content lambda) is selectively re-executed.</text>
+</svg>
+</div>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — How Donut-Hole Works Internally</div>
+  <p>The content lambda (<code>{ Text(); ProfileImage(); StatusBadge() }</code>) is a separate recomposition scope from Card itself. When Card is skipped, the runtime still walks into the lambda's scope to check if any of its children need recomposition. This works because the slot table stores the lambda's content as a nested group — the Composer can skip Card's own logic but still enter the content group. This is why <code>@Composable</code> content lambdas are special — they create their own scopes, enabling this "skip the wrapper, update the content" pattern.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Positional Memoization — remember</h2>
+
+<p><code>remember</code> stores a value in the <strong>slot table at the current position</strong>. The position is determined by the call site (source location), not the value:</p>
+
+<pre><code>@Composable
+fun MyList(items: List&lt;String&gt;) {
+    Column {
+        items.forEach { item ->
+            // DANGER: remember's position is based on the forEach index
+            // If items are reordered, remembered values don't follow the items
+            val color = remember { randomColor() }
+            Text(item, color = color)
+        }
+    }
+}
+
+// Fix: use key() to give each item a stable identity
+@Composable
+fun MyList(items: List&lt;String&gt;) {
+    Column {
+        items.forEach { item ->
+            key(item) { // Stable identity — remembered values follow the item
+                val color = remember { randomColor() }
+                Text(item, color = color)
+            }
+        }
+    }
+}</code></pre>
+
+<h3>How remember Works Internally</h3>
+
+<pre><code>// Simplified from compose-runtime source:
+@Composable
+inline fun &lt;T&gt; remember(calculation: () -> T): T {
+    val composer = currentComposer
+    // On first composition: calculate and store in slot table
+    // On recomposition: read from slot table (skip calculation)
+    return if (composer.inserting) {
+        val value = calculation()
+        composer.updateRememberedValue(value)
+        value
+    } else {
+        composer.rememberedValue() as T
+    }
+}
+
+// remember with keys:
+@Composable
+inline fun &lt;T&gt; remember(key1: Any?, calculation: () -> T): T {
+    val composer = currentComposer
+    return if (composer.inserting || composer.changed(key1)) {
+        // Key changed → recalculate
+        val value = calculation()
+        composer.updateRememberedValue(value)
+        value
+    } else {
+        composer.rememberedValue() as T
+    }
+}</code></pre>
+
+<div class="callout danger">
+  <div class="callout-label">Common remember Pitfalls</div>
+  <ul>
+    <li><strong>remember without key:</strong> <code>remember { expensiveCalc(param) }</code> — the calculation runs only once, even if <code>param</code> changes. Fix: <code>remember(param) { expensiveCalc(param) }</code></li>
+    <li><strong>remember in loops without key():</strong> Values are tied to position, not identity. Reordering items shuffles remembered values.</li>
+    <li><strong>remember with unstable keys:</strong> If the key object's <code>equals()</code> is broken, remember recalculates every recomposition.</li>
+    <li><strong>remember { mutableStateOf() } vs rememberSaveable:</strong> <code>remember</code> survives recomposition but NOT process death or config change. <code>rememberSaveable</code> survives both.</li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Keys — Controlling Identity</h2>
+
+<pre><code>// Without key: identity is based on position in the slot table
+LazyColumn {
+    items(users) { user ->
+        UserRow(user) // Position 0, 1, 2, ... — reordering breaks state
+    }
+}
+
+// With key: identity is based on the key value
+LazyColumn {
+    items(users, key = { it.id }) { user ->
+        UserRow(user) // Identity tied to user.id — reordering preserves state
+    }
+}
+
+// key() composable for non-lazy contexts
+@Composable
+fun ChatMessages(messages: List&lt;Message&gt;) {
+    Column {
+        messages.forEach { msg ->
+            key(msg.id) {
+                MessageBubble(msg) // State follows the message, not the position
+            }
+        }
+    }
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — How Keys Work in the Slot Table</div>
+  <p>Without keys, the Composer matches composables by <strong>position</strong> in the parent's child list. Position 0 maps to slot 0, position 1 to slot 1, etc. If you insert an item at position 0, every subsequent item shifts — all their remembered state is now associated with the wrong item.</p>
+  <p>With keys, the Composer uses the key value to find the correct slot, regardless of position. Internally, it uses a hash map to look up slots by key. This is more expensive (hash lookup vs array index), but correct. The rule: <strong>always use keys when items have stable identity and can be reordered, inserted, or removed.</strong></p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. The Recomposition Loop</h2>
+
+<p>Recomposition doesn't happen immediately when state changes. It's batched and scheduled:</p>
+
+<ol>
+  <li><strong>State write:</strong> <code>count++</code> triggers the snapshot system</li>
+  <li><strong>Invalidation:</strong> All recomposition scopes that read <code>count</code> are marked invalid</li>
+  <li><strong>Scheduling:</strong> A recomposition is scheduled for the next frame (via <code>Choreographer</code> on Android)</li>
+  <li><strong>Recomposition:</strong> On the next frame, the Composer re-executes all invalidated scopes</li>
+  <li><strong>Apply changes:</strong> The Applier applies node tree changes (inserts, removes, moves)</li>
+  <li><strong>Layout + Draw:</strong> Changed LayoutNodes are re-measured and re-drawn</li>
+</ol>
+
+<pre><code>// Multiple state changes in the same frame are batched:
+var a by mutableStateOf(0)
+var b by mutableStateOf(0)
+
+fun onClick() {
+    a = 1  // Invalidates scopes reading 'a'
+    b = 2  // Invalidates scopes reading 'b'
+    // Only ONE recomposition happens (on next frame), not two
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Recomposition Is Always on the Main Thread</div>
+  <p>Recomposition (the Composition phase) always runs on the main thread because it accesses the slot table, which is not thread-safe. However, state <strong>writes</strong> can happen from any thread — the snapshot system is thread-safe. The invalidation is posted to the main thread's Choreographer, which triggers recomposition on the next VSYNC. This is why <code>mutableStateOf</code> is safe to update from a background coroutine — the write is thread-safe, and the resulting recomposition is automatically scheduled on the main thread.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Debugging Recomposition</h2>
+
+<pre><code>// Method 1: Recomposition counter (debug only)
+@Composable
+fun RecompositionCounter(label: String) {
+    val count = remember { mutableIntStateOf(0) }
+    SideEffect { count.intValue++ }
+    Log.d("Recomposition", "$label: ${count.intValue}")
+}
+
+// Method 2: Layout Inspector
+// Android Studio → Layout Inspector → Show Recomposition Counts
+// Shows how many times each composable recomposed and how many were skipped
+
+// Method 3: Compose compiler reports
+// Add to build.gradle:
+// kotlinOptions {
+//     freeCompilerArgs += listOf(
+//         "-P", "plugin:androidx.compose.compiler.plugins.kotlin:reportsDestination=" +
+//             project.buildDir.absolutePath + "/compose_reports"
+//     )
+// }
+// Generates: *-composables.txt (skippability), *-classes.txt (stability)</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Reading Compiler Reports</div>
+  <p>The compiler reports show two critical things: (1) which composables are <strong>skippable</strong> (can be skipped on recomposition) and (2) which classes are <strong>stable</strong> (safe for equality comparison). If a composable shows as "not skippable," check its parameters — one of them is likely unstable. If a class shows as "unstable," it either has mutable properties, uses a type the compiler can't verify (like <code>List&lt;T&gt;</code>), or comes from a non-Compose module. These reports are the primary tool for diagnosing unnecessary recompositions.</p>
+</div>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  ← <a href="01-compose-runtime.html">01 — Compose Runtime</a> &nbsp;|&nbsp;
+  <a href="03-snapshot-system.html">03 — Snapshot System →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

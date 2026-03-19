@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 — Android Memory Model — Heap, Stack, Native & How the OS Sees Your App</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a class="active" href="01-memory-model.html">01 Memory Model</a>
+  <a href="02-gc-internals.html">02 GC Internals</a>
+  <a href="03-memory-leaks.html">03 Memory Leaks</a>
+  <a href="04-anr-deep-dive.html">04 ANR Deep Dive</a>
+  <a href="05-oom-lmk.html">05 OOM & LMK</a>
+  <a href="06-app-startup.html">06 App Startup</a>
+  <a href="07-baseline-profiles.html">07 Baseline Profiles</a>
+  <a href="08-interview-qa.html">08 Interview Q&A</a>
+</div>
+
+<h1>01 — Android Memory Model</h1>
+<p class="subtitle">How memory is organized in an Android process — Java heap, native heap, stack, mmap regions, and how the OS accounts for it all</p>
+
+<!-- ============================================================ -->
+<h2>1. Process Memory Layout</h2>
+
+<div class="diagram-container">
+<pre><code>  Virtual Address Space of an Android App Process
+  ┌─────────────────────────────────────────────────┐  High address
+  │  Kernel Space (inaccessible to userspace)        │
+  ├─────────────────────────────────────────────────┤
+  │  Stack (main thread)     ~1MB default            │  ← grows down
+  │  Stack (thread 2)        ~1MB per thread         │
+  │  Stack (thread N)                                │
+  ├─────────────────────────────────────────────────┤
+  │  mmap regions                                    │
+  │  ├── Binder mmap buffer (~1MB)                   │
+  │  ├── ashmem / SharedMemory                       │
+  │  ├── APK (memory-mapped, read-only)              │
+  │  ├── .so libraries (native code)                 │
+  │  ├── .dex / .oat files (compiled code)           │
+  │  ├── Font files, resource tables                 │
+  │  └── GPU memory mappings                         │
+  ├─────────────────────────────────────────────────┤
+  │  Native Heap (malloc / jemalloc)                 │  ← grows up
+  │  ├── Bitmap pixel data (Android 8+)              │
+  │  ├── RenderNode / DisplayList data               │
+  │  ├── SQLite page cache                           │
+  │  ├── NDK allocations                             │
+  │  └── ART internal structures                     │
+  ├─────────────────────────────────────────────────┤
+  │  Java/ART Heap (managed by GC)                   │  ← grows up
+  │  ├── RegionSpace (main allocation space)         │
+  │  ├── Large Object Space (LOS)                    │
+  │  ├── Zygote Space (preloaded, shared COW)        │
+  │  ├── Image Space (.art files, boot image)        │
+  │  └── Non-Moving Space (JNI globals, interned)    │
+  ├─────────────────────────────────────────────────┤
+  │  .data / .bss (global/static variables)          │
+  │  .text (executable code)                         │
+  └─────────────────────────────────────────────────┘  Low address</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Java/ART Heap — Spaces</h2>
+
+<pre><code>// The ART runtime divides the managed heap into several spaces:
+
+// 1. RegionSpace (main allocation space, Android 8+):
+// - Used by the Concurrent Copying (CC) collector
+// - Divided into 256KB regions
+// - New objects allocated via bump pointer (fast)
+// - During GC: live objects copied to new regions, old regions freed
+// - This is where most of your objects live
+
+// 2. Large Object Space (LOS):
+// - Objects > 12KB (3 pages) go here
+// - Allocated individually via mmap
+// - Not compacted — freed individually
+// - Large arrays, big Bitmaps (pre-Android 8), large strings
+
+// 3. Zygote Space:
+// - Objects allocated during Zygote preloading (before fork)
+// - Shared across all app processes via COW
+// - Never collected by app's GC (belongs to Zygote)
+// - ~30-50MB of framework classes, resources, etc.
+
+// 4. Image Space:
+// - Pre-compiled .art files (boot image)
+// - Memory-mapped, shared across processes
+// - Contains pre-initialized objects (String pool, Class objects)
+// - Read-only after loading
+
+// 5. Non-Moving Space:
+// - Objects that can't be moved (JNI global refs, interned strings)
+// - Used by mark-sweep, not copying collector
+// - Fragmentation risk — kept small
+
+// Heap size limits:
+// Per-app heap limit set by the device manufacturer:
+// dalvik.vm.heapsize = 256m (typical)
+// dalvik.vm.heapgrowthlimit = 128m (default limit)
+// android:largeHeap="true" → uses heapsize instead of heapgrowthlimit
+// Check at runtime: Runtime.getRuntime().maxMemory()</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — largeHeap is a Code Smell</div>
+  <p><code>android:largeHeap="true"</code> doubles the heap limit but signals to the system that your app is memory-hungry. The OOM killer will target your app more aggressively when memory is low. It also increases GC pause times (more heap to scan). At Google, using largeHeap requires justification — photo editors and video apps may need it, but most apps should optimize their memory usage instead. If you need largeHeap, you likely have a leak or are caching too aggressively.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Native Heap — The Unmanaged Side</h2>
+
+<pre><code>// Native heap is allocated via malloc() (jemalloc on Android).
+// NOT managed by the GC — you must free it yourself (or use RAII in C++).
+
+// What lives on the native heap:
+// 1. Bitmap pixel data (Android 8+ moved from Java heap to native)
+//    - Bitmap.createBitmap(1000, 1000, ARGB_8888) = 4MB native memory
+//    - Freed when Bitmap is GC'd (weak reference + native destructor)
+//    - Before Android 8: Bitmap pixels were on the Java heap (counted toward limit)
+
+// 2. RenderNode / DisplayList data
+//    - Hardware-accelerated drawing commands
+//    - Created by View.draw() → Canvas → RenderNode
+//    - Freed when View is detached and GC'd
+
+// 3. SQLite page cache
+//    - Default page cache: 2000 pages × 4KB = ~8MB per database
+//    - Plus WAL file mapping
+
+// 4. NDK allocations (your native code)
+// 5. WebView renderer (Chromium)
+//    - Can use 50-200MB of native memory
+//    - Separate process on Android 8+ (isolated)
+
+// 6. ART internal structures
+//    - JIT code cache (~2MB)
+//    - Class metadata, method tables
+//    - Thread stacks for GC workers
+
+// Native memory is NOT subject to the Java heap limit.
+// An app with 128MB Java heap limit can use 500MB+ of native memory.
+// This is a common source of OOM on low-memory devices.</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. Stack Memory</h2>
+
+<pre><code>// Each thread gets its own stack (default ~1MB on Android):
+// - Local variables (primitives, object references)
+// - Method call frames
+// - Return addresses
+
+// Stack is allocated when the thread is created:
+// pthread_attr_setstack() in native, Thread() in Java
+// Default sizes:
+// - Main thread: ~8MB (set by Zygote)
+// - Java threads: ~1MB (configurable via -Xss, rarely changed)
+// - Coroutine: NO dedicated stack — uses the dispatcher thread's stack
+//   (this is why coroutines are lightweight — no 1MB stack per coroutine)
+
+// StackOverflowError:
+// - Deep recursion exhausts the stack
+// - Common with: recursive layout inflation, deep View hierarchies,
+//   recursive JSON parsing, unbounded tree traversal
+// - Fix: convert recursion to iteration, or increase stack size for specific threads
+
+// Stack vs Heap for objects:
+// Java: ALL objects are heap-allocated (even small ones)
+// Kotlin: value classes with @JvmInline can be stack-allocated (scalar replacement)
+// ART optimization: escape analysis can stack-allocate objects that don't escape
+//   the method — but this is limited and not guaranteed</code></pre>
+
+<!-- ============================================================ -->
+<h2>5. Memory Metrics — PSS, RSS, USS, VSS</h2>
+
+<pre><code>// The OS tracks memory usage with several metrics:
+
+// VSS (Virtual Set Size):
+// Total virtual address space mapped (including unmapped pages)
+// Includes: code, data, mmap, heap, stack, shared libs
+// NOT useful for real memory usage — can be 2GB+ for a simple app
+
+// RSS (Resident Set Size):
+// Physical pages currently in RAM (not swapped/paged out)
+// Includes shared pages at FULL size (double-counted across processes)
+// Useful for: "how much RAM is this process touching right now?"
+
+// PSS (Proportional Set Size):
+// Like RSS but shared pages are divided by the number of sharing processes
+// If 3 processes share a 12KB page, each is charged 4KB
+// This is what Android uses for memory accounting and OOM decisions
+// "dumpsys meminfo" reports PSS
+
+// USS (Unique Set Size) / Private Dirty:
+// Pages used ONLY by this process (not shared with anyone)
+// This is the "real cost" of your app — memory freed if you kill the process
+// Most important metric for optimization
+
+// Viewing memory:
+// adb shell dumpsys meminfo <package>
+// Shows: Java Heap, Native Heap, Code, Stack, Graphics, Private Dirty, Shared Clean
+// adb shell cat /proc/<pid>/smaps  — detailed per-mapping breakdown
+// adb shell procrank — sorted by PSS across all processes</code></pre>
+
+<table>
+  <tr>
+    <th>Metric</th>
+    <th>Shared Pages</th>
+    <th>Use Case</th>
+    <th>Command</th>
+  </tr>
+  <tr>
+    <td>VSS</td>
+    <td>Full count</td>
+    <td>Virtual space (not useful)</td>
+    <td><code>cat /proc/pid/status</code></td>
+  </tr>
+  <tr>
+    <td>RSS</td>
+    <td>Full count</td>
+    <td>Physical pages in RAM</td>
+    <td><code>cat /proc/pid/status</code></td>
+  </tr>
+  <tr>
+    <td>PSS</td>
+    <td>Proportional</td>
+    <td>Fair accounting (OOM decisions)</td>
+    <td><code>dumpsys meminfo</code></td>
+  </tr>
+  <tr>
+    <td>USS</td>
+    <td>Excluded</td>
+    <td>True per-app cost</td>
+    <td><code>dumpsys meminfo</code> (Private Dirty)</td>
+  </tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>6. dumpsys meminfo — Reading the Output</h2>
+
+<pre><code>// adb shell dumpsys meminfo com.example.app
+//
+// Applications Memory Usage (in Kilobytes):
+// Uptime: 123456 Realtime: 123456
+//
+//                    Pss    Private   Private   SwapPss    Heap     Heap     Heap
+//                  Total      Dirty     Clean     Dirty    Size    Alloc     Free
+//                ------   --------  --------  --------  ------   ------   ------
+//   Native Heap   45000     44800       0         0     65536    52000    13536
+//   Dalvik Heap   32000     31500       0         0     48000    38000    10000
+//  Dalvik Other    5000      4800       0         0
+//         Stack    1200      1200       0         0
+//        Ashmem     500       100       0         0
+//     Other dev      20        20       0         0
+//      .so mmap   12000       800     8000         0
+//     .apk mmap    3000         0     3000         0
+//     .dex mmap    8000         0     8000         0
+//     .oat mmap    2000         0     2000         0
+//     .art mmap    5000      3000     1000         0
+//    Other mmap    1000       200       0         0
+//      Graphics   25000     25000       0         0
+//        GL mmap    8000      8000       0         0
+//
+//          TOTAL  148720    119420    22000         0    113536    90000    23536
+
+// Key sections to analyze:
+// Native Heap: Bitmaps, SQLite, NDK, RenderNodes
+// Dalvik Heap: Java objects (your code + framework)
+// .so mmap: Native libraries (shared = Shared Clean, private = Private Dirty)
+// .dex/.oat mmap: Compiled code (mostly shared)
+// .art mmap: Boot image objects (shared with Zygote)
+// Graphics: GPU memory (textures, framebuffers)
+// Stack: Thread stacks
+
+// Heap Size vs Heap Alloc vs Heap Free:
+// Size = current heap size (can grow up to maxMemory())
+// Alloc = bytes currently allocated
+// Free = Size - Alloc (available before GC or growth needed)</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Bitmap Migration (Android 8)</div>
+  <p>Before Android 8, Bitmap pixel data lived on the Java heap and counted toward the heap limit. This meant a 128MB heap could be exhausted by a few large images. Android 8 moved Bitmap pixels to the native heap — they no longer count toward the Java heap limit. This dramatically reduced OOM crashes for image-heavy apps but created a new problem: native memory leaks from Bitmaps are invisible to the Java heap monitor. You must track native heap growth separately. Use <code>Debug.getNativeHeapAllocatedSize()</code> to monitor.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Memory Accounting in Practice</h2>
+
+<pre><code>// Programmatic memory checks:
+
+// Java heap:
+val runtime = Runtime.getRuntime()
+val maxMemory = runtime.maxMemory()         // Heap limit (128MB typical)
+val totalMemory = runtime.totalMemory()     // Current heap size
+val freeMemory = runtime.freeMemory()       // Free within current heap
+val usedMemory = totalMemory - freeMemory   // Currently allocated
+
+// Native heap:
+val nativeHeapSize = Debug.getNativeHeapSize()
+val nativeHeapAlloc = Debug.getNativeHeapAllocatedSize()
+val nativeHeapFree = Debug.getNativeHeapFreeSize()
+
+// Full memory info (requires Debug permission or same process):
+val memInfo = Debug.MemoryInfo()
+Debug.getMemoryInfo(memInfo)
+val totalPss = memInfo.totalPss              // Total PSS in KB
+val javaPss = memInfo.dalvikPss              // Java heap PSS
+val nativePss = memInfo.nativePss            // Native heap PSS
+val otherPss = memInfo.otherPss              // Everything else
+
+// ActivityManager memory class (device capability):
+val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+val memoryClass = am.memoryClass             // MB (e.g., 128, 256)
+val largeMemoryClass = am.largeMemoryClass   // MB with largeHeap
+// Use memoryClass to size your caches:
+// val cacheSize = memoryClass * 1024 * 1024 / 8  // 1/8 of heap for image cache</code></pre>
+
+<!-- ============================================================ -->
+<h2>8. NativeAllocationRegistry — Bridging Native Memory with GC</h2>
+
+<pre><code>// Problem: Android 8+ moved Bitmap pixels to native heap.
+// The GC only tracks Java heap — it has no idea about native allocations.
+// Without intervention, an app could allocate 500MB of Bitmaps
+// and the GC would never trigger because the Java heap is only 30MB.
+
+// Solution: NativeAllocationRegistry (android.os.NativeAllocationRegistry)
+// Registers a native allocation size + free function with a Java object.
+// When the Java object is GC'd, the native memory is freed.
+// CRITICALLY: it also tells ART's GC about the native memory size.
+
+// How it works internally:
+// 1. Java object (e.g., Bitmap) is created
+// 2. Native code allocates pixel buffer via malloc (e.g., 4MB)
+// 3. NativeAllocationRegistry.registerNativeAllocation(size) is called
+//    → ART adds 4MB to its internal "native bytes allocated" counter
+//    → If native bytes exceed the GC trigger threshold → GC fires
+// 4. A Cleaner (PhantomReference) is attached to the Java object
+// 5. When the Java object becomes unreachable:
+//    → GC enqueues the PhantomReference
+//    → Cleaner thread calls the native free function (e.g., free(pixelBuffer))
+//    → ART decrements the native bytes counter
+
+// This is why Bitmaps on Android 8+ don't cause Java OOM
+// but DO trigger GC when you allocate too many of them.
+
+// Used by: Bitmap, Typeface, HardwareBuffer, NativeAllocationRegistry
+// Source: frameworks/base/core/java/android/os/NativeAllocationRegistry.java
+
+// Kotlin example — how Bitmap uses it:
+// (simplified from frameworks/base/graphics/java/android/graphics/Bitmap.java)
+//
+// class Bitmap {
+//     init {
+//         val registry = NativeAllocationRegistry(
+//             Bitmap::class.java.classLoader,
+//             nativeGetNativeFinalizer(),  // pointer to C++ destructor
+//             allocationByteCount.toLong()
+//         )
+//         registry.registerNativeAllocation(this, nativePtr)
+//     }
+// }</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Cleaner vs finalize()</div>
+  <p>Before Android 8, native cleanup used <code>finalize()</code> — a method called by the GC before reclaiming an object. Problems: (1) Finalizers run on a single <code>FinalizerDaemon</code> thread — if one finalizer blocks, ALL finalization stalls, causing memory buildup. (2) Finalizable objects require two GC cycles to reclaim (first GC marks for finalization, second GC actually frees). (3) The <code>FinalizerWatchdogDaemon</code> kills the process if a finalizer takes >10 seconds. <code>NativeAllocationRegistry</code> uses <code>sun.misc.Cleaner</code> (a <code>PhantomReference</code> subclass) instead — Cleaners run on the <code>ReferenceQueueDaemon</code> thread, don't delay GC, and objects are reclaimable in a single GC cycle. At L6, you should know: never use <code>finalize()</code> in modern Android code. Use <code>Cleaner</code> (Java 9+) or <code>NativeAllocationRegistry</code> for native resource cleanup.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. TLAB — Thread-Local Allocation Buffers</h2>
+
+<pre><code>// TLAB is ART's fast-path allocation mechanism.
+// Each thread gets a private chunk of RegionSpace (typically one 256KB region).
+// Allocation within a TLAB is a simple bump-pointer increment — no locks needed.
+
+// Allocation fast path (pseudocode from ART):
+// Object* Allocate(size_t size) {
+//     if (tlab_pos + size <= tlab_end) {
+//         Object* obj = tlab_pos;
+//         tlab_pos += size;
+//         return obj;  // No lock, no CAS, just pointer bump
+//     }
+//     return SlowPathAllocate(size);  // Request new TLAB from RegionSpace
+// }
+
+// SlowPathAllocate:
+// 1. Return current TLAB to RegionSpace
+// 2. Request a new free region (requires lock, but infrequent)
+// 3. If no free regions → trigger GC
+// 4. If GC doesn't free enough → grow heap (up to max)
+// 5. If at max → OutOfMemoryError
+
+// Why this matters for performance:
+// - Most allocations (>99%) hit the TLAB fast path
+// - Cost: ~3 CPU instructions (load, add, store)
+// - No synchronization needed (thread-local)
+// - This is why object allocation in ART is nearly free
+// - BUT: high allocation RATE still causes frequent TLAB exhaustion
+//   → frequent slow-path calls → frequent GC triggers</code></pre>
+
+<!-- ============================================================ -->
+<h2>10. Page Reclaim — madvise and Memory Return</h2>
+
+<pre><code>// After GC, ART has freed regions in RegionSpace.
+// But the OS still thinks those pages are "used" (RSS stays high).
+// ART must explicitly tell the kernel to reclaim the physical pages.
+
+// ART uses madvise() system call:
+// madvise(addr, length, MADV_DONTNEED)
+//   → Kernel marks pages as "not needed"
+//   → Physical pages are freed immediately
+//   → Virtual address mapping remains (no munmap needed)
+//   → Next access triggers a page fault → kernel allocates a new zero page
+
+// When ART calls madvise:
+// 1. After every GC: freed RegionSpace regions → MADV_DONTNEED
+// 2. On background transition: aggressive compaction + MADV_DONTNEED
+// 3. Heap trim: if free space > heapMaxFree → shrink and MADV_DONTNEED
+
+// Android 12+ also uses:
+// madvise(addr, length, MADV_FREE)
+//   → "Lazy" reclaim: kernel MAY reclaim the pages if under pressure
+//   → If not reclaimed, the data is still there (faster re-access)
+//   → Better performance than MADV_DONTNEED when memory isn't tight
+
+// This is why an app's RSS drops after going to background:
+// ART compacts the heap and calls madvise to return pages to the OS.
+// The app's virtual address space stays the same, but physical RAM is freed.</code></pre>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  <a href="02-gc-internals.html">02 — GC Internals →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

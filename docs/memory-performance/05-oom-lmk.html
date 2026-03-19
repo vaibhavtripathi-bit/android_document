@@ -1,0 +1,902 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 — OOM & Low Memory Killer — lmkd, oom_adj, onTrimMemory & Surviving Low-Memory Conditions</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-memory-model.html">01 Memory Model</a>
+  <a href="02-gc-internals.html">02 GC Internals</a>
+  <a href="03-memory-leaks.html">03 Memory Leaks</a>
+  <a href="04-anr-deep-dive.html">04 ANR Deep Dive</a>
+  <a class="active" href="05-oom-lmk.html">05 OOM &amp; LMK</a>
+  <a href="06-app-startup.html">06 App Startup</a>
+  <a href="07-baseline-profiles.html">07 Baseline Profiles</a>
+  <a href="08-interview-qa.html">08 Interview Q&amp;A</a>
+</div>
+
+<h1>05 — OOM & Low Memory Killer</h1>
+<p class="subtitle">Linux OOM killer, Android's lmkd, oom_adj scores, process priority, onTrimMemory, and surviving low-memory conditions</p>
+
+<!-- ============================================================ -->
+<h2>1. Linux OOM Killer vs Android LMK</h2>
+
+<p>Standard Linux and Android take fundamentally different approaches to memory exhaustion. Linux treats process killing as a last resort; Android treats it as a normal, continuous optimization.</p>
+
+<h3>Linux OOM Killer — Last Resort</h3>
+
+<pre><code>// The Linux kernel OOM killer activates when:
+// 1. All physical RAM is exhausted
+// 2. All swap space is exhausted
+// 3. The kernel cannot reclaim any more pages
+//
+// At this point the kernel MUST kill something or the entire system hangs.
+//
+// Selection algorithm (simplified):
+// For each process:
+//   oom_score = (process_RSS / total_RAM) * 1000
+//   oom_score += oom_score_adj  (userspace hint: -1000 to +1000)
+//   // Higher score = more likely to be killed
+//
+// The process with the HIGHEST oom_score is killed via SIGKILL.
+//
+// Problems for mobile:
+// - Too late: by the time OOM killer fires, the system is already thrashing
+// - Too coarse: kills one process, but the system may need to free much more
+// - No awareness of Android's component model (Activities, Services, etc.)
+// - No concept of "foreground" vs "background" in the Android sense</code></pre>
+
+<h3>Android's lmkd — Proactive Killing</h3>
+
+<pre><code>// Android replaces the reactive Linux OOM killer with a proactive daemon: lmkd.
+// lmkd kills processes BEFORE the system reaches critical memory pressure.
+//
+// Key differences:
+// ┌────────────────────────┬──────────────────────┬─────────────────────────────┐
+// │                        │ Linux OOM Killer      │ Android lmkd                │
+// ├────────────────────────┼──────────────────────┼─────────────────────────────┤
+// │ When it kills          │ Last resort (no RAM)  │ Proactively (thresholds)    │
+// │ Selection criteria     │ oom_score (RSS-based)  │ oom_adj (component-aware)   │
+// │ Who sets priority      │ Kernel heuristics     │ ActivityManagerService       │
+// │ Awareness of UI state  │ None                  │ Full (fg/bg/cached/service) │
+// │ Runs as                │ Kernel code           │ Userspace daemon             │
+// │ Trigger mechanism      │ Page allocation fail  │ Memory pressure thresholds  │
+// └────────────────────────┴──────────────────────┴─────────────────────────────┘
+
+// lmkd evolution:
+// Android 1-8: kernel lowmemorykiller module (drivers/staging/android/)
+//   - Kernel module that hooks into the page allocator
+//   - Kills processes when free pages drop below configured thresholds
+//   - Simple but effective; ran entirely in kernel space
+//   - Deprecated because kernel staging drivers are hard to maintain
+//
+// Android 9+: lmkd userspace daemon (/system/bin/lmkd)
+//   - Moved to userspace for better maintainability
+//   - Communicates with AMS via a Unix domain socket
+//   - Polls /proc/meminfo or uses vmpressure events
+//   - More sophisticated kill strategies
+//
+// Android 10+: lmkd with PSI (Pressure Stall Information)
+//   - Uses kernel PSI metrics instead of free-memory thresholds
+//   - PSI measures actual stall time caused by memory pressure
+//   - More accurate: "how much is memory pressure hurting performance?"
+//   - vs old approach: "how many free pages remain?" (misleading with caches)</code></pre>
+
+<h3>PSI — Pressure Stall Information</h3>
+
+<pre><code>// PSI provides three metrics in /proc/pressure/memory:
+//
+// some avg10=0.50 avg60=1.20 avg300=0.80 total=12345678
+// full avg10=0.00 avg60=0.10 avg300=0.05 total=1234567
+//
+// "some": percentage of time at least SOME tasks are stalled on memory
+// "full": percentage of time ALL tasks are stalled (system completely blocked)
+//
+// avg10/avg60/avg300: moving averages over 10s, 60s, 300s windows
+//
+// lmkd uses these to make kill decisions:
+// - Low pressure (some avg10 > threshold): kill cached processes
+// - Medium pressure (some avg60 > threshold): kill heavier cached processes
+// - Critical pressure (full avg10 > threshold): kill service processes
+//
+// Why PSI is better than free-memory thresholds:
+// Free memory can be low but the system is fine (pages are reclaimable cache).
+// Free memory can be "adequate" but the system is thrashing (fragmentation).
+// PSI directly measures the IMPACT of memory pressure on task execution.</code></pre>
+
+<!-- ============================================================ -->
+<h2>2. oom_adj Scores — The Priority System</h2>
+
+<p>Every Android process has an <code>oom_adj</code> score that determines its kill priority. Lower scores = higher importance = killed last. ActivityManagerService continuously recomputes these scores as the app's state changes.</p>
+
+<table>
+  <tr><th>Constant</th><th>Value</th><th>Meaning</th><th>Example</th></tr>
+  <tr><td><code>NATIVE_ADJ</code></td><td>-1000</td><td>Native system process — never killed by lmkd</td><td>init, lmkd itself, servicemanager</td></tr>
+  <tr><td><code>SYSTEM_ADJ</code></td><td>-900</td><td>system_server — killing it reboots the device</td><td>system_server</td></tr>
+  <tr><td><code>PERSISTENT_PROC_ADJ</code></td><td>-800</td><td>Persistent system apps</td><td>Phone, SystemUI, Settings</td></tr>
+  <tr><td><code>PERSISTENT_SERVICE_ADJ</code></td><td>-700</td><td>Process bound to a persistent process</td><td>App bound to Phone process</td></tr>
+  <tr><td><code>FOREGROUND_APP_ADJ</code></td><td>0</td><td>Currently in foreground — user is interacting</td><td>Active Activity, active instrumentation</td></tr>
+  <tr><td><code>VISIBLE_APP_ADJ</code></td><td>100</td><td>Visible but not foreground</td><td>Activity behind a dialog, PiP window</td></tr>
+  <tr><td><code>PERCEPTIBLE_APP_ADJ</code></td><td>200</td><td>User would notice if killed</td><td>Running foreground service, active media playback</td></tr>
+  <tr><td><code>PERCEPTIBLE_LOW_APP_ADJ</code></td><td>250</td><td>Perceptible but less critical</td><td>Hosting an overlay, toast window</td></tr>
+  <tr><td><code>BACKUP_APP_ADJ</code></td><td>300</td><td>Hosting a backup agent</td><td>App during auto-backup</td></tr>
+  <tr><td><code>HEAVY_WEIGHT_APP_ADJ</code></td><td>400</td><td>Heavy-weight process (legacy)</td><td>Rarely used in modern Android</td></tr>
+  <tr><td><code>SERVICE_ADJ</code></td><td>500</td><td>Running a started service</td><td>Background service doing work</td></tr>
+  <tr><td><code>HOME_APP_ADJ</code></td><td>600</td><td>Home/launcher process</td><td>Pixel Launcher, Nova Launcher</td></tr>
+  <tr><td><code>PREVIOUS_APP_ADJ</code></td><td>700</td><td>Previous foreground app</td><td>The app user just left</td></tr>
+  <tr><td><code>SERVICE_B_ADJ</code></td><td>800</td><td>Old service, demoted from SERVICE_ADJ</td><td>Service running > 30 minutes</td></tr>
+  <tr><td><code>CACHED_APP_MIN_ADJ</code></td><td>900</td><td>Cached process (least recently used end)</td><td>Background app with saved state</td></tr>
+  <tr><td><code>CACHED_APP_MAX_ADJ</code></td><td>999</td><td>Cached process (most expendable)</td><td>Oldest cached app in LRU list</td></tr>
+</table>
+
+<h3>How AMS Computes oom_adj — updateOomAdjLocked()</h3>
+
+<pre><code>// AMS recomputes oom_adj for ALL processes whenever significant state changes:
+// - Activity lifecycle transitions (resume, pause, stop, destroy)
+// - Service start/stop/bind/unbind
+// - Broadcast receiver registration
+// - Content provider acquisition/release
+// - Process importance changes from client bindings
+
+// Source: frameworks/base/services/core/java/com/android/server/am/OomAdjuster.java
+
+// Simplified logic of updateOomAdjLocked():
+fun computeOomAdj(app: ProcessRecord): Int {
+    // 1. Start with the worst priority
+    var adj = CACHED_APP_MAX_ADJ
+
+    // 2. Check for foreground Activity
+    if (app.hasActivityInState(RESUMED)) {
+        adj = FOREGROUND_APP_ADJ  // 0
+    }
+
+    // 3. Check for visible Activity (not resumed but visible)
+    else if (app.hasActivityInState(PAUSING, PAUSED) && app.isVisible) {
+        adj = VISIBLE_APP_ADJ  // 100
+    }
+
+    // 4. Check for foreground service
+    else if (app.hasForegroundService()) {
+        adj = PERCEPTIBLE_APP_ADJ  // 200
+    }
+
+    // 5. Check for active instrumentation (testing)
+    else if (app.hasActiveInstrumentation()) {
+        adj = FOREGROUND_APP_ADJ  // 0
+    }
+
+    // 6. Check for active broadcast receiver
+    else if (app.isReceivingBroadcast()) {
+        adj = FOREGROUND_APP_ADJ  // 0 (temporarily, while receiving)
+    }
+
+    // 7. Check for running service
+    else if (app.hasStartedService()) {
+        adj = SERVICE_ADJ  // 500
+        // Demote to SERVICE_B_ADJ (800) if running > 30 min
+        if (app.serviceStartTime + 30.minutes < now) {
+            adj = SERVICE_B_ADJ
+        }
+    }
+
+    // 8. Check bindings — a bound service inherits client's priority
+    for (connection in app.serviceConnections) {
+        val clientAdj = connection.client.currentAdj
+        if (connection.hasFlag(BIND_ABOVE_CLIENT)) {
+            adj = minOf(adj, clientAdj)  // At least as important as client
+        } else if (connection.hasFlag(BIND_IMPORTANT)) {
+            adj = minOf(adj, clientAdj + 1)  // Slightly below client
+        } else if (connection.hasFlag(BIND_NOT_FOREGROUND)) {
+            // Don't promote above PERCEPTIBLE
+        } else {
+            adj = minOf(adj, maxOf(clientAdj, PERCEPTIBLE_APP_ADJ))
+        }
+    }
+
+    // 9. Check content provider clients
+    for (provider in app.publishedProviders) {
+        for (client in provider.connections) {
+            adj = minOf(adj, client.currentAdj + 1)
+        }
+    }
+
+    // 10. Apply to the process
+    return adj
+}
+
+// After computing, AMS writes the value:
+// ProcessList.setOomAdj(pid, uid, adj)
+//   → writes to /proc/{pid}/oom_score_adj
+//   → also notifies lmkd via socket: "pid X has adj Y"</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Binding Flags Matter Enormously</div>
+  <p>The flags you pass to <code>bindService()</code> directly control whether the service's process gets promoted. <code>BIND_ABOVE_CLIENT</code> makes the service at least as important as the binding Activity. <code>BIND_NOT_FOREGROUND</code> prevents the service from being promoted above <code>PERCEPTIBLE_APP_ADJ</code>. <code>BIND_WAIVE_PRIORITY</code> means the binding doesn't affect the service's priority at all. Choosing the wrong flag can either cause your service to be killed too easily or prevent the system from reclaiming memory from processes that should be killable.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Process Priority — What Affects It</h2>
+
+<h3>The Five Process Buckets</h3>
+
+<pre><code>// Android documentation describes five process importance levels.
+// Internally these map to ranges of oom_adj values.
+
+// 1. FOREGROUND PROCESS (adj = 0)
+//    - Has a resumed Activity (user is interacting with it)
+//    - Is executing a BroadcastReceiver.onReceive()
+//    - Is executing a Service lifecycle callback (onCreate, onStart, onBind)
+//    - Has active instrumentation
+//    Kill policy: NEVER killed unless absolutely necessary (system is dying)
+
+// 2. VISIBLE PROCESS (adj = 100)
+//    - Has a visible but not resumed Activity (behind a transparent Activity/dialog)
+//    - Has a foreground Service (startForeground() called with notification)
+//    Kill policy: Only killed if necessary to keep foreground process alive
+
+// 3. SERVICE PROCESS (adj = 500)
+//    - Running a started Service (startService()) that is not foreground
+//    - Doing background work the user doesn't directly see
+//    Kill policy: Killed when memory is needed; demoted after 30 min
+//    Note: Android 8+ restricts background services heavily
+
+// 4. CACHED (BACKGROUND) PROCESS (adj = 900-999)
+//    - Not currently needed — no active components
+//    - Kept alive for faster re-launch (warm start)
+//    - Organized in an LRU list — most recently used = lower adj
+//    Kill policy: Freely killed, starting from highest adj (oldest)
+//    System maintains ~16-32 cached processes (device-dependent)
+
+// 5. EMPTY PROCESS (adj = 999)
+//    - No active components at all
+//    - Exists only as a process cache
+//    Kill policy: First to be killed</code></pre>
+
+<h3>How Foreground Services Change oom_adj</h3>
+
+<pre><code>// Starting a foreground service dramatically changes process priority:
+
+class UploadService : Service() {
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Before startForeground(): process adj = SERVICE_ADJ (500)
+        // or CACHED_APP_MAX_ADJ (999) if no other components
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Uploading...")
+            .setSmallIcon(R.drawable.ic_upload)
+            .build()
+
+        startForeground(NOTIFICATION_ID, notification)
+        // After startForeground(): process adj = PERCEPTIBLE_APP_ADJ (200)
+        // This is a HUGE jump — from "freely killable" to "user-perceptible"
+
+        return START_STICKY
+    }
+}
+
+// Timeline of oom_adj changes:
+// 1. App in foreground:           adj = 0   (FOREGROUND_APP_ADJ)
+// 2. User presses Home:           adj = 700 (PREVIOUS_APP_ADJ)
+// 3. Another app opens:           adj = 900 (CACHED_APP_MIN_ADJ)
+// 4. Service.startForeground():   adj = 200 (PERCEPTIBLE_APP_ADJ)
+// 5. Service.stopForeground():    adj = 900 (back to CACHED)
+// 6. Time passes, more apps open: adj = 950 → 999 (slides toward MAX)</code></pre>
+
+<h3>How Binding Elevates a Service Process</h3>
+
+<pre><code>// When an Activity binds to a Service in another process,
+// the Service's process priority is elevated based on the binding flags.
+
+// Scenario: Activity (adj=0) binds to a Service (adj=900)
+
+// Default binding (no special flags):
+bindService(intent, connection, Context.BIND_AUTO_CREATE)
+// Service adj becomes: max(clientAdj, PERCEPTIBLE_APP_ADJ) = max(0, 200) = 200
+
+// BIND_ABOVE_CLIENT: service is at least as important as the client
+bindService(intent, connection, BIND_AUTO_CREATE or BIND_ABOVE_CLIENT)
+// Service adj becomes: clientAdj = 0 (same as the Activity!)
+
+// BIND_IMPORTANT: slightly below client
+bindService(intent, connection, BIND_AUTO_CREATE or BIND_IMPORTANT)
+// Service adj becomes: clientAdj + 1 = 1
+
+// BIND_NOT_FOREGROUND: don't promote above perceptible
+bindService(intent, connection, BIND_AUTO_CREATE or BIND_NOT_FOREGROUND)
+// Service adj becomes: max(clientAdj, PERCEPTIBLE_APP_ADJ) = 200
+
+// BIND_WAIVE_PRIORITY: binding doesn't affect priority at all
+bindService(intent, connection, BIND_AUTO_CREATE or BIND_WAIVE_PRIORITY)
+// Service adj stays at 900 — binding is "invisible" to OOM adjuster
+
+// When the Activity unbinds or is destroyed:
+// Service adj reverts to its own intrinsic priority (SERVICE_ADJ or CACHED)</code></pre>
+
+<h3>Cached Processes and the LRU List</h3>
+
+<pre><code>// Cached processes are organized in an LRU (Least Recently Used) list.
+// AMS maintains this list in ProcessList.mLruProcesses.
+
+// When a process transitions to cached:
+// - It's placed at the "recent" end of the LRU list (adj = 900)
+// - As more processes become cached, older ones slide toward adj = 999
+// - lmkd kills from the 999 end first
+
+// The system maintains a target number of cached processes:
+// CachedAppOptimizer in AMS manages this:
+//   - Typical target: 32 cached processes (varies by device RAM)
+//   - When count exceeds target: oldest cached processes are killed
+//   - On low-RAM devices (< 2GB): target may be as low as 8-16
+
+// Cached process compaction (Android 10+):
+// Instead of killing, AMS first tries to COMPACT cached processes:
+// - Sends SIGSTOP to freeze the process
+// - Calls process_madvise(MADV_COLD) to hint pages as reclaimable
+// - Kernel can reclaim those pages without killing the process
+// - If the process is resumed, pages are faulted back in (slower but alive)
+
+// Freezer (Android 11+):
+// Cached processes can be FROZEN using cgroup v2 freezer:
+// - Process is completely stopped (no CPU time)
+// - Memory pages are marked as candidates for swap/zRAM
+// - Unfreezing is faster than cold-starting the process
+// echo 1 > /sys/fs/cgroup/uid_{uid}/pid_{pid}/cgroup.freeze</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. onTrimMemory Callbacks</h2>
+
+<p>Android notifies apps about memory pressure via the <code>ComponentCallbacks2</code> interface. The system sends increasingly urgent levels, giving apps a chance to release resources before being killed.</p>
+
+<pre><code>// ComponentCallbacks2 is implemented by Application, Activity, Service, etc.
+// Override onTrimMemory(level: Int) to respond to memory pressure.
+
+class MyApplication : Application(), ComponentCallbacks2 {
+
+    private val imageCache = LruCache&lt;String, Bitmap&gt;(50 * 1024 * 1024) // 50MB
+    private val dataCache = mutableMapOf&lt;String, Any&gt;()
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+
+        when (level) {
+            // ── App is RUNNING (foreground) ──────────────────────
+
+            TRIM_MEMORY_RUNNING_MODERATE -> {  // level = 5
+                // System is getting low on memory. Your app is running
+                // and not killable, but consider releasing non-critical resources.
+                // Other background apps are being killed.
+                dataCache.entries
+                    .filter { it.value is SoftReference&lt;*&gt; }
+                    .forEach { dataCache.remove(it.key) }
+            }
+
+            TRIM_MEMORY_RUNNING_LOW -> {  // level = 10
+                // System is considerably low on memory while your app is running.
+                // Release unnecessary resources NOW to avoid performance degradation.
+                imageCache.trimToSize(imageCache.maxSize() / 2)
+                dataCache.clear()
+            }
+
+            TRIM_MEMORY_RUNNING_CRITICAL -> {  // level = 15
+                // System is critically low on memory. Your app is not yet killable
+                // but the system WILL kill background processes and may kill yours
+                // if you don't free memory immediately.
+                imageCache.evictAll()
+                dataCache.clear()
+                // Release any recreatable resources: decoded bitmaps,
+                // layout caches, view pools, typeface caches
+            }
+
+            // ── App's UI is HIDDEN ──────────────────────────────
+
+            TRIM_MEMORY_UI_HIDDEN -> {  // level = 20
+                // App moved to background — UI is no longer visible.
+                // This is NOT a memory pressure signal — it's a lifecycle hint.
+                // Release UI-specific resources: image caches, view references,
+                // large layout hierarchies that can be recreated.
+                imageCache.evictAll()
+                // This is the most important callback for most apps.
+                // Glide/Coil listen for this to clear their memory caches.
+            }
+
+            // ── App is CACHED (background, killable) ────────────
+
+            TRIM_MEMORY_BACKGROUND -> {  // level = 40
+                // App is in the cached LRU list near the beginning (recently used).
+                // Free resources that can be efficiently rebuilt if the app returns.
+                imageCache.evictAll()
+                dataCache.clear()
+            }
+
+            TRIM_MEMORY_MODERATE -> {  // level = 60
+                // App is in the middle of the cached LRU list.
+                // More aggressive cleanup — you're getting closer to being killed.
+                imageCache.evictAll()
+                dataCache.clear()
+                // Release database connections, close cursors,
+                // trim thread pools, release WebView if possible
+            }
+
+            TRIM_MEMORY_COMPLETE -> {  // level = 80
+                // App is at the END of the cached LRU list — next to be killed.
+                // Release EVERYTHING that isn't absolutely needed to restart.
+                imageCache.evictAll()
+                dataCache.clear()
+                // Last chance: release all caches, pools, buffers.
+                // If you don't free enough, you'll be killed.
+            }
+        }
+    }
+}</code></pre>
+
+<table>
+  <tr><th>Level</th><th>Value</th><th>App State</th><th>What to Release</th></tr>
+  <tr><td><code>RUNNING_MODERATE</code></td><td>5</td><td>Foreground, running</td><td>Soft-referenced caches, prefetched data</td></tr>
+  <tr><td><code>RUNNING_LOW</code></td><td>10</td><td>Foreground, running</td><td>Half of image cache, all data caches</td></tr>
+  <tr><td><code>RUNNING_CRITICAL</code></td><td>15</td><td>Foreground, running</td><td>All caches, recreatable resources, view pools</td></tr>
+  <tr><td><code>UI_HIDDEN</code></td><td>20</td><td>Background (just hidden)</td><td>All UI resources — image caches, decoded bitmaps</td></tr>
+  <tr><td><code>BACKGROUND</code></td><td>40</td><td>Cached (recent)</td><td>All caches, data structures</td></tr>
+  <tr><td><code>MODERATE</code></td><td>60</td><td>Cached (middle)</td><td>DB connections, thread pools, WebView</td></tr>
+  <tr><td><code>COMPLETE</code></td><td>80</td><td>Cached (about to die)</td><td>Everything possible — last chance</td></tr>
+</table>
+
+<div class="callout warn">
+  <div class="callout-label">UI_HIDDEN Is Not Memory Pressure</div>
+  <p><code>TRIM_MEMORY_UI_HIDDEN</code> (level 20) is sent every time your app goes to background, regardless of memory conditions. It's a lifecycle signal, not a pressure signal. The RUNNING_* levels (5, 10, 15) are sent while your app is in the foreground and indicate actual system-wide memory pressure. The BACKGROUND/MODERATE/COMPLETE levels (40, 60, 80) are sent to cached apps and indicate your position in the kill queue. Many developers confuse these categories.</p>
+</div>
+
+<h3>How Image Libraries Handle onTrimMemory</h3>
+
+<pre><code>// Glide's implementation (simplified):
+// Glide registers a ComponentCallbacks2 on the Application:
+
+class GlideMemoryTrimmer : ComponentCallbacks2 {
+    override fun onTrimMemory(level: Int) {
+        when {
+            level >= TRIM_MEMORY_MODERATE -> {
+                // Clear both memory cache and bitmap pool entirely
+                memoryCache.clearMemory()
+                bitmapPool.clearMemory()
+            }
+            level >= TRIM_MEMORY_BACKGROUND || level == TRIM_MEMORY_RUNNING_CRITICAL -> {
+                // Trim to 50% of max size
+                memoryCache.trimMemory(level)
+                bitmapPool.trimMemory(level)
+            }
+            level == TRIM_MEMORY_UI_HIDDEN -> {
+                // App went to background — clear memory cache
+                // but keep bitmap pool (bitmaps are expensive to allocate)
+                memoryCache.clearMemory()
+            }
+        }
+    }
+}
+
+// Coil's implementation:
+// Coil uses a similar approach but with its MemoryCache:
+// - UI_HIDDEN: trim to 50%
+// - RUNNING_LOW: trim to 25%
+// - BACKGROUND+: clear entirely
+
+// Key insight: image libraries are the #1 consumer of onTrimMemory
+// because bitmap memory is the largest reclaimable resource in most apps.</code></pre>
+
+<!-- ============================================================ -->
+<h2>5. OutOfMemoryError — Java vs Native</h2>
+
+<h3>Java Heap OOM</h3>
+
+<pre><code>// Java OOM occurs when the Dalvik/ART heap cannot grow further.
+// Each app has a per-app heap limit set by the device manufacturer.
+
+// Check your heap limits:
+val runtime = Runtime.getRuntime()
+val maxHeap = runtime.maxMemory()       // Hard limit (e.g., 256MB, 512MB)
+val totalHeap = runtime.totalMemory()   // Currently allocated heap size
+val freeHeap = runtime.freeMemory()     // Free within current allocation
+val usedHeap = totalHeap - freeHeap     // Actually used
+
+// Typical limits (varies by device):
+// Low-RAM devices:  128MB - 192MB
+// Mid-range:        256MB - 384MB
+// Flagships:        512MB - 1GB
+// largeHeap=true:   2x-4x the normal limit (NOT recommended)
+
+// The limit is set in /system/build.prop:
+// dalvik.vm.heapsize=512m          (max heap per app)
+// dalvik.vm.heapgrowthlimit=256m   (default limit)
+// dalvik.vm.heapstartsize=8m       (initial heap)
+// dalvik.vm.heapmaxfree=8m         (max free before shrinking)
+// dalvik.vm.heapminfree=512k       (min free after GC)
+// dalvik.vm.heaptargetutilization=0.75  (target 75% utilization)
+
+// When usedHeap approaches maxMemory():
+// 1. ART triggers GC (concurrent, then stop-the-world if needed)
+// 2. If GC can't free enough → ART tries to grow the heap
+// 3. If heap is at maxMemory() → java.lang.OutOfMemoryError
+
+// Common causes of Java heap OOM:
+// - Holding too many Bitmaps in memory (pre-Android 8)
+// - Memory leaks (Activity references held by static fields, singletons)
+// - Unbounded caches (HashMap growing without eviction)
+// - Large JSON/XML parsing (loading entire response into memory)
+// - Too many threads (each thread stack = 1-8MB)</code></pre>
+
+<h3>Native OOM</h3>
+
+<pre><code>// Native OOM is fundamentally different from Java OOM.
+// Native memory (malloc/mmap) has NO per-app heap limit.
+// It's bounded only by:
+// 1. Device physical RAM + swap/zRAM
+// 2. Virtual address space (practically unlimited on 64-bit)
+// 3. Per-process limits (RLIMIT_AS, rarely set on Android)
+
+// Native malloc failure:
+// - malloc() returns NULL (C/C++)
+// - If not checked → SIGSEGV (crash) when dereferencing NULL
+// - Unlike Java, there's no exception — just a NULL pointer
+
+// Major native memory consumers in Android apps:
+// 1. Bitmaps (Android 8+): pixel data stored in native heap
+//    - A 4K photo: 4032 × 3024 × 4 bytes = ~46MB native memory
+//    - 10 such photos = 460MB — no Java OOM, but device runs out of RAM
+
+// 2. WebView / Chromium renderer:
+//    - Each WebView tab: 50-200MB native memory
+//    - DOM, render tree, composited layers, V8 JS heap
+//    - Completely invisible to Java heap monitoring
+
+// 3. SQLite:
+//    - Page cache, WAL file mapping, prepared statements
+//    - Typically 2-20MB but can grow with large transactions
+
+// 4. Graphics / GPU buffers:
+//    - EGL surfaces, texture uploads, shader programs
+//    - Managed by the GPU driver, not the Java heap
+
+// 5. RenderScript / Vulkan compute buffers
+
+// Monitoring native memory:
+// Debug.getNativeHeapSize()         // Total native heap
+// Debug.getNativeHeapAllocatedSize() // Used native heap
+// Debug.getNativeHeapFreeSize()     // Free native heap
+// Or: adb shell dumpsys meminfo &lt;package&gt;</code></pre>
+
+<h3>Bitmap OOM — The Great Migration</h3>
+
+<pre><code>// Pre-Android 8 (API < 26):
+// Bitmap pixel data stored on the JAVA heap.
+// - Counted against Runtime.maxMemory()
+// - Easy to trigger OOM with a few large images
+// - Bitmap.recycle() was critical to free memory promptly
+// - Bitmap pixel data backed by byte[] on the Java heap
+
+// Android 8+ (API 26+):
+// Bitmap pixel data stored on the NATIVE heap.
+// - NOT counted against Runtime.maxMemory()
+// - Java heap only holds the Bitmap object (~64 bytes)
+// - Pixel data allocated via native malloc (hardware bitmaps use GPU memory)
+// - Bitmap.recycle() still frees native memory but is less critical
+//   (GC + native finalizer will eventually free it)
+
+// The catch: native memory is invisible to most monitoring tools.
+// An app can use 500MB of Bitmap native memory and show only 30MB Java heap.
+// This is why apps "mysteriously" get killed without hitting Java OOM.
+
+// Hardware Bitmaps (Android 8+):
+// Bitmap.Config.HARDWARE — pixel data stored in GPU memory
+// - Cannot be read/modified on CPU (getPixels() throws)
+// - Most memory-efficient for display-only bitmaps
+// - Memory is managed by the graphics driver
+// - Glide uses HARDWARE config by default
+
+// Monitoring bitmap memory:
+val bitmap = BitmapFactory.decodeResource(resources, R.drawable.large_image)
+val byteCount = bitmap.byteCount        // Pixel data size
+val allocationByteCount = bitmap.allocationByteCount  // Allocated buffer size
+// On Android 8+: this memory is in native heap, not Java heap</code></pre>
+
+<h3>Handling OOM Gracefully</h3>
+
+<pre><code>// Strategy 1: Catch OOM for non-critical allocations
+fun loadBitmapSafely(path: String, reqWidth: Int, reqHeight: Int): Bitmap? {
+    return try {
+        val options = BitmapFactory.Options().apply {
+            inJustDecodeBounds = true
+        }
+        BitmapFactory.decodeFile(path, options)
+
+        options.inSampleSize = calculateInSampleSize(options, reqWidth, reqHeight)
+        options.inJustDecodeBounds = false
+        BitmapFactory.decodeFile(path, options)
+    } catch (e: OutOfMemoryError) {
+        // Log, report to analytics, return placeholder
+        System.gc()  // Hint to GC (not guaranteed)
+        null
+    }
+}
+
+// Strategy 2: Use inSampleSize to downsample large images
+fun calculateInSampleSize(
+    options: BitmapFactory.Options,
+    reqWidth: Int,
+    reqHeight: Int
+): Int {
+    val (height, width) = options.outHeight to options.outWidth
+    var inSampleSize = 1
+    if (height > reqHeight || width > reqWidth) {
+        val halfHeight = height / 2
+        val halfWidth = width / 2
+        while (halfHeight / inSampleSize >= reqHeight &&
+               halfWidth / inSampleSize >= reqWidth) {
+            inSampleSize *= 2
+        }
+    }
+    return inSampleSize
+}
+
+// Strategy 3: Monitor memory proactively
+class MemoryMonitor(private val context: Context) {
+    fun isMemoryLow(): Boolean {
+        val activityManager = context.getSystemService&lt;ActivityManager&gt;()!!
+        val memInfo = ActivityManager.MemoryInfo()
+        activityManager.getMemoryInfo(memInfo)
+        return memInfo.lowMemory  // true when available RAM < threshold
+    }
+
+    fun getAvailableMemoryMB(): Long {
+        val memInfo = ActivityManager.MemoryInfo()
+        context.getSystemService&lt;ActivityManager&gt;()!!.getMemoryInfo(memInfo)
+        return memInfo.availMem / (1024 * 1024)
+    }
+
+    fun getHeapUsagePercent(): Float {
+        val runtime = Runtime.getRuntime()
+        val used = runtime.totalMemory() - runtime.freeMemory()
+        return used.toFloat() / runtime.maxMemory()
+    }
+}
+
+// Strategy 4: Never use android:largeHeap="true" as a fix
+// It masks the real problem and hurts other apps:
+// - Your app takes longer to GC (larger heap to scan)
+// - Less RAM available for other apps → more kills
+// - Google Play review may flag it
+// - Only legitimate use: apps that genuinely need large data sets
+//   (photo editors, video editors, CAD apps)</code></pre>
+
+<!-- ============================================================ -->
+<h2>6. lmkd Decision Flow</h2>
+
+<div class="diagram-container">
+<pre><code>                         ┌─────────────────────────┐
+                         │   Kernel Memory Subsystem │
+                         │                           │
+                         │  /proc/pressure/memory    │
+                         │  some avg10=X  full avg10=Y│
+                         └────────────┬──────────────┘
+                                      │
+                                      ▼
+                         ┌─────────────────────────┐
+                         │         lmkd             │
+                         │   (userspace daemon)     │
+                         └────────────┬──────────────┘
+                                      │
+                              ┌───────┴───────┐
+                              │ Read PSI data  │
+                              │ every ~100ms   │
+                              └───────┬───────┘
+                                      │
+                         ┌────────────┴────────────┐
+                         │  Evaluate pressure level  │
+                         └────────────┬────────────┘
+                                      │
+                    ┌─────────────────┼─────────────────┐
+                    ▼                 ▼                  ▼
+             ┌──────────┐     ┌──────────┐      ┌──────────────┐
+             │   LOW     │     │  MEDIUM   │      │   CRITICAL   │
+             │           │     │           │      │              │
+             │ some>10%  │     │ some>30%  │      │  full>5%     │
+             └─────┬─────┘     └─────┬─────┘      └──────┬───────┘
+                   │                 │                    │
+                   ▼                 ▼                    ▼
+          Kill processes     Kill processes       Kill processes
+          with adj ≥ 900     with adj ≥ 800       with adj ≥ 200
+          (cached only)      (old services +      (services +
+                              cached)              perceptible)
+                   │                 │                    │
+                   ▼                 ▼                    ▼
+          ┌────────────────────────────────────────────────────┐
+          │              For each eligible process:             │
+          │                                                    │
+          │  1. Sort by oom_adj (highest first = least important)│
+          │  2. Among same adj: sort by RSS (largest first)     │
+          │  3. Send SIGKILL to the selected process            │
+          │  4. Check if enough memory was freed                │
+          │  5. If not enough: kill next process                │
+          │  6. Repeat until pressure drops below threshold     │
+          └────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+                         ┌─────────────────────────┐
+                         │  AMS receives SIGCHLD /   │
+                         │  process death notification│
+                         │                           │
+                         │  - Cleans up ProcessRecord │
+                         │  - Sends onTrimMemory to   │
+                         │    remaining processes     │
+                         │  - Recalculates oom_adj    │
+                         │    for all processes       │
+                         └─────────────────────────┘</code></pre>
+</div>
+
+<h3>lmkd Communication with AMS</h3>
+
+<pre><code>// AMS and lmkd communicate via a Unix domain socket: /dev/socket/lmkd
+
+// AMS → lmkd messages:
+// LMK_TARGET: set memory thresholds for each adj level
+//   Format: LMK_TARGET &lt;minfree_1&gt; &lt;adj_1&gt; &lt;minfree_2&gt; &lt;adj_2&gt; ...
+//   Example: LMK_TARGET 18432 0 23040 100 27648 200 32256 300 55296 900 80640 999
+//   (minfree values in pages: 18432 pages × 4KB = 72MB for adj 0)
+
+// LMK_PROCPRIO: update a process's oom_adj
+//   Format: LMK_PROCPRIO &lt;pid&gt; &lt;uid&gt; &lt;adj&gt;
+//   Sent every time AMS recomputes oom_adj for a process
+
+// LMK_PROCREMOVE: process has died, remove from lmkd's tracking
+//   Format: LMK_PROCREMOVE &lt;pid&gt;
+
+// lmkd → AMS messages:
+// LMK_PROCKILL: lmkd killed a process
+//   Format: LMK_PROCKILL &lt;pid&gt; &lt;uid&gt;
+//   AMS uses this to clean up the ProcessRecord
+
+// lmkd configuration (system properties):
+// ro.lmk.low=1001           (adj threshold for low pressure kills)
+// ro.lmk.medium=800         (adj threshold for medium pressure kills)
+// ro.lmk.critical=0         (adj threshold for critical pressure kills)
+// ro.lmk.use_psi=true       (use PSI instead of vmpressure)
+// ro.lmk.psi_partial_stall_ms=70  (PSI threshold for partial stall)
+// ro.lmk.psi_complete_stall_ms=700 (PSI threshold for complete stall)</code></pre>
+
+<!-- ============================================================ -->
+<h2>7. Surviving Low-Memory Conditions</h2>
+
+<h3>Architecture-Level Strategies</h3>
+
+<pre><code>// 1. Saved instance state — survive process death
+class DetailActivity : AppCompatActivity() {
+    private var scrollPosition = 0
+    private var formData: FormState? = null
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putInt("scroll_position", scrollPosition)
+        outState.putParcelable("form_data", formData)
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        savedInstanceState?.let {
+            scrollPosition = it.getInt("scroll_position")
+            formData = it.getParcelable("form_data")
+        }
+    }
+}
+
+// 2. ViewModel + SavedStateHandle — survive both config change AND process death
+class DetailViewModel(private val savedState: SavedStateHandle) : ViewModel() {
+    // Survives config change (retained in memory)
+    private val _uiState = MutableStateFlow(DetailUiState())
+    val uiState: StateFlow&lt;DetailUiState&gt; = _uiState.asStateFlow()
+
+    // Survives process death (persisted to Bundle)
+    var searchQuery: String
+        get() = savedState["query"] ?: ""
+        set(value) { savedState["query"] = value }
+
+    // getStateFlow() for reactive saved state
+    val savedQuery: StateFlow&lt;String&gt; = savedState.getStateFlow("query", "")
+}
+
+// 3. Proactive memory management in custom views
+class ThumbnailGridView(context: Context) : RecyclerView(context) {
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        // Release adapter references to prevent holding bitmaps
+        adapter = null
+    }
+}
+
+// 4. WorkManager for critical background work
+// If your process is killed during background work, WorkManager
+// automatically reschedules the work when the process restarts.
+val uploadWork = OneTimeWorkRequestBuilder&lt;UploadWorker&gt;()
+    .setConstraints(Constraints.Builder()
+        .setRequiredNetworkType(NetworkType.CONNECTED)
+        .build())
+    .build()
+WorkManager.getInstance(context).enqueue(uploadWork)</code></pre>
+
+<h3>Testing Process Death</h3>
+
+<pre><code>// Method 1: Developer Options → "Don't keep activities"
+// Destroys every Activity as soon as the user leaves it.
+// Simulates aggressive memory reclamation.
+
+// Method 2: adb command to kill the process
+// adb shell am kill com.example.app
+// Kills the app's process as if lmkd killed it.
+// Different from "force stop" — preserves saved state.
+
+// Method 3: Background the app and kill via adb
+// 1. Open your app, navigate to a deep screen
+// 2. Press Home (app goes to background)
+// 3. adb shell am kill com.example.app
+// 4. Tap the app in Recents — it should restore from saved state
+
+// Method 4: Simulate low memory
+// adb shell am send-trim-memory com.example.app RUNNING_CRITICAL
+// adb shell am send-trim-memory com.example.app COMPLETE
+
+// Method 5: Programmatic (in tests)
+// Use the SavedStateRegistry test utilities:
+@Test
+fun testProcessDeath() {
+    val scenario = launchActivity&lt;DetailActivity&gt;()
+    scenario.moveToState(Lifecycle.State.CREATED)
+    scenario.recreate()  // Simulates process death + recreation
+    scenario.onActivity { activity ->
+        // Verify state was restored
+        assertEquals(expectedData, activity.restoredData)
+    }
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — The Real OOM Killer at Scale</div>
+  <p>The real OOM killer at Google scale is not the Java heap — it's native memory from Bitmaps, WebView, and SQLite that grows invisibly. A production app might show 80MB Java heap usage but consume 400MB total (PSS) because of native allocations. <code>Runtime.maxMemory()</code> only guards the Java heap; native memory is bounded only by device RAM. This is why apps get killed by lmkd without ever throwing <code>OutOfMemoryError</code>. At L6, you must monitor <strong>total PSS</strong> (via <code>Debug.getMemoryInfo()</code> or <code>dumpsys meminfo</code>), not just Java heap. The biggest offenders: (1) Bitmap pixel buffers on Android 8+ (native heap), (2) WebView renderer processes (50-200MB each), (3) SQLite page caches and memory-mapped WAL files, (4) Protobuf/FlatBuffer deserialization buffers, (5) JNI global references holding native objects. Google's internal memory tooling tracks RSS/PSS per-process with per-allocation-site attribution — something you can approximate with <code>malloc_debug</code> or Android Studio's native memory profiler.</p>
+</div>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  ← <a href="04-anr-deep-dive.html">04 — ANR Deep Dive</a> &nbsp;|&nbsp;
+  <a href="06-app-startup.html">06 — App Startup →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

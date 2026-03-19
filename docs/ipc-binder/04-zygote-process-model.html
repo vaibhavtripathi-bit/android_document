@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 — Zygote & App Process Model — Fork, Specialize, Preload & UID Assignment</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-binder-architecture.html">01 Binder Architecture</a>
+  <a href="02-binder-call-flow.html">02 Call Flow</a>
+  <a href="03-aidl-internals.html">03 AIDL</a>
+  <a class="active" href="04-zygote-process-model.html">04 Zygote</a>
+  <a href="05-system-services.html">05 System Services</a>
+  <a href="06-ipc-bottlenecks.html">06 IPC Bottlenecks</a>
+  <a href="07-interview-qa.html">07 Interview Q&A</a>
+</div>
+
+<h1>04 — Zygote & App Process Model</h1>
+<p class="subtitle">How every Android app process is born — Zygote's fork model, preloaded resources, UID assignment, specialization, and why this design makes app startup fast</p>
+
+<!-- ============================================================ -->
+<h2>1. Why Zygote Exists</h2>
+
+<pre><code>// Problem: Starting a new Android app requires:
+// 1. Loading the ART runtime (~30MB of native code)
+// 2. Loading the Android framework classes (~10,000+ classes)
+// 3. Loading shared resources (framework drawables, themes, etc.)
+// 4. Initializing the Binder driver connection
+// 5. Setting up the main Looper
+//
+// Doing this from scratch for every app would take 2-5 seconds.
+
+// Solution: Zygote
+// - A special process that starts early in boot
+// - Preloads ALL common classes and resources ONCE
+// - When a new app is needed: fork() — instant copy of everything
+// - fork() uses copy-on-write (COW): shared memory until modified
+// - Result: app startup in ~100-300ms instead of 2-5 seconds
+
+// The name "Zygote" comes from biology — a fertilized cell that
+// divides to create all other cells. Every app process is a "child" of Zygote.</code></pre>
+
+<!-- ============================================================ -->
+<h2>2. Boot Sequence — From init to Zygote</h2>
+
+<div class="diagram-container">
+<pre><code>  Kernel Boot
+      │
+      ▼
+  init (PID 1)
+      │
+      ├── Parses init.rc / init.zygote64_32.rc
+      │
+      ├── Starts servicemanager (native)
+      │     └── Opens /dev/binder, becomes handle 0
+      │
+      ├── Starts zygote64 (primary)
+      │     └── service zygote /system/bin/app_process64
+      │           -Xzygote /system/bin --zygote --start-system-server
+      │
+      └── Starts zygote32 (secondary, for 32-bit apps)
+            └── service zygote_secondary /system/bin/app_process32
+                  -Xzygote /system/bin --zygote
+
+  Zygote64 startup:
+      │
+      ├── 1. AndroidRuntime::start("com.android.internal.os.ZygoteInit")
+      │     └── Starts ART VM, loads ZygoteInit.main()
+      │
+      ├── 2. ZygoteInit.preload()
+      │     ├── preloadClasses()    — ~10,000 framework classes
+      │     ├── preloadResources()  — framework drawables, themes
+      │     ├── preloadSharedLibraries() — ICU, OpenGL, etc.
+      │     └── preloadTextResources()
+      │
+      ├── 3. ZygoteInit.forkSystemServer()
+      │     └── Forks system_server (the first child)
+      │
+      └── 4. ZygoteServer.runSelectLoop()
+            └── Listens on /dev/socket/zygote for fork requests</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Preloading — What and Why</h2>
+
+<pre><code>// ZygoteInit.preload() loads resources that ALL apps will need:
+
+// preloadClasses():
+// Source: frameworks/base/config/preloaded-classes
+// Contains ~10,000 class names, one per line:
+//   android.app.Activity
+//   android.app.Application
+//   android.content.Context
+//   android.view.View
+//   android.widget.TextView
+//   java.lang.String
+//   java.util.ArrayList
+//   ... etc.
+//
+// Each class is loaded via Class.forName() → triggers class initialization
+// This takes ~2-3 seconds during boot but saves time for every app launch
+// After fork(), child processes share these class objects via COW pages
+
+// preloadResources():
+// Loads framework resources (com.android.internal.R):
+// - Drawables (icons, backgrounds)
+// - Layouts (framework dialogs)
+// - Themes (Material, Holo)
+// - Colors, dimensions, strings
+// These are memory-mapped from the APK and shared across all processes
+
+// preloadSharedLibraries():
+// - libandroid.so (Android NDK runtime)
+// - libcompiler_rt.so
+// - libjnigraphics.so
+// - libicu.so (Unicode/i18n)
+// - libOpenGLES.so
+// These native libraries are loaded once, shared via COW after fork
+
+// Memory impact:
+// Zygote uses ~50-80MB after preloading
+// But this memory is SHARED across all app processes (COW)
+// Without Zygote: each of 50 apps would load 50-80MB = 2.5-4GB
+// With Zygote: 50-80MB shared + per-app delta = ~200-400MB total</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — COW and Dirty Pages</div>
+  <p>After <code>fork()</code>, parent and child share all memory pages as read-only. When either writes to a page, the kernel copies it (copy-on-write). The "dirty" pages are the app-specific overhead. You can measure this with <code>dumpsys meminfo &lt;pid&gt;</code>: "Private Dirty" = pages modified by this process (real cost), "Shared Clean" = pages shared with Zygote (free). A well-optimized app has low Private Dirty relative to its total PSS. Preloaded classes that are never modified remain shared forever — this is why Zygote preloads aggressively.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Fork and Specialize — App Process Birth</h2>
+
+<pre><code>// When AMS needs to start a new app process:
+
+// Step 1: AMS calls ZygoteProcess.start()
+// Source: frameworks/base/core/java/android/os/ZygoteProcess.java
+//
+// ZygoteProcess.openZygoteSocketIfNeeded()
+// - Connects to /dev/socket/zygote (Unix domain socket)
+// - Or /dev/socket/zygote_secondary for 32-bit apps
+
+// Step 2: Send arguments over the socket
+// ZygoteProcess.zygoteSendArgsAndGetResult(zygoteState, args)
+// Arguments include:
+//   --runtime-args
+//   --setuid=10042          (app's UID)
+//   --setgid=10042          (app's GID)
+//   --setgroups=3003,9997   (supplemental GIDs: inet, everybody)
+//   --nice-name=com.example.app
+//   --target-sdk-version=34
+//   --seinfo=default:targetSdkVersion=34:complete
+//   android.app.ActivityThread  (entry point class)
+
+// Step 3: ZygoteServer receives the request
+// ZygoteServer.runSelectLoop() → ZygoteConnection.processCommand()
+// Parses arguments into ZygoteArguments
+
+// Step 4: Fork
+// Zygote.forkAndSpecialize(uid, gid, gids, runtimeFlags, ...)
+//   → nativeForkAndSpecialize() (JNI → native)
+//     → fork() system call
+//     → In child process:
+//       1. setuid(uid), setgid(gid), setgroups(gids)
+//       2. setresuid(), setresgid() — drop all privilege
+//       3. Apply SELinux context: selinux_android_setcontext()
+//          → Changes from "zygote" domain to "untrusted_app" (or similar)
+//       4. Apply seccomp filter: set_app_seccomp_filter()
+//       5. Close Zygote's server socket (child doesn't need it)
+//       6. Reset signal handlers
+//       7. Call Thread.currentThread().setName(niceName)
+
+// Step 5: Child specializes
+// ZygoteInit.childZygoteInit() or RuntimeInit.commonInit()
+// → Calls ActivityThread.main() (the app's entry point)
+// → Creates the main Looper
+// → Attaches to AMS via Binder
+// → AMS sends back the pending Activity/Service/etc. to launch</code></pre>
+
+<div class="diagram-container">
+<pre><code>  AMS (system_server)                    Zygote Process
+  ─────────────────                      ──────────────
+  startProcessLocked()
+      │
+      ▼
+  ZygoteProcess.start()
+      │
+      ├── connect to /dev/socket/zygote
+      │
+      ├── send: "--setuid=10042 --nice-name=com.example ..."
+      │                                      │
+      │                                      ▼
+      │                              ZygoteConnection.processCommand()
+      │                                      │
+      │                                      ▼
+      │                              Zygote.forkAndSpecialize()
+      │                                      │
+      │                              ┌───────┴───────┐
+      │                              │               │
+      │                          PARENT          CHILD (new app)
+      │                          (Zygote)            │
+      │                          returns pid    setuid(10042)
+      │                                         SELinux → untrusted_app
+      │                                         seccomp filter
+      │                                              │
+      │                                         ActivityThread.main()
+      │                                              │
+      │◄─────────────────────────────────────── attach to AMS (Binder)
+      │
+  scheduleLaunchActivity()
+      │──────────────────────────────────────►  onCreate()</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. UID Assignment — The Identity System</h2>
+
+<pre><code>// Every app gets a unique Linux UID at install time.
+// This is the foundation of Android's security sandbox.
+
+// UID ranges:
+// 0         = root
+// 1000      = system (system_server)
+// 1001-1999 = reserved system UIDs (radio, bluetooth, wifi, etc.)
+// 2000      = shell (adb shell)
+// 10000-19999 = app UIDs (first user, user 0)
+// 100000+   = multi-user offset (user 1 starts at 100000 + appId)
+
+// Assignment:
+// PackageManagerService assigns UIDs during app installation.
+// Stored in /data/system/packages.xml:
+// <package name="com.example.app" userId="10042" ... />
+// Also in /data/system/packages.list (kernel-readable):
+// com.example.app 10042 0 /data/data/com.example.app ...
+
+// Multi-user:
+// User 0: UID = appId (e.g., 10042)
+// User 1: UID = 100000 + appId (e.g., 110042)
+// User 2: UID = 200000 + appId (e.g., 210042)
+// UserHandle.getAppId(uid) extracts the appId
+// UserHandle.getUserId(uid) extracts the userId
+
+// Supplemental GIDs:
+// Apps get additional group memberships for specific capabilities:
+// GID 3003 (inet)     → permission.INTERNET → can create sockets
+// GID 1028 (sdcard_r) → read shared storage
+// GID 1015 (sdcard_rw)→ write shared storage
+// GID 9997 (everybody)→ shared cache access
+// These are set via setgroups() during fork specialization
+
+// sharedUserId (DEPRECATED):
+// Legacy mechanism: apps with the same sharedUserId share a UID
+// Same UID = same sandbox = can read each other's files
+// Deprecated in Android 13 — new apps cannot use it
+// Existing apps are grandfathered but cannot change it</code></pre>
+
+<!-- ============================================================ -->
+<h2>6. AppZygote & WebView Zygote</h2>
+
+<pre><code>// Android 10+ introduced AppZygote for isolated processes:
+
+// Regular Zygote:
+// - Forks all app processes
+// - Preloads framework classes and resources
+// - Child inherits everything
+
+// AppZygote (per-app):
+// - Created when an app declares android:useAppZygote="true"
+// - Forked from the regular Zygote
+// - The app can preload its OWN classes and resources into its AppZygote
+// - Isolated services (android:isolatedProcess="true") fork from AppZygote
+// - Benefit: isolated services start faster (app classes already loaded)
+// - Used by: Chrome (WebView), apps with many isolated processes
+
+// WebView Zygote:
+// - Special AppZygote for the WebView renderer
+// - Preloads WebView/Chromium native libraries
+// - WebView renderer processes fork from this
+// - SELinux domain: webview_zygote → isolated_app
+// - Separate from the main Zygote for security isolation
+
+// Process hierarchy:
+// init
+//   └── zygote64
+//         ├── system_server
+//         ├── com.example.app (regular app)
+//         ├── com.example.app:appzygote (AppZygote for this app)
+//         │     └── com.example.app:isolated0 (isolated service)
+//         └── webview_zygote
+//               └── com.example.app:sandboxed_process0 (WebView renderer)</code></pre>
+
+<!-- ============================================================ -->
+<h2>7. 32-bit vs 64-bit Process Selection</h2>
+
+<pre><code>// Android devices can run both 32-bit and 64-bit processes.
+// Two Zygote processes start at boot: zygote64 (primary) and zygote32 (secondary).
+
+// How the system chooses:
+// 1. Check the app's native libraries:
+//    - If app has arm64-v8a libs → 64-bit Zygote
+//    - If app has armeabi-v7a libs only → 32-bit Zygote
+//    - If app has both → 64-bit (primary ABI)
+//    - If app has NO native libs → 64-bit (default)
+//
+// 2. ro.product.cpu.abilist determines supported ABIs
+//    Typical: arm64-v8a,armeabi-v7a,armeabi
+//
+// 3. PackageManagerService determines the ABI at install time
+//    Stored in packages.xml: primaryCpuAbi="arm64-v8a"
+
+// Android 12+ (some devices): 64-bit only
+// - No 32-bit Zygote
+// - 32-bit-only apps cannot be installed
+// - Saves ~200MB RAM (no 32-bit Zygote + libraries)
+
+// Impact on Binder:
+// 32-bit and 64-bit processes can communicate via Binder normally
+// Parcel handles pointer-size differences transparently
+// But: file descriptors, shared memory offsets are size-independent</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Zygote Death is Fatal</div>
+  <p>If the Zygote process dies, <code>init</code> detects it (Zygote is a critical service) and triggers a soft reboot — all Java processes are killed and restarted. This is because no new app processes can be forked without Zygote. The system is designed so that Zygote never crashes in normal operation — it does minimal work after boot (just listens on the socket). If you see Zygote crashes in production, it's usually a system-level bug (bad ROM, kernel issue, or memory corruption).</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. USAP — Unspecialized App Process Pool (Android 10+)</h2>
+
+<pre><code>// Problem: even with Zygote's fork(), the fork + specialize sequence takes
+// ~50-100ms (setuid, SELinux, seccomp, socket close, etc.).
+// For rapid app launches (e.g., user tapping multiple apps), this adds up.
+
+// Solution: USAP (Unspecialized App Process) pool
+// Zygote pre-forks a pool of "blank" processes that are already forked
+// but NOT yet specialized (no UID, no SELinux context, no app code).
+
+// How it works:
+// 1. Zygote forks N processes (default: 1-10, configurable)
+// 2. Each USAP blocks on an eventfd, waiting for specialization args
+// 3. When AMS needs a new app process:
+//    a. Instead of asking Zygote to fork, AMS picks a USAP
+//    b. Sends specialization args (UID, GID, SELinux, package) via the eventfd
+//    c. USAP specializes itself: setuid, setgid, SELinux, seccomp
+//    d. Calls ActivityThread.main()
+// 4. Zygote refills the pool (UsapPoolRefillAction)
+
+// Performance gain:
+// Without USAP: fork (1-2ms) + specialize (50-100ms) = 50-100ms
+// With USAP: specialize only (5-20ms) — fork already done
+// ~3-5x faster process creation
+
+// Source:
+// frameworks/base/core/java/com/android/internal/os/Zygote.java
+// - getUsapPoolEventFD()
+// - usapPoolRefillAction()
+// frameworks/base/core/jni/com_android_internal_os_Zygote.cpp
+// - nativeForkUsap()
+
+// When USAP is used:
+// - Enabled by default on Android 10+ (can be disabled via system property)
+// - Pool is refilled when it drops below a threshold
+// - Not used for system_server (always direct fork)</code></pre>
+
+<!-- ============================================================ -->
+<h2>9. Fork Failure & Child Crash Handling</h2>
+
+<pre><code>// Fork can fail for several reasons:
+// 1. ENOMEM — not enough memory to create process
+// 2. EAGAIN — RLIMIT_NPROC exceeded (too many processes for this UID)
+// 3. Kernel OOM — system under extreme memory pressure
+
+// AMS handling (ProcessList.startProcessLocked()):
+// - If Zygote returns pid < 0 → fork failed
+// - AMS retries with exponential backoff (up to ~10 seconds)
+// - If retries exhausted → app launch fails, user sees "App not responding"
+// - AMS may kill cached processes to free memory, then retry
+
+// Child crash before attach:
+// After fork, the child must call ActivityThread.main() and then
+// attach to AMS via Binder (IActivityManager.attachApplication()).
+// If the child crashes before attach:
+// 1. Zygote detects child death (SIGCHLD)
+// 2. AMS has a timeout (~10 seconds) for attachApplication()
+// 3. If timeout expires → AMS cleans up the ProcessRecord
+// 4. If the app was being launched → user sees "App has stopped"
+
+// nativeForkAndSpecialize path:
+// com_android_internal_os_Zygote.cpp → ForkCommon():
+//   1. SetSignalHandlers() — block signals during fork
+//   2. fork() system call
+//   3. In child: UnsetChldSignalHandler()
+//   4. SpecializeCommon():
+//      a. MountEmulatedStorage() — per-app storage namespace
+//      b. setgid(), setuid(), setgroups() — drop privileges
+//      c. selinux_android_setcontext() — SELinux transition
+//      d. SetSchedulerPolicy() — set nice value
+//      e. set_app_seccomp_filter() — apply syscall filter
+//      f. Close Zygote's server socket fd
+//   5. Return to Java: ZygoteInit.childZygoteInit() or RuntimeInit</code></pre>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  ← <a href="03-aidl-internals.html">03 — AIDL Internals</a> &nbsp;|&nbsp;
+  <a href="05-system-services.html">05 — System Services →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 — ANR Deep Dive — Taxonomy, AOSP Internals, traces.txt Analysis & Prevention</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-memory-model.html">01 Memory Model</a>
+  <a href="02-gc-internals.html">02 GC Internals</a>
+  <a href="03-memory-leaks.html">03 Memory Leaks</a>
+  <a class="active" href="04-anr-deep-dive.html">04 ANR Deep Dive</a>
+  <a href="05-oom-lmk.html">05 OOM &amp; LMK</a>
+  <a href="06-app-startup.html">06 App Startup</a>
+  <a href="07-baseline-profiles.html">07 Baseline Profiles</a>
+  <a href="08-interview-qa.html">08 Interview Q&amp;A</a>
+</div>
+
+<h1>04 — ANR Deep Dive</h1>
+<p class="subtitle">ANR taxonomy, AOSP internals (InputDispatcher, AMS timeouts), traces.txt analysis, and prevention strategies</p>
+
+<!-- ============================================================ -->
+<h2>1. ANR Taxonomy — Every Timeout the System Enforces</h2>
+
+<p>An Application Not Responding (ANR) is triggered when the system detects that an app's main thread has failed to process a message within a deadline. The system enforces different timeouts depending on the component type and its foreground/background state.</p>
+
+<table>
+  <tr>
+    <th>ANR Type</th>
+    <th>Timeout</th>
+    <th>Trigger Condition</th>
+    <th>AOSP Enforcer</th>
+  </tr>
+  <tr>
+    <td><strong>Input Dispatch</strong></td>
+    <td>5 s</td>
+    <td>Key or touch event not consumed; no <code>finishInputEvent()</code> callback</td>
+    <td><code>InputDispatcher.cpp</code> (native, system_server)</td>
+  </tr>
+  <tr>
+    <td><strong>BroadcastReceiver (foreground)</strong></td>
+    <td>10 s</td>
+    <td><code>onReceive()</code> doesn't return within deadline</td>
+    <td><code>BroadcastQueue.java</code></td>
+  </tr>
+  <tr>
+    <td><strong>BroadcastReceiver (background)</strong></td>
+    <td>60 s</td>
+    <td>Same, but for broadcasts sent to background queue</td>
+    <td><code>BroadcastQueue.java</code></td>
+  </tr>
+  <tr>
+    <td><strong>Service (foreground)</strong></td>
+    <td>20 s</td>
+    <td><code>onCreate()</code> / <code>onStartCommand()</code> / <code>onBind()</code> doesn't complete</td>
+    <td><code>ActiveServices.java</code></td>
+  </tr>
+  <tr>
+    <td><strong>Service (background)</strong></td>
+    <td>200 s</td>
+    <td>Same, but for services in background processes</td>
+    <td><code>ActiveServices.java</code></td>
+  </tr>
+  <tr>
+    <td><strong>ContentProvider</strong></td>
+    <td>10 s</td>
+    <td>Provider publish timeout — <code>ContentProvider.onCreate()</code> doesn't return during app startup</td>
+    <td><code>ActivityManagerService.java</code></td>
+  </tr>
+  <tr>
+    <td><strong>JobService</strong></td>
+    <td>~10 min (soft)</td>
+    <td>Job execution limit exceeded; <code>onStopJob()</code> called, then force-stop if unresponsive</td>
+    <td><code>JobServiceContext.java</code></td>
+  </tr>
+</table>
+
+<div class="callout warn">
+  <div class="callout-label">Watch Out — Background Timeouts Are Generous but Still Fatal</div>
+  <p>The 200s background service timeout and 60s background broadcast timeout are much longer, but they still produce ANRs visible in Play Vitals. Users on slow devices hit these more often than you'd expect — especially during cold starts when the system is under memory pressure and your <code>onCreate()</code> chain blocks on disk I/O.</p>
+</div>
+
+<pre><code>// AOSP constants — where the timeouts are defined:
+
+// Input dispatch: frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+// constexpr nsecs_t DEFAULT_INPUT_DISPATCHING_TIMEOUT = 5000 * 1000000LL; // 5 seconds
+
+// Broadcast: frameworks/base/services/core/java/com/android/server/am/BroadcastConstants.java
+// BROADCAST_FG_TIMEOUT = 10 * 1000   // 10 seconds (foreground)
+// BROADCAST_BG_TIMEOUT = 60 * 1000   // 60 seconds (background)
+
+// Service: frameworks/base/services/core/java/com/android/server/am/ActiveServices.java
+// SERVICE_TIMEOUT = 20 * 1000        // 20 seconds (foreground)
+// SERVICE_BACKGROUND_TIMEOUT = SERVICE_TIMEOUT * 10  // 200 seconds
+
+// ContentProvider: frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+// CONTENT_PROVIDER_PUBLISH_TIMEOUT_MILLIS = 10 * 1000  // 10 seconds</code></pre>
+
+<!-- ============================================================ -->
+<h2>2. ANR Internals — How the System Detects ANRs</h2>
+
+<p>Each ANR type has a distinct detection mechanism inside <code>system_server</code>. Understanding these paths is critical for diagnosing <em>why</em> an ANR was triggered and what the system was waiting for.</p>
+
+<h3>2.1 Input Dispatch Timeout — InputDispatcher.cpp</h3>
+
+<pre><code>// InputDispatcher lives in system_server's native layer.
+// Source: frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp
+
+// Flow:
+// 1. InputReader reads raw events from /dev/input/* (EventHub)
+// 2. InputDispatcher receives processed events via InputListener
+// 3. Dispatcher finds the focused window (via WindowManagerService)
+// 4. Dispatcher sends the event to the app via an InputChannel (Unix socket pair)
+// 5. Dispatcher starts a timer: DEFAULT_INPUT_DISPATCHING_TIMEOUT (5s)
+// 6. App's main thread Looper picks up the event → ViewRootImpl → View hierarchy
+// 7. App calls finishInputEvent() → signal sent back through InputChannel
+// 8. Dispatcher cancels the timer
+
+// If step 7 never happens within 5s:
+// - InputDispatcher::onAnrLocked() is called
+// - It notifies InputManagerService (Java) via JNI callback
+// - InputManagerService calls AMS.inputDispatchingTimedOut()
+// - AMS delegates to AppErrors.appNotResponding()
+
+// Key detail: the timer starts when the event is DISPATCHED to the app,
+// not when the event arrives at InputDispatcher. If the app's window
+// is not focused or the previous event hasn't been consumed yet,
+// the dispatcher WAITS (doesn't start the timer until dispatch).
+
+// This means: if your main thread is blocked BEFORE the event arrives,
+// the 5s timer starts only when InputDispatcher actually sends the event.
+// The real wall-clock delay the user experiences can be much longer.</code></pre>
+
+<h3>2.2 Broadcast Timeout — BroadcastQueue.java</h3>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/am/BroadcastQueue.java
+
+// Two queues: foreground (10s) and background (60s)
+// Ordered broadcasts are delivered sequentially; each receiver gets a timeout.
+
+// Flow:
+// 1. AMS.broadcastIntentLocked() enqueues BroadcastRecord
+// 2. BroadcastQueue.processNextBroadcastLocked() picks next receiver
+// 3. Sets alarm: setBroadcastTimeoutLocked(timeoutTime)
+//    → Handler.sendMessageAtTime(BROADCAST_TIMEOUT_MSG, timeoutTime)
+// 4. Delivers to app via IApplicationThread.scheduleReceiver()
+// 5. App's main thread runs onReceive() in ReceiverDispatcher
+// 6. App calls AMS.finishReceiver() when done
+// 7. BroadcastQueue cancels the timeout alarm
+
+// If finishReceiver() never comes:
+// 8. BROADCAST_TIMEOUT_MSG fires → broadcastTimeoutLocked()
+// 9. Checks if the app is still processing (hasn't finished)
+// 10. Calls AMS → AppErrors.appNotResponding()
+
+// Gotcha: for manifest-registered receivers, the system must LAUNCH
+// the process first. The timeout includes process start time.
+// On a cold start under memory pressure, just Zygote fork + class loading
+// can eat 3-5 seconds of your 10-second budget.</code></pre>
+
+<h3>2.3 Service Timeout — ActiveServices.java</h3>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/am/ActiveServices.java
+
+// Flow:
+// 1. AMS calls ActiveServices.realStartServiceLocked()
+// 2. Calls bumpServiceExecutingNoBatteryStatsLocked() which posts:
+//    → SERVICE_TIMEOUT_MSG with delay = SERVICE_TIMEOUT (20s or 200s)
+// 3. Delivers to app via IApplicationThread.scheduleCreateService()
+// 4. App's main thread calls Service.onCreate() then onStartCommand()/onBind()
+// 5. App calls AMS.serviceDoneExecuting() when lifecycle method returns
+// 6. ActiveServices cancels the timeout message
+
+// If serviceDoneExecuting() never comes:
+// 7. SERVICE_TIMEOUT_MSG fires → serviceTimeout()
+// 8. Calls AppErrors.appNotResponding()
+
+// The timeout covers the ENTIRE lifecycle callback chain:
+// onCreate() + onStartCommand() must both complete within the window.
+// If onCreate() takes 15s and onStartCommand() takes 6s = 21s → ANR.</code></pre>
+
+<h3>2.4 The ANR Dialog Flow — AppErrors.java</h3>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/am/AppErrors.java
+
+// AppErrors.appNotResponding(ProcessRecord app, ...) does:
+// 1. Dumps thread stacks → /data/anr/traces.txt (via dumpStackTraces())
+//    - Dumps the offending process FIRST
+//    - Then dumps system_server, SurfaceFlinger, and other key processes
+//    - Uses Process.sendSignal(pid, SIGNAL_QUIT) → SIGQUIT triggers VM dump
+// 2. Logs to EventLog: am_anr
+// 3. Adds ANR record to ProcessRecord
+// 4. If the app is in the foreground:
+//    - Shows the ANR dialog ("App isn't responding. Wait / Close")
+//    - User can choose to wait or kill
+// 5. If the app is in the background:
+//    - Silently kills the process (no dialog)
+//    - Still recorded in Play Vitals
+// 6. Broadcasts ACTION_ANR (for system monitoring)
+
+// On Android 11+, multiple ANR trace files are kept:
+// /data/anr/anr_* (timestamped, up to ~64 files)
+// Older devices: single /data/anr/traces.txt (overwritten each time)</code></pre>
+
+<div class="diagram-container">
+<pre><code>                         ANR Detection Flow
+
+  ┌──────────────┐     ┌──────────────────────┐     ┌─────────────────┐
+  │ InputReader   │────►│ InputDispatcher      │────►│ App Process     │
+  │ (/dev/input)  │     │ (native, system_srv) │     │ (main thread)   │
+  └──────────────┘     └──────────┬───────────┘     └────────┬────────┘
+                                  │                          │
+                          dispatch event              finishInputEvent()
+                          + start 5s timer                   │
+                                  │                          │
+                                  ▼                          │
+                        ┌─────────────────┐                  │
+                        │  Timer expires? │◄─────────────────┘
+                        └────────┬────────┘        (cancel if received)
+                                 │ YES
+                                 ▼
+                        ┌─────────────────┐
+                        │ InputManager    │
+                        │ Service (Java)  │
+                        └────────┬────────┘
+                                 │ inputDispatchingTimedOut()
+                                 ▼
+  ┌──────────────┐     ┌─────────────────┐     ┌─────────────────────┐
+  │ BroadcastQueue│────►│ ActivityManager │◄────│ ActiveServices      │
+  │ (timeout)    │     │ Service         │     │ (service timeout)   │
+  └──────────────┘     └────────┬────────┘     └─────────────────────┘
+                                │
+                                ▼
+                       ┌─────────────────┐
+                       │  AppErrors      │
+                       │  .appNot        │
+                       │  Responding()   │
+                       └────────┬────────┘
+                                │
+                    ┌───────────┼───────────┐
+                    ▼           ▼           ▼
+             ┌───────────┐ ┌────────┐ ┌──────────┐
+             │ Dump      │ │ Log    │ │ Show     │
+             │ traces.txt│ │ am_anr │ │ Dialog / │
+             │ (SIGQUIT) │ │        │ │ Kill bg  │
+             └───────────┘ └────────┘ └──────────┘</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. traces.txt Analysis — Reading ANR Thread Dumps</h2>
+
+<p>When an ANR occurs, the system sends <code>SIGQUIT</code> to the offending process, which triggers ART to dump all thread stacks to <code>/data/anr/traces.txt</code>. Knowing how to read this file is the single most important ANR debugging skill.</p>
+
+<h3>3.1 Thread Dump Format</h3>
+
+<pre><code>// Each thread entry looks like this:
+
+"main" prio=5 tid=1 Blocked
+  | group="main" sCount=1 ucsCount=0 flags=1 obj=0x72a01e18 self=0xb400007a
+  | sysTid=12345 nice=-10 cgrp=top-app sched=0/0 handle=0x7b1234
+  | state=S schedstat=( 12345678 9876543 210 ) utm=100 stm=50 core=3 HZ=100
+  | stack=0x7fc0000000-0x7fc0002000 stackSize=8192KB
+  | held mutexes=
+  at com.example.app.DatabaseHelper.querySync(DatabaseHelper.kt:45)
+  - waiting to lock &lt;0x0a1b2c3d&gt; (a java.lang.Object) held by thread 15
+  at com.example.app.MainActivity.onCreate(MainActivity.kt:32)
+  at android.app.Activity.performCreate(Activity.java:8051)
+  at android.app.Instrumentation.callActivityOnCreate(Instrumentation.java:1309)
+  at android.app.ActivityThread.performLaunchActivity(ActivityThread.java:3422)
+  at android.app.ActivityThread.handleLaunchActivity(ActivityThread.java:3601)
+  at android.app.servertransaction.LaunchActivityItem.execute(LaunchActivityItem.java:85)
+  at android.app.ActivityThread.main(ActivityThread.java:7656)
+
+// Key fields to examine:
+// "main"       → thread name ("main" = UI thread — the one that matters for ANRs)
+// tid=1        → ART thread ID (tid=1 is always the main thread)
+// Blocked      → thread STATE — this is the critical field
+// sysTid=12345 → Linux kernel thread ID (for systrace/perfetto correlation)
+// waiting to lock <0x...> held by thread 15 → LOCK CONTENTION</code></pre>
+
+<h3>3.2 Thread States — What They Mean for ANRs</h3>
+
+<table>
+  <tr>
+    <th>State</th>
+    <th>Meaning</th>
+    <th>ANR Implication</th>
+  </tr>
+  <tr>
+    <td><code>Runnable</code></td>
+    <td>Thread is executing or ready to execute</td>
+    <td>CPU-bound work on main thread (heavy computation, layout inflation)</td>
+  </tr>
+  <tr>
+    <td><code>Blocked</code></td>
+    <td>Waiting to acquire a monitor lock</td>
+    <td><strong>Lock contention</strong> — another thread holds the lock</td>
+  </tr>
+  <tr>
+    <td><code>Waiting</code></td>
+    <td>Waiting on <code>Object.wait()</code> with no timeout</td>
+    <td>Waiting for a condition that may never come (potential deadlock)</td>
+  </tr>
+  <tr>
+    <td><code>TimedWaiting</code></td>
+    <td>Waiting with a timeout (<code>Thread.sleep()</code>, <code>Object.wait(timeout)</code>)</td>
+    <td>Sleeping on main thread, or waiting for a Binder reply with timeout</td>
+  </tr>
+  <tr>
+    <td><code>Native</code></td>
+    <td>Executing in native code (JNI)</td>
+    <td>Blocked in a native call — Binder IPC, file I/O, SQLite, DNS lookup</td>
+  </tr>
+  <tr>
+    <td><code>Suspended</code></td>
+    <td>Suspended by debugger or GC</td>
+    <td>GC pause (rare on ART with concurrent GC, but possible under heap pressure)</td>
+  </tr>
+</table>
+
+<h3>3.3 Example: Lock Contention ANR</h3>
+
+<pre><code>// Main thread is BLOCKED waiting for a lock held by a background thread:
+
+"main" prio=5 tid=1 Blocked
+  at com.example.app.CacheManager.get(CacheManager.kt:28)
+  - waiting to lock &lt;0x0d4e5f6a&gt; (a java.lang.Object) held by thread 22
+  at com.example.app.HomeFragment.onViewCreated(HomeFragment.kt:45)
+  at androidx.fragment.app.Fragment.performViewCreated(Fragment.java:3128)
+  ...
+
+"CacheWriter-1" prio=5 tid=22 Runnable
+  at com.example.app.CacheManager.writeToDisk(CacheManager.kt:89)
+  - locked &lt;0x0d4e5f6a&gt; (a java.lang.Object)
+  at com.example.app.CacheManager.persist(CacheManager.kt:72)
+  ...
+
+// Analysis:
+// 1. Main thread (tid=1) is in state "Blocked"
+// 2. It's trying to lock object 0x0d4e5f6a
+// 3. That lock is held by thread 22 ("CacheWriter-1")
+// 4. Thread 22 is "Runnable" — doing disk I/O in writeToDisk()
+// 5. Main thread is stuck until the disk write completes
+//
+// Fix: Don't share a synchronized lock between main thread and I/O threads.
+// Use a ConcurrentHashMap or copy-on-write pattern instead.</code></pre>
+
+<h3>3.4 Example: Binder Call Blocking Main Thread</h3>
+
+<pre><code>// Main thread stuck in a synchronous Binder call:
+
+"main" prio=5 tid=1 Native
+  at android.os.BinderProxy.transactNative(Native method)
+  at android.os.BinderProxy.transact(BinderProxy.java:568)
+  at android.content.pm.IPackageManager$Stub$Proxy.getInstalledPackages(IPackageManager.java:3842)
+  at android.app.ApplicationPackageManager.getInstalledPackages(ApplicationPackageManager.java:1024)
+  at com.example.app.AnalyticsTracker.collectDeviceInfo(AnalyticsTracker.kt:56)
+  at com.example.app.MainActivity.onCreate(MainActivity.kt:38)
+  ...
+
+// Analysis:
+// 1. Main thread is in state "Native" — stuck in native Binder transact
+// 2. It's calling getInstalledPackages() — a synchronous Binder IPC to PMS
+// 3. PMS (PackageManagerService) in system_server is slow to respond
+//    (could be busy resolving packages, or system_server is under load)
+// 4. Main thread is completely blocked waiting for the Binder reply
+//
+// This is one of the most common ANR patterns. getInstalledPackages()
+// can take 1-10+ seconds on devices with many apps installed.</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. Common ANR Causes — With Code Examples</h2>
+
+<h3>4.1 Synchronous Binder Call on Main Thread</h3>
+
+<pre><code>// BAD: Synchronous IPC on main thread
+class MainActivity : AppCompatActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        // getInstalledPackages() is a Binder call to PackageManagerService.
+        // On a device with 200+ apps, this can take 2-8 seconds.
+        val packages = packageManager.getInstalledPackages(0) // ANR risk!
+
+        // ContentResolver.query() is a Binder call to the ContentProvider's process.
+        // If the provider is in another process, this is cross-process IPC.
+        val cursor = contentResolver.query(
+            ContactsContract.Contacts.CONTENT_URI,
+            null, null, null, null
+        ) // ANR risk!
+    }
+}
+
+// GOOD: Move to background
+class MainActivity : AppCompatActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        lifecycleScope.launch {
+            val packages = withContext(Dispatchers.IO) {
+                packageManager.getInstalledPackages(0)
+            }
+            updateUI(packages)
+        }
+    }
+}</code></pre>
+
+<h3>4.2 SharedPreferences.commit() on Main Thread</h3>
+
+<pre><code>// BAD: commit() is synchronous — writes to disk and BLOCKS until done
+class SettingsActivity : AppCompatActivity() {
+    fun saveUserPreference(key: String, value: String) {
+        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+        prefs.edit().putString(key, value).commit() // Blocks main thread!
+        // commit() calls:
+        // 1. commitToMemory() — fast, in-memory
+        // 2. enqueueDiskWrite() with isSync=true
+        // 3. writeToFile() — fsync() to disk — can take 50-500ms on slow storage
+    }
+}
+
+// GOOD: apply() is asynchronous — writes to memory immediately, disk later
+class SettingsActivity : AppCompatActivity() {
+    fun saveUserPreference(key: String, value: String) {
+        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
+        prefs.edit().putString(key, value).apply()
+        // apply() calls:
+        // 1. commitToMemory() — instant
+        // 2. enqueueDiskWrite() with isSync=false
+        // 3. Disk write happens on QueuedWork's HandlerThread
+    }
+}
+
+// DANGER: apply() has its own ANR trap!
+// ActivityThread.handleStopActivity() calls QueuedWork.waitToFinish()
+// which blocks the main thread until ALL pending apply() writes complete.
+// If you call apply() many times rapidly, the pending writes queue up,
+// and the next Activity stop/pause blocks until they all flush.
+// This is a VERY common ANR cause that most developers don't know about.</code></pre>
+
+<div class="callout danger">
+  <div class="callout-label">Danger — apply() Can Still Cause ANRs</div>
+  <p><code>SharedPreferences.apply()</code> queues disk writes on a background thread, but <code>ActivityThread.handleStopActivity()</code> and <code>handlePauseActivity()</code> call <code>QueuedWork.waitToFinish()</code>, which blocks the main thread until all pending <code>apply()</code> writes are flushed. If you batch many <code>apply()</code> calls (e.g., in a loop), the next activity transition blocks until all writes complete. On Android 8+, Google optimized this to only wait for the last write, but on older devices this is a major ANR source. Consider DataStore or batching edits into a single <code>apply()</code>.</p>
+</div>
+
+<h3>4.3 Database Query on Main Thread</h3>
+
+<pre><code>// BAD: Room DAO called on main thread
+@Dao
+interface UserDao {
+    @Query("SELECT * FROM users WHERE active = 1")
+    fun getActiveUsers(): List&lt;User&gt;  // Returns synchronously
+}
+
+class UserListFragment : Fragment() {
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        // This executes a SQLite query on the main thread.
+        // Room actually throws IllegalStateException by default,
+        // but allowMainThreadQueries() disables this safety check.
+        val users = database.userDao().getActiveUsers() // ANR risk!
+    }
+}
+
+// GOOD: Use suspend functions or Flow
+@Dao
+interface UserDao {
+    @Query("SELECT * FROM users WHERE active = 1")
+    suspend fun getActiveUsers(): List&lt;User&gt;
+
+    @Query("SELECT * FROM users WHERE active = 1")
+    fun observeActiveUsers(): Flow&lt;List&lt;User&gt;&gt;
+}
+
+class UserListFragment : Fragment() {
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        viewLifecycleOwner.lifecycleScope.launch {
+            val users = database.userDao().getActiveUsers() // Runs on IO dispatcher
+            adapter.submitList(users)
+        }
+    }
+}</code></pre>
+
+<h3>4.4 Lock Contention — Synchronized Block Held by Background Thread</h3>
+
+<pre><code>// BAD: Shared lock between main thread and I/O thread
+class ConfigManager {
+    private val lock = Any()
+    private var config: Map&lt;String, String&gt; = emptyMap()
+
+    fun getConfig(key: String): String? {
+        synchronized(lock) {  // Main thread acquires lock
+            return config[key]
+        }
+    }
+
+    fun refreshFromNetwork() {
+        // Called from background thread
+        val newConfig = api.fetchConfig() // Takes 2-5 seconds
+        synchronized(lock) {  // Holds lock during slow parsing
+            config = parseConfig(newConfig) // 500ms of parsing
+        }
+    }
+}
+
+// If main thread calls getConfig() while refreshFromNetwork() holds the lock,
+// main thread blocks for the duration of parseConfig() → ANR if > 5s total.
+
+// GOOD: Lock-free reads with atomic reference swap
+class ConfigManager {
+    @Volatile
+    private var config: Map&lt;String, String&gt; = emptyMap()
+
+    fun getConfig(key: String): String? = config[key]  // No lock needed
+
+    fun refreshFromNetwork() {
+        val newConfig = api.fetchConfig()
+        val parsed = parseConfig(newConfig)
+        config = parsed // Atomic reference swap — readers see old or new, never partial
+    }
+}</code></pre>
+
+<h3>4.5 BroadcastReceiver Doing Heavy Work in onReceive()</h3>
+
+<pre><code>// BAD: Heavy work in onReceive() — runs on main thread
+class SyncReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        // onReceive() runs on the MAIN THREAD of the app process.
+        // You have 10 seconds (foreground) before ANR.
+        val db = Room.databaseBuilder(context, AppDb::class.java, "app.db").build()
+        val data = api.fetchSync() // Network call — blocks main thread!
+        db.syncDao().insertAll(data) // Disk I/O — blocks main thread!
+    }
+}
+
+// GOOD: Use goAsync() to extend the deadline, then move work off main thread
+class SyncReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        val pendingResult = goAsync() // Tells system: "I'm not done yet"
+        // goAsync() prevents the system from calling finishReceiver()
+        // You now have the full broadcast timeout to complete.
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val data = api.fetchSync()
+                database.syncDao().insertAll(data)
+            } finally {
+                pendingResult.finish() // MUST call this or the system leaks the broadcast
+            }
+        }
+    }
+}
+
+// Even with goAsync(), you're still bound by the broadcast timeout (10s/60s).
+// For truly long-running work, enqueue a WorkManager job instead.</code></pre>
+
+<h3>4.6 Deadlock Between Main Thread and Background Thread</h3>
+
+<pre><code>// Classic deadlock: two threads acquire two locks in opposite order
+class DataManager {
+    private val lockA = Any()
+    private val lockB = Any()
+
+    // Called on main thread
+    fun readData(): String {
+        synchronized(lockA) {
+            synchronized(lockB) {
+                return cache.get("data") ?: ""
+            }
+        }
+    }
+
+    // Called on background thread
+    fun writeData(value: String) {
+        synchronized(lockB) {      // Acquires B first
+            synchronized(lockA) {  // Then tries to acquire A
+                cache.put("data", value)
+            }
+        }
+    }
+}
+
+// Deadlock scenario:
+// T1 (main):       acquires lockA → tries to acquire lockB → BLOCKED (held by T2)
+// T2 (background): acquires lockB → tries to acquire lockA → BLOCKED (held by T1)
+// Neither thread can proceed → main thread blocked forever → ANR
+
+// traces.txt will show:
+// "main" tid=1 Blocked
+//   - waiting to lock &lt;0xAAA&gt; (lockB) held by thread 15
+// "Worker-1" tid=15 Blocked
+//   - waiting to lock &lt;0xBBB&gt; (lockA) held by thread 1
+
+// Fix: Always acquire locks in the same order, or use lock-free data structures.</code></pre>
+
+<!-- ============================================================ -->
+<h2>5. Prevention Strategies</h2>
+
+<h3>5.1 StrictMode — Detect Violations During Development</h3>
+
+<pre><code>class MyApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
+
+        if (BuildConfig.DEBUG) {
+            StrictMode.setThreadPolicy(
+                StrictMode.ThreadPolicy.Builder()
+                    .detectDiskReads()       // File I/O on main thread
+                    .detectDiskWrites()      // File writes on main thread
+                    .detectNetwork()         // Network calls on main thread
+                    .detectCustomSlowCalls() // Custom slow-call markers
+                    .penaltyLog()            // Log to Logcat
+                    .penaltyDeath()          // Crash on violation (aggressive but effective)
+                    .build()
+            )
+
+            StrictMode.setVmPolicy(
+                StrictMode.VmPolicy.Builder()
+                    .detectLeakedClosableObjects()
+                    .detectLeakedSqlLiteObjects()
+                    .detectActivityLeaks()
+                    .penaltyLog()
+                    .build()
+            )
+        }
+    }
+}</code></pre>
+
+<h3>5.2 Move Work Off Main Thread — Coroutines Pattern</h3>
+
+<pre><code>// Pattern: wrap any potentially blocking call in withContext(Dispatchers.IO)
+class Repository(
+    private val dao: UserDao,
+    private val api: ApiService,
+    private val prefs: SharedPreferences
+) {
+    suspend fun loadUserProfile(userId: String): UserProfile {
+        return withContext(Dispatchers.IO) {
+            val cached = dao.getUser(userId)
+            if (cached != null && !cached.isStale()) {
+                cached.toProfile()
+            } else {
+                val remote = api.fetchUser(userId)
+                dao.insertUser(remote)
+                remote.toProfile()
+            }
+        }
+    }
+
+    suspend fun savePreference(key: String, value: String) {
+        withContext(Dispatchers.IO) {
+            prefs.edit().putString(key, value).apply()
+        }
+    }
+}
+
+// In ViewModel — collect on main, work on IO:
+class ProfileViewModel(private val repo: Repository) : ViewModel() {
+    private val _state = MutableStateFlow&lt;UiState&gt;(UiState.Loading)
+    val state: StateFlow&lt;UiState&gt; = _state
+
+    fun loadProfile(userId: String) {
+        viewModelScope.launch {
+            _state.value = UiState.Loading
+            try {
+                val profile = repo.loadUserProfile(userId)
+                _state.value = UiState.Success(profile)
+            } catch (e: Exception) {
+                _state.value = UiState.Error(e.message ?: "Unknown error")
+            }
+        }
+    }
+}</code></pre>
+
+<h3>5.3 goAsync() for BroadcastReceiver</h3>
+
+<pre><code>// goAsync() returns a PendingResult that keeps the broadcast "alive"
+// while you move work to a background thread.
+// CRITICAL: you MUST call pendingResult.finish() or the broadcast leaks.
+
+class BootReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+
+        val pendingResult = goAsync()
+
+        // Use a coroutine scope that won't be cancelled by the receiver lifecycle
+        CoroutineScope(Dispatchers.IO + SupervisorJob()).launch {
+            try {
+                WorkManager.getInstance(context).enqueue(
+                    OneTimeWorkRequestBuilder&lt;BootSyncWorker&gt;().build()
+                )
+            } finally {
+                pendingResult.finish()
+            }
+        }
+    }
+}</code></pre>
+
+<h3>5.4 Avoid Holding Locks Across Binder Calls</h3>
+
+<pre><code>// BAD: Lock held while making a Binder call
+class ServiceProxy {
+    private val lock = Any()
+    private var cachedResult: List&lt;PackageInfo&gt;? = null
+
+    fun getPackages(pm: PackageManager): List&lt;PackageInfo&gt; {
+        synchronized(lock) {
+            if (cachedResult == null) {
+                // Binder call while holding lock — if another thread needs this lock,
+                // it blocks for the entire duration of the IPC round-trip.
+                cachedResult = pm.getInstalledPackages(0)
+            }
+            return cachedResult!!
+        }
+    }
+}
+
+// GOOD: Double-checked locking with volatile, or compute outside lock
+class ServiceProxy {
+    @Volatile
+    private var cachedResult: List&lt;PackageInfo&gt;? = null
+
+    fun getPackages(pm: PackageManager): List&lt;PackageInfo&gt; {
+        cachedResult?.let { return it }
+        val result = pm.getInstalledPackages(0) // Binder call outside lock
+        cachedResult = result
+        return result
+    }
+}</code></pre>
+
+<h3>5.5 ANR Monitoring in Production</h3>
+
+<pre><code>// Google Play Vitals: automatically reports ANR rates
+// Threshold: > 0.47% ANR rate = "bad behavior" flag in Play Console
+// > 8% = risk of search ranking penalty
+
+// Firebase Crashlytics ANR reporting (enabled by default in recent SDKs):
+// Captures ANR stack traces and reports them alongside crashes.
+// Includes device state, memory pressure, and battery level.
+
+// Custom ANR watchdog — detect ANRs before the system does:
+class AnrWatchdog(private val timeoutMs: Long = 5000L) : Thread("ANR-Watchdog") {
+    @Volatile private var tick = 0L
+    @Volatile private var reported = false
+    private val handler = Handler(Looper.getMainLooper())
+
+    private val ticker = Runnable { tick = System.currentTimeMillis() }
+
+    override fun run() {
+        while (!isInterrupted) {
+            tick = 0
+            handler.post(ticker)
+            Thread.sleep(timeoutMs)
+            if (tick == 0L && !reported) {
+                // Main thread didn't process our Runnable within timeoutMs
+                reported = true
+                val stackTrace = Looper.getMainLooper().thread.stackTrace
+                reportAnrToBackend(stackTrace)
+            } else {
+                reported = false
+            }
+        }
+    }
+}
+
+// Start in Application.onCreate():
+// AnrWatchdog().start()</code></pre>
+
+<h3>5.6 Perfetto / Systrace for ANR Investigation</h3>
+
+<pre><code>// Perfetto (modern) or Systrace (legacy) captures system-wide traces
+// that show exactly what the main thread was doing during an ANR.
+
+// Capture a trace:
+// $ adb shell perfetto -o /data/misc/perfetto-traces/trace.perfetto-trace \
+//     -t 10s sched freq idle am wm input view
+
+// In the trace, look for:
+// 1. The main thread's scheduling state (Running, Sleeping, Blocked)
+// 2. Binder transactions — which service the main thread called
+// 3. Lock contention events (futex waits)
+// 4. Disk I/O on the main thread (f2fs_write, ext4_da_write)
+// 5. GC pauses (concurrent-GC, young-GC)
+
+// Perfetto SQL query to find main thread blocks:
+// SELECT ts, dur, name FROM slice
+// WHERE track_id = (SELECT id FROM thread_track WHERE name = 'main')
+// AND dur > 1000000000  -- longer than 1 second
+// ORDER BY dur DESC
+
+// For ANR-specific traces on Android 11+:
+// $ adb bugreport
+// The bugreport includes ANR traces, system health data, and Perfetto traces.</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — ANRs Are Often Lock Contention, Not Just Heavy Work</div>
+  <p>Junior engineers assume ANRs are caused by "doing too much on the main thread." At L6, you know the most insidious ANRs come from <strong>lock contention</strong>: the main thread does almost no work itself, but blocks waiting for a lock held by a background thread doing I/O. The traces.txt shows the main thread in <code>Blocked</code> state with <code>waiting to lock &lt;0x...&gt; held by thread N</code>. The fix isn't to "move work off main thread" — the work is already off the main thread. The fix is to eliminate shared mutable state, use lock-free data structures (<code>ConcurrentHashMap</code>, <code>AtomicReference</code>, <code>@Volatile</code>), or redesign the synchronization so the main thread never contends. At Google scale, this pattern accounts for ~30-40% of ANRs that aren't simple "network on main thread" mistakes.</p>
+</div>
+
+<div class="callout">
+  <div class="callout-label">Summary — ANR Prevention Checklist</div>
+  <ul>
+    <li><strong>StrictMode</strong> in debug builds to catch disk/network on main thread</li>
+    <li><strong>Coroutines + Dispatchers.IO</strong> for all blocking operations</li>
+    <li><strong>apply()</strong> over <code>commit()</code> for SharedPreferences (but beware <code>QueuedWork.waitToFinish()</code>)</li>
+    <li><strong>goAsync()</strong> for BroadcastReceivers, or delegate to WorkManager</li>
+    <li><strong>Lock-free patterns</strong> — <code>@Volatile</code>, <code>ConcurrentHashMap</code>, <code>AtomicReference</code></li>
+    <li><strong>Never hold locks across Binder calls</strong></li>
+    <li><strong>Monitor in production</strong> — Play Vitals, Crashlytics, custom watchdog</li>
+    <li><strong>Perfetto traces</strong> for deep investigation of specific ANR reports</li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. ApplicationExitInfo — Programmatic ANR Detection (Android 11+)</h2>
+
+<pre><code>// Android 11 (API 30) introduced ApplicationExitInfo — a programmatic API
+// to query WHY your app's process was killed in previous sessions.
+// This is a game-changer for ANR and OOM diagnosis in production.
+
+// Query exit reasons:
+val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+val exitInfos = am.getHistoricalProcessExitReasons(
+    packageName,  // null for all packages (requires permission)
+    0,            // pid (0 = all)
+    10            // max results
+)
+
+for (info in exitInfos) {
+    when (info.reason) {
+        ApplicationExitInfo.REASON_ANR -> {
+            // ANR detected — get the traces
+            val trace = info.traceInputStream?.bufferedReader()?.readText()
+            // trace contains the full thread dump (same as traces.txt)
+            // Send to your analytics backend for analysis
+            analytics.reportAnr(
+                timestamp = info.timestamp,
+                description = info.description,  // e.g., "Input dispatching timed out"
+                importance = info.importance,     // process importance at time of ANR
+                pss = info.pss,                   // PSS at time of death
+                rss = info.rss,                   // RSS at time of death
+                trace = trace
+            )
+        }
+        ApplicationExitInfo.REASON_LOW_MEMORY -> {
+            // Killed by lmkd — log the memory state
+            analytics.reportLmkKill(
+                pss = info.pss,
+                rss = info.rss,
+                importance = info.importance
+            )
+        }
+        ApplicationExitInfo.REASON_CRASH -> {
+            // Unhandled exception
+        }
+        ApplicationExitInfo.REASON_CRASH_NATIVE -> {
+            // Native crash (SIGSEGV, SIGABRT)
+        }
+        ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> {
+            // System killed for using too much CPU/memory
+        }
+    }
+}
+
+// Key fields on ApplicationExitInfo:
+// .reason          → REASON_ANR, REASON_LOW_MEMORY, REASON_CRASH, etc.
+// .status          → exit code or signal number
+// .importance      → RunningAppProcessInfo.IMPORTANCE_* at time of death
+// .pss / .rss      → memory usage at time of death (in KB)
+// .timestamp       → wall-clock time of death
+// .description     → human-readable description (e.g., ANR message)
+// .traceInputStream → full thread dump for ANR (null for non-ANR exits)
+// .processStateSummary → custom byte[] you set via setProcessStateSummary()</code></pre>
+
+<h3>Custom State for Crash Diagnostics</h3>
+
+<pre><code>// You can attach custom state that survives process death:
+// This is invaluable for debugging — attach your app's current screen,
+// pending operations, or memory snapshot.
+
+class MyApplication : Application() {
+    override fun onCreate() {
+        super.onCreate()
+
+        // Set custom state that will be available in ApplicationExitInfo
+        // after the process is killed. Max 256 bytes.
+        val state = "screen=home,pending_uploads=3,cache_mb=45"
+        ActivityManager.setProcessStateSummary(state.toByteArray())
+    }
+
+    fun onScreenChanged(screen: String) {
+        val state = "screen=$screen,heap_pct=${getHeapUsagePercent()}"
+        ActivityManager.setProcessStateSummary(state.toByteArray())
+    }
+}
+
+// On next launch, read it:
+val exitInfos = am.getHistoricalProcessExitReasons(packageName, 0, 1)
+exitInfos.firstOrNull()?.let { info ->
+    val customState = info.processStateSummary?.let { String(it) }
+    // customState = "screen=home,pending_uploads=3,cache_mb=45"
+    // Now you know exactly what the app was doing when it was killed
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — ApplicationExitInfo Replaces Guesswork</div>
+  <p>Before Android 11, diagnosing production ANRs required: (1) hoping the user opted into Play Vitals, (2) parsing aggregated ANR clusters in Play Console with limited stack traces, (3) guessing from Crashlytics ANR reports which often lack the full thread dump. <code>ApplicationExitInfo</code> gives you the <strong>exact thread dump</strong> (via <code>traceInputStream</code>), the <strong>memory state</strong> (PSS/RSS), and your <strong>custom diagnostic state</strong> — all queryable programmatically on the next app launch. At Google, this API is used to build internal ANR dashboards with per-build regression tracking. For L6 interviews, knowing this API signals you understand production debugging at scale, not just development-time tooling.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Play Vitals ANR Thresholds</h2>
+
+<pre><code>// Google Play Console tracks ANR rates and penalizes apps that exceed thresholds.
+
+// Metrics:
+// Overall ANR rate = ANR sessions / total sessions
+// User-perceived ANR rate = foreground ANR sessions / foreground sessions
+
+// Thresholds (as of 2024):
+// ┌──────────────────────────────────┬───────────────┬─────────────────────────┐
+// │ Metric                           │ Bad Threshold  │ Consequence             │
+// ├──────────────────────────────────┼───────────────┼─────────────────────────┤
+// │ Overall ANR rate                 │ > 0.47%        │ "Bad behavior" badge    │
+// │ User-perceived ANR rate          │ > 0.24%        │ "Bad behavior" badge    │
+// │ Overall ANR rate (severe)        │ > 8%           │ Search ranking penalty  │
+// │ Crash rate                       │ > 1.09%        │ "Bad behavior" badge    │
+// └──────────────────────────────────┴───────────────┴─────────────────────────┘
+
+// "Bad behavior" badge:
+// - Shown on your Play Store listing
+// - Reduces visibility in search results and recommendations
+// - Can trigger manual review by Google Play team
+
+// How to check your rates:
+// Play Console → Android Vitals → ANR rate
+// Filter by: device, Android version, country, app version
+
+// Calculating your ANR budget:
+// If your app has 1 million daily sessions:
+// 0.47% threshold = 4,700 ANR sessions per day maximum
+// 0.24% user-perceived = 2,400 foreground ANRs per day maximum
+// At Google scale (billions of sessions), even 0.01% is millions of ANRs.
+
+// Monitoring in code (Android 11+):
+// Use ApplicationExitInfo to count ANR exits per session
+// and report to your own analytics for real-time monitoring.</code></pre>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  <a href="03-memory-leaks.html">← 03 — Memory Leaks</a> &nbsp;|&nbsp;
+  <a href="05-oom-lmk.html">05 — OOM &amp; LMK →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

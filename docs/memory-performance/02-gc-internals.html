@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 — GC Internals — ART's Concurrent Copying Collector, Pauses & Tuning</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-memory-model.html">01 Memory Model</a>
+  <a class="active" href="02-gc-internals.html">02 GC Internals</a>
+  <a href="03-memory-leaks.html">03 Memory Leaks</a>
+  <a href="04-anr-deep-dive.html">04 ANR Deep Dive</a>
+  <a href="05-oom-lmk.html">05 OOM & LMK</a>
+  <a href="06-app-startup.html">06 App Startup</a>
+  <a href="07-baseline-profiles.html">07 Baseline Profiles</a>
+  <a href="08-interview-qa.html">08 Interview Q&A</a>
+</div>
+
+<h1>02 — GC Internals</h1>
+<p class="subtitle">ART's garbage collection algorithms — from Dalvik's stop-the-world to ART's concurrent copying collector, read barriers, GC roots, pause anatomy, and tuning</p>
+
+<!-- ============================================================ -->
+<h2>1. GC Evolution on Android</h2>
+
+<table>
+  <tr>
+    <th>Era</th>
+    <th>Runtime</th>
+    <th>GC Algorithm</th>
+    <th>Pause</th>
+  </tr>
+  <tr>
+    <td>Android 1-4</td>
+    <td>Dalvik</td>
+    <td>Stop-the-world mark-sweep</td>
+    <td>50-200ms (catastrophic for 16ms frames)</td>
+  </tr>
+  <tr>
+    <td>Android 5-7</td>
+    <td>ART</td>
+    <td>Concurrent Mark-Sweep (CMS)</td>
+    <td>2-5ms pause (mark roots only)</td>
+  </tr>
+  <tr>
+    <td>Android 8+</td>
+    <td>ART</td>
+    <td>Concurrent Copying (CC)</td>
+    <td>&lt;1ms pause (no heap fragmentation)</td>
+  </tr>
+  <tr>
+    <td>Android 10+</td>
+    <td>ART</td>
+    <td>CC + Generational</td>
+    <td>&lt;1ms (young gen collected more often)</td>
+  </tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>2. Concurrent Copying (CC) Collector — The Current Default</h2>
+
+<pre><code>// The CC collector is ART's primary GC since Android 8.
+// Source: art/runtime/gc/collector/concurrent_copying.cc
+
+// Key properties:
+// 1. CONCURRENT: most work happens while the app runs (no long pauses)
+// 2. COPYING: live objects are copied to new regions (compaction)
+// 3. REGION-BASED: heap divided into 256KB regions
+// 4. READ-BARRIER: uses a read barrier (not write barrier) for correctness
+
+// How it works:
+
+// Phase 1: PAUSE (< 1ms)
+// - Stop all mutator (app) threads briefly
+// - Flip the "to-space" and "from-space" pointers
+// - Mark GC roots (thread stacks, JNI globals, class statics)
+// - Resume all threads
+
+// Phase 2: CONCURRENT MARK + COPY
+// - GC threads traverse the object graph from roots
+// - For each live object found in from-space:
+//   a. Copy it to to-space (a new region)
+//   b. Install a "forwarding pointer" in the old location
+//   c. Update all references to point to the new copy
+// - App threads continue running concurrently
+// - Read barriers ensure app threads see the correct (new) copy
+
+// Phase 3: RECLAIM
+// - All live objects are now in to-space
+// - from-space regions are freed entirely (no fragmentation!)
+// - No second pause needed (unlike CMS)</code></pre>
+
+<div class="diagram-container">
+<pre><code>  Before GC:
+  ┌──────────┬──────────┬──────────┬──────────┐
+  │ Region 1 │ Region 2 │ Region 3 │ Region 4 │  (from-space)
+  │ [A][B][ ]│ [C][ ][ ]│ [D][E][F]│ [ ][ ][ ]│
+  └──────────┴──────────┴──────────┴──────────┘
+   A,C,D,F are live; B,E are garbage
+
+  After CC GC:
+  ┌──────────┬──────────┬──────────┬──────────┐
+  │ Region 5 │ Region 6 │          │          │  (to-space)
+  │ [A][C][D]│ [F][ ][ ]│  (free)  │  (free)  │
+  └──────────┴──────────┴──────────┴──────────┘
+   Live objects compacted; Regions 1-4 freed entirely
+   No fragmentation — bump pointer allocation resumes</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Read Barriers — How Concurrent Copying Works Safely</h2>
+
+<pre><code>// Problem: while GC is copying objects, app threads are still running.
+// An app thread might read a reference that points to the OLD location
+// of an object that's been copied to a NEW location.
+
+// Solution: READ BARRIER
+// Every time the app reads an object reference, the runtime checks:
+// "Has this object been moved? If so, follow the forwarding pointer."
+
+// Implementation (simplified):
+// Object* ReadBarrier(Object* ref) {
+//     if (ref->forwarding_ptr != null) {
+//         return ref->forwarding_ptr;  // Object was moved — use new location
+//     }
+//     return ref;  // Object hasn't been moved yet
+// }
+
+// This is inserted by the ART compiler at every object reference load.
+// Cost: ~1 extra instruction per reference load (branch + load)
+// This is why CC is slightly slower per-operation than CMS,
+// but the elimination of fragmentation and <1ms pauses is worth it.
+
+// Baker's read barrier (used by ART):
+// Uses the object's lock word to store the forwarding state.
+// During GC: lock word's "read barrier state" bit is set.
+// Read barrier checks this bit — fast path is a single branch.
+
+// Gray objects:
+// During concurrent marking, objects can be in three states:
+// - White: not yet visited (may be garbage)
+// - Gray: visited but references not yet scanned
+// - Black: visited and all references scanned
+// The read barrier ensures that when an app thread accesses a gray object,
+// it's scanned immediately (pushed to the mark stack).</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Why Read Barrier, Not Write Barrier?</div>
+  <p>CMS (Android 5-7) used a <strong>write barrier</strong>: every time the app writes a reference, the GC is notified. This is cheaper per-operation but requires a second pause to re-scan "dirty" cards (objects modified during concurrent marking). CC uses a <strong>read barrier</strong>: every reference load is intercepted. This is slightly more expensive per-operation but eliminates the need for a second pause and enables true compaction. The trade-off: CC has ~2-5% throughput overhead from read barriers but achieves sub-millisecond pauses and zero fragmentation. For interactive apps where frame drops matter more than raw throughput, CC is the clear winner.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. GC Roots — Where Scanning Starts</h2>
+
+<pre><code>// GC roots are the starting points for reachability analysis.
+// Any object reachable from a root is "live" and won't be collected.
+
+// Root types in ART:
+// 1. Thread stacks: local variables and parameters on each thread's stack
+// 2. JNI global references: native code holding Java object refs
+// 3. JNI local references: native method's local refs (freed on return)
+// 4. Class statics: static fields of loaded classes
+// 5. Monitor locks: objects currently used as synchronized locks
+// 6. Interned strings: String.intern() pool
+// 7. Sticky (remembered) objects: objects in non-moving/image spaces
+// 8. Finalizer references: objects with finalize() pending
+
+// The PAUSE phase scans roots — this is why the pause is short:
+// Roots are a small, fixed set. The bulk of work (traversing the graph)
+// happens concurrently.
+
+// Common leak pattern:
+// A static field holds a reference to an Activity → Activity is a GC root
+// → Activity and everything it references (Views, Bitmaps, etc.) can't be collected
+// → Memory leak</code></pre>
+
+<!-- ============================================================ -->
+<h2>5. Generational GC (Android 10+)</h2>
+
+<pre><code>// Observation: most objects die young (generational hypothesis).
+// Scanning the entire heap to find short-lived objects is wasteful.
+
+// ART's generational CC:
+// - Divides RegionSpace into "young" and "old" regions
+// - Young regions: recently allocated objects
+// - Old regions: objects that survived a young GC
+
+// Minor GC (young generation only):
+// - Only scans young regions
+// - Fast: young gen is small
+// - Promotes survivors to old gen
+// - Triggered frequently (every few MB of allocation)
+
+// Major GC (full heap):
+// - Scans both young and old regions
+// - Slower but less frequent
+// - Triggered when old gen grows too large
+
+// Performance impact:
+// Minor GC: ~1-3ms total (< 0.5ms pause)
+// Major GC: ~10-50ms total (< 1ms pause)
+// Without generational: every GC scans the full heap (~10-50ms)
+// With generational: most GCs are minor (~1-3ms)
+
+// This is why Android 10+ apps feel smoother —
+// GC pauses are shorter and less frequent for typical allocation patterns.</code></pre>
+
+<!-- ============================================================ -->
+<h2>6. GC Triggers</h2>
+
+<pre><code>// What causes a GC to run:
+
+// 1. Allocation failure:
+// Bump pointer reaches the end of the current region
+// → Try to allocate a new region
+// → If heap is at its growth limit → trigger GC
+// → If GC doesn't free enough → grow the heap (up to max)
+// → If at max → OutOfMemoryError
+
+// 2. Explicit GC:
+// System.gc() → requests a GC (not guaranteed to run immediately)
+// Runtime.gc() → same as System.gc()
+// ART may delay or skip explicit GC requests
+
+// 3. Native allocation trigger:
+// When native memory (Bitmaps, etc.) grows, ART triggers GC
+// to collect Java objects that reference native memory
+// (e.g., Bitmap's weak reference → native pixel buffer)
+
+// 4. Background GC:
+// When the app goes to background, ART runs a compacting GC
+// to reduce memory footprint (helps the OOM killer spare your process)
+
+// 5. Heap trim:
+// After GC, if the heap has significant free space,
+// ART releases pages back to the OS (madvise(MADV_DONTNEED))
+
+// GC logging (logcat):
+// I/art: CC GC freed 12345(678KB) AllocSpace objects,
+//        0(0B) LOS objects, 45% free, 32MB/58MB, paused 0.5ms, total 12ms
+//
+// Breakdown:
+// CC = Concurrent Copying
+// freed 12345(678KB) = objects freed in RegionSpace
+// LOS objects = Large Object Space freed
+// 45% free = heap utilization
+// 32MB/58MB = allocated/heap size
+// paused 0.5ms = stop-the-world pause
+// total 12ms = total GC time (including concurrent phases)</code></pre>
+
+<!-- ============================================================ -->
+<h2>7. GC Impact on Performance</h2>
+
+<pre><code>// Even with < 1ms pauses, GC affects performance:
+
+// 1. CPU contention:
+// GC threads compete with app threads for CPU time
+// On a 4-core device, 2 GC threads = 50% CPU stolen during GC
+// This can cause jank even without a visible pause
+
+// 2. Cache pollution:
+// GC traverses the entire object graph → thrashes CPU caches
+// App's hot data gets evicted → slower execution after GC
+
+// 3. Memory pressure:
+// During copying GC, both from-space and to-space exist simultaneously
+// Peak memory usage is ~2x the live data size
+// This can trigger LMK to kill other processes
+
+// 4. Allocation rate:
+// High allocation rate → more frequent GC → more CPU stolen
+// Measure with: Debug.getGlobalAllocCount(), Debug.getGlobalAllocSize()
+
+// Optimization strategies:
+// 1. Reduce allocation rate (object pooling, avoid autoboxing)
+// 2. Reduce live object count (smaller caches, WeakReference)
+// 3. Avoid large temporary objects (reuse buffers, StringBuilder)
+// 4. Use value classes (@JvmInline) for small wrappers
+// 5. Profile with Android Studio Memory Profiler → Allocation Tracking</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Allocation Rate is the #1 GC Metric</div>
+  <p>At Google, the primary metric for GC health is <strong>allocation rate</strong> (MB/s). A well-optimized app allocates &lt;5 MB/s during steady-state UI interaction. A poorly optimized app can allocate 50+ MB/s (e.g., creating objects in <code>onDraw()</code>, string concatenation in RecyclerView binding). High allocation rate causes frequent minor GCs, which steal CPU and cause micro-jank. Use Android Studio's Allocation Tracker to find hot allocation sites. The fix is almost always object reuse, not GC tuning.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. Finalizer Queue — The Legacy Bottleneck</h2>
+
+<pre><code>// Objects with finalize() methods go through a special GC path:
+// 1. First GC: object is unreachable → moved to the FinalizerReference queue
+//    (NOT freed yet — it needs finalization first)
+// 2. FinalizerDaemon thread picks up the object → calls finalize()
+// 3. Second GC: object is now truly unreachable → freed
+//
+// Problems:
+// - Objects with finalizers take 2 GC cycles to reclaim (double the memory pressure)
+// - FinalizerDaemon is a SINGLE thread — if one finalize() blocks, ALL finalization stalls
+// - FinalizerWatchdogDaemon monitors the FinalizerDaemon:
+//   if a single finalize() takes > 10 seconds → the process is killed with:
+//   "java.util.concurrent.TimeoutException: android.graphics.Bitmap.finalize()
+//    timed out after 10 seconds"
+//
+// This was a major crash source before Android 8 (Bitmaps used finalize()).
+// Modern approach: PhantomReference + Cleaner (used by NativeAllocationRegistry)
+// - No finalize() method needed
+// - Cleaner runs on ReferenceQueueDaemon (separate from FinalizerDaemon)
+// - Object is reclaimable in a single GC cycle
+// - No 10-second watchdog timeout risk
+
+// Rule: NEVER use finalize() in modern Android code.
+// Use AutoCloseable + try-with-resources, or Cleaner for native resources.</code></pre>
+
+<!-- ============================================================ -->
+<h2>9. Background GC — Collector Transition</h2>
+
+<pre><code>// When the app moves to background (TRIM_MEMORY_UI_HIDDEN), ART switches
+// its GC strategy to be more aggressive about returning memory to the OS.
+
+// Foreground mode:
+// - CC (Concurrent Copying) collector
+// - Optimized for low pause times (< 1ms)
+// - Heap allowed to stay at current footprint
+// - Read barriers active
+
+// Background transition:
+// 1. ART receives notification from AMS (via Runtime::NotifyAppBackgrounded())
+// 2. Triggers a full compacting GC (not just young-gen)
+// 3. After compaction, calls madvise(MADV_DONTNEED) on freed pages
+// 4. May also call madvise(MADV_FREE) on pages that are "cold" but not freed
+// 5. Adjusts heap target: reduces target utilization to free more memory
+//    (e.g., from 75% to 50% — allowing more aggressive shrinking)
+
+// The result: an app that uses 200MB in foreground might drop to 80MB RSS
+// after backgrounding, because ART compacted the heap and returned pages.
+
+// Foreground transition:
+// 1. ART receives Runtime::NotifyAppForegrounded()
+// 2. Switches back to low-pause CC mode
+// 3. Heap target returns to normal utilization
+// 4. No immediate GC — waits for allocation pressure
+
+// This is why "Don't keep activities" in Developer Options is useful for testing:
+// it forces the background GC path, revealing memory issues that only
+// appear after the aggressive compaction.</code></pre>
+
+<!-- ============================================================ -->
+<h2>10. GC and Compose — Allocation Patterns in Recomposition</h2>
+
+<pre><code>// Compose introduces unique allocation patterns that affect GC:
+
+// 1. Recomposition allocates:
+//    - New lambda instances for event handlers (onClick, onValueChange)
+//    - New Modifier chains (Modifier.padding().background()...)
+//    - State snapshot reads (creating SnapshotStateObserver entries)
+//    - Composer internal bookkeeping (groups, slots)
+//
+// 2. Strong Skipping Mode (Compose 1.5.4+):
+//    - Lambdas are memoized by the compiler → fewer allocations
+//    - Unstable parameters can still be skipped (compared by equals())
+//    - Reduces allocation rate during recomposition by 30-50%
+//
+// 3. Slot table reuse:
+//    - remember {} values are stored in the slot table, not re-allocated
+//    - Stable parameters skip recomposition entirely → zero allocations
+//    - Unstable parameters trigger recomposition → allocations for new lambdas
+//
+// 4. LazyColumn/LazyRow:
+//    - Items leaving the viewport are disposed → their slot table entries freed
+//    - Items entering are composed fresh → new allocations
+//    - Fast scrolling = high allocation rate → frequent young-gen GC
+//    - Fix: use contentType to enable SubComposition reuse
+//
+// Compose-specific GC optimization:
+// - Mark all data classes as @Stable or @Immutable where possible
+// - Use derivedStateOf {} to reduce recomposition scope
+// - Avoid creating new objects in Composable functions:
+//   BAD:  Text(style = TextStyle(fontSize = 16.sp))  // new TextStyle every recomposition
+//   GOOD: val style = remember { TextStyle(fontSize = 16.sp) }
+//         Text(style = style)
+// - Profile with Android Studio Memory Profiler → Allocation Tracking
+//   during scrolling to find hot allocation sites in Composables</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Compose Allocation Budget</div>
+  <p>At Google, the Compose team targets &lt;2 MB/s allocation rate during steady-state scrolling in <code>LazyColumn</code>. Before Strong Skipping Mode, a typical Compose list allocated 5-10 MB/s due to lambda re-creation and Modifier chain rebuilding. Strong Skipping Mode + proper stability annotations brought this to &lt;2 MB/s. If your Compose UI allocates more, use the Compose compiler's stability report (<code>-P plugin:androidx.compose.compiler.plugins.kotlin:reportsDestination=...</code>) to find unstable parameters causing unnecessary recomposition and allocation.</p>
+</div>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  ← <a href="01-memory-model.html">01 — Memory Model</a> &nbsp;|&nbsp;
+  <a href="03-memory-leaks.html">03 — Memory Leaks →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

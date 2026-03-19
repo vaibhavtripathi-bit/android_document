@@ -1,0 +1,1036 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 — App Startup Optimization — Cold, Warm, Hot Start Internals & Measurement</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-memory-model.html">01 Memory Model</a>
+  <a href="02-gc-internals.html">02 GC Internals</a>
+  <a href="03-memory-leaks.html">03 Memory Leaks</a>
+  <a href="04-anr-deep-dive.html">04 ANR Deep Dive</a>
+  <a href="05-oom-lmk.html">05 OOM &amp; LMK</a>
+  <a class="active" href="06-app-startup.html">06 App Startup</a>
+  <a href="07-baseline-profiles.html">07 Baseline Profiles</a>
+  <a href="08-interview-qa.html">08 Interview Q&amp;A</a>
+</div>
+
+<h1>06 — App Startup Optimization</h1>
+<p class="subtitle">Cold, warm, and hot start internals — Zygote fork to first frame, ContentProvider cost, App Startup library, Splash Screen API, reportFullyDrawn, and Macrobenchmark measurement</p>
+
+<!-- ============================================================ -->
+<h2>1. Cold / Warm / Hot Start Definitions</h2>
+
+<p>Android distinguishes three startup modes based on how much of the app's process and Activity state already exists in memory. The distinction matters because each mode exercises a completely different code path through the framework.</p>
+
+<table>
+  <tr><th>Start Type</th><th>Process State</th><th>Activity State</th><th>What Happens</th><th>Typical Time</th></tr>
+  <tr>
+    <td><strong>Cold</strong></td>
+    <td>Not running</td>
+    <td>Does not exist</td>
+    <td>Zygote fork → Application.attachBaseContext → ContentProviders → Application.onCreate → Activity.onCreate → onStart → onResume → first frame</td>
+    <td>300ms–1.5s+</td>
+  </tr>
+  <tr>
+    <td><strong>Warm</strong></td>
+    <td>Alive in memory</td>
+    <td>Destroyed (finished or killed)</td>
+    <td>Activity.onCreate → onStart → onResume → first frame (skips process creation, Application init, ContentProviders)</td>
+    <td>150ms–500ms</td>
+  </tr>
+  <tr>
+    <td><strong>Hot</strong></td>
+    <td>Alive in memory</td>
+    <td>Stopped (in background)</td>
+    <td>Activity.onRestart → onStart → onResume → first frame (skips onCreate entirely)</td>
+    <td>50ms–150ms</td>
+  </tr>
+</table>
+
+<pre><code>// How the system decides which start type to use:
+//
+// 1. User taps the launcher icon
+// 2. System (AMS) checks: is the app's process alive?
+//    NO  → COLD START (fork from Zygote, full initialization)
+//    YES → Is the Activity instance still in memory?
+//           NO  → WARM START (process alive, but Activity was destroyed)
+//           YES → HOT START (Activity is stopped, just bring to front)
+//
+// Key distinction for warm start:
+// The process survived (Application object, singletons, static state all intact),
+// but the Activity was destroyed — either by the user pressing Back, or by the
+// system reclaiming memory (onSaveInstanceState was called).
+//
+// What "first frame" means:
+// The system measures startup time from the intent to the first
+// ViewTreeObserver.OnDrawListener callback after the Activity's window
+// becomes visible. This is the TTID (Time To Initial Display) metric.
+//
+// Google Play Vitals thresholds:
+// Cold start: excessive if > 5s (warning at > 3s)
+// Warm start: excessive if > 2s
+// Hot start:  excessive if > 1.5s
+//
+// Google's internal target for flagship apps: < 500ms cold start</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Warm Start Is Not What Most Developers Think</div>
+  <p>Many developers assume "warm start" means the app was recently in the background. That's actually a <strong>hot start</strong>. A warm start specifically means the process is alive but the Activity was destroyed — the system must call <code>Activity.onCreate()</code> again, re-inflate the layout, and re-bind data. This happens when the user presses Back and then re-launches, or when the system destroyed the Activity to reclaim memory while the process survived. The process-level state (Application, singletons, cached data) is still in memory, which is why it's faster than cold.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Cold Start Internals — Step by Step</h2>
+
+<p>A cold start is the most expensive path and the one that matters most for optimization. Every millisecond from Zygote fork to first frame is time the user stares at a blank or splash screen.</p>
+
+<div class="diagram-container">
+<pre><code>  User taps icon
+       │
+       ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  SYSTEM_SERVER (ActivityManagerService)                             │
+  │                                                                     │
+  │  1. AMS.startActivity()                                             │
+  │     → Resolve intent, check permissions, find target Activity       │
+  │     → Check if process exists → NO → request Zygote fork            │
+  │                                                                     │
+  │  2. AMS → Zygote (via socket /dev/socket/zygote)                    │
+  │     → Send: "fork process for com.example.app, uid=10234"           │
+  └─────────────────────┬───────────────────────────────────────────────┘
+                        │
+                        ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  ZYGOTE                                                             │
+  │                                                                     │
+  │  3. fork() → child process inherits:                                │
+  │     - Pre-loaded framework classes (~4000 classes)                   │
+  │     - Pre-loaded resources (drawables, layouts, themes)             │
+  │     - Pre-initialized ICU, OpenSSL, ART runtime                     │
+  │     - Shared memory via COW (copy-on-write)                         │
+  │                                                                     │
+  │  4. Child process: specialize                                       │
+  │     → Set UID, GID, SELinux context                                 │
+  │     → Close Zygote's server socket                                  │
+  │     → Call RuntimeInit.commonInit()                                  │
+  └─────────────────────┬───────────────────────────────────────────────┘
+                        │
+                        ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  APP PROCESS (new)                                                  │
+  │                                                                     │
+  │  5. ActivityThread.main()                ← entry point              │
+  │     → Looper.prepareMainLooper()                                    │
+  │     → ActivityThread.attach(false)                                  │
+  │       → AMS.attachApplication(appThread)  (Binder call to system)   │
+  │                                                                     │
+  │  6. AMS.attachApplicationLocked()                                   │
+  │     → bindApplication() → schedules handleBindApplication()         │
+  │                                                                     │
+  │  7. handleBindApplication()                                         │
+  │     → LoadedApk.makeApplication()                                   │
+  │       → Instrumentation.newApplication()                            │
+  │         → Application.attachBaseContext()     ← YOUR CODE           │
+  │         → Install ContentProviders            ← ALL OF THEM         │
+  │           → ContentProvider.onCreate() × N    ← HIDDEN COST        │
+  │         → Application.onCreate()              ← YOUR CODE           │
+  │                                                                     │
+  │  8. AMS sends scheduleLaunchActivity()                              │
+  │     → handleLaunchActivity()                                        │
+  │       → Activity.onCreate()                   ← YOUR CODE           │
+  │       → Activity.onStart()                                          │
+  │       → Activity.onResume()                                         │
+  │                                                                     │
+  │  9. First traversal                                                 │
+  │     → ViewRootImpl.performTraversals()                              │
+  │       → measure → layout → draw                                     │
+  │       → RenderThread submits frame to SurfaceFlinger                │
+  │                                                                     │
+  │  10. FIRST FRAME RENDERED ← system records TTID here               │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  Timeline (typical cold start ~600ms):
+  ┌──────┬──────────┬──────┬──────────┬────────────┬──────────┬────────┐
+  │Zygote│ AT.main  │attach│ CProviders│App.onCreate│Act.create│ Draw   │
+  │ fork │  + init  │ Base │ .onCreate │            │ + layout │ frame  │
+  │~50ms │  ~30ms   │~10ms │ ~100-300ms│  ~50-200ms │~100-200ms│~50ms   │
+  └──────┴──────────┴──────┴──────────┴────────────┴──────────┴────────┘
+  0ms                                                              ~600ms</code></pre>
+</div>
+
+<pre><code>// The critical ordering inside handleBindApplication():
+// Source: frameworks/base/core/java/android/app/ActivityThread.java
+
+// Step 1: Create the Application object
+val app = loadedApk.makeApplication(/*instrumented=*/ false, /*instrumentation=*/ null)
+// This calls Application() constructor + attachBaseContext()
+
+// Step 2: Install ALL ContentProviders declared in the manifest
+// This happens BEFORE Application.onCreate()!
+installContentProviders(app, providers)
+// For EACH provider in the list:
+//   → ContentProvider.attachInfo() → ContentProvider.onCreate()
+//   → This is synchronous, on the main thread, blocking startup
+
+// Step 3: Call Application.onCreate()
+instrumentation.callApplicationOnCreate(app)
+
+// The order is: attachBaseContext → ContentProviders → Application.onCreate
+// Most developers don't realize ContentProviders run BEFORE onCreate.
+// This is the #1 source of hidden startup cost in modern Android apps.</code></pre>
+
+<div class="callout danger">
+  <div class="callout-label">The 500ms Budget</div>
+  <p>Google's target for cold start is <strong>under 500ms</strong> from process creation to first frame. On a Pixel device with a release build, this is achievable. But consider what eats into that budget: Zygote fork (~50ms, fixed), <code>ActivityThread.main()</code> setup (~30ms, fixed), ContentProvider initialization (~100-300ms, <strong>you control this</strong>), <code>Application.onCreate()</code> (~50-200ms, <strong>you control this</strong>), Activity creation + layout inflation (~100-200ms, <strong>you control this</strong>), first draw (~50ms, mostly fixed). The framework overhead is ~130ms. That leaves you ~370ms for everything your app does before the first frame.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. ContentProvider Init Cost</h2>
+
+<p>ContentProviders are the silent killer of startup performance. They're initialized <strong>before</strong> <code>Application.onCreate()</code>, on the main thread, with no way to defer or parallelize them through the standard manifest mechanism.</p>
+
+<pre><code>// Every ContentProvider declared in the merged manifest is instantiated
+// and has its onCreate() called during handleBindApplication().
+//
+// The problem: libraries use ContentProviders for auto-initialization.
+// Each library adds its own ContentProvider to your merged manifest
+// via manifest merger, and each one runs before your code.
+//
+// Common offenders and their approximate cost:
+// ┌────────────────────────────────────┬──────────────┬──────────────────────┐
+// │ Library                            │ ContentProvider                     │
+// │                                    │ Approx. Cost │ What It Initializes  │
+// ├────────────────────────────────────┼──────────────┼──────────────────────┤
+// │ Firebase Core                      │ ~50-100ms    │ FirebaseApp, analytics│
+// │ Firebase Crashlytics               │ ~30-60ms     │ NDK crash handler     │
+// │ WorkManager                        │ ~20-40ms     │ WorkManagerImpl       │
+// │ AndroidX Lifecycle                 │ ~10-20ms     │ ProcessLifecycleOwner │
+// │ AndroidX Startup                   │ ~5-10ms      │ InitializationProvider│
+// │ Facebook SDK                       │ ~40-80ms     │ FB App Events         │
+// │ Google Play Services (Ads)         │ ~30-50ms     │ Ad initialization     │
+// │ Leak Canary (debug)                │ ~20-40ms     │ Watcher installation  │
+// │ Room (if auto-migrating)           │ ~10-30ms     │ Database verification │
+// └────────────────────────────────────┴──────────────┴──────────────────────┘
+//
+// Worst case: 10 libraries × 50ms each = 500ms BEFORE Application.onCreate()
+// Your entire startup budget is gone before a single line of your code runs.
+
+// Measuring the damage:
+// adb shell am start -W com.example.app/.MainActivity
+//
+// Output:
+// Starting: Intent { act=android.intent.action.MAIN ... }
+// Status: ok
+// LaunchState: COLD
+// Activity: com.example.app/.MainActivity
+// TotalTime: 847        ← Total time from intent to first frame
+// WaitTime: 853         ← Includes system overhead
+//
+// TotalTime is what Google Play Vitals reports as TTID.
+
+// To see exactly which ContentProviders are installed:
+// adb shell dumpsys package com.example.app | grep -A 5 "ContentProvider"
+//
+// Or inspect the merged manifest:
+// app/build/intermediates/merged_manifests/release/AndroidManifest.xml
+// Search for &lt;provider&gt; tags — you'll be surprised how many there are.</code></pre>
+
+<h3>Profiling ContentProvider Cost in Perfetto</h3>
+
+<pre><code>// In a Perfetto/Systrace trace, look for these trace sections:
+//
+// "bindApplication" — the entire handleBindApplication() call
+//   └── "installProvider: [authority]" — each ContentProvider.onCreate()
+//       ├── "installProvider: com.google.firebase.provider.FirebaseInitProvider"
+//       ├── "installProvider: androidx.work.impl.WorkManagerInitializer"
+//       ├── "installProvider: androidx.lifecycle.ProcessLifecycleOwnerInitializer"
+//       └── ... (one per provider)
+//
+// To capture a startup trace:
+// adb shell am force-stop com.example.app
+// adb shell am start -W -S \
+//   --ez "profile_startup" true \
+//   com.example.app/.MainActivity
+//
+// Or use Macrobenchmark (covered in section 7).</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. Jetpack App Startup Library</h2>
+
+<p>The App Startup library solves the ContentProvider proliferation problem by consolidating all library initializations into a single <code>ContentProvider</code> and providing a dependency-aware lazy initialization mechanism.</p>
+
+<pre><code>// Dependency:
+// implementation "androidx.startup:startup-runtime:1.1.1"
+
+// How it works:
+// 1. App Startup provides ONE ContentProvider: InitializationProvider
+// 2. Libraries implement the Initializer&lt;T&gt; interface instead of their own CP
+// 3. InitializationProvider reads metadata from the manifest and calls
+//    each Initializer in dependency order
+// 4. Libraries can be lazily initialized (not at startup) if desired
+
+// Step 1: Implement an Initializer for your library
+class WorkManagerInitializer : Initializer&lt;WorkManager&gt; {
+
+    override fun create(context: Context): WorkManager {
+        val config = Configuration.Builder()
+            .setMinimumLoggingLevel(Log.INFO)
+            .build()
+        WorkManager.initialize(context, config)
+        return WorkManager.getInstance(context)
+    }
+
+    // Declare dependencies: what must be initialized first?
+    override fun dependencies(): List&lt;Class&lt;out Initializer&lt;*&gt;&gt;&gt; {
+        // WorkManager depends on nothing — empty list
+        return emptyList()
+    }
+}
+
+class AnalyticsInitializer : Initializer&lt;AnalyticsTracker&gt; {
+
+    override fun create(context: Context): AnalyticsTracker {
+        // This runs AFTER WorkManagerInitializer because we declared the dependency
+        val tracker = AnalyticsTracker.Builder(context)
+            .setEndpoint(BuildConfig.ANALYTICS_URL)
+            .build()
+        tracker.initialize()
+        return tracker
+    }
+
+    override fun dependencies(): List&lt;Class&lt;out Initializer&lt;*&gt;&gt;&gt; {
+        // Analytics depends on WorkManager (for batched event upload)
+        return listOf(WorkManagerInitializer::class.java)
+    }
+}</code></pre>
+
+<h3>Manifest Configuration</h3>
+
+<pre><code>// In your AndroidManifest.xml, declare initializers as metadata
+// on the InitializationProvider:
+
+// &lt;provider
+//     android:name="androidx.startup.InitializationProvider"
+//     android:authorities="${applicationId}.androidx-startup"
+//     android:exported="false"
+//     tools:node="merge"&gt;
+//
+//     &lt;meta-data
+//         android:name="com.example.WorkManagerInitializer"
+//         android:value="androidx.startup" /&gt;
+//
+//     &lt;meta-data
+//         android:name="com.example.AnalyticsInitializer"
+//         android:value="androidx.startup" /&gt;
+// &lt;/provider&gt;
+
+// REMOVING a library's auto-init ContentProvider:
+// Many libraries (WorkManager, Lifecycle) already support App Startup.
+// To disable their standalone ContentProvider and use App Startup instead:
+
+// &lt;provider
+//     android:name="androidx.work.impl.WorkManagerInitializer"
+//     android:authorities="${applicationId}.workmanager-init"
+//     tools:node="remove" /&gt;
+//
+// tools:node="remove" tells the manifest merger to strip this provider
+// from the final merged manifest. Now WorkManager won't auto-init via
+// its own ContentProvider — you control when it initializes.</code></pre>
+
+<h3>Lazy (Manual) Initialization</h3>
+
+<pre><code>// For libraries that aren't needed at startup, skip auto-init entirely
+// and initialize them on-demand:
+
+// 1. Disable auto-init in the manifest:
+// &lt;provider
+//     android:name="androidx.startup.InitializationProvider"
+//     android:authorities="${applicationId}.androidx-startup"
+//     android:exported="false"
+//     tools:node="merge"&gt;
+//     &lt;meta-data
+//         android:name="com.example.AnalyticsInitializer"
+//         android:value="androidx.startup"
+//         tools:node="remove" /&gt;   &lt;!-- Remove from auto-init --&gt;
+// &lt;/provider&gt;
+
+// 2. Initialize manually when needed:
+class HomeFragment : Fragment() {
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+
+        // Initialize analytics lazily — only when the user reaches Home
+        val analytics = AppInitializer.getInstance(requireContext())
+            .initializeComponent(AnalyticsInitializer::class.java)
+
+        analytics.trackScreenView("home")
+    }
+}
+
+// Benefits:
+// - Startup cost reduced: analytics init moved from cold start to first screen
+// - Dependencies are still resolved: if AnalyticsInitializer depends on
+//   WorkManagerInitializer, App Startup initializes WorkManager first
+// - Thread-safe: AppInitializer handles concurrent initialization calls
+// - Idempotent: calling initializeComponent() twice returns the cached result</code></pre>
+
+<div class="callout">
+  <div class="callout-label">Measuring the Impact</div>
+  <p>A real-world app with Firebase, WorkManager, Lifecycle, Crashlytics, and a custom analytics SDK had <strong>5 ContentProviders</strong> adding ~280ms to cold start. After migrating to App Startup with lazy init for analytics and Crashlytics, cold start dropped to ~120ms of ContentProvider overhead — a single <code>InitializationProvider</code> running only the two initializers needed before first frame. The remaining three initialized lazily within the first 2 seconds of user interaction.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Splash Screen API (Android 12+)</h2>
+
+<p>Before Android 12, the system showed a blank window (with the app's <code>windowBackground</code> theme) during cold start. Developers hacked around this with custom splash Activities or themed windows. Android 12 introduced a proper Splash Screen API that the system controls, ensuring a consistent, fast experience.</p>
+
+<pre><code>// The Splash Screen API works at the WINDOW level, not the Activity level.
+// The system draws the splash screen BEFORE your Activity's first frame.
+//
+// How it works internally:
+// 1. AMS creates a "starting window" (splash) immediately when launching the app
+// 2. The splash is drawn by the system (WindowManagerService), not your app
+// 3. Your app process forks, initializes, creates the Activity
+// 4. When the Activity's first frame is ready, the system cross-fades
+//    from the splash to your Activity's content
+//
+// This means the user sees the splash INSTANTLY — no blank screen.
+
+// Theme configuration (in res/values/themes.xml):
+// &lt;style name="Theme.App" parent="Theme.MaterialComponents.DayNight"&gt;
+//     &lt;!-- Splash screen background color --&gt;
+//     &lt;item name="android:windowSplashScreenBackground"&gt;@color/brand_dark&lt;/item&gt;
+//
+//     &lt;!-- Center icon (adaptive icon or AnimatedVectorDrawable) --&gt;
+//     &lt;item name="android:windowSplashScreenAnimatedIcon"&gt;@drawable/splash_icon&lt;/item&gt;
+//
+//     &lt;!-- Icon animation duration (max 1000ms) --&gt;
+//     &lt;item name="android:windowSplashScreenAnimationDuration"&gt;500&lt;/item&gt;
+//
+//     &lt;!-- Branding image at the bottom (optional, NOT recommended by Google) --&gt;
+//     &lt;item name="android:windowSplashScreenBrandingImage"&gt;@drawable/brand&lt;/item&gt;
+// &lt;/style&gt;
+
+// Compat library for Android 5+ (backports the API):
+// implementation "androidx.core:core-splashscreen:1.0.1"</code></pre>
+
+<h3>Controlling the Splash Screen from Code</h3>
+
+<pre><code>class MainActivity : AppCompatActivity() {
+
+    private val viewModel: MainViewModel by viewModels()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        // MUST be called before super.onCreate()
+        val splashScreen = installSplashScreen()
+
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        // Keep the splash screen visible while loading initial data.
+        // The splash stays until this condition returns false.
+        splashScreen.setKeepOnScreenCondition {
+            viewModel.isLoading.value
+        }
+        // How it works internally:
+        // The system checks this condition on every frame via a
+        // ViewTreeObserver.OnPreDrawListener. As long as it returns true,
+        // the Activity's content is not drawn (the splash stays).
+        // When it returns false, the system removes the splash and
+        // draws the Activity's first frame.
+
+        // Custom exit animation — animate the splash screen away
+        splashScreen.setOnExitAnimationListener { splashScreenView ->
+            // splashScreenView is the actual View of the splash screen
+            // You can animate it however you want
+
+            val slideUp = ObjectAnimator.ofFloat(
+                splashScreenView,
+                View.TRANSLATION_Y,
+                0f,
+                -splashScreenView.height.toFloat()
+            ).apply {
+                interpolator = AnticipateInterpolator()
+                duration = 300L
+            }
+
+            val fadeOut = ObjectAnimator.ofFloat(
+                splashScreenView,
+                View.ALPHA,
+                1f,
+                0f
+            ).apply {
+                duration = 300L
+            }
+
+            AnimatorSet().apply {
+                playTogether(slideUp, fadeOut)
+                doOnEnd { splashScreenView.remove() }
+                start()
+            }
+        }
+    }
+}
+
+class MainViewModel : ViewModel() {
+    val isLoading = MutableStateFlow(true)
+
+    init {
+        viewModelScope.launch {
+            // Load critical data needed for first screen
+            val config = async { repository.fetchConfig() }
+            val user = async { repository.getCurrentUser() }
+            config.await()
+            user.await()
+            isLoading.value = false
+        }
+    }
+}</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Don't Abuse setKeepOnScreenCondition</div>
+  <p>Holding the splash screen for too long defeats its purpose. The splash should only stay while loading data that is <strong>absolutely required</strong> for the first frame — authentication state, critical config, or feature flags. If you hold it for 3+ seconds to load a full feed, users perceive the app as slow. Instead, show a skeleton UI or shimmer placeholder and load data asynchronously. Google Play Vitals measures TTID (Time To Initial Display) from the splash, so a long splash still counts as slow startup.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. reportFullyDrawn()</h2>
+
+<p><code>Activity.reportFullyDrawn()</code> tells the system when your app is actually <strong>usable</strong> — not just when the first frame was drawn, but when the meaningful content is visible and interactive. This is the TTFD (Time To Full Display) metric.</p>
+
+<pre><code>// TTID vs TTFD:
+// TTID (Time To Initial Display): first frame rendered — may be a skeleton/placeholder
+// TTFD (Time To Full Display): app is usable — real content is visible
+//
+// The system automatically measures TTID. YOU must report TTFD.
+//
+// When you call reportFullyDrawn():
+// 1. A "fully drawn" timestamp appears in Perfetto/Systrace
+// 2. Google Play Vitals records it as your app's TTFD metric
+// 3. Macrobenchmark can measure it via StartupTimingMetric
+//
+// In logcat, you'll see:
+// I/ActivityTaskManager: Fully drawn com.example.app/.MainActivity: +1s200ms
+
+class FeedActivity : AppCompatActivity() {
+
+    private var reportedFullyDrawn = false
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_feed)
+
+        val recyclerView = findViewById&lt;RecyclerView&gt;(R.id.feed_list)
+        val adapter = FeedAdapter()
+        recyclerView.adapter = adapter
+
+        lifecycleScope.launch {
+            val feedItems = repository.loadFeed()
+            adapter.submitList(feedItems)
+
+            // Report fully drawn AFTER the data is loaded AND rendered.
+            // Post to ensure the RecyclerView has laid out the items.
+            recyclerView.post {
+                if (!reportedFullyDrawn) {
+                    reportFullyDrawn()
+                    reportedFullyDrawn = true
+                }
+            }
+        }
+    }
+}
+
+// More precise: wait for the RecyclerView to actually render items
+class FeedActivity : AppCompatActivity() {
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_feed)
+
+        val recyclerView = findViewById&lt;RecyclerView&gt;(R.id.feed_list)
+
+        // Use a pre-draw listener to detect when content is actually on screen
+        recyclerView.viewTreeObserver.addOnPreDrawListener(
+            object : ViewTreeObserver.OnPreDrawListener {
+                override fun onPreDraw(): Boolean {
+                    if (recyclerView.childCount > 0) {
+                        recyclerView.viewTreeObserver.removeOnPreDrawListener(this)
+                        reportFullyDrawn()
+                        return true
+                    }
+                    return true
+                }
+            }
+        )
+
+        lifecycleScope.launch {
+            val items = repository.loadFeed()
+            (recyclerView.adapter as FeedAdapter).submitList(items)
+        }
+    }
+}</code></pre>
+
+<h3>FullyDrawnReporter for Jetpack Compose</h3>
+
+<pre><code>// Starting with Activity 1.7+ and Compose, use FullyDrawnReporter
+// to coordinate multiple async data sources before reporting.
+
+// FullyDrawnReporter tracks multiple "reporters" — it calls
+// reportFullyDrawn() only when ALL reporters have completed.
+
+class ComposeActivity : ComponentActivity() {
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            MyApp()
+        }
+    }
+}
+
+@Composable
+fun MyApp() {
+    val feedState by feedViewModel.uiState.collectAsStateWithLifecycle()
+    val profileState by profileViewModel.uiState.collectAsStateWithLifecycle()
+
+    // ReportDrawnWhen — reports fully drawn when the condition is true
+    ReportDrawnWhen {
+        feedState is FeedUiState.Success && profileState is ProfileUiState.Success
+    }
+
+    // Alternatively, for more control:
+    // ReportDrawnAfter — reports after the suspending block completes
+    ReportDrawnAfter {
+        feedViewModel.waitForInitialLoad()
+    }
+
+    Column {
+        ProfileHeader(profileState)
+        FeedList(feedState)
+    }
+}
+
+// Under the hood, ReportDrawnWhen uses FullyDrawnReporter:
+// 1. It registers a "reporter" with the Activity's FullyDrawnReporter
+// 2. When the condition becomes true, it removes the reporter
+// 3. When ALL reporters are removed, FullyDrawnReporter calls reportFullyDrawn()
+//
+// This is critical for Compose screens with multiple async data sources:
+// you don't want to report "fully drawn" until ALL sections have data.</code></pre>
+
+<!-- ============================================================ -->
+<h2>7. Measuring Startup with Macrobenchmark</h2>
+
+<p>Macrobenchmark is the gold standard for measuring startup performance. It launches your app from outside the process (like a real user), measures real timing, and captures Perfetto traces for analysis.</p>
+
+<pre><code>// Module setup: create a :macrobenchmark module (or :benchmark)
+// build.gradle.kts:
+// plugins {
+//     id("com.android.test")
+//     id("org.jetbrains.kotlin.android")
+// }
+// android {
+//     targetProjectPath = ":app"
+//     experimentalProperties["android.experimental.self-instrumenting"] = true
+// }
+// dependencies {
+//     implementation("androidx.benchmark:benchmark-macro-junit4:1.2.4")
+// }
+
+@RunWith(AndroidJUnit4::class)
+class StartupBenchmark {
+
+    @get:Rule
+    val benchmarkRule = MacrobenchmarkRule()
+
+    @Test
+    fun startupCold() = benchmarkRule.measureRepeated(
+        packageName = "com.example.app",
+        metrics = listOf(StartupTimingMetric()),
+        iterations = 10,
+        startupMode = StartupMode.COLD,
+        setupBlock = {
+            // Runs before each iteration
+            pressHome()
+            // For COLD: the framework kills the process automatically
+        }
+    ) {
+        // measureBlock: the actual startup action
+        startActivityAndWait()
+        // startActivityAndWait() launches the default Activity and waits
+        // until the first frame is drawn (TTID).
+        // If reportFullyDrawn() is called, it also captures TTFD.
+    }
+
+    @Test
+    fun startupWarm() = benchmarkRule.measureRepeated(
+        packageName = "com.example.app",
+        metrics = listOf(StartupTimingMetric()),
+        iterations = 10,
+        startupMode = StartupMode.WARM
+    ) {
+        startActivityAndWait()
+    }
+
+    @Test
+    fun startupHot() = benchmarkRule.measureRepeated(
+        packageName = "com.example.app",
+        metrics = listOf(StartupTimingMetric()),
+        iterations = 10,
+        startupMode = StartupMode.HOT
+    ) {
+        startActivityAndWait()
+    }
+}
+
+// StartupTimingMetric captures:
+// - timeToInitialDisplayMs: time from intent to first frame (TTID)
+// - timeToFullDisplayMs: time from intent to reportFullyDrawn() (TTFD)
+//
+// Output example:
+// StartupBenchmark_startupCold
+//   timeToInitialDisplayMs   min 412.3, median 438.7, max 521.1
+//   timeToFullDisplayMs      min 891.2, median 1023.4, max 1187.6</code></pre>
+
+<h3>Custom Trace Sections with TraceSectionMetric</h3>
+
+<pre><code>// TraceSectionMetric lets you measure specific sections of your startup code.
+// Add trace sections to your app code, then measure them in Macrobenchmark.
+
+// In your app code — add trace sections:
+class MyApplication : Application() {
+    override fun onCreate() {
+        super.onCreate()
+
+        Trace.beginSection("AppInit:DaggerComponent")
+        val component = DaggerAppComponent.builder()
+            .appModule(AppModule(this))
+            .build()
+        component.inject(this)
+        Trace.endSection()
+
+        Trace.beginSection("AppInit:ConfigLoad")
+        ConfigManager.initialize(this)
+        Trace.endSection()
+
+        Trace.beginSection("AppInit:NetworkSetup")
+        NetworkModule.initialize(this)
+        Trace.endSection()
+    }
+}
+
+// In your benchmark — measure those sections:
+@Test
+fun startupWithCustomMetrics() = benchmarkRule.measureRepeated(
+    packageName = "com.example.app",
+    metrics = listOf(
+        StartupTimingMetric(),
+        TraceSectionMetric("AppInit:DaggerComponent"),
+        TraceSectionMetric("AppInit:ConfigLoad"),
+        TraceSectionMetric("AppInit:NetworkSetup")
+    ),
+    iterations = 10,
+    startupMode = StartupMode.COLD
+) {
+    startActivityAndWait()
+}
+
+// Output:
+// startupWithCustomMetrics
+//   timeToInitialDisplayMs          median 438.7
+//   AppInit:DaggerComponent         median 87.3ms   ← Dagger is expensive!
+//   AppInit:ConfigLoad              median 23.1ms
+//   AppInit:NetworkSetup            median 12.4ms</code></pre>
+
+<h3>CI Integration</h3>
+
+<pre><code>// Macrobenchmark outputs JSON results that can be tracked over time.
+// Results are written to:
+//   /storage/emulated/0/Android/media/com.example.benchmark/
+//     com.example.benchmark-benchmarkData.json
+//
+// CI pipeline integration:
+// 1. Run benchmarks on a consistent device (physical or Firebase Test Lab)
+// 2. Parse the JSON output
+// 3. Compare against baseline thresholds
+// 4. Fail the build if startup regresses beyond a threshold
+//
+// Example CI script (Gradle):
+// ./gradlew :macrobenchmark:connectedBenchmarkAndroidTest
+//   -Pandroid.testInstrumentationRunnerArguments.class=
+//     com.example.benchmark.StartupBenchmark
+//
+// For Firebase Test Lab:
+// gcloud firebase test android run \
+//   --type instrumentation \
+//   --app app-release.apk \
+//   --test macrobenchmark-release.apk \
+//   --device model=oriole,version=33 \
+//   --directories-to-pull /sdcard/Android/media/com.example.benchmark \
+//   --results-bucket gs://my-bucket
+//
+// Key CI considerations:
+// - Always use a RELEASE build (debug builds have ART verification overhead)
+// - Use a physical device or a consistent emulator image
+// - Run at least 10 iterations for statistical significance
+// - Track P50 (median) and P90 over time
+// - Set regression thresholds: e.g., fail if median TTID increases > 50ms</code></pre>
+
+<!-- ============================================================ -->
+<h2>8. Startup Optimization Techniques</h2>
+
+<h3>Lazy Initialization in Application.onCreate()</h3>
+
+<pre><code>// BAD: initializing everything eagerly in Application.onCreate()
+class MyApplication : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        Firebase.initialize(this)          // ~80ms
+        CrashReporter.init(this)           // ~40ms
+        AnalyticsTracker.init(this)        // ~30ms
+        ImageLoader.init(this)             // ~20ms
+        NetworkClient.init(this)           // ~15ms
+        FeatureFlags.init(this)            // ~25ms (network call!)
+        AdSdk.init(this)                   // ~50ms
+        // Total: ~260ms before Activity.onCreate() even starts
+    }
+}
+
+// GOOD: only initialize what's needed for the first frame
+class MyApplication : Application() {
+
+    override fun onCreate() {
+        super.onCreate()
+        // Only critical-path items: crash reporting + image loader
+        CrashReporter.init(this)           // ~40ms — need this for safety
+        ImageLoader.init(this)             // ~20ms — needed for first frame
+        // Total: ~60ms — 200ms saved
+    }
+
+    // Lazy singletons for everything else
+    val analytics: AnalyticsTracker by lazy { AnalyticsTracker(this) }
+    val networkClient: NetworkClient by lazy { NetworkClient(this) }
+    val featureFlags: FeatureFlags by lazy { FeatureFlags(this) }
+}</code></pre>
+
+<h3>Background Thread Initialization</h3>
+
+<pre><code>// Move non-UI initialization off the main thread.
+// Use a background thread or coroutine for anything that doesn't
+// need to touch Views or the main thread's Looper.
+
+class MyApplication : Application() {
+
+    private val initScope = CoroutineScope(
+        SupervisorJob() + Dispatchers.Default + CoroutineName("AppInit")
+    )
+
+    override fun onCreate() {
+        super.onCreate()
+
+        // Critical path (main thread): only what's needed before first frame
+        CrashReporter.init(this)
+
+        // Background initialization: everything else
+        initScope.launch {
+            // These run concurrently on background threads
+            launch { Firebase.initialize(this@MyApplication) }
+            launch { AnalyticsTracker.init(this@MyApplication) }
+            launch { AdSdk.init(this@MyApplication) }
+            launch {
+                // Preload Dagger component graph on background thread
+                // so it's ready when the first injection happens
+                DaggerAppComponent.create()
+            }
+        }
+    }
+}
+
+// CAUTION: some libraries REQUIRE main thread initialization.
+// Firebase, for example, must be initialized on the main thread.
+// Always check library documentation before moving init to background.
+// If unsure, wrap in a try-catch and fall back to main thread init.</code></pre>
+
+<h3>Reducing Layout Inflation Cost</h3>
+
+<pre><code>// Layout inflation is a significant part of Activity.onCreate() cost.
+// Complex view hierarchies with deep nesting are expensive to inflate.
+
+// Techniques to reduce inflation cost:
+
+// 1. Use ViewStub for views not needed immediately
+// &lt;ViewStub
+//     android:id="@+id/error_stub"
+//     android:layout="@layout/error_view"
+//     android:layout_width="match_parent"
+//     android:layout_height="wrap_content" /&gt;
+
+// ViewStub costs ~0ms at inflation time. Inflate only when needed:
+val errorView = findViewById&lt;ViewStub&gt;(R.id.error_stub).inflate()
+
+// 2. Flatten view hierarchy — use ConstraintLayout instead of nested LinearLayouts
+// Deep nesting: measure/layout cost grows exponentially
+// ConstraintLayout: flat hierarchy, single measure/layout pass
+
+// 3. Use Compose — no XML inflation at all
+// Compose skips the entire XML parsing + View instantiation pipeline.
+// First composition is typically faster than XML inflation for complex layouts.
+
+// 4. AsyncLayoutInflater for non-critical UI
+val asyncInflater = AsyncLayoutInflater(this)
+asyncInflater.inflate(R.layout.heavy_layout, parentView) { view, _, parent ->
+    parent?.addView(view)
+}</code></pre>
+
+<h3>Dagger/Hilt: Lazy Injection</h3>
+
+<pre><code>// Dagger creates ALL injected dependencies eagerly by default.
+// For startup-critical paths, use Provider&lt;T&gt; or Lazy&lt;T&gt; to defer creation.
+
+@HiltViewModel
+class MainViewModel @Inject constructor(
+    private val userRepo: UserRepository,             // Created immediately
+    private val analytics: Lazy&lt;AnalyticsTracker&gt;,    // Created on first .get()
+    private val adManager: Provider&lt;AdManager&gt;        // Created on each .get()
+) : ViewModel() {
+
+    fun onScreenVisible() {
+        // analytics is only created NOW, not when the ViewModel was constructed
+        analytics.get().trackScreenView("main")
+    }
+
+    fun loadAd() {
+        // adManager creates a new instance each time (Provider)
+        adManager.get().loadBanner()
+    }
+}
+
+// Lazy&lt;T&gt; vs Provider&lt;T&gt;:
+// Lazy&lt;T&gt;: creates the instance on first .get(), caches it for subsequent calls
+// Provider&lt;T&gt;: creates a new instance on every .get() call
+//
+// For startup optimization, Lazy&lt;T&gt; is what you want — defer creation
+// but still get a singleton-like behavior within the injection scope.
+
+// Hilt entry point for manual lazy access:
+@EntryPoint
+@InstallIn(SingletonComponent::class)
+interface LazyEntryPoint {
+    fun analyticsTracker(): AnalyticsTracker
+}
+
+// Access lazily from anywhere:
+val entryPoint = EntryPointAccessors.fromApplication(
+    context, LazyEntryPoint::class.java
+)
+val analytics = entryPoint.analyticsTracker()</code></pre>
+
+<h3>Avoid Disk I/O on Main Thread During Startup</h3>
+
+<pre><code>// SharedPreferences.getXxx() can block the main thread on first access.
+// The first call to getSharedPreferences() triggers a file read from disk.
+// If the file is large or the disk is slow, this can take 10-50ms.
+
+// BAD: blocking main thread during startup
+class MyApplication : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        val prefs = getSharedPreferences("config", MODE_PRIVATE)
+        val theme = prefs.getString("theme", "light")  // Blocks until file is read!
+        applyTheme(theme)
+    }
+}
+
+// GOOD: use apply() instead of commit(), and preload on background thread
+class MyApplication : Application() {
+    lateinit var prefs: SharedPreferences
+
+    override fun attachBaseContext(base: Context) {
+        super.attachBaseContext(base)
+        // Trigger the file load early — it happens asynchronously
+        // but the first getString() will still block if not yet loaded.
+        // At least we start the I/O as early as possible.
+        Thread { getSharedPreferences("config", MODE_PRIVATE) }.start()
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        prefs = getSharedPreferences("config", MODE_PRIVATE)
+        // By now, the background thread likely finished loading the file
+    }
+}
+
+// BEST: use DataStore (async by design, no main-thread blocking)
+val Context.configStore by preferencesDataStore(name = "config")
+
+class MainViewModel @Inject constructor(
+    private val dataStore: DataStore&lt;Preferences&gt;
+) : ViewModel() {
+    val theme: StateFlow&lt;String&gt; = dataStore.data
+        .map { prefs -> prefs[THEME_KEY] ?: "light" }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, "light")
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight</div>
+  <p><code>ContentProvider.onCreate()</code> is the hidden startup tax — at Google, we audit every ContentProvider and remove or defer any that aren't needed before first frame. A single library adding a ContentProvider that does disk I/O or network in its <code>onCreate()</code> can add 100ms+ to cold start, and developers never see it because it runs before their code. The fix is systematic: (1) inspect the merged manifest for all <code>&lt;provider&gt;</code> tags, (2) profile each one with Perfetto to measure its cost, (3) migrate to App Startup or remove via <code>tools:node="remove"</code>, (4) add a Macrobenchmark startup test to CI that fails on regression. At Google scale, we track P50 and P90 cold start times per release and investigate any regression > 20ms. The startup budget is a shared resource — every library, every ContentProvider, every eager singleton competes for the same 500ms window.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Startup Optimization Checklist</h2>
+
+<table>
+  <tr><th>#</th><th>Technique</th><th>Typical Savings</th><th>Effort</th></tr>
+  <tr><td>1</td><td>Audit and remove unnecessary ContentProviders</td><td>50–300ms</td><td>Low</td></tr>
+  <tr><td>2</td><td>Migrate to Jetpack App Startup library</td><td>30–150ms</td><td>Medium</td></tr>
+  <tr><td>3</td><td>Lazy-init non-critical singletons</td><td>50–200ms</td><td>Low</td></tr>
+  <tr><td>4</td><td>Move initialization to background threads</td><td>100–300ms</td><td>Medium</td></tr>
+  <tr><td>5</td><td>Avoid disk I/O on main thread (SharedPrefs, DB)</td><td>10–80ms</td><td>Low</td></tr>
+  <tr><td>6</td><td>Flatten view hierarchy / use Compose</td><td>20–100ms</td><td>Medium–High</td></tr>
+  <tr><td>7</td><td>Use ViewStub for non-critical UI</td><td>10–50ms</td><td>Low</td></tr>
+  <tr><td>8</td><td>Dagger/Hilt Lazy&lt;T&gt; injection</td><td>20–80ms</td><td>Low</td></tr>
+  <tr><td>9</td><td>Baseline Profiles (covered next)</td><td>20–40% faster first frame</td><td>Medium</td></tr>
+  <tr><td>10</td><td>Add Macrobenchmark CI gate</td><td>Prevents regressions</td><td>Medium</td></tr>
+</table>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  ← <a href="05-oom-lmk.html">05 — OOM &amp; LMK</a> &nbsp;|&nbsp;
+  <a href="07-baseline-profiles.html">07 — Baseline Profiles →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

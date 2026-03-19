@@ -1,0 +1,1105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 — Memory Leaks — Leak Taxonomy, Detection, and Prevention Patterns</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-memory-model.html">01 Memory Model</a>
+  <a href="02-gc-internals.html">02 GC Internals</a>
+  <a class="active" href="03-memory-leaks.html">03 Memory Leaks</a>
+  <a href="04-anr-deep-dive.html">04 ANR Deep Dive</a>
+  <a href="05-oom-lmk.html">05 OOM &amp; LMK</a>
+  <a href="06-app-startup.html">06 App Startup</a>
+  <a href="07-baseline-profiles.html">07 Baseline Profiles</a>
+  <a href="08-interview-qa.html">08 Interview Q&amp;A</a>
+</div>
+
+<h1>03 — Memory Leaks</h1>
+<p class="subtitle">Leak taxonomy at architectural boundaries — Activity, Fragment, View, Listener, Coroutine, Compose leaks, detection tools, and prevention patterns</p>
+
+<!-- ============================================================ -->
+<h2>1. GC Root Retention Path — How Leaks Form</h2>
+
+<p>A memory leak occurs when an object that should be garbage-collected is kept alive by an unintended strong reference chain from a GC root. The GC cannot reclaim the object because it's still "reachable" — even though the application no longer needs it.</p>
+
+<pre><code>// GC roots in the JVM / ART runtime:
+//
+// 1. Thread stacks — local variables and parameters of all live threads
+// 2. Static fields — fields of loaded classes (ClassLoader keeps classes alive)
+// 3. JNI global references — native code holding Java object refs
+// 4. Monitor objects — objects used as synchronized locks
+// 5. GC-internal roots — runtime bookkeeping objects
+//
+// A leak forms when:
+// GC Root → ... → Retaining Object → Leaked Object
+//
+// The "retaining object" is the nearest object in the chain that
+// SHOULD have released its reference but didn't.
+// LeakCanary calls this the "leak trace" — the shortest path from
+// a GC root to the leaked object.</code></pre>
+
+<h3>Typical Activity Leak Chain</h3>
+
+<div class="diagram-container">
+<pre><code>  GC Root                    Retaining Object              Leaked Object
+  ──────                     ────────────────              ─────────────
+
+  Thread Stack               Anonymous Runnable            Destroyed Activity
+  (Main Thread)              (posted to Handler)           (should be GC'd)
+       │                           │                            │
+       ▼                           ▼                            ▼
+  ┌──────────┐    strong     ┌───────────┐    strong     ┌──────────────┐
+  │  Handler  │─────────────►│ Runnable  │──────────────►│  Activity    │
+  │ (static   │              │ (inner    │  implicit     │  (destroyed, │
+  │  in Main  │              │  class of │  outer ref)   │   onDestroy  │
+  │  Looper)  │              │  Activity)│               │   called)    │
+  └──────────┘               └───────────┘               └──────────────┘
+       │                                                        │
+       │                                                        ▼
+       │                                                 ┌──────────────┐
+  GC root: MessageQueue                                  │  View tree   │
+  holds the Handler which                                │  Bitmaps     │
+  holds the Runnable which                               │  Adapters    │
+  holds the Activity                                     │  ~10-50 MB   │
+                                                         └──────────────┘
+
+  The Activity's entire View hierarchy, all Bitmaps, Drawables,
+  and Adapters are retained — potentially tens of megabytes.</code></pre>
+</div>
+
+<div class="callout">
+  <div class="callout-label">Key Insight</div>
+  <p>The leaked Activity itself may be small, but it retains its entire View tree, all Bitmaps, Drawables, and any objects referenced by its fields. A single Activity leak can retain 10–50 MB depending on UI complexity. On a device with 256 MB heap, that's catastrophic after a few configuration changes.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Leak Taxonomy — Comprehensive Reference</h2>
+
+<table>
+  <tr>
+    <th>Category</th>
+    <th>Leak Source</th>
+    <th>Retained Object</th>
+    <th>Severity</th>
+  </tr>
+  <tr><td>Static Reference</td><td>Companion object / top-level holding Context</td><td>Activity + View tree</td><td style="color: var(--red);">Critical</td></tr>
+  <tr><td>Inner Class</td><td>Non-static inner class / anonymous object</td><td>Enclosing Activity/Fragment</td><td style="color: var(--red);">Critical</td></tr>
+  <tr><td>Handler/Runnable</td><td>Delayed message holding Activity reference</td><td>Activity until message executes</td><td style="color: var(--orange);">High</td></tr>
+  <tr><td>Listener/Callback</td><td>System service callback not unregistered</td><td>Activity/Fragment</td><td style="color: var(--orange);">High</td></tr>
+  <tr><td>ViewModel</td><td>ViewModel holding View or Activity ref</td><td>Destroyed Activity's Views</td><td style="color: var(--red);">Critical</td></tr>
+  <tr><td>Fragment</td><td>Fragment retained beyond host Activity</td><td>Activity + Fragment View tree</td><td style="color: var(--orange);">High</td></tr>
+  <tr><td>Coroutine</td><td>GlobalScope / leaked Job</td><td>Captured lambda references</td><td style="color: var(--orange);">High</td></tr>
+  <tr><td>Compose</td><td>Remembering Activity/Context in composition</td><td>Activity across recomposition</td><td style="color: var(--orange);">High</td></tr>
+  <tr><td>Thread</td><td>Thread/AsyncTask holding Activity</td><td>Activity until thread completes</td><td style="color: var(--red);">Critical</td></tr>
+  <tr><td>Singleton</td><td>Singleton holding Activity Context</td><td>Activity for app lifetime</td><td style="color: var(--red);">Critical</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>3. Leak Type: Static Reference to Activity/Context</h2>
+
+<h3>BAD — Static holds Activity Context</h3>
+
+<pre><code>class LeakyActivity : AppCompatActivity() {
+
+    companion object {
+        // Static reference survives Activity destruction.
+        // After rotation, the OLD Activity is retained forever.
+        lateinit var instance: LeakyActivity
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        instance = this // Leak: static → destroyed Activity
+    }
+}</code></pre>
+
+<h3>GOOD — Use Application Context or WeakReference only where appropriate</h3>
+
+<pre><code>class SafeActivity : AppCompatActivity() {
+
+    companion object {
+        // If you truly need a static context, use Application context.
+        // Application context lives for the entire process lifetime —
+        // it cannot leak an Activity.
+        lateinit var appContext: Context
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        appContext = applicationContext
+    }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. Leak Type: Inner Class / Anonymous Class</h2>
+
+<p>In Kotlin, inner classes (and anonymous object expressions) capture an implicit reference to the enclosing class. This is the single most common source of Android memory leaks.</p>
+
+<h3>BAD — Anonymous Runnable captures Activity</h3>
+
+<pre><code>class LeakyActivity : AppCompatActivity() {
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        // This anonymous Runnable is an inner class of LeakyActivity.
+        // It holds an implicit reference to `this` (the Activity).
+        // If the Activity is destroyed before 30s, the Runnable
+        // keeps the Activity alive until it executes.
+        Handler(Looper.getMainLooper()).postDelayed({
+            updateUI() // `this@LeakyActivity` is captured
+        }, 30_000)
+    }
+
+    private fun updateUI() { /* ... */ }
+}</code></pre>
+
+<h3>GOOD — Remove callbacks on destroy</h3>
+
+<pre><code>class SafeActivity : AppCompatActivity() {
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val updateRunnable = Runnable { updateUI() }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        handler.postDelayed(updateRunnable, 30_000)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        handler.removeCallbacks(updateRunnable)
+    }
+
+    private fun updateUI() { /* ... */ }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2>5. Leak Type: Handler/Runnable Holding Activity</h2>
+
+<p>The Handler leak is a variant of the inner-class problem, but it's so pervasive it deserves its own section. The <code>MessageQueue</code> on the main Looper is a GC root — any Message in the queue retains its target Handler, which retains the Activity.</p>
+
+<h3>BAD — Handler as inner class with delayed message</h3>
+
+<pre><code>class LeakyActivity : AppCompatActivity() {
+
+    // Inner class Handler holds implicit ref to LeakyActivity.
+    // Messages in the queue → Handler → Activity.
+    private val handler = object : Handler(Looper.getMainLooper()) {
+        override fun handleMessage(msg: Message) {
+            // `this@LeakyActivity` is captured
+            textView.text = "Updated"
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        handler.sendMessageDelayed(Message.obtain(), 60_000)
+    }
+    // Activity destroyed → message still in queue → leak for up to 60s
+}</code></pre>
+
+<h3>GOOD — Static Handler with WeakReference, or lifecycle-aware removal</h3>
+
+<pre><code>class SafeActivity : AppCompatActivity() {
+
+    // Approach 1: Remove all messages on destroy
+    private val handler = Handler(Looper.getMainLooper())
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        handler.postDelayed({ safeUpdate() }, 60_000)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        handler.removeCallbacksAndMessages(null) // Nuclear option: clear everything
+    }
+
+    // Approach 2: Use lifecycleScope (preferred in modern Android)
+    // No Handler needed — coroutine is cancelled when Activity is destroyed
+    private fun scheduleUpdate() {
+        lifecycleScope.launch {
+            delay(60_000)
+            textView.text = "Updated"
+        }
+    }
+
+    private fun safeUpdate() { /* ... */ }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2>6. Leak Type: Listener/Callback Not Unregistered</h2>
+
+<p>System services hold strong references to registered listeners. If you register a listener in <code>onCreate</code>/<code>onResume</code> and forget to unregister in the symmetric lifecycle callback, the system service retains your Activity.</p>
+
+<h3>BAD — LocationManager listener never unregistered</h3>
+
+<pre><code>class LeakyActivity : AppCompatActivity() {
+
+    private val locationListener = object : LocationListener {
+        override fun onLocationChanged(location: Location) {
+            // `this@LeakyActivity` captured via outer ref
+            updateMap(location)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val lm = getSystemService(LOCATION_SERVICE) as LocationManager
+        lm.requestLocationUpdates(
+            LocationManager.GPS_PROVIDER, 1000, 10f, locationListener
+        )
+    }
+
+    // Missing onPause() → locationListener → Activity leaked
+    // LocationManager lives in system_server, holds a Binder callback
+    // to our listener. The listener's anonymous class holds the Activity.
+}</code></pre>
+
+<h3>GOOD — Symmetric register/unregister</h3>
+
+<pre><code>class SafeActivity : AppCompatActivity() {
+
+    private val locationListener = object : LocationListener {
+        override fun onLocationChanged(location: Location) {
+            updateMap(location)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val lm = getSystemService(LOCATION_SERVICE) as LocationManager
+        lm.requestLocationUpdates(
+            LocationManager.GPS_PROVIDER, 1000, 10f, locationListener
+        )
+    }
+
+    override fun onPause() {
+        super.onPause()
+        val lm = getSystemService(LOCATION_SERVICE) as LocationManager
+        lm.removeUpdates(locationListener) // Symmetric unregister
+    }
+}</code></pre>
+
+<h3>Other common offenders</h3>
+
+<pre><code>// SensorManager — register/unregister in onResume/onPause
+sensorManager.registerListener(listener, sensor, SENSOR_DELAY_NORMAL)
+sensorManager.unregisterListener(listener)
+
+// BroadcastReceiver — register/unregister
+registerReceiver(receiver, IntentFilter("ACTION"))
+unregisterReceiver(receiver)
+
+// OnSharedPreferenceChangeListener — the classic silent leak
+// SharedPreferences stores listeners in a WeakHashMap internally,
+// BUT if you register an anonymous listener, nothing else holds a
+// strong ref → it gets GC'd immediately and never fires.
+// If you store it in a field, the Activity holds it, and
+// SharedPreferences holds the Activity via the listener.
+// Fix: unregister in onDestroy.
+prefs.registerOnSharedPreferenceChangeListener(listener)
+prefs.unregisterOnSharedPreferenceChangeListener(listener)</code></pre>
+
+<!-- ============================================================ -->
+<h2>7. Leak Type: ViewModel Holding View/Activity Reference</h2>
+
+<p><code>ViewModel</code> survives configuration changes — it outlives the Activity that created it. If a ViewModel holds a reference to a View or Activity, the destroyed Activity is retained until the ViewModel is cleared.</p>
+
+<h3>BAD — ViewModel holds Activity reference</h3>
+
+<pre><code>class LeakyViewModel(
+    private val activity: Activity // ViewModel outlives Activity → leak
+) : ViewModel() {
+
+    fun loadData() {
+        // Uses activity to show a Toast — seems harmless, but
+        // after rotation the OLD activity is retained
+        Toast.makeText(activity, "Loading...", Toast.LENGTH_SHORT).show()
+    }
+}
+
+// Also bad: ViewModel holding a View reference
+class AlsoLeakyViewModel : ViewModel() {
+    var recyclerView: RecyclerView? = null // Retains Activity's View tree
+}</code></pre>
+
+<h3>GOOD — ViewModel never touches Views; use Application context if needed</h3>
+
+<pre><code>class SafeViewModel(application: Application) : AndroidViewModel(application) {
+
+    // AndroidViewModel provides getApplication() — Application context
+    // that lives for the process lifetime. Safe to hold.
+    fun loadData() {
+        Toast.makeText(getApplication(), "Loading...", Toast.LENGTH_SHORT).show()
+    }
+}
+
+// Even better: ViewModel exposes state, UI observes it
+class BetterViewModel : ViewModel() {
+    private val _uiState = MutableStateFlow(UiState())
+    val uiState: StateFlow&lt;UiState&gt; = _uiState.asStateFlow()
+
+    fun loadData() {
+        viewModelScope.launch {
+            _uiState.value = UiState(message = "Loading...")
+        }
+    }
+}
+
+// Activity observes — ViewModel has zero knowledge of Views
+class SafeActivity : AppCompatActivity() {
+    private val viewModel: BetterViewModel by viewModels()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.uiState.collect { state ->
+                    textView.text = state.message
+                }
+            }
+        }
+    }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2>8. Leak Type: Fragment Retained Beyond Activity Lifecycle</h2>
+
+<pre><code>// Pre-AndroidX problem: setRetainInstance(true) kept the Fragment
+// across configuration changes, but its View was destroyed.
+// If the Fragment held View references, the old Activity's Views leaked.
+
+// BAD — retained Fragment holding View references
+class LeakyFragment : Fragment() {
+    private var binding: FragmentDetailBinding? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        retainInstance = true // Deprecated — Fragment survives config change
+    }
+
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, s: Bundle?): View {
+        binding = FragmentDetailBinding.inflate(inflater, container, false)
+        return binding!!.root
+    }
+    // After rotation: Fragment is retained, but its View is destroyed and recreated.
+    // `binding` still points to the OLD View → old Activity's View tree leaked.
+}
+
+// GOOD — clear View references in onDestroyView
+class SafeFragment : Fragment() {
+    private var _binding: FragmentDetailBinding? = null
+    private val binding get() = _binding!!
+
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, s: Bundle?): View {
+        _binding = FragmentDetailBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null // Release View references — prevents leak
+    }
+}</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Fragment ViewBinding Leak — The #1 Fragment Leak</div>
+  <p>The Fragment outlives its View (Fragment is in CREATED state but View is destroyed during back-stack transactions). If you hold a ViewBinding reference without nulling it in <code>onDestroyView()</code>, the entire View tree of the previous Activity is retained. This is so common that it's the default LeakCanary finding in most Android apps. Navigation Component makes this worse because Fragments on the back stack have their Views destroyed but the Fragment instance stays alive.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Leak Type: Coroutine Scope Leak</h2>
+
+<h3>BAD — GlobalScope captures Activity</h3>
+
+<pre><code>class LeakyActivity : AppCompatActivity() {
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        // GlobalScope is NEVER cancelled — it lives for the process lifetime.
+        // The lambda captures `this` (the Activity).
+        // If the Activity is destroyed, the coroutine keeps it alive
+        // until the network call completes.
+        GlobalScope.launch {
+            val data = repository.fetchData() // 30-second timeout
+            withContext(Dispatchers.Main) {
+                textView.text = data // `this@LeakyActivity` captured
+            }
+        }
+    }
+}</code></pre>
+
+<h3>BAD — Custom scope without cancellation</h3>
+
+<pre><code>class LeakyActivity : AppCompatActivity() {
+
+    // Custom scope but never cancelled → same as GlobalScope
+    private val scope = CoroutineScope(Dispatchers.Main + Job())
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        scope.launch {
+            val data = repository.fetchData()
+            textView.text = data
+        }
+    }
+    // Missing: scope.cancel() in onDestroy()
+}</code></pre>
+
+<h3>GOOD — lifecycleScope or viewModelScope</h3>
+
+<pre><code>class SafeActivity : AppCompatActivity() {
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        // lifecycleScope is cancelled when Activity is destroyed.
+        // All child coroutines are cancelled → no leak.
+        lifecycleScope.launch {
+            val data = repository.fetchData()
+            textView.text = data
+        }
+
+        // Even better: repeatOnLifecycle for flow collection
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.dataFlow.collect { data ->
+                    textView.text = data
+                }
+            }
+        }
+    }
+}
+
+// In ViewModel — viewModelScope is cancelled in onCleared()
+class SafeViewModel : ViewModel() {
+    fun loadData() {
+        viewModelScope.launch {
+            // Cancelled when ViewModel is cleared
+            val data = repository.fetchData()
+            _state.value = data
+        }
+    }
+}</code></pre>
+
+<div class="callout">
+  <div class="callout-label">Coroutine Leak Internals</div>
+  <p>When a coroutine suspends, its continuation object holds references to all captured variables in the lambda. The continuation is kept alive by the Job in the coroutine's scope. If the Job is never cancelled (GlobalScope, orphaned custom scope), the continuation — and everything it captures — lives until the coroutine completes or the process dies. <code>lifecycleScope</code> uses <code>LifecycleCoroutineScope</code> which registers a <code>LifecycleObserver</code> that calls <code>cancel()</code> on <code>ON_DESTROY</code>.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>10. Leak Type: Compose — Remembering Activity/Context</h2>
+
+<h3>BAD — Capturing Activity in remember</h3>
+
+<pre><code>@Composable
+fun LeakyScreen() {
+    // LocalContext.current returns the Activity in an Activity-hosted composition.
+    // Storing it in remember{} keeps the reference across recompositions.
+    // If the Activity is recreated (config change), the old Activity is retained
+    // by the Compose slot table until the composition is disposed.
+    val context = LocalContext.current
+    val manager = remember {
+        // This captures `context` (which is the Activity) in the slot table.
+        // The slot table survives recomposition but the Activity doesn't.
+        SomeManager(context) // Leak if SomeManager stores the context
+    }
+}</code></pre>
+
+<h3>GOOD — Use Application context or remember with keys</h3>
+
+<pre><code>@Composable
+fun SafeScreen() {
+    val context = LocalContext.current
+
+    // Option 1: Use applicationContext — safe, never leaks an Activity
+    val manager = remember {
+        SomeManager(context.applicationContext)
+    }
+
+    // Option 2: Use DisposableEffect for cleanup
+    DisposableEffect(Unit) {
+        val listener = SomeListener()
+        someService.register(listener)
+        onDispose {
+            someService.unregister(listener)
+        }
+    }
+
+    // Option 3: For system services, use rememberUpdatedState
+    // to always reference the current context without capturing it
+    val currentContext by rememberUpdatedState(context)
+    LaunchedEffect(Unit) {
+        // currentContext always points to the latest Activity
+        // No stale reference retained
+        doSomethingWith(currentContext)
+    }
+}</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Compose Slot Table Retention</div>
+  <p>The Compose slot table stores all <code>remember{}</code> values. During recomposition, the slot table is reused — values persist across recompositions. If a <code>remember{}</code> block captures an Activity reference, that reference lives in the slot table until the composition is disposed (the Composable leaves the tree). For Composables in a <code>NavHost</code>, back-stack destinations keep their composition alive, meaning remembered Activity references survive even when the screen isn't visible.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>11. Leak Type: Thread Holding Activity Reference</h2>
+
+<h3>BAD — Long-running thread captures Activity</h3>
+
+<pre><code>class LeakyActivity : AppCompatActivity() {
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        // Thread is a GC root while running.
+        // The lambda captures `this` (Activity).
+        // If the Activity is destroyed before the thread finishes,
+        // the Activity is retained for up to 60 seconds.
+        Thread {
+            val result = heavyComputation() // Takes 60 seconds
+            runOnUiThread {
+                textView.text = result // `this@LeakyActivity` captured
+            }
+        }.start()
+    }
+}</code></pre>
+
+<h3>GOOD — Use structured concurrency</h3>
+
+<pre><code>class SafeActivity : AppCompatActivity() {
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        // lifecycleScope cancels when Activity is destroyed.
+        // Dispatchers.Default runs on a thread pool — no new thread created.
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.Default) {
+                heavyComputation()
+            }
+            textView.text = result
+        }
+    }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2>12. Leak Type: Singleton Holding Activity Context</h2>
+
+<h3>BAD — Singleton stores Activity context</h3>
+
+<pre><code>object Analytics {
+    private lateinit var context: Context
+
+    fun init(context: Context) {
+        // If called with an Activity context, the Activity is retained
+        // for the entire process lifetime (singleton never dies).
+        this.context = context
+    }
+
+    fun trackEvent(event: String) {
+        // Uses context to get package info, etc.
+        val packageName = context.packageName
+    }
+}
+
+// In Activity:
+class LeakyActivity : AppCompatActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        Analytics.init(this) // Passes Activity context → leaked
+    }
+}</code></pre>
+
+<h3>GOOD — Always use Application context in singletons</h3>
+
+<pre><code>object Analytics {
+    private lateinit var context: Context
+
+    fun init(context: Context) {
+        // applicationContext is safe — it lives for the process lifetime,
+        // same as the singleton. No leak possible.
+        this.context = context.applicationContext
+    }
+
+    fun trackEvent(event: String) {
+        val packageName = context.packageName
+    }
+}
+
+// Even better: inject via Hilt
+@Singleton
+class Analytics @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    fun trackEvent(event: String) { /* ... */ }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2>13. Architectural Boundary Leaks</h2>
+
+<h3>Service → Activity Reference</h3>
+
+<pre><code>// BAD: Service holds a direct reference to Activity
+class MyService : Service() {
+    var activity: MainActivity? = null // Service outlives Activity → leak
+
+    override fun onBind(intent: Intent): IBinder {
+        return LocalBinder()
+    }
+
+    inner class LocalBinder : Binder() {
+        fun getService(): MyService = this@MyService
+    }
+}
+
+// In Activity:
+// serviceConnection callback stores `service.activity = this` → leak
+
+// GOOD: Use callbacks/interfaces, clear on unbind
+class MyService : Service() {
+    private var callback: ServiceCallback? = null
+
+    fun setCallback(callback: ServiceCallback?) {
+        this.callback = callback
+    }
+
+    override fun onBind(intent: Intent): IBinder = LocalBinder()
+
+    inner class LocalBinder : Binder() {
+        fun getService(): MyService = this@MyService
+    }
+}
+
+class SafeActivity : AppCompatActivity(), ServiceCallback {
+    private var service: MyService? = null
+
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+            service = (binder as MyService.LocalBinder).getService()
+            service?.setCallback(this@SafeActivity)
+        }
+        override fun onServiceDisconnected(name: ComponentName) {
+            service = null
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        service?.setCallback(null) // Clear callback before unbind
+        unbindService(connection)
+    }
+}</code></pre>
+
+<h3>BroadcastReceiver — Registered but Not Unregistered</h3>
+
+<pre><code>// BAD: registered in onCreate, never unregistered
+class LeakyActivity : AppCompatActivity() {
+    private val receiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            updateUI(intent) // captures outer Activity
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        registerReceiver(receiver, IntentFilter("com.example.ACTION"))
+    }
+    // Missing unregisterReceiver → Activity leaked
+    // Also causes "Activity has leaked IntentReceiver" crash on destroy
+}
+
+// GOOD: symmetric register/unregister
+class SafeActivity : AppCompatActivity() {
+    private val receiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            updateUI(intent)
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        registerReceiver(receiver, IntentFilter("com.example.ACTION"))
+    }
+
+    override fun onStop() {
+        super.onStop()
+        unregisterReceiver(receiver)
+    }
+}</code></pre>
+
+<h3>WebView — Notorious Activity Leak</h3>
+
+<pre><code>// WebView is one of the worst leakers in Android.
+// It holds references to the Activity context internally,
+// and its native layer (Chromium) has its own reference counting
+// that doesn't align with Android's lifecycle.
+
+// BAD: WebView in XML layout
+// &lt;WebView android:id="@+id/webview" ... /&gt;
+// The WebView holds the Activity context from inflation.
+// Even calling webView.destroy() doesn't fully release it
+// on some Android versions.
+
+// GOOD: Create WebView programmatically with Application context,
+// add to layout, and aggressively clean up
+class SafeWebViewActivity : AppCompatActivity() {
+
+    private var webView: WebView? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_webview)
+
+        // Create with Application context to avoid Activity leak
+        webView = WebView(applicationContext).apply {
+            layoutParams = ViewGroup.LayoutParams(MATCH_PARENT, MATCH_PARENT)
+            settings.javaScriptEnabled = true
+        }
+        findViewById&lt;ViewGroup&gt;(R.id.webview_container).addView(webView)
+        webView?.loadUrl("https://example.com")
+    }
+
+    override fun onDestroy() {
+        webView?.let { wv ->
+            // Remove from parent first
+            (wv.parent as? ViewGroup)?.removeView(wv)
+            wv.stopLoading()
+            wv.settings.javaScriptEnabled = false
+            wv.clearHistory()
+            wv.clearCache(true)
+            wv.loadUrl("about:blank")
+            wv.onPause()
+            wv.removeAllViews()
+            wv.destroyDrawingCache()
+            wv.destroy()
+        }
+        webView = null
+        super.onDestroy()
+    }
+}</code></pre>
+
+<h3>InputMethodManager Leak (System Bug)</h3>
+
+<pre><code>// InputMethodManager (IMM) is a system singleton that holds a reference
+// to the currently focused View's "served view" — which references
+// the Activity. This is a known Android framework bug that has existed
+// since early Android versions.
+//
+// The leak path:
+// InputMethodManager (static singleton)
+//   → mServedView (the focused EditText)
+//     → mContext (the Activity)
+//
+// This leak is NOT your fault — it's a framework bug.
+// It's been partially fixed in newer Android versions but still
+// appears on older devices.
+
+// Workaround: clear focus and hide keyboard in onDestroy
+class SafeActivity : AppCompatActivity() {
+
+    override fun onDestroy() {
+        // Clear focus from any EditText
+        currentFocus?.let { view ->
+            val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.hideSoftInputFromWindow(view.windowToken, 0)
+            view.clearFocus()
+        }
+        // On older devices, you may need to use reflection to null out
+        // InputMethodManager.mServedView — but this is fragile and
+        // not recommended for production. LeakCanary will flag this
+        // as a "known framework leak" and exclude it from reports.
+        super.onDestroy()
+    }
+}</code></pre>
+
+<div class="callout danger">
+  <div class="callout-label">ContentProvider Context Leak</div>
+  <p><code>ContentProvider</code> is initialized before <code>Application.onCreate()</code> and receives the Application context via <code>getContext()</code>. However, if a ContentProvider stores a reference to a Context passed via a query caller (e.g., from <code>ContentResolver</code> in an Activity), it can leak that Activity. The fix: ContentProviders should only use <code>getContext()</code> (Application context) and never store references from external callers. Libraries that abuse ContentProvider for initialization (like Firebase, WorkManager) are careful about this — but custom providers often aren't.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>14. Detection Tools</h2>
+
+<h3>LeakCanary — How It Works Internally</h3>
+
+<pre><code>// LeakCanary is the gold standard for leak detection in Android.
+// Add to debug builds only:
+// debugImplementation("com.squareup.leakcanary:leakcanary-android:2.14")
+//
+// No code changes needed — it auto-installs via ContentProvider.
+
+// Internal architecture:
+//
+// 1. ObjectWatcher
+//    - Watches objects that should be GC'd (Activities, Fragments, Views)
+//    - Uses WeakReference + ReferenceQueue pattern:
+//
+//      val weakRef = WeakReference(activity, referenceQueue)
+//      watchedObjects[uuid] = KeyedWeakReference(weakRef, description)
+//
+//    - After 5 seconds, checks if the WeakReference was enqueued
+//      (enqueued = object was GC'd = no leak)
+//    - If NOT enqueued after GC trigger → object is "retained"
+//
+// 2. Retained Object Threshold
+//    - Default: 5 retained objects trigger a heap dump
+//    - Configurable via LeakCanary.config
+//    - Avoids dumping on every single retained object (expensive)
+//
+// 3. HeapDumper
+//    - Calls Debug.dumpHprofData(file) — freezes the app briefly
+//    - Produces an .hprof file (heap dump)
+//    - On Android 11+, uses non-blocking heap dump API
+//
+// 4. Shark (Smart Heap Analysis Reports for Kotlin)
+//    - LeakCanary's heap analysis engine
+//    - Parses the .hprof file
+//    - Finds the shortest strong-reference path from GC roots
+//      to each retained object
+//    - Identifies the "leak trace" — the chain of references
+//    - Classifies leaks: Application leak vs Library leak vs Framework leak
+//    - Runs in a separate process to avoid OOM during analysis
+
+// LeakCanary hooks into:
+// - Application.registerActivityLifecycleCallbacks() → watches Activities
+// - FragmentManager.registerFragmentLifecycleCallbacks() → watches Fragments
+// - ViewTreeLifecycleOwner → watches root Views
+// - ViewModel.onCleared() → watches ViewModels (via reflection)</code></pre>
+
+<h3>Android Studio Memory Profiler</h3>
+
+<pre><code>// Android Studio Profiler → Memory tab
+//
+// Key capabilities:
+//
+// 1. Real-time memory graph
+//    - Shows Java heap, native heap, graphics, stack, code, others
+//    - Useful for spotting memory growth patterns (sawtooth = healthy GC,
+//      staircase = leak)
+//
+// 2. Heap Dump
+//    - Capture button → takes a snapshot of all live objects
+//    - Filter by class name, package, or "Activity" / "Fragment"
+//    - Look for: multiple instances of the same Activity class
+//      (after rotation, there should be only 1)
+//    - "Retained Size" column shows total memory held by the object
+//
+// 3. Allocation Tracking
+//    - Records every object allocation with stack trace
+//    - Expensive — slows the app significantly
+//    - Useful for finding allocation-heavy code paths
+//
+// 4. Leak Detection (Android Studio Hedgehog+)
+//    - Built-in leak detection in the profiler
+//    - Automatically identifies Activity/Fragment leaks in heap dumps
+//    - Shows the retention path similar to LeakCanary
+
+// Pro tip: force a GC before taking a heap dump (click the trash icon).
+// This ensures you're only seeing truly retained objects, not
+// objects that are eligible for GC but haven't been collected yet.</code></pre>
+
+<h3>MAT (Eclipse Memory Analyzer)</h3>
+
+<pre><code>// For complex leak analysis that LeakCanary can't resolve:
+//
+// 1. Capture heap dump: adb shell am dumpheap &lt;pid&gt; /data/local/tmp/heap.hprof
+// 2. Pull: adb pull /data/local/tmp/heap.hprof
+// 3. Convert: hprof-conv heap.hprof heap-converted.hprof
+//    (Android hprof format differs from standard Java format)
+// 4. Open in MAT
+//
+// Key MAT features:
+// - Dominator Tree: shows which objects "dominate" (retain) the most memory
+// - Histogram: object count by class — find duplicate Activities
+// - OQL (Object Query Language): SQL-like queries on the heap
+//   SELECT * FROM android.app.Activity WHERE mDestroyed = true
+// - Path to GC Roots: right-click any object → shows why it's retained
+// - Leak Suspects Report: automatic analysis of likely leaks</code></pre>
+
+<h3>StrictMode & adb meminfo</h3>
+
+<pre><code>// StrictMode — detect leaked Closeable objects at runtime
+class MyApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        if (BuildConfig.DEBUG) {
+            StrictMode.setVmPolicy(
+                StrictMode.VmPolicy.Builder()
+                    .detectLeakedClosableObjects()  // Cursor, TypedArray, etc.
+                    .detectLeakedRegistrationObjects() // BroadcastReceiver, ServiceConnection
+                    .detectLeakedSqlLiteObjects()    // Unclosed SQLite cursors
+                    .detectActivityLeaks()           // Activity instances after destroy
+                    .penaltyLog()                    // Log violations (use in debug)
+                    .build()
+            )
+        }
+    }
+}
+
+// adb shell dumpsys meminfo — monitor memory from outside the app
+// $ adb shell dumpsys meminfo com.example.myapp
+//
+// Key sections to watch:
+// - "Activities": count of Activity instances (should match expected)
+// - "Views": total View count (grows unbounded = leak)
+// - "AppContexts": Application context count (should be 1)
+// - "TOTAL PSS": total proportional set size
+//
+// Compare before and after rotating the screen 10 times:
+// If TOTAL PSS grows linearly, you have a leak.
+//
+// Scripted leak detection:
+// for i in {1..10}; do
+//   adb shell am start -n com.example/.MainActivity
+//   sleep 1
+//   adb shell input keyevent KEYCODE_BACK
+//   sleep 1
+// done
+// adb shell dumpsys meminfo com.example.myapp | grep "Activities"</code></pre>
+
+<!-- ============================================================ -->
+<h2>15. WeakReference Is Not a Fix for Leaks</h2>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — WeakReference Is a Band-Aid, Not a Cure</div>
+  <p>A common junior-to-mid-level "fix" for memory leaks is to wrap the problematic reference in a <code>WeakReference</code>. This masks the symptom but doesn't fix the architectural problem. Here's why it's dangerous:</p>
+  <ul>
+    <li><strong>Non-deterministic behavior</strong> — The GC can collect the weakly-referenced object at any time. Your code must handle <code>null</code> on every access, leading to silent failures and hard-to-reproduce bugs.</li>
+    <li><strong>Hides the real bug</strong> — The leak exists because a lifecycle boundary is violated. <code>WeakReference</code> papers over it instead of fixing the ownership model.</li>
+    <li><strong>Testing becomes impossible</strong> — You can't reliably test code that depends on GC timing. The behavior differs between debug and release builds, between devices, and between ART versions.</li>
+    <li><strong>Performance overhead</strong> — <code>WeakReference</code> objects add GC pressure. The GC must process the <code>ReferenceQueue</code> for every collected weak ref. At scale, this is measurable.</li>
+  </ul>
+  <p>The correct fix is always structural: use lifecycle-aware components (<code>lifecycleScope</code>, <code>viewModelScope</code>, <code>DisposableEffect</code>), unregister callbacks symmetrically, and never pass Activity context where Application context suffices. If you find yourself reaching for <code>WeakReference</code>, step back and ask: "Who owns this object, and when should the reference be released?" Fix the ownership, not the reference type.</p>
+</div>
+
+<pre><code>// BAD — WeakReference as a "fix"
+class AnalyticsTracker {
+    // "Fixed" the leak by using WeakReference. But now:
+    // - trackEvent() silently does nothing if Activity was GC'd
+    // - No guarantee WHEN the Activity will be collected
+    // - Behavior differs between debug (GC aggressive) and release
+    private var activityRef: WeakReference&lt;Activity&gt;? = null
+
+    fun attach(activity: Activity) {
+        activityRef = WeakReference(activity)
+    }
+
+    fun trackEvent(event: String) {
+        val activity = activityRef?.get() ?: return // Silent failure
+        // What if this was a critical analytics event? It's just lost.
+    }
+}
+
+// GOOD — Fix the architecture
+class AnalyticsTracker(
+    private val context: Context // Application context — no leak possible
+) {
+    fun trackEvent(event: String) {
+        // Always works, no null checks, deterministic behavior
+        val packageName = context.packageName
+        // ... send event
+    }
+}
+
+// Inject properly:
+// @Singleton
+// class AnalyticsTracker @Inject constructor(
+//     @ApplicationContext private val context: Context
+// )</code></pre>
+
+<!-- ============================================================ -->
+<h2>16. Leak Prevention Cheat Sheet</h2>
+
+<table>
+  <tr>
+    <th>Rule</th>
+    <th>Why</th>
+  </tr>
+  <tr>
+    <td>Never store Activity context in singletons or companion objects</td>
+    <td>Singleton outlives Activity → retains destroyed Activity forever</td>
+  </tr>
+  <tr>
+    <td>Use <code>applicationContext</code> in anything that outlives an Activity</td>
+    <td>Application context lives for the process — cannot leak an Activity</td>
+  </tr>
+  <tr>
+    <td>Null out Fragment ViewBinding in <code>onDestroyView()</code></td>
+    <td>Fragment outlives its View on back stack → retains old View tree</td>
+  </tr>
+  <tr>
+    <td>Use <code>lifecycleScope</code> / <code>viewModelScope</code> instead of GlobalScope</td>
+    <td>Structured concurrency cancels coroutines at lifecycle boundaries</td>
+  </tr>
+  <tr>
+    <td>Unregister listeners in the symmetric lifecycle callback</td>
+    <td>System services hold strong refs to listeners → retains Activity</td>
+  </tr>
+  <tr>
+    <td>Never pass View or Activity to ViewModel</td>
+    <td>ViewModel survives config changes → retains destroyed Activity</td>
+  </tr>
+  <tr>
+    <td>Remove Handler callbacks in <code>onDestroy()</code></td>
+    <td>MessageQueue is a GC root → pending messages retain Handler → Activity</td>
+  </tr>
+  <tr>
+    <td>Create WebView with Application context</td>
+    <td>WebView's Chromium internals hold context references aggressively</td>
+  </tr>
+  <tr>
+    <td>Use <code>DisposableEffect</code> for cleanup in Compose</td>
+    <td>Ensures resources are released when Composable leaves the tree</td>
+  </tr>
+  <tr>
+    <td>Run LeakCanary in every debug build</td>
+    <td>Catches leaks early — before they compound in production</td>
+  </tr>
+</table>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  <a href="02-gc-internals.html">← 02 — GC Internals</a> &nbsp;|&nbsp;
+  <a href="04-anr-deep-dive.html">04 — ANR Deep Dive →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

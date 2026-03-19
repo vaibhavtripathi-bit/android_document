@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 — Scoped Storage — FUSE Daemon, MediaStore, SAF, FileProvider, Cross-App Sharing</title>
+<style>
+  :root { --bg: #0f1117; --surface: #1a1d27; --surface2: #232733; --border: #2e3345; --text: #e2e4ed; --text-dim: #8b8fa3; --accent: #6c9eff; --accent2: #c084fc; --green: #4ade80; --red: #f87171; --orange: #fb923c; --yellow: #fbbf24; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; padding: 2rem; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; }
+  .nav a.active { background: var(--accent); color: var(--bg); }
+  code { background: #282d42; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #e8ecf7; }
+  pre { background: #1e2130; border: 1px solid #3a3f55; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.88rem; line-height: 1.6; }
+  pre code { background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--surface); padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: rgba(192,132,252,0.07); }
+  .callout.warn { border-left-color: var(--orange); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--surface); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-permission-model.html">01 Permissions</a>
+  <a class="active" href="02-scoped-storage.html">02 Scoped Storage</a>
+  <a href="03-keystore-crypto.html">03 Keystore</a>
+  <a href="04-secure-networking.html">04 Networking</a>
+  <a href="05-app-sandbox.html">05 App Sandbox</a>
+  <a href="06-proguard-r8.html">06 R8/ProGuard</a>
+  <a href="07-runtime-security.html">07 Runtime Security</a>
+  <a href="08-interview-qa.html">08 Interview Q&A</a>
+</div>
+
+<h1>Scoped Storage</h1>
+<p class="subtitle">How Android 10+ restricts file access — FUSE daemon internals, MediaStore API, Storage Access Framework, FileProvider, content URIs, and migration strategies</p>
+
+<!-- ============================================================ -->
+<h2>1. The Problem Scoped Storage Solves</h2>
+
+<p>Before Android 10, any app with <code>READ_EXTERNAL_STORAGE</code> could read <strong>every file</strong> on shared storage — photos, downloads, documents from other apps. This was a massive privacy and security hole. Scoped storage restricts each app to its own sandboxed directory, with controlled access to shared media via MediaStore.</p>
+
+<table>
+  <tr><th>Storage Area</th><th>Access</th><th>Permission Needed</th><th>Survives Uninstall</th></tr>
+  <tr>
+    <td><strong>Internal storage</strong><br><code>context.filesDir</code></td>
+    <td>App-only (sandboxed)</td>
+    <td>None</td>
+    <td>No</td>
+  </tr>
+  <tr>
+    <td><strong>App-specific external</strong><br><code>context.getExternalFilesDir()</code></td>
+    <td>App-only (sandboxed)</td>
+    <td>None</td>
+    <td>No</td>
+  </tr>
+  <tr>
+    <td><strong>MediaStore</strong><br>(Photos, Videos, Audio, Downloads)</td>
+    <td>Own files: unrestricted<br>Other apps' files: permission required</td>
+    <td><code>READ_MEDIA_IMAGES</code> etc. (Android 13+)</td>
+    <td>Yes</td>
+  </tr>
+  <tr>
+    <td><strong>SAF-managed</strong><br>(arbitrary documents)</td>
+    <td>User-selected via system picker</td>
+    <td>None (user grants via picker)</td>
+    <td>Yes</td>
+  </tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>2. FUSE Daemon — How Scoped Storage Is Enforced</h2>
+
+<pre><code>// Android 11+ uses a FUSE (Filesystem in Userspace) daemon to enforce
+// scoped storage at the filesystem level:
+
+// Before FUSE (Android 10):
+// - Scoped storage was enforced only at the MediaStore/ContentResolver level
+// - Direct file paths (File, FileInputStream) could bypass restrictions
+// - Apps with requestLegacyExternalStorage=true bypassed everything
+
+// With FUSE (Android 11+):
+// 1. App opens a file path: File("/sdcard/DCIM/photo.jpg")
+// 2. The kernel routes the open() syscall to the FUSE daemon
+//    (MediaProvider process, running as system_server)
+// 3. FUSE daemon checks:
+//    a. Is this the app's own file? → Allow
+//    b. Does the app have the relevant media permission? → Allow
+//    c. Was this file granted via MediaStore URI? → Allow
+//    d. None of the above → EACCES (Permission Denied)
+// 4. If allowed, FUSE daemon opens the real file and returns an fd
+
+// This means even native code (JNI, NDK) respects scoped storage.
+// No more bypassing via direct file paths.</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — FUSE Performance Implications</div>
+  <p>The FUSE daemon adds a context switch for every file operation on shared storage: app → kernel → FUSE daemon (userspace) → kernel → actual filesystem. This adds ~10-30% overhead for sequential reads and significantly more for random I/O. For media-heavy apps (photo editors, video players), this is measurable. Mitigations: (1) Use <code>ContentResolver.openFileDescriptor()</code> which returns a direct fd after the initial check — subsequent reads bypass FUSE. (2) Copy files to app-specific storage for intensive processing. (3) Use <code>MediaStore.setRequireOriginal()</code> for apps that need unmodified originals. Google has been optimizing the FUSE daemon in each release — Android 12+ added read-ahead caching and reduced context switches.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. MediaStore API</h2>
+
+<pre><code>// Creating a media file (no permission needed for your own files):
+val contentValues = ContentValues().apply {
+    put(MediaStore.Images.Media.DISPLAY_NAME, "photo_${System.currentTimeMillis()}.jpg")
+    put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+    put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/MyApp")
+    put(MediaStore.Images.Media.IS_PENDING, 1) // Hide until write is complete
+}
+
+val uri = contentResolver.insert(
+    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+    contentValues
+) ?: return
+
+contentResolver.openOutputStream(uri)?.use { outputStream ->
+    bitmap.compress(Bitmap.CompressFormat.JPEG, 90, outputStream)
+}
+
+// Mark as complete — now visible to other apps and MediaStore queries
+contentValues.clear()
+contentValues.put(MediaStore.Images.Media.IS_PENDING, 0)
+contentResolver.update(uri, contentValues, null, null)
+
+// Querying other apps' media (requires READ_MEDIA_IMAGES on Android 13+):
+val projection = arrayOf(
+    MediaStore.Images.Media._ID,
+    MediaStore.Images.Media.DISPLAY_NAME,
+    MediaStore.Images.Media.SIZE,
+    MediaStore.Images.Media.DATE_ADDED
+)
+
+val cursor = contentResolver.query(
+    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+    projection,
+    "${MediaStore.Images.Media.SIZE} > ?",
+    arrayOf("1000000"), // > 1MB
+    "${MediaStore.Images.Media.DATE_ADDED} DESC"
+)</code></pre>
+
+<h3>Modifying/Deleting Other Apps' Media</h3>
+
+<pre><code>// Android 10+: modifying or deleting another app's media requires user consent.
+// The system throws RecoverableSecurityException:
+
+try {
+    contentResolver.delete(otherAppMediaUri, null, null)
+} catch (e: RecoverableSecurityException) {
+    // Android 10: launch the recovery intent
+    val intentSender = e.userAction.actionIntent.intentSender
+    startIntentSenderForResult(intentSender, REQUEST_CODE, null, 0, 0, 0)
+}
+
+// Android 11+: batch operations with createDeleteRequest/createWriteRequest:
+val urisToDelete = listOf(uri1, uri2, uri3)
+val pendingIntent = MediaStore.createDeleteRequest(contentResolver, urisToDelete)
+startIntentSenderForResult(pendingIntent.intentSender, REQUEST_CODE, null, 0, 0, 0)</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. Storage Access Framework (SAF)</h2>
+
+<pre><code>// SAF lets users pick files/directories via a system UI.
+// The app receives a content URI with persistent access.
+
+// Pick a single document:
+val openDocumentLauncher = registerForActivityResult(
+    ActivityResultContracts.OpenDocument()
+) { uri: Uri? ->
+    uri?.let { processDocument(it) }
+}
+openDocumentLauncher.launch(arrayOf("application/pdf", "text/*"))
+
+// Pick a directory (Android 5+):
+val openTreeLauncher = registerForActivityResult(
+    ActivityResultContracts.OpenDocumentTree()
+) { uri: Uri? ->
+    uri?.let { treeUri ->
+        // Persist access across reboots:
+        contentResolver.takePersistableUriPermission(
+            treeUri,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        )
+        // Enumerate files in the directory:
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
+            treeUri,
+            DocumentsContract.getTreeDocumentId(treeUri)
+        )
+        contentResolver.query(childrenUri, null, null, null, null)?.use { cursor ->
+            while (cursor.moveToNext()) {
+                val name = cursor.getString(
+                    cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                )
+            }
+        }
+    }
+}</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">SAF Restrictions (Android 11+)</div>
+  <p>Android 11 restricts SAF: apps can no longer use <code>ACTION_OPEN_DOCUMENT_TREE</code> to access the root of internal storage, the Downloads directory, or the Android/data and Android/obb directories. These restrictions prevent apps from gaining broad access to other apps' data via the directory picker. File manager apps that need broad access must use <code>MANAGE_EXTERNAL_STORAGE</code> (requires Play Store review).</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. FileProvider — Secure Cross-App File Sharing</h2>
+
+<pre><code>// FileProvider converts a file:// URI to a content:// URI
+// with temporary read/write permissions.
+
+// 1. Declare in AndroidManifest.xml:
+// &lt;provider
+//     android:name="androidx.core.content.FileProvider"
+//     android:authorities="${applicationId}.fileprovider"
+//     android:exported="false"
+//     android:grantUriPermissions="true"&gt;
+//     &lt;meta-data
+//         android:name="android.support.FILE_PROVIDER_PATHS"
+//         android:resource="@xml/file_paths" /&gt;
+// &lt;/provider&gt;
+
+// 2. Define accessible paths in res/xml/file_paths.xml:
+// &lt;paths&gt;
+//     &lt;files-path name="internal" path="shared/" /&gt;
+//     &lt;cache-path name="cache" path="images/" /&gt;
+//     &lt;external-files-path name="external" path="exports/" /&gt;
+// &lt;/paths&gt;
+
+// 3. Share a file:
+val file = File(context.filesDir, "shared/report.pdf")
+val uri = FileProvider.getUriForFile(context, "${packageName}.fileprovider", file)
+
+val shareIntent = Intent(Intent.ACTION_SEND).apply {
+    type = "application/pdf"
+    putExtra(Intent.EXTRA_STREAM, uri)
+    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+}
+startActivity(Intent.createChooser(shareIntent, "Share report"))</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Why file:// URIs Are Banned</div>
+  <p>Since Android 7 (API 24), passing a <code>file://</code> URI to another app via an Intent throws <code>FileUriExposedException</code>. The reason: file:// URIs expose your app's internal file path, and the receiving app may not have filesystem access to that path (especially with scoped storage). <code>content://</code> URIs via FileProvider are secure because: (1) the path is opaque — the receiver doesn't know the real file location, (2) access is temporary — revoked when the receiving Activity finishes, (3) permissions are explicit — you control read vs write. For L6: understand that FileProvider uses a <code>ContentProvider</code> internally. When the receiving app reads the content URI, it makes a Binder IPC call to your app's FileProvider, which opens the file and returns a <code>ParcelFileDescriptor</code>.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Content URI vs File URI vs File Path</h2>
+
+<table>
+  <tr><th>Type</th><th>Format</th><th>Cross-App Safe</th><th>Scoped Storage Compatible</th></tr>
+  <tr>
+    <td><code>File</code> path</td>
+    <td><code>/storage/emulated/0/DCIM/photo.jpg</code></td>
+    <td>No (FileUriExposedException)</td>
+    <td>Only for own files (FUSE enforced)</td>
+  </tr>
+  <tr>
+    <td><code>file://</code> URI</td>
+    <td><code>file:///storage/emulated/0/DCIM/photo.jpg</code></td>
+    <td>No (banned since API 24)</td>
+    <td>No</td>
+  </tr>
+  <tr>
+    <td><code>content://</code> URI</td>
+    <td><code>content://com.example.fileprovider/images/photo.jpg</code></td>
+    <td>Yes (with FLAG_GRANT_*_URI_PERMISSION)</td>
+    <td>Yes (the correct approach)</td>
+  </tr>
+  <tr>
+    <td>MediaStore URI</td>
+    <td><code>content://media/external/images/media/42</code></td>
+    <td>Yes (with permission)</td>
+    <td>Yes (primary API for shared media)</td>
+  </tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>7. Photo Picker — No Permission Needed</h2>
+
+<pre><code>// Android 13+ Photo Picker (backported to Android 11 via Play Services):
+// System-provided UI for selecting photos/videos. No storage permission needed.
+
+// Single image:
+val pickMedia = registerForActivityResult(
+    ActivityResultContracts.PickVisualMedia()
+) { uri: Uri? ->
+    uri?.let { processImage(it) }
+}
+pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+
+// Multiple images (with limit):
+val pickMultiple = registerForActivityResult(
+    ActivityResultContracts.PickMultipleVisualMedia(maxItems = 5)
+) { uris: List&lt;Uri&gt; ->
+    uris.forEach { processImage(it) }
+}
+pickMultiple.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+
+// Why Photo Picker is preferred over READ_MEDIA_IMAGES:
+// 1. No permission dialog — user picks exactly what they want to share
+// 2. Works on Android 11+ (via Play Services backport)
+// 3. Respects user privacy — app never sees the full media library
+// 4. Returns content:// URIs with temporary read access
+// 5. Google Play policy: prefer Photo Picker over broad media permissions</code></pre>
+
+<!-- ============================================================ -->
+<h2>8. sdcardfs vs FUSE — Storage Enforcement History</h2>
+
+<pre><code>// Android's storage enforcement has evolved through three eras:
+
+// Era 1: sdcardfs (Android 7-10)
+// - Kernel module that emulates FAT filesystem permissions on ext4
+// - Mapped UIDs to provide per-app views of /sdcard
+// - Fast (kernel-level), but inflexible and hard to maintain
+// - Could not enforce scoped storage granularly
+
+// Era 2: FUSE (Android 11+)
+// - Userspace daemon (MediaProvider process) intercepts all file ops
+// - Full control: can check ownership, permissions, MediaStore grants
+// - Slower (~10-30% overhead) due to kernel ↔ userspace context switches
+// - Enables scoped storage enforcement even for native code (JNI/NDK)
+
+// Era 3: FUSE + optimizations (Android 12+)
+// - Read-ahead caching reduces FUSE overhead
+// - Passthrough mode for app's own files (bypasses FUSE after initial check)
+// - ContentResolver.openFileDescriptor() returns direct fd after check
+
+// requestLegacyExternalStorage behavior:
+// Android 10 (API 29): Setting to true opts out of scoped storage entirely
+//   → App gets full legacy access to /sdcard
+// Android 11 (API 30): IGNORED — all apps use scoped storage regardless
+//   → Apps that relied on this flag break on upgrade to Android 11
+// Migration: replace File paths with MediaStore/SAF before targeting API 30</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Version-Specific Permission Branching</div>
+  <p>A production app must handle three different permission models for media access depending on the Android version. This is a common L6 interview question — "how do you handle storage permissions across API levels?"</p>
+</div>
+
+<pre><code>// Version-specific media permission handling:
+fun requestMediaPermissions() {
+    val permissions = when {
+        Build.VERSION.SDK_INT >= 34 -> {
+            // Android 14+: prefer Photo Picker, or use selected photos
+            arrayOf(
+                Manifest.permission.READ_MEDIA_IMAGES,
+                Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED
+            )
+        }
+        Build.VERSION.SDK_INT >= 33 -> {
+            // Android 13: granular media permissions
+            arrayOf(Manifest.permission.READ_MEDIA_IMAGES)
+        }
+        Build.VERSION.SDK_INT >= 29 -> {
+            // Android 10-12: legacy permission (scoped storage enforced by FUSE)
+            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+        else -> {
+            // Android 9 and below: legacy
+            arrayOf(
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            )
+        }
+    }
+    permissionLauncher.launch(permissions)
+}</code></pre>
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  ← <a href="01-permission-model.html">01 — Permission Model</a> &nbsp;|&nbsp;
+  <a href="03-keystore-crypto.html">03 — Keystore & Crypto →</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>
