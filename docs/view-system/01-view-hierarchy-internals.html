@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 — View Hierarchy Internals — ViewRootImpl, DecorView, and the View-Window Bridge</title>
+<style>
+  :root { --bg: #ffffff; --surface: #f7f8fa; --surface2: #edeef2; --border: #d4d7e0; --text: #1e2028; --text-dim: #5c6070; --accent: #2563eb; --accent2: #7c3aed; --green: #16803c; --red: #dc2626; --orange: #c2410c; --yellow: #a16207; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.75; padding: 2rem; max-width: 920px; margin: 0 auto; font-size: 1.08rem; }
+  h1 { font-size: 2.2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.6rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.25rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; color: var(--text); }
+  .nav a.active { background: var(--accent); color: #fff; }
+  code { background: #f0f1f5; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.88em; color: #c7254e; border: 1px solid #e2e4ea; }
+  pre { background: #fafbfc; border: 1px solid #d4d7e0; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 1rem; line-height: 1.7; }
+  pre code { background: none; padding: 0; color: #2e3440; border: none; }
+  .callout { border-left: 4px solid var(--accent); background: #f0f4ff; padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: #f5f0ff; }
+  .callout.warn { border-left-color: var(--orange); background: #fff7ed; }
+  .callout.danger { border-left-color: var(--red); background: #fef2f2; }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.95rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--bg); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+  footer { margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--border); font-size: 0.95rem; color: var(--text-dim); display: flex; justify-content: space-between; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a class="active" href="01-view-hierarchy-internals.html">01 View Hierarchy</a>
+  <a href="02-measure-layout.html">02 Measure &amp; Layout</a>
+  <a href="03-drawing-canvas.html">03 Drawing &amp; Canvas</a>
+  <a href="04-custom-views.html">04 Custom Views</a>
+  <a href="05-touch-input.html">05 Touch &amp; Input</a>
+  <a href="06-animations.html">06 Animations</a>
+  <a href="07-recyclerview.html">07 RecyclerView</a>
+  <a href="08-performance.html">08 Performance</a>
+  <a href="09-interview-qa.html">09 Interview Q&amp;A</a>
+</div>
+
+<h1>01 — View Hierarchy Internals</h1>
+<p class="subtitle">ViewRootImpl, DecorView, AttachInfo, the traversal pipeline, invalidation mechanics, and how the View tree connects to the Window system — the foundation everything else builds on</p>
+
+<!-- ============================================================ -->
+<h2>1. The View Tree Architecture</h2>
+
+<p>Every screen in Android is a <strong>tree</strong> of <code>View</code> and <code>ViewGroup</code> objects. This tree is the fundamental data structure of the entire UI framework — measure, layout, draw, touch dispatch, accessibility, and focus traversal all operate by walking this tree.</p>
+
+<h3>DecorView — The Root of Every Window</h3>
+
+<p>The root of the View tree is always a <code>DecorView</code>, which extends <code>FrameLayout</code>. It is the top-level View in every Activity window and is owned by the <code>PhoneWindow</code> (the sole concrete implementation of the abstract <code>Window</code> class).</p>
+
+<p><code>DecorView</code> is responsible for:</p>
+<ul>
+  <li>Hosting the system chrome — status bar background, navigation bar background, caption bar in freeform mode</li>
+  <li>Providing the <strong>content frame</strong> (<code>android.R.id.content</code>) where your layout lives</li>
+  <li>Handling window-level insets (system bars, display cutouts, IME)</li>
+  <li>Dispatching key events and back-press handling</li>
+</ul>
+
+<h3>From setContentView() to a Live Tree</h3>
+
+<p>When you call <code>setContentView(R.layout.main)</code>, the following chain executes:</p>
+
+<pre><code>// Activity.setContentView() delegates to PhoneWindow
+Activity.setContentView(layoutResID)
+  → PhoneWindow.setContentView(layoutResID)
+    → installDecor()                          // creates DecorView if needed
+      → generateDecor()                       // new DecorView(context)
+      → generateLayout(mDecor)                // inflates system layout into DecorView
+        // system layout depends on window features (action bar, title, etc.)
+        // always contains a FrameLayout with id android.R.id.content
+    → mLayoutInflater.inflate(layoutResID, mContentParent)
+      // mContentParent = the FrameLayout (android.R.id.content)
+      // LayoutInflater recursively parses XML → creates View objects
+      // → attaches them as children of mContentParent</code></pre>
+
+<h3>The Full Tree Structure</h3>
+
+<div class="diagram-container">
+<pre><code>                        PhoneWindow
+                            │
+                            ▼
+                       ┌─────────┐
+                       │DecorView│  (FrameLayout)
+                       └────┬────┘
+                            │
+               ┌────────────┴────────────┐
+               ▼                         ▼
+        ┌─────────────┐          ┌──────────────┐
+        │ Status Bar   │          │ Navigation   │
+        │ Background   │          │ Bar Bg       │
+        └─────────────┘          └──────────────┘
+               │
+               ▼
+        ┌─────────────┐
+        │ LinearLayout │  (vertical: optional title + content)
+        └──────┬──────┘
+               │
+     ┌─────────┴─────────┐
+     ▼                    ▼
+┌──────────┐      ┌──────────────────┐
+│ Title Bar│      │   FrameLayout    │  ← android.R.id.content
+│ (if any) │      │   (ContentFrame) │
+└──────────┘      └────────┬─────────┘
+                           │
+                           ▼
+                  ┌─────────────────┐
+                  │  YOUR LAYOUT    │  ← what you pass to setContentView()
+                  │  (e.g. Toolbar  │
+                  │   + RecyclerView│
+                  │   + FAB)        │
+                  └─────────────────┘</code></pre>
+</div>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Insight</div>
+  The system layout inflated into <code>DecorView</code> varies based on window feature flags (<code>requestWindowFeature()</code>). There are ~15 different system layout resources in AOSP (<code>screen_simple.xml</code>, <code>screen_action_bar.xml</code>, <code>screen_toolbar.xml</code>, etc.). The <code>generateLayout()</code> method in <code>PhoneWindow</code> selects the appropriate one based on the theme attributes and requested features. This is why <code>requestWindowFeature()</code> must be called <strong>before</strong> <code>setContentView()</code> — the system layout hasn't been inflated yet.
+</div>
+
+<!-- ============================================================ -->
+<h2>2. ViewRootImpl — The Bridge Between View and Window</h2>
+
+<p><code>ViewRootImpl</code> is the most important class in the View system that most developers never directly interact with. It is <strong>not</strong> a <code>View</code> — it implements <code>ViewParent</code> and acts as the bridge between the View tree and the <code>WindowManagerService</code> (WMS).</p>
+
+<h3>One ViewRootImpl Per Window</h3>
+
+<p>Every window in Android has its own <code>ViewRootImpl</code>. An Activity has one, but so does every Dialog, Toast, PopupWindow, and system overlay. They are independent rendering pipelines:</p>
+
+<table>
+  <tr><th>Window Type</th><th>ViewRootImpl</th><th>Surface</th><th>Input Channel</th></tr>
+  <tr><td>Activity</td><td>1 per Activity</td><td>Own Surface</td><td>Own InputChannel</td></tr>
+  <tr><td>Dialog</td><td>Separate from Activity</td><td>Own Surface</td><td>Own InputChannel</td></tr>
+  <tr><td>Toast</td><td>Separate</td><td>Own Surface</td><td>None (no input)</td></tr>
+  <tr><td>PopupWindow</td><td>Separate</td><td>Own Surface</td><td>Own InputChannel</td></tr>
+  <tr><td>System Alert</td><td>Separate</td><td>Own Surface</td><td>Own InputChannel</td></tr>
+</table>
+
+<h3>Creation Path</h3>
+
+<p><code>ViewRootImpl</code> is created when a View tree is added to the window system:</p>
+
+<pre><code>// The chain that creates ViewRootImpl:
+WindowManager.addView(view, layoutParams)
+  → WindowManagerImpl.addView(view, params)
+    → WindowManagerGlobal.addView(view, params, display, parentWindow, userId)
+      → root = new ViewRootImpl(view.getContext(), display)
+      → root.setView(view, params, panelParentView, userId)
+
+// WindowManagerGlobal maintains parallel arrays:
+//   mViews[]  — the root Views (DecorViews)
+//   mRoots[]  — the ViewRootImpl instances
+//   mParams[] — the WindowManager.LayoutParams</code></pre>
+
+<h3>What ViewRootImpl Holds</h3>
+
+<p><code>ViewRootImpl</code> is the central coordinator. It owns or manages:</p>
+
+<ul>
+  <li><code>mView</code> — reference to the root View (typically <code>DecorView</code>)</li>
+  <li><code>mSurface</code> / <code>mSurfaceControl</code> — the drawing target allocated by SurfaceFlinger</li>
+  <li><code>mChoreographer</code> — schedules work on VSYNC boundaries</li>
+  <li><code>mAttachInfo</code> — shared context for all Views in the tree (see Section 3)</li>
+  <li><code>mInputChannel</code> / <code>mInputEventReceiver</code> — receives touch/key events from InputDispatcher</li>
+  <li><code>mDirty</code> — the dirty region that needs redrawing</li>
+  <li><code>mTraversalBarrier</code> — a sync barrier posted to the MessageQueue to prioritize traversal messages</li>
+  <li><code>mWinFrame</code> — the window's frame as assigned by WMS</li>
+  <li><code>IWindowSession</code> — Binder proxy to WMS for window operations</li>
+</ul>
+
+<h3>ViewRootImpl.setView() — The Connection Point</h3>
+
+<p><code>setView()</code> is where the View tree becomes a live window. This single method call triggers a cascade of critical setup:</p>
+
+<pre><code>// Simplified ViewRootImpl.setView() — AOSP
+void setView(View view, WindowManager.LayoutParams attrs, View panelParentView) {
+    synchronized (this) {
+        if (mView == null) {
+            mView = view;
+
+            // 1. Schedule the first traversal
+            requestLayout();   // → scheduleTraversals()
+
+            // 2. Set up input event pipeline
+            mInputChannel = new InputChannel();
+
+            // 3. Add window to WMS via Binder IPC
+            //    This is the cross-process call that registers the window
+            res = mWindowSession.addToDisplayAsUser(
+                mWindow,           // IWindow — WMS's callback handle
+                mWindowAttributes,
+                getHostVisibility(),
+                mDisplay.getDisplayId(),
+                userId,
+                mInsetsController,
+                mInputChannel,     // WMS fills this with the input pipe
+                mTempInsets,
+                mTempControls
+            );
+
+            // 4. Set up input event receiver on the Looper
+            mInputEventReceiver = new WindowInputEventReceiver(
+                mInputChannel, Looper.myLooper()
+            );
+
+            // 5. Assign the View tree's parent to this ViewRootImpl
+            view.assignParent(this);
+        }
+    }
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Insight</div>
+  <code>ViewRootImpl</code> posts a <strong>sync barrier</strong> to the <code>MessageQueue</code> before scheduling a traversal via <code>Choreographer</code>. A sync barrier blocks all synchronous messages (regular <code>Handler.post()</code>) and only allows <strong>asynchronous messages</strong> through. The Choreographer callback is posted as an async message, so it jumps ahead of any pending synchronous work. This is why <code>View.post()</code> runnables execute <em>after</em> the traversal — they are synchronous messages blocked by the barrier until the traversal completes and the barrier is removed.
+</div>
+
+<!-- ============================================================ -->
+<h2>3. View.AttachInfo — The Shared Context</h2>
+
+<p><code>View.AttachInfo</code> is a package-private inner class of <code>View</code> that holds shared state for every View in a window. There is exactly <strong>one instance per ViewRootImpl</strong>, and every View in the tree shares the same reference.</p>
+
+<h3>What AttachInfo Contains</h3>
+
+<table>
+  <tr><th>Field</th><th>Purpose</th></tr>
+  <tr><td><code>mViewRootImpl</code></td><td>Back-reference to the ViewRootImpl</td></tr>
+  <tr><td><code>mHandler</code></td><td>Handler bound to the UI thread's Looper — used by <code>View.post()</code></td></tr>
+  <tr><td><code>mRootView</code></td><td>The root View (DecorView)</td></tr>
+  <tr><td><code>mSurface</code></td><td>The Surface this window draws to</td></tr>
+  <tr><td><code>mWindowToken</code></td><td>IBinder token identifying this window to WMS</td></tr>
+  <tr><td><code>mTreeObserver</code></td><td>The ViewTreeObserver for this tree</td></tr>
+  <tr><td><code>mHardwareAccelerated</code></td><td>Whether hardware-accelerated rendering is enabled</td></tr>
+  <tr><td><code>mDisplayId</code></td><td>Which display this window is on</td></tr>
+  <tr><td><code>mContentInsets</code></td><td>Insets consumed by system bars</td></tr>
+  <tr><td><code>mHasWindowFocus</code></td><td>Whether this window currently has focus</td></tr>
+  <tr><td><code>mWindowVisibility</code></td><td>Current visibility of the window</td></tr>
+</table>
+
+<h3>How AttachInfo Propagates</h3>
+
+<p>When a View is added to the tree, <code>AttachInfo</code> flows down from the root:</p>
+
+<pre><code>// ViewGroup.addViewInner() — simplified
+void addViewInner(View child, int index, LayoutParams params, boolean preventRequestLayout) {
+    // ... parameter validation ...
+
+    if (mAttachInfo != null) {
+        // Propagate AttachInfo down to the new child (and its subtree)
+        child.dispatchAttachedToWindow(mAttachInfo, mViewFlags & VISIBILITY_MASK);
+    }
+    // ...
+}
+
+// View.dispatchAttachedToWindow()
+void dispatchAttachedToWindow(AttachInfo info, int visibility) {
+    mAttachInfo = info;
+
+    // Execute any pending View.post() runnables that were queued before attach
+    if (mRunQueue != null) {
+        mRunQueue.executeActions(info.mHandler);
+        mRunQueue = null;
+    }
+
+    onAttachedToWindow();
+    // ...
+}
+
+// ViewGroup overrides to recurse into children:
+void dispatchAttachedToWindow(AttachInfo info, int visibility) {
+    super.dispatchAttachedToWindow(info, visibility);
+    for (int i = 0; i &lt; mChildrenCount; i++) {
+        children[i].dispatchAttachedToWindow(info, visibility);
+    }
+}</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Common Trap</div>
+  <code>View.mAttachInfo</code> is <code>null</code> until the View is attached to a window. Many View operations silently fail or throw when called before attach. For example, <code>View.getLocationOnScreen()</code> returns <code>[0, 0]</code>, <code>View.getWindowToken()</code> returns <code>null</code>, and <code>View.startAnimation()</code> won't schedule properly. Always check <code>View.isAttachedToWindow()</code> or use <code>View.doOnAttach { }</code> (Kotlin extension) when you need guaranteed attach state.
+</div>
+
+<!-- ============================================================ -->
+<h2>4. The Traversal — performTraversals()</h2>
+
+<p><code>ViewRootImpl.performTraversals()</code> is the <strong>single most important method</strong> in the entire View system. It orchestrates the three phases of rendering — Measure, Layout, Draw — in a single pass triggered by VSYNC.</p>
+
+<h3>How a Traversal Gets Scheduled</h3>
+
+<pre><code>// Something triggers a traversal (requestLayout, invalidate, etc.)
+ViewRootImpl.scheduleTraversals()
+  → mTraversalBarrier = mHandler.getLooper().getQueue().postSyncBarrier()
+  → mChoreographer.postCallback(
+        Choreographer.CALLBACK_TRAVERSAL,
+        mTraversalRunnable,    // → doTraversal()
+        null
+    )
+
+// On next VSYNC:
+mTraversalRunnable.run()
+  → doTraversal()
+    → mHandler.getLooper().getQueue().removeSyncBarrier(mTraversalBarrier)
+    → performTraversals()</code></pre>
+
+<h3>performTraversals() Flow</h3>
+
+<p>This method is ~900 lines in AOSP. Here is the essential flow:</p>
+
+<div class="diagram-container">
+<pre><code>performTraversals()
+│
+├─ 1. Window size / configuration changed?
+│     → relayoutWindow()  ← Binder IPC to WMS
+│     → WMS assigns window frame, allocates/resizes Surface
+│     → mSurface is now valid for drawing
+│
+├─ 2. MEASURE PHASE
+│     → desiredWindowWidth/Height from WMS frame
+│     → childWidthMeasureSpec = getRootMeasureSpec(windowWidth, lp.width)
+│     → childHeightMeasureSpec = getRootMeasureSpec(windowHeight, lp.height)
+│     → performMeasure(childWidthMeasureSpec, childHeightMeasureSpec)
+│        → mView.measure(widthSpec, heightSpec)
+│           → onMeasure() — recursive down the entire tree
+│
+├─ 3. LAYOUT PHASE
+│     → performLayout(lp, desiredWindowWidth, desiredWindowHeight)
+│        → mView.layout(0, 0, mView.getMeasuredWidth(), mView.getMeasuredHeight())
+│           → onLayout() — recursive, each ViewGroup positions children
+│
+├─ 4. Report draw if first traversal
+│     → pendingDrawFinished or reportNextDraw
+│
+└─ 5. DRAW PHASE
+      → performDraw()
+         → draw(fullRedrawNeeded)
+            → Hardware path: mAttachInfo.mThreadedRenderer.draw(mView, ...)
+            │  → builds/updates RenderNode display list
+            │  → hands off to RenderThread
+            │
+            └─ Software path: drawSoftware(surface, ...)
+               → surface.lockCanvas(dirty)
+               → mView.draw(canvas)  — recursive
+               → surface.unlockCanvasAndPost(canvas)</code></pre>
+</div>
+
+<h3>The Three Phases at a Glance</h3>
+
+<table>
+  <tr><th>Phase</th><th>Trigger</th><th>Walks Tree?</th><th>What It Does</th></tr>
+  <tr><td><strong>Measure</strong></td><td><code>requestLayout()</code></td><td>Top-down</td><td>Each View calculates its desired width/height via <code>MeasureSpec</code> negotiation</td></tr>
+  <tr><td><strong>Layout</strong></td><td><code>requestLayout()</code></td><td>Top-down</td><td>Each ViewGroup assigns final positions (<code>left, top, right, bottom</code>) to children</td></tr>
+  <tr><td><strong>Draw</strong></td><td><code>invalidate()</code> or <code>requestLayout()</code></td><td>Top-down</td><td>Each View renders itself to the Canvas (or updates its RenderNode)</td></tr>
+</table>
+
+<div class="callout">
+  <div class="callout-label">Key Detail</div>
+  <code>invalidate()</code> only triggers the <strong>draw phase</strong>. <code>requestLayout()</code> triggers <strong>all three phases</strong>. This distinction is critical for performance — if only visual appearance changed (color, alpha, text content), use <code>invalidate()</code>. If size or position might change, you need <code>requestLayout()</code>.
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Invalidation — Triggering Redraws</h2>
+
+<p>Invalidation is the mechanism by which a View tells the system "I need to be redrawn." It is the most common trigger for rendering work.</p>
+
+<h3>The Invalidation Chain</h3>
+
+<pre><code>// View.invalidate() — simplified AOSP flow
+public void invalidate() {
+    invalidate(true);  // invalidateCache = true
+}
+
+void invalidateInternal(int l, int t, int r, int b,
+                         boolean invalidateCache, boolean fullInvalidate) {
+    // Skip if View is not visible and not animating
+    if (skipInvalidate()) return;
+
+    // Set dirty flags
+    if (invalidateCache) {
+        mPrivateFlags |= PFLAG_INVALIDATED;    // mark display list as invalid
+    }
+    mPrivateFlags |= PFLAG_DIRTY;
+
+    // Propagate up to parent
+    final AttachInfo ai = mAttachInfo;
+    final ViewParent p = mParent;
+    if (p != null &amp;&amp; ai != null) {
+        final Rect damage = ai.mTmpInvalRect;
+        damage.set(l, t, r, b);
+        p.invalidateChild(this, damage);
+    }
+}
+
+// ViewGroup.invalidateChild() propagates up the tree:
+// child → parent → parent → ... → ViewRootImpl
+
+// ViewRootImpl.invalidateChildInParent()
+//   → union the dirty rect into mDirty
+//   → scheduleTraversals()  (only draw phase will execute)</code></pre>
+
+<h3>Hardware-Accelerated Invalidation</h3>
+
+<p>With hardware acceleration (default since Android 4.1), invalidation is fundamentally different:</p>
+
+<ul>
+  <li>Each View has a <code>RenderNode</code> (display list) that records its drawing commands</li>
+  <li><code>invalidate()</code> marks only that View's <code>RenderNode</code> as dirty</li>
+  <li>The parent's <code>RenderNode</code> still references the child's <code>RenderNode</code> — it does <strong>not</strong> need to re-record</li>
+  <li>Only the invalidated View's display list is rebuilt; the rest of the tree is untouched</li>
+  <li>This is O(1) per invalidated View, not O(n) for the tree</li>
+</ul>
+
+<p>In software rendering (legacy), invalidation uses <strong>dirty rectangles</strong>. The union of all dirty rects is computed, and the entire draw pass clips to that region. Every View that intersects the dirty rect must redraw — much more expensive.</p>
+
+<h3>invalidate() vs postInvalidate()</h3>
+
+<pre><code>// invalidate() — must be called on the UI thread
+view.invalidate()
+
+// postInvalidate() — safe from any thread
+// Posts to the UI thread's Handler via AttachInfo
+view.postInvalidate()
+
+// Under the hood:
+public void postInvalidate() {
+    val attachInfo = mAttachInfo ?: return
+    attachInfo.mViewRootImpl.dispatchInvalidateDelayed(this, 0)
+}
+// → Handler.sendMessageDelayed(MSG_INVALIDATE, view, delayMillis)</code></pre>
+
+<!-- ============================================================ -->
+<h2>6. requestLayout() — Triggering Re-measurement</h2>
+
+<p><code>requestLayout()</code> is the heavier sibling of <code>invalidate()</code>. It signals that a View's size or position may have changed, requiring the full measure → layout → draw pipeline.</p>
+
+<h3>The requestLayout() Chain</h3>
+
+<pre><code>// View.requestLayout() — simplified AOSP
+public void requestLayout() {
+    if (mMeasureCache != null) mMeasureCache.clear();
+
+    // Set flags that force measure and layout
+    mPrivateFlags |= PFLAG_FORCE_LAYOUT;
+    mPrivateFlags |= PFLAG_INVALIDATED;
+
+    // Propagate up to parent
+    if (mParent != null &amp;&amp; !mParent.isLayoutRequested()) {
+        mParent.requestLayout();
+    }
+}
+
+// This propagates all the way up:
+// View → ViewGroup → ViewGroup → ... → ViewRootImpl.requestLayout()
+
+// ViewRootImpl.requestLayout()
+public void requestLayout() {
+    if (!mHandlingLayoutInLayoutRequest) {
+        checkThread();                    // must be UI thread
+        mLayoutRequested = true;
+        scheduleTraversals();             // full traversal: measure + layout + draw
+    }
+}</code></pre>
+
+<h3>The PFLAG_FORCE_LAYOUT Optimization</h3>
+
+<p>Not every View in the tree gets re-measured on every <code>requestLayout()</code>. The flag propagation creates a <strong>dirty path</strong> from the requesting View up to the root. During the measure pass:</p>
+
+<pre><code>// View.measure() — simplified
+public final void measure(int widthMeasureSpec, int heightMeasureSpec) {
+    // Only re-measure if forced OR if the MeasureSpec changed
+    boolean forceLayout = (mPrivateFlags &amp; PFLAG_FORCE_LAYOUT) == PFLAG_FORCE_LAYOUT;
+    boolean specChanged = widthMeasureSpec != mOldWidthMeasureSpec
+                       || heightMeasureSpec != mOldHeightMeasureSpec;
+
+    if (forceLayout || specChanged) {
+        onMeasure(widthMeasureSpec, heightMeasureSpec);
+        mPrivateFlags |= PFLAG_LAYOUT_REQUIRED;  // ensure layout() runs too
+    }
+
+    mOldWidthMeasureSpec = widthMeasureSpec;
+    mOldHeightMeasureSpec = heightMeasureSpec;
+}</code></pre>
+
+<p>Views <em>not</em> on the dirty path skip <code>onMeasure()</code> entirely because their <code>PFLAG_FORCE_LAYOUT</code> is not set and their <code>MeasureSpec</code> hasn't changed. This is a critical optimization for deep trees.</p>
+
+<div class="callout danger">
+  <div class="callout-label">Danger — Infinite Layout Loop</div>
+  Calling <code>requestLayout()</code> from inside <code>onLayout()</code> or <code>onMeasure()</code> creates an infinite loop. The framework detects this and logs <code>"requestLayout() improperly called during layout"</code>, but in older API levels it could cause ANRs. A common trigger: setting text on a <code>TextView</code> inside <code>onLayout()</code>, which internally calls <code>requestLayout()</code> because the text bounds changed. Always separate layout-triggering logic from the layout pass itself.
+</div>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Insight</div>
+  Multiple <code>requestLayout()</code> calls within the same frame are <strong>coalesced</strong>. Once <code>ViewRootImpl.scheduleTraversals()</code> has been called, the <code>mTraversalScheduled</code> flag is set to <code>true</code>, and subsequent calls to <code>scheduleTraversals()</code> are no-ops until the traversal executes. This means you can freely call <code>requestLayout()</code> on multiple Views in the same frame without triggering multiple traversals — they all collapse into a single measure/layout/draw pass.
+</div>
+
+<!-- ============================================================ -->
+<h2>7. ViewTreeObserver — Lifecycle Callbacks</h2>
+
+<p><code>ViewTreeObserver</code> provides a set of callbacks for observing events in the View tree's lifecycle. It is the primary mechanism for reacting to layout completion, draw scheduling, and scroll events.</p>
+
+<h3>Key Listeners</h3>
+
+<table>
+  <tr><th>Listener</th><th>When Fired</th><th>Common Use</th></tr>
+  <tr><td><code>OnPreDrawListener</code></td><td>After layout, before draw</td><td>Shared element transitions, last-minute adjustments; return <code>false</code> to cancel the draw</td></tr>
+  <tr><td><code>OnGlobalLayoutListener</code></td><td>After layout completes</td><td>Getting final View dimensions, keyboard visibility detection</td></tr>
+  <tr><td><code>OnScrollChangedListener</code></td><td>Any View in the tree scrolls</td><td>Parallax effects, scroll-linked animations</td></tr>
+  <tr><td><code>OnWindowFocusChangeListener</code></td><td>Window gains/loses focus</td><td>Pausing animations when backgrounded</td></tr>
+  <tr><td><code>OnWindowAttachListener</code></td><td>View tree attached/detached</td><td>Cleanup, resource management</td></tr>
+  <tr><td><code>OnDrawListener</code></td><td>Every draw pass</td><td>Frame-level monitoring (use sparingly)</td></tr>
+</table>
+
+<h3>Getting Dimensions After Layout</h3>
+
+<pre><code>// The classic pattern — get dimensions after layout completes
+view.viewTreeObserver.addOnGlobalLayoutListener(object : ViewTreeObserver.OnGlobalLayoutListener {
+    override fun onGlobalLayout() {
+        // Remove immediately to avoid repeated calls
+        view.viewTreeObserver.removeOnGlobalLayoutListener(this)
+
+        val width = view.width
+        val height = view.height
+        // Now safe to use dimensions
+    }
+})
+
+// Modern Kotlin alternative using doOnLayout extension:
+view.doOnLayout {
+    val width = it.width
+    val height = it.height
+}
+// doOnLayout uses OnPreDrawListener internally and auto-removes</code></pre>
+
+<h3>The Floating Observer Problem</h3>
+
+<p><code>View.getViewTreeObserver()</code> behaves differently depending on attach state:</p>
+
+<ul>
+  <li><strong>Before attach:</strong> returns a "floating" <code>ViewTreeObserver</code> owned by the View itself</li>
+  <li><strong>After attach:</strong> returns the <code>ViewTreeObserver</code> from <code>AttachInfo</code> (shared by all Views in the tree)</li>
+  <li>When the View is attached, listeners from the floating observer are <strong>merged</strong> into the real observer</li>
+  <li>When the View is detached, the observer is marked as "dead" — adding listeners to a dead observer throws <code>IllegalStateException</code></li>
+</ul>
+
+<pre><code>// Safe pattern — always check isAlive()
+val vto = view.viewTreeObserver
+if (vto.isAlive) {
+    vto.addOnGlobalLayoutListener { /* ... */ }
+}</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Memory Leak Trap</div>
+  <code>ViewTreeObserver</code> listeners hold a strong reference to their enclosing scope. If you add an <code>OnGlobalLayoutListener</code> from an Activity or Fragment and forget to remove it, the listener keeps the entire View tree alive through the <code>ViewTreeObserver → AttachInfo → ViewRootImpl → DecorView</code> chain. Always remove listeners when done, or use the one-shot pattern shown above. The <code>doOnLayout</code> / <code>doOnPreDraw</code> Kotlin extensions handle removal automatically.
+</div>
+
+<!-- ============================================================ -->
+<h2>8. View Lifecycle — From Inflation to Detachment</h2>
+
+<p>A View goes through a well-defined lifecycle. Understanding the order and guarantees of each callback is essential for correct resource management and avoiding subtle bugs.</p>
+
+<h3>Complete Lifecycle Order</h3>
+
+<table>
+  <tr><th>#</th><th>Callback</th><th>When</th><th>Key Guarantees</th></tr>
+  <tr><td>1</td><td><code>constructor</code></td><td>Inflation or programmatic creation</td><td>Context available; no parent, no AttachInfo</td></tr>
+  <tr><td>2</td><td><code>onFinishInflate()</code></td><td>After XML inflation completes</td><td>All children exist (for ViewGroups); attributes parsed</td></tr>
+  <tr><td>3</td><td><code>onAttachedToWindow()</code></td><td>View added to a window</td><td><code>AttachInfo</code> is set; <code>View.post()</code> works; <code>getWindowToken()</code> non-null</td></tr>
+  <tr><td>4</td><td><code>onWindowVisibilityChanged(VISIBLE)</code></td><td>Window becomes visible</td><td>Window is on-screen (may not have focus yet)</td></tr>
+  <tr><td>5</td><td><code>onMeasure()</code></td><td>First traversal — measure phase</td><td>Must call <code>setMeasuredDimension()</code></td></tr>
+  <tr><td>6</td><td><code>onSizeChanged()</code></td><td>After measure, if size changed</td><td>Old and new dimensions provided</td></tr>
+  <tr><td>7</td><td><code>onLayout()</code></td><td>First traversal — layout phase</td><td>Position is final; children can be positioned</td></tr>
+  <tr><td>8</td><td><code>onDraw()</code></td><td>First traversal — draw phase</td><td>Canvas is ready; clip is set to View bounds</td></tr>
+  <tr><td>9</td><td><code>onWindowFocusChanged(true)</code></td><td>Window gains focus</td><td>View is fully visible and interactive</td></tr>
+  <tr><td>—</td><td><em>View is live — repeated measure/layout/draw cycles</em></td><td></td><td></td></tr>
+  <tr><td>10</td><td><code>onWindowFocusChanged(false)</code></td><td>Window loses focus</td><td>Another window took focus (dialog, notification shade)</td></tr>
+  <tr><td>11</td><td><code>onWindowVisibilityChanged(GONE)</code></td><td>Window hidden</td><td>Activity stopped or window removed</td></tr>
+  <tr><td>12</td><td><code>onDetachedFromWindow()</code></td><td>View removed from window</td><td>Cleanup: cancel animations, release resources, unregister listeners</td></tr>
+</table>
+
+<h3>Key Lifecycle Details</h3>
+
+<pre><code>// onAttachedToWindow — start ongoing work
+override fun onAttachedToWindow() {
+    super.onAttachedToWindow()
+    // Safe to register observers, start animations, acquire resources
+    // mAttachInfo is now non-null
+    // View.post() will execute on the UI thread
+}
+
+// onDetachedFromWindow — the View's "onDestroy"
+override fun onDetachedFromWindow() {
+    super.onDetachedFromWindow()
+    // MUST cleanup here:
+    // - Cancel running animations (animator.cancel())
+    // - Remove ViewTreeObserver listeners
+    // - Unregister broadcast receivers
+    // - Release hardware resources (Bitmap, SurfaceTexture)
+    // - Cancel pending Handler callbacks
+}
+
+// onVisibilityChanged — called for THIS View and ancestors
+override fun onVisibilityChanged(changedView: View, visibility: Int) {
+    super.onVisibilityChanged(changedView, visibility)
+    // changedView may be an ancestor, not necessarily this View
+    // visibility: VISIBLE (0), INVISIBLE (4), GONE (8)
+    // Use to pause/resume expensive operations like video playback
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Insight</div>
+  <code>onDetachedFromWindow()</code> is <strong>not guaranteed</strong> to be called if the process is killed. For Activity-scoped cleanup, prefer <code>Lifecycle</code> observers or <code>onDestroy()</code>. However, for View-internal resources (animations, hardware layers, registered listeners), <code>onDetachedFromWindow()</code> is the correct place because it fires when the View is removed from the tree — which happens during <code>Activity.onDestroy()</code> when the window is removed, during Fragment transactions, or when a parent <code>ViewGroup</code> calls <code>removeView()</code>.
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Window ↔ View Connection</h2>
+
+<p>Understanding how the View tree connects to the window system is essential for grasping why things like <code>Dialog</code> windows, <code>Toast</code> overlays, and multi-window mode work the way they do.</p>
+
+<h3>The Full Connection Chain</h3>
+
+<div class="diagram-container">
+<pre><code>┌─────────────────────────────────────────────────────────────────┐
+│                        YOUR APP PROCESS                         │
+│                                                                 │
+│  Activity                                                       │
+│    │                                                            │
+│    ├── PhoneWindow (Window impl)                                │
+│    │     └── DecorView (the root View)                          │
+│    │                                                            │
+│    └── WindowManager.addView(decorView, params)                 │
+│          │                                                      │
+│          ▼                                                      │
+│    WindowManagerGlobal                                          │
+│          │                                                      │
+│          ▼                                                      │
+│    ViewRootImpl ─────────── owns ──────────→ DecorView          │
+│      │  │  │                                                    │
+│      │  │  └── Choreographer (VSYNC scheduling)                 │
+│      │  └── Surface (drawing target)                            │
+│      └── IWindowSession (Binder proxy)                          │
+│              │                                                  │
+│              │  Binder IPC                                      │
+├──────────────┼──────────────────────────────────────────────────┤
+│              ▼                        SYSTEM_SERVER PROCESS     │
+│    WindowManagerService                                         │
+│      └── WindowState (server-side representation of the window) │
+│            │                                                    │
+│            ▼                                                    │
+│    SurfaceFlinger (native)                                      │
+│      └── Layer → composites to display                          │
+└─────────────────────────────────────────────────────────────────┘</code></pre>
+</div>
+
+<h3>Activity.makeVisible() — When the Window Actually Appears</h3>
+
+<p>The View tree is created during <code>onCreate()</code> via <code>setContentView()</code>, but the window doesn't appear on screen until <code>makeVisible()</code> is called during <code>onResume()</code>:</p>
+
+<pre><code>// Activity.makeVisible() — called by ActivityThread after onResume()
+void makeVisible() {
+    if (!mWindowAdded) {
+        val wm = getWindowManager()
+        wm.addView(mDecor, getWindow().getAttributes())
+        // ↑ This creates ViewRootImpl, calls WMS.addWindow(),
+        //   allocates Surface, schedules first traversal
+        mWindowAdded = true
+    }
+    mDecor.visibility = View.VISIBLE
+}
+
+// Timeline:
+// onCreate()  → setContentView() → DecorView + View tree created (no window yet)
+// onStart()   → (nothing window-related)
+// onResume()  → (nothing yet)
+// makeVisible() → WindowManager.addView() → ViewRootImpl → WMS.addWindow()
+//              → Surface allocated → first performTraversals() → pixels on screen</code></pre>
+
+<h3>Surface Allocation</h3>
+
+<p>The <code>Surface</code> that the View tree draws to is not created by the app — it is allocated by <code>SurfaceFlinger</code> and passed to <code>ViewRootImpl</code> via WMS:</p>
+
+<ol>
+  <li><code>ViewRootImpl.setView()</code> → <code>mWindowSession.addToDisplayAsUser()</code> → WMS creates <code>WindowState</code></li>
+  <li>First <code>performTraversals()</code> → <code>relayoutWindow()</code> → WMS asks SurfaceFlinger to create a <code>SurfaceControl</code></li>
+  <li>SurfaceFlinger creates a <code>Layer</code> backed by a <code>BufferQueue</code></li>
+  <li>WMS returns the <code>SurfaceControl</code> to <code>ViewRootImpl</code>, which wraps it in a <code>Surface</code></li>
+  <li><code>ViewRootImpl</code> draws to the <code>Surface</code> (dequeues a buffer, draws, queues it back)</li>
+  <li>SurfaceFlinger composites all Layers and sends the final frame to the display via HWC</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2>10. Staff-Level Corner Cases</h2>
+
+<h3>Single-Threaded Rendering</h3>
+
+<p><code>ViewRootImpl</code> runs entirely on the main (UI) thread. All traversals — measure, layout, draw (the recording phase) — are single-threaded. The only concurrency is with the <code>RenderThread</code>, which takes the recorded display list and renders it on the GPU asynchronously. This means:</p>
+
+<ul>
+  <li>You cannot call <code>View.invalidate()</code> or <code>View.requestLayout()</code> from a background thread (throws <code>CalledFromWrongThreadException</code>)</li>
+  <li>The <code>checkThread()</code> in <code>ViewRootImpl.requestLayout()</code> compares <code>Thread.currentThread()</code> against the thread that created the <code>ViewRootImpl</code></li>
+  <li>Technically, if you create a <code>ViewRootImpl</code> on a non-main thread (via <code>WindowManager.addView()</code> from a <code>HandlerThread</code> with a Looper), that View tree runs on that thread — but this is extremely rare and fragile</li>
+</ul>
+
+<h3>View.post() Before Attach</h3>
+
+<p>Calling <code>View.post(Runnable)</code> before the View is attached to a window doesn't crash — the Runnable is queued in a <code>HandlerActionQueue</code> (formerly <code>RunQueue</code>):</p>
+
+<pre><code>// View.post() — simplified
+public boolean post(Runnable action) {
+    val attachInfo = mAttachInfo
+    if (attachInfo != null) {
+        // Attached — post directly to the UI thread Handler
+        return attachInfo.mHandler.post(action)
+    }
+
+    // Not attached yet — queue for later
+    getRunQueue().post(action)
+    return true
+}
+
+// When the View is finally attached:
+// dispatchAttachedToWindow() → mRunQueue.executeActions(info.mHandler)
+// All queued Runnables are posted to the Handler at that point</code></pre>
+
+<div class="callout">
+  <div class="callout-label">Subtle Timing</div>
+  Runnables queued via <code>View.post()</code> before attach execute <em>after</em> the View is attached but <em>before</em> the first traversal completes. They are posted to the Handler during <code>dispatchAttachedToWindow()</code>, but the first traversal hasn't happened yet (it was scheduled via <code>Choreographer</code>). So <code>view.post { view.width }</code> in <code>onCreate()</code> will return <code>0</code> because layout hasn't run yet. Use <code>view.doOnLayout { }</code> instead.
+</div>
+
+<h3>Multiple Windows in One Activity</h3>
+
+<p>An Activity can have multiple windows, each with its own <code>ViewRootImpl</code>:</p>
+
+<pre><code>// Each of these creates a separate ViewRootImpl:
+val dialog = AlertDialog.Builder(this).setTitle("Test").create()
+dialog.show()  // → WindowManager.addView() → new ViewRootImpl
+
+val popup = PopupWindow(contentView, width, height)
+popup.showAtLocation(anchor, gravity, x, y)  // → new ViewRootImpl
+
+// Toast (before API 30) also created a separate window:
+Toast.makeText(this, "Hello", Toast.LENGTH_SHORT).show()  // → new ViewRootImpl
+
+// You can inspect all windows:
+// WindowManagerGlobal.getInstance().mViews  — all root Views
+// WindowManagerGlobal.getInstance().mRoots  — all ViewRootImpls</code></pre>
+
+<h3>DecorView vs Window.getDecorView()</h3>
+
+<p><code>Window.getDecorView()</code> is not a simple getter — it triggers <code>installDecor()</code> if the <code>DecorView</code> hasn't been created yet:</p>
+
+<pre><code>// PhoneWindow.getDecorView()
+public final View getDecorView() {
+    if (mDecor == null || mForceDecorInstall) {
+        installDecor()  // creates DecorView + inflates system layout
+    }
+    return mDecor
+}
+
+// This means calling getDecorView() before setContentView() will:
+// 1. Create the DecorView with the DEFAULT system layout
+// 2. Your subsequent setContentView() will inflate into the already-created content frame
+// 3. But if you called requestWindowFeature() AFTER getDecorView(), it's too late —
+//    the system layout was already chosen</code></pre>
+
+<h3>ViewRootImpl and Configuration Changes</h3>
+
+<p>During a configuration change that triggers Activity recreation:</p>
+
+<ol>
+  <li>Old Activity's <code>onDestroy()</code> → <code>WindowManager.removeView(decorView)</code> → <code>ViewRootImpl.die()</code></li>
+  <li><code>ViewRootImpl.die()</code> → <code>doDie()</code> → <code>dispatchDetachedFromWindow()</code> → <code>mWindowSession.remove(mWindow)</code> (WMS removes the window)</li>
+  <li>New Activity created → <code>setContentView()</code> → new <code>DecorView</code></li>
+  <li><code>makeVisible()</code> → new <code>ViewRootImpl</code> → <code>WMS.addWindow()</code> → new <code>Surface</code></li>
+  <li>The old and new windows briefly overlap — WMS handles the transition animation between them</li>
+</ol>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Insight — Thread Affinity Trick</div>
+  The "wrong thread" check in <code>ViewRootImpl</code> compares against <code>mThread</code>, which is set in the constructor to <code>Thread.currentThread()</code>. This is <em>not</em> hardcoded to the main thread — it's whatever thread created the <code>ViewRootImpl</code>. In AOSP system UI code (SystemUI, Launcher), you'll occasionally see View trees created on dedicated <code>HandlerThread</code>s for isolation. The entire View tree then runs on that thread, including traversals and input dispatch. This is an advanced pattern used for system overlays that must not block the main thread, but it's extremely fragile — any cross-thread View access will crash.
+</div>
+
+<h3>The isLayoutRequested() Check</h3>
+
+<p>When <code>requestLayout()</code> propagates up the tree, each <code>ViewGroup</code> checks <code>isLayoutRequested()</code> to avoid redundant propagation:</p>
+
+<pre><code>// View.requestLayout()
+if (mParent != null &amp;&amp; !mParent.isLayoutRequested()) {
+    mParent.requestLayout();
+}
+
+// If the parent already has PFLAG_FORCE_LAYOUT set (from a previous
+// requestLayout() in the same frame), propagation stops.
+// This prevents O(n²) propagation when multiple children request layout.</code></pre>
+
+<h3>View IDs and Tag System</h3>
+
+<pre><code>// View.findViewById() walks the tree recursively — O(n)
+// For deep trees, this is expensive. Cache references in onViewCreated() or use ViewBinding.
+
+// View tags: arbitrary key-value storage on any View
+view.setTag(R.id.my_key, someObject)
+val obj = view.getTag(R.id.my_key)
+
+// Tags use a SparseArray internally — O(log n) lookup
+// Common use: ViewHolder pattern (pre-RecyclerView), avoiding redundant work in adapters</code></pre>
+
+<div class="callout danger">
+  <div class="callout-label">Danger — Leaking via View Tags</div>
+  Storing Activity or Fragment references in View tags creates a leak path. The View may outlive the Activity (e.g., if it's in a static cache or a <code>RecyclerView.RecycledViewPool</code> shared across Activities). Always store lightweight data in tags, never lifecycle-scoped objects. The same applies to <code>View.setTag(Object)</code> — the tag holds a strong reference.
+</div>
+
+<!-- ============================================================ -->
+<h2>Summary — The Big Picture</h2>
+
+<div class="diagram-container">
+<pre><code>                    ┌──────────────────────────────┐
+                    │     WindowManagerService      │  (system_server)
+                    │  WindowState  │  InputDispatcher│
+                    └──────┬───────┴───────┬────────┘
+                           │ Binder IPC    │ InputChannel
+                    ┌──────▼───────────────▼────────┐
+                    │       ViewRootImpl             │  (app process, UI thread)
+                    │                                │
+                    │  ┌─ Choreographer (VSYNC)      │
+                    │  ├─ Surface (drawing target)   │
+                    │  ├─ AttachInfo (shared context) │
+                    │  └─ InputEventReceiver         │
+                    └──────────────┬─────────────────┘
+                                   │ mView
+                    ┌──────────────▼─────────────────┐
+                    │         DecorView               │
+                    │    (system chrome + content)     │
+                    └──────────────┬─────────────────┘
+                                   │
+                    ┌──────────────▼─────────────────┐
+                    │     android.R.id.content        │
+                    │       (FrameLayout)             │
+                    └──────────────┬─────────────────┘
+                                   │
+                    ┌──────────────▼─────────────────┐
+                    │       YOUR VIEW TREE            │
+                    │  (ConstraintLayout, RecyclerView│
+                    │   TextView, ImageView, etc.)    │
+                    └────────────────────────────────┘
+
+  Each VSYNC frame (when dirty):
+    performTraversals()
+      → performMeasure()   — top-down, MeasureSpec negotiation
+      → performLayout()    — top-down, position assignment
+      → performDraw()      — display list recording → RenderThread → GPU → SurfaceFlinger</code></pre>
+</div>
+
+<footer>
+  <a href="index.html">← Back to Index</a>
+  <a href="02-measure-layout.html">Next: Measure &amp; Layout →</a>
+</footer>
+
+</body>
+</html>

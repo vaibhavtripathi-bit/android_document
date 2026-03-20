@@ -1,0 +1,1424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 — PackageManagerService Internals — Scanning, Installation, Permissions & Intent Resolution</title>
+<style>
+  :root { --bg: #ffffff; --surface: #f7f8fa; --surface2: #edeef2; --border: #d4d7e0; --text: #1e2028; --text-dim: #5c6070; --accent: #2563eb; --accent2: #7c3aed; --green: #16803c; --red: #dc2626; --orange: #c2410c; --yellow: #a16207; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); font-size: 1.08rem; line-height: 1.75; padding: 2rem; max-width: 920px; margin: 0 auto; }
+  h1 { font-size: 2.2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.6rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.25rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; color: var(--text); }
+  .nav a.active { background: var(--accent); color: #fff; }
+  code { background: #f0f1f5; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #c7254e; border: 1px solid #e2e4ea; }
+  pre { background: #fafbfc; border: 1px solid #d4d7e0; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 1rem; line-height: 1.7; }
+  pre code { color: #2e3440; border: none; background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: #f0f4ff; padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: #f5f0ff; }
+  .callout.warn { border-left-color: var(--orange); background: #fff7ed; }
+  .callout.danger { border-left-color: var(--red); background: #fef2f2; }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--bg); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-ams-wms-overview.html">01 AMS &amp; WMS</a>
+  <a href="02-activity-manager-internals.html">02 AMS Internals</a>
+  <a href="03-window-manager-internals.html">03 WMS Internals</a>
+  <a class="active" href="04-package-manager-internals.html">04 PMS Internals</a>
+  <a href="05-system-server-boot.html">05 Boot Sequence</a>
+  <a href="06-content-providers-internals.html">06 ContentProviders</a>
+  <a href="07-broadcast-internals.html">07 Broadcasts</a>
+  <a href="08-interview-qa.html">08 Interview Q&amp;A</a>
+</div>
+
+<h1>04 — PackageManagerService Internals</h1>
+<p class="subtitle">How Android discovers, installs, verifies, and resolves every package on the device — from boot-time scanning to runtime intent matching, permission enforcement, and APEX modules</p>
+
+<!-- ============================================================ -->
+<h2>1. PMS Architecture — The Package Authority</h2>
+
+<p><code>PackageManagerService</code> (PMS) is one of the very first services started during <code>system_server</code>'s bootstrap phase. It is the single source of truth for everything package-related: what's installed, what permissions exist, which component handles which intent, and whether an APK's signature is trusted.</p>
+
+<div class="diagram-container">
+<pre><code>  system_server bootstrap order (simplified)
+  ──────────────────────────────────────────
+  Installer                        ← installd socket connection
+    → DeviceIdentifiersPolicyService
+      → ActivityTaskManagerService
+        → ActivityManagerService
+          → PowerManagerService
+            → PackageManagerService  ← HERE: scans ALL packages
+              → UserManagerService
+                → OverlayManagerService
+                  → ... (core + other services)
+
+  PMS must start early because almost every other service
+  depends on package metadata (permissions, components, etc.)</code></pre>
+</div>
+
+<h3>Core Responsibilities</h3>
+
+<table>
+  <tr>
+    <th>Responsibility</th>
+    <th>Key Classes</th>
+    <th>Persistent State</th>
+  </tr>
+  <tr>
+    <td>Package scanning &amp; parsing</td>
+    <td><code>PackageParser2</code>, <code>ParsingPackage</code></td>
+    <td>In-memory package cache</td>
+  </tr>
+  <tr>
+    <td>Install / uninstall</td>
+    <td><code>InstallPackageHelper</code>, <code>PackageInstallerService</code></td>
+    <td><code>/data/system/packages.xml</code></td>
+  </tr>
+  <tr>
+    <td>Permission management</td>
+    <td><code>PermissionManagerService</code>, <code>AppOpsManager</code></td>
+    <td><code>/data/system/runtime-permissions.xml</code></td>
+  </tr>
+  <tr>
+    <td>Intent resolution</td>
+    <td><code>IntentResolver</code>, <code>ComponentResolver</code></td>
+    <td><code>PreferredActivity</code> records</td>
+  </tr>
+  <tr>
+    <td>Signature verification</td>
+    <td><code>ApkSignatureVerifier</code></td>
+    <td>Signing certificates in <code>packages.xml</code></td>
+  </tr>
+  <tr>
+    <td>dexopt coordination</td>
+    <td><code>ArtManagerService</code>, <code>installd</code></td>
+    <td><code>/data/dalvik-cache/</code>, <code>/data/app/*/oat/</code></td>
+  </tr>
+</table>
+
+<h3>The Computer Snapshot Model (Android 12+)</h3>
+
+<pre><code>// Before Android 12, PMS used a single global lock for all queries.
+// This caused severe contention — every getPackageInfo(), queryIntentActivities(),
+// checkPermission() call competed for the same lock.
+
+// Android 12 introduced the Computer snapshot model:
+// Source: frameworks/base/services/core/java/com/android/server/pm/Computer.java
+
+// PMS now maintains an immutable snapshot of package state:
+// - Mutations (install, uninstall, permission grant) update the live state
+//   then atomically publish a new Computer snapshot
+// - Read queries (getPackageInfo, resolveIntent) run against the snapshot
+//   with NO lock contention
+
+// This is essentially a copy-on-write / MVCC pattern:
+class PackageManagerService {
+    // The live mutable state — protected by mLock
+    private val mSettings: Settings
+    private val mPackages: Map&lt;String, AndroidPackage&gt;
+
+    // The snapshot — atomically swapped, lock-free reads
+    @Volatile
+    private var mComputer: Computer
+
+    fun snapshotComputer(): Computer {
+        return mComputer  // Lock-free read
+    }
+
+    // After any mutation:
+    private fun invalidateComputer() {
+        mComputer = ComputerEngine(mSettings.snapshot(), mPackages.snapshot())
+    }
+}
+
+// Impact: resolveIntent() went from ~2ms (lock-contended) to ~0.1ms on Pixel</code></pre>
+
+<h3>The Settings Class — Persistent Package State</h3>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/pm/Settings.java
+// Persists to: /data/system/packages.xml
+
+// Settings maintains a PackageSetting for every known package:
+class PackageSetting {
+    val name: String                    // e.g., "com.google.android.gms"
+    val codePath: File                  // e.g., /data/app/com.google.android.gms-xxx/
+    val resourcePath: File              // Same as codePath for monolithic APKs
+    val primaryCpuAbi: String?          // e.g., "arm64-v8a"
+    val secondaryCpuAbi: String?        // e.g., "armeabi-v7a"
+    val versionCode: Long               // From manifest
+    val signatures: PackageSignatures   // Signing certificate chain
+    val installPermissionsFixed: Boolean
+    val pkgFlags: Int                   // FLAG_SYSTEM, FLAG_UPDATED_SYSTEM_APP, etc.
+
+    // Per-user state (multi-user support):
+    val userState: SparseArray&lt;PackageUserState&gt;
+    // PackageUserState per userId:
+    //   installed: Boolean      — is it installed for this user?
+    //   enabled: Int            — ENABLED / DISABLED / DISABLED_USER
+    //   hidden: Boolean         — hidden by admin?
+    //   stopped: Boolean        — force-stopped?
+    //   notLaunched: Boolean    — never launched since install?
+}
+
+// packages.xml structure (simplified):
+// &lt;packages&gt;
+//   &lt;package name="com.example.app" codePath="/data/app/..." ft="1a2b3c" ut="1a2b3c"
+//            version="42" userId="10123"&gt;
+//     &lt;sigs count="1"&gt;
+//       &lt;cert index="0" key="MIIBIj..." /&gt;
+//     &lt;/sigs&gt;
+//     &lt;perms&gt;
+//       &lt;item name="android.permission.INTERNET" granted="true" /&gt;
+//     &lt;/perms&gt;
+//   &lt;/package&gt;
+// &lt;/packages&gt;</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Critical File</div>
+  <p><code>/data/system/packages.xml</code> is the single most important file for PMS. If it becomes corrupted and the backup (<code>packages-backup.xml</code>) is also lost, the device effectively loses all knowledge of installed packages — permissions, signing certificates, user state — and typically requires a factory reset. PMS writes atomically (write to temp, fsync, rename) to minimize corruption risk.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Package Scanning — Boot Time</h2>
+
+<p>When the device boots, PMS must discover every installed package. This is the most time-consuming part of PMS initialization and a major contributor to boot time.</p>
+
+<h3>Scan Directories</h3>
+
+<table>
+  <tr>
+    <th>Directory</th>
+    <th>Contents</th>
+    <th>Flags</th>
+  </tr>
+  <tr>
+    <td><code>/system/app/</code></td>
+    <td>Non-privileged system apps</td>
+    <td><code>FLAG_SYSTEM</code></td>
+  </tr>
+  <tr>
+    <td><code>/system/priv-app/</code></td>
+    <td>Privileged system apps (can hold <code>signatureOrSystem</code> perms)</td>
+    <td><code>FLAG_SYSTEM | FLAG_PRIVILEGED</code></td>
+  </tr>
+  <tr>
+    <td><code>/data/app/</code></td>
+    <td>User-installed apps</td>
+    <td>(none)</td>
+  </tr>
+  <tr>
+    <td><code>/vendor/app/</code></td>
+    <td>Vendor-specific apps</td>
+    <td><code>FLAG_SYSTEM</code></td>
+  </tr>
+  <tr>
+    <td><code>/product/app/</code></td>
+    <td>Product partition apps (Android 9+)</td>
+    <td><code>FLAG_SYSTEM</code></td>
+  </tr>
+  <tr>
+    <td><code>/apex/*/</code></td>
+    <td>APEX module contents (Android 10+)</td>
+    <td>Special APEX handling</td>
+  </tr>
+</table>
+
+<h3>The Scanning Pipeline</h3>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/pm/
+// Key classes: ScanPackageUtils, PackageParser2, ParsingPackageUtils
+
+// Boot-time scanning flow:
+// 1. PMS constructor reads packages.xml → known packages with cached metadata
+// 2. For each scan directory:
+//    a. List APK files (or directories containing split APKs)
+//    b. Check if APK has changed since last scan (mtime comparison)
+//    c. If unchanged AND cached parse result exists → skip parsing (fast path)
+//    d. If changed → full parse with PackageParser2
+
+// PackageParser2 (replaced the monolithic PackageParser in Android 11):
+// - Parses AndroidManifest.xml from the APK (binary XML)
+// - Extracts: package name, version, components, permissions, uses-sdk, etc.
+// - Returns a ParsingPackage (builder) → converted to AndroidPackage (immutable)
+
+// Component registration during scanning:
+// For each parsed package, PMS registers:
+//   Activities    → mComponentResolver.addActivity(activity)
+//   Services      → mComponentResolver.addService(service)
+//   Receivers     → mComponentResolver.addReceiver(receiver)
+//   Providers     → mComponentResolver.addProvider(provider)
+//   Permissions   → mPermissionManager.addPermission(permission)
+//   Instrumentations → mInstrumentation.put(...)
+
+// After scanning, PMS reconciles:
+// - Packages in packages.xml but missing from disk → mark uninstalled
+// - Packages on disk but not in packages.xml → new install (assign UID)
+// - Updated system apps: /data/app/ version overlays /system/app/ version</code></pre>
+
+<h3>Signature Verification During Scan</h3>
+
+<pre><code>// Every APK is verified against its signing certificate(s).
+// PMS supports four APK signing schemes:
+
+// v1 — JAR Signing (original, Android 1.0+)
+//   Signs individual files in META-INF/
+//   Vulnerable: unsigned portions of the ZIP can be modified
+//   Slow: must decompress and verify each entry
+
+// v2 — APK Signature Scheme (Android 7.0+)
+//   Signs the ENTIRE APK as a binary blob
+//   Signing block inserted before the Central Directory
+//   Fast: no decompression needed, streaming verification
+//   Tamper-proof: any byte change invalidates the signature
+
+// v3 — APK Signature Scheme v3 (Android 9.0+)
+//   Adds key rotation support via proof-of-rotation chain
+//   An app can rotate its signing key while maintaining trust
+//   Critical for long-lived apps that need to change keys
+
+// v4 — APK Signature Scheme v4 (Android 11+)
+//   Produces a separate .idsig file (Merkle tree of 4KB blocks)
+//   Enables incremental installation (ADB Incremental / Play)
+//   APK can start installing before fully downloaded
+
+// Verification order: v4 → v3 → v2 → v1 (highest first)
+// If v2+ is present, v1 is ignored (stronger scheme takes precedence)
+
+// Source: frameworks/base/core/java/android/util/apk/ApkSignatureVerifier.java
+// ApkSignatureVerifier.verify(apkPath, minSignatureScheme)
+//   → ApkSignatureSchemeV4Verifier.verify()
+//   → ApkSignatureSchemeV3Verifier.verify()
+//   → ApkSignatureSchemeV2Verifier.verify()
+//   → ApkSigningBlockUtils.verifyJarSignature()  // v1 fallback</code></pre>
+
+<h3>Boot Time Optimization</h3>
+
+<pre><code>// Scanning 200+ packages on first boot can take 30+ seconds.
+// PMS uses several strategies to minimize boot time:
+
+// 1. Parallel scanning (Android 10+)
+//    System partition packages are scanned in parallel using a thread pool.
+//    /data/app/ packages are also parallelized.
+//    ParallelPackageParser wraps PackageParser2 with a work queue.
+
+// 2. Cached parsing results
+//    On subsequent boots, PMS caches parsed package metadata.
+//    If the APK file hasn't changed (same mtime + size), the cached
+//    result is reused — skipping expensive manifest parsing.
+//    Cache location: /data/system/package_cache/
+
+// 3. Incremental scan
+//    Only re-scan packages whose files have changed since last boot.
+//    packages.xml records the last-modified time for each package.
+
+// 4. Deferred dexopt
+//    First boot: only dexopt critical-path packages (SystemUI, Launcher, Settings)
+//    Background: bg-dexopt-job runs idle-time optimization for the rest
+//    This trades first-launch performance for faster boot time.
+
+// 5. Profiles from Play (Cloud Profiles, Android 12+)
+//    Pre-compiled hot methods based on aggregated user profiles
+//    Reduces the need for on-device profiling + recompilation</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — PMS Boot Time is a System-Wide Bottleneck</div>
+  <p>PMS scanning blocks the entire <code>system_server</code> bootstrap. No other service can fully initialize until PMS finishes because they depend on package metadata (permissions, component registrations, shared library paths). On devices with 200+ pre-installed apps (common on OEM devices with bloatware), first-boot PMS scan can exceed 45 seconds. At Google, this is tracked as a critical boot-time metric. The Android 12 <code>Computer</code> snapshot model and Android 10 parallel scanning were direct responses to PMS being the #1 boot-time bottleneck. A Staff Engineer working on system performance should know that adding a new system app to <code>/system/priv-app/</code> has a measurable boot-time cost — and that the <code>package_cache</code> invalidation strategy (mtime-based) can cause full re-scans when OTA updates touch timestamps.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. App Installation Flow</h2>
+
+<p>Installation is a multi-stage pipeline that involves user-space services, a privileged native daemon, and the kernel. Understanding this flow is essential for debugging install failures.</p>
+
+<div class="diagram-container">
+<pre><code>  App Installation Pipeline
+  ═════════════════════════
+
+  Play Store / adb install / PackageInstaller UI
+      │
+      ▼
+  PackageInstaller API (client-side)
+      │ createSession() → openSession() → write APK → commit()
+      ▼
+  PackageInstallerService (system_server, Binder)
+      │ Validates session, checks caller permissions
+      ▼
+  InstallPackageHelper
+      │
+      ├─── Stage 1: COPY
+      │    Copy APK to staging dir /data/app/vmdl*.tmp/
+      │    (via installd for privilege separation)
+      │
+      ├─── Stage 2: VERIFY
+      │    ├── Signature verification (ApkSignatureVerifier)
+      │    ├── Package verification (Play Protect → VerifyingSession)
+      │    └── Permission review (new permissions check)
+      │
+      ├─── Stage 3: PREPARE
+      │    ├── Extract native libs (.so) to lib/ directory
+      │    ├── Create app data directories (/data/data/&lt;pkg&gt;/)
+      │    └── Assign UID (or reuse existing for updates)
+      │
+      ├─── Stage 4: DEXOPT
+      │    ├── installd → dex2oat (AOT compilation)
+      │    ├── speed-profile or speed compilation filter
+      │    └── Output: .odex + .vdex in oat/ directory
+      │
+      └─── Stage 5: COMMIT
+           ├── Rename staging dir to final path
+           ├── Update packages.xml atomically
+           ├── Register components with PMS resolvers
+           ├── Send ACTION_PACKAGE_ADDED broadcast
+           └── Notify launcher to show new icon</code></pre>
+</div>
+
+<h3>The installd Daemon</h3>
+
+<pre><code>// installd is a native daemon running as root (UID 0).
+// PMS (running as system, UID 1000) cannot directly perform privileged
+// file operations — it delegates to installd via a Binder interface.
+
+// Source: frameworks/native/cmds/installd/
+
+// Key operations installd performs:
+// - createAppData()     → mkdir /data/data/&lt;pkg&gt;/, chown to app UID
+// - clearAppData()      → rm -rf app data directories
+// - destroyAppData()    → remove all traces of an app
+// - dexopt()            → fork+exec dex2oat for AOT compilation
+// - moveCompleteApp()   → atomic rename of staging → final directory
+// - fixupAppData()      → fix ownership/permissions after restore
+// - createOatDir()      → create oat/ directory for compiled code
+// - linkNativeLibraryDirectory() → symlink native libs
+
+// Why a separate daemon?
+// 1. PMS runs as UID 1000 (system) — can't chown to arbitrary UIDs
+// 2. dex2oat needs to run with specific capabilities
+// 3. File operations need root for cross-UID directory creation
+// 4. Privilege separation: PMS logic is isolated from root operations
+
+// Communication: PMS → IInstalld (AIDL over Binder)
+// installd registers as "installd" with ServiceManager</code></pre>
+
+<h3>Split APKs and App Bundles</h3>
+
+<pre><code>// Modern apps use Android App Bundles (AAB) → Play generates split APKs:
+
+// Base APK: contains code + resources common to all devices
+// Config APKs: device-specific resources
+//   - base-xxhdpi.apk        (density split)
+//   - base-arm64_v8a.apk     (ABI split)
+//   - base-en.apk            (language split)
+// Feature APKs: dynamic feature modules
+//   - feature_camera.apk     (on-demand feature)
+
+// On-device structure:
+// /data/app/com.example.app-randomSuffix/
+//   ├── base.apk
+//   ├── split_config.xxhdpi.apk
+//   ├── split_config.arm64_v8a.apk
+//   ├── split_config.en.apk
+//   └── lib/
+//       └── arm64/
+//           └── libnative.so
+
+// PMS tracks split APKs as a single PackageSetting:
+// PackageSetting.splitNames = ["config.xxhdpi", "config.arm64_v8a", "config.en"]
+// PackageSetting.splitCodePaths = [path1, path2, path3]
+
+// Install flow for splits:
+// 1. PackageInstaller session opened with multi-package mode
+// 2. Each split APK written to the session
+// 3. On commit, PMS verifies ALL splits have the same:
+//    - Package name
+//    - Version code
+//    - Signing certificate
+// 4. Splits are installed atomically — all or nothing</code></pre>
+
+<h3>Instant Apps</h3>
+
+<pre><code>// Instant Apps (Android 6.0+, now "Google Play Instant"):
+// Apps that run without full installation.
+
+// How it works:
+// 1. User clicks a URL → Play resolves to an instant app
+// 2. Play downloads a small instant APK (max 15MB → 10MB limit removed)
+// 3. PMS installs it with FLAG_INSTANT — restricted sandbox:
+//    - No background services
+//    - No implicit broadcasts
+//    - Limited permissions (no CALL_PHONE, READ_CONTACTS, etc.)
+//    - Invisible to other apps (package visibility)
+//    - Data cleared after inactivity timeout
+// 4. If user "installs" → PMS upgrades to full install, preserving data
+
+// PMS handling:
+// Instant apps have a separate visibility domain:
+// - Regular apps can't see instant apps via getInstalledPackages()
+// - Instant apps can't see other apps (strict package visibility)
+// - Only the app that handled the URL can see the instant app</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. Permission Management</h2>
+
+<p>Permission enforcement is split across multiple components. PMS owns the permission registry, <code>PermissionManagerService</code> handles grant/revoke logic, and <code>AppOpsManager</code> provides the runtime enforcement layer.</p>
+
+<h3>Permission Architecture</h3>
+
+<div class="diagram-container">
+<pre><code>  Permission Enforcement Stack
+  ════════════════════════════
+
+  App calls a protected API (e.g., getLastLocation())
+      │
+      ▼
+  System service checks permission:
+  context.checkCallingPermission("android.permission.ACCESS_FINE_LOCATION")
+      │
+      ▼
+  PermissionManagerService.checkPermission()
+      │
+      ├── Is permission granted in packages.xml / runtime-permissions.xml?
+      │   YES → check AppOps
+      │   NO  → PERMISSION_DENIED
+      │
+      ▼
+  AppOpsManager.noteOp(OP_FINE_LOCATION, uid, packageName)
+      │
+      ├── MODE_ALLOWED  → proceed
+      ├── MODE_IGNORED  → return empty/default (no crash)
+      ├── MODE_ERRORED  → throw SecurityException
+      └── MODE_FOREGROUND → allowed only if app is in foreground
+
+  Two-layer model:
+  - Permissions = static grant (user said "yes")
+  - AppOps = dynamic enforcement (system can override at runtime)</code></pre>
+</div>
+
+<h3>Permission Levels</h3>
+
+<table>
+  <tr>
+    <th>Level</th>
+    <th>Grant Mechanism</th>
+    <th>Example</th>
+  </tr>
+  <tr>
+    <td><code>normal</code></td>
+    <td>Auto-granted at install, no user prompt</td>
+    <td><code>INTERNET</code>, <code>VIBRATE</code>, <code>WAKE_LOCK</code></td>
+  </tr>
+  <tr>
+    <td><code>dangerous</code></td>
+    <td>Runtime prompt (Android 6+), per-group grant</td>
+    <td><code>CAMERA</code>, <code>LOCATION</code>, <code>READ_CONTACTS</code></td>
+  </tr>
+  <tr>
+    <td><code>signature</code></td>
+    <td>Only to apps signed with same certificate as declarer</td>
+    <td><code>MANAGE_DOCUMENTS</code></td>
+  </tr>
+  <tr>
+    <td><code>signatureOrSystem</code></td>
+    <td>Same cert OR app in <code>/system/priv-app/</code> (deprecated)</td>
+    <td><code>INSTALL_PACKAGES</code></td>
+  </tr>
+  <tr>
+    <td><code>internal</code></td>
+    <td>Only grantable to system UID apps (Android 11+)</td>
+    <td>Platform-internal permissions</td>
+  </tr>
+</table>
+
+<h3>Permission Grant Flow</h3>
+
+<pre><code>// When a user grants a runtime permission:
+
+// 1. App calls ActivityCompat.requestPermissions()
+//    → starts the system permission dialog (GrantPermissionsActivity)
+
+// 2. User taps "Allow"
+//    → PermissionController (system app) calls:
+//       PackageManager.grantRuntimePermission(pkg, permission, user)
+
+// 3. PMS delegates to PermissionManagerService (split out in Android 10):
+//    PermissionManagerService.grantRuntimePermission()
+//      → validates: is it a dangerous permission? is the app targeting correct SDK?
+//      → updates in-memory permission state
+//      → persists to /data/system/users/{userId}/runtime-permissions.xml
+
+// 4. PMS notifies the app:
+//    onRequestPermissionsResult(requestCode, permissions, grantResults)
+
+// runtime-permissions.xml structure:
+// &lt;runtime-permissions&gt;
+//   &lt;pkg name="com.example.app"&gt;
+//     &lt;item name="android.permission.CAMERA" granted="true" flags="0" /&gt;
+//     &lt;item name="android.permission.READ_CONTACTS" granted="false" flags="2" /&gt;
+//   &lt;/pkg&gt;
+// &lt;/runtime-permissions&gt;
+
+// Permission flags (bitmask):
+// FLAG_PERMISSION_USER_SET = 1          — user explicitly set
+// FLAG_PERMISSION_USER_FIXED = 2        — user denied with "don't ask again"
+// FLAG_PERMISSION_POLICY_FIXED = 4      — set by device admin
+// FLAG_PERMISSION_REVOKED_COMPAT = 8    — revoked for compat (targetSdk upgrade)
+// FLAG_PERMISSION_ONE_TIME = 16         — one-time grant (Android 11+)
+// FLAG_PERMISSION_AUTO_REVOKED = 32     — auto-revoked for unused apps (Android 11+)</code></pre>
+
+<h3>PermissionManagerService Split</h3>
+
+<pre><code>// Before Android 10: all permission logic lived inside PMS (~15K lines).
+// Android 10 extracted it into PermissionManagerService for:
+// 1. Separation of concerns — PMS was a 20K+ line god class
+// 2. Testability — permission logic can be tested independently
+// 3. Mainline readiness — permission module could theoretically be updatable
+
+// PermissionManagerService handles:
+// - checkPermission() / checkUidPermission()
+// - grantRuntimePermission() / revokeRuntimePermission()
+// - Permission group management
+// - Permission auto-revocation (unused apps, Android 11+)
+// - One-time permissions (Android 11+)
+
+// PMS still owns:
+// - Permission declaration (parsing &lt;permission&gt; from manifests)
+// - Install-time permission granting (normal + signature)
+// - The packages.xml persistence layer for install permissions</code></pre>
+
+<!-- ============================================================ -->
+<h2>5. Intent Resolution</h2>
+
+<p>Intent resolution is how Android decides which component handles an implicit intent. PMS maintains indexed data structures for fast matching across thousands of registered intent filters.</p>
+
+<h3>The Resolution Engine</h3>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/pm/
+//         resolution/ComponentResolver.java
+// Source: frameworks/base/core/java/android/content/IntentFilter.java
+
+// ComponentResolver maintains four IntentResolver instances:
+// - mActivities   → resolves to Activity components
+// - mServices     → resolves to Service components
+// - mReceivers    → resolves to BroadcastReceiver components
+// - mProviders    → resolves to ContentProvider components
+
+// IntentResolver&lt;F extends IntentFilter, R extends ResolveInfo&gt;
+// uses a multi-index structure for fast matching:
+//   mSchemeToFilter:    Map&lt;String, List&lt;F&gt;&gt;   // "https" → [filter1, filter2]
+//   mActionToFilter:    Map&lt;String, List&lt;F&gt;&gt;   // "VIEW" → [filter1, filter3]
+//   mTypedActionToFilter: Map&lt;String, List&lt;F&gt;&gt; // actions with MIME types
+//   mTypeToFilter:      Map&lt;String, List&lt;F&gt;&gt;   // "image/*" → [filter4]
+//   mBaseTypeToFilter:  Map&lt;String, List&lt;F&gt;&gt;   // "image" → [filter4, filter5]
+//   mWildTypeToFilter:  List&lt;F&gt;                 // "*/*" → [filter6]
+
+// Resolution algorithm for queryIntentActivities():
+fun queryIntentActivities(intent: Intent, flags: Int): List&lt;ResolveInfo&gt; {
+    // Step 1: Explicit intent? → direct lookup by ComponentName
+    if (intent.component != null) {
+        return listOf(getActivityInfo(intent.component))
+    }
+
+    // Step 2: Implicit intent → match against all registered filters
+    val candidates = mutableListOf&lt;ResolveInfo&gt;()
+
+    // 2a. Find filters matching the action
+    val actionFilters = mActionToFilter[intent.action] ?: emptyList()
+
+    // 2b. For each candidate filter, check ALL match criteria:
+    for (filter in actionFilters) {
+        val match = filter.match(
+            intent.action,        // Action match
+            intent.type,          // MIME type match
+            intent.scheme,        // URI scheme match
+            intent.data,          // URI authority + path match
+            intent.categories,    // Category match
+            "IntentResolver"      // Tag for logging
+        )
+        if (match >= 0) {
+            candidates.add(ResolveInfo(filter, match))
+        }
+    }
+
+    // Step 3: Sort by priority and specificity
+    candidates.sortWith(ResolveInfo.COMPARATOR)
+
+    // Step 4: Apply package visibility filtering (Android 11+)
+    return filterByVisibility(candidates, callingUid)
+}</code></pre>
+
+<h3>Intent Filter Matching Rules</h3>
+
+<table>
+  <tr>
+    <th>Criterion</th>
+    <th>Match Rule</th>
+    <th>Required?</th>
+  </tr>
+  <tr>
+    <td>Action</td>
+    <td>Filter must contain the intent's action (or have no actions = match all)</td>
+    <td>Yes (if intent has action)</td>
+  </tr>
+  <tr>
+    <td>Category</td>
+    <td>Filter must contain ALL of the intent's categories</td>
+    <td>Yes (all must match)</td>
+  </tr>
+  <tr>
+    <td>Data — scheme</td>
+    <td><code>https</code>, <code>content</code>, <code>geo</code>, etc.</td>
+    <td>If filter declares data</td>
+  </tr>
+  <tr>
+    <td>Data — authority</td>
+    <td>Host + port match</td>
+    <td>If filter declares authority</td>
+  </tr>
+  <tr>
+    <td>Data — path</td>
+    <td>Literal, prefix, or pattern match</td>
+    <td>If filter declares path</td>
+  </tr>
+  <tr>
+    <td>Data — MIME type</td>
+    <td><code>image/png</code>, <code>image/*</code>, <code>*/*</code></td>
+    <td>If filter declares type</td>
+  </tr>
+</table>
+
+<h3>Default App Handling and App Links</h3>
+
+<pre><code>// When multiple apps match an implicit intent, Android shows the chooser.
+// Users can select "Always" → creates a PreferredActivity record.
+
+// App Links (Android 6.0+) bypass the chooser entirely:
+// 1. App declares autoVerify in its intent filter:
+//    &lt;intent-filter android:autoVerify="true"&gt;
+//        &lt;action android:name="android.intent.action.VIEW" /&gt;
+//        &lt;category android:name="android.intent.category.BROWSABLE" /&gt;
+//        &lt;data android:scheme="https" android:host="example.com" /&gt;
+//    &lt;/intent-filter&gt;
+
+// 2. At install time, PMS triggers domain verification:
+//    DomainVerificationManagerInternal.verifyPackageDomains(pkg)
+//    → HTTP GET https://example.com/.well-known/assetlinks.json
+//    → Response must contain:
+//    [{
+//      "relation": ["delegate_permission/common.handle_all_urls"],
+//      "target": {
+//        "namespace": "android_app",
+//        "package_name": "com.example.app",
+//        "sha256_cert_fingerprints": ["AB:CD:EF:..."]
+//      }
+//    }]
+
+// 3. If verified → app becomes the default handler for that domain
+//    No chooser dialog, no "Always/Just Once" prompt
+
+// Android 12+ changes:
+// - Domain verification moved to DomainVerificationService (separate from PMS)
+// - Users can override verified links in Settings
+// - Unverified domains no longer auto-open in apps (must go through chooser)
+// - adb shell pm get-app-links &lt;package&gt;  → check verification status</code></pre>
+
+<!-- ============================================================ -->
+<h2>6. Package Verification and Security</h2>
+
+<h3>APK Signature Schemes — Deep Comparison</h3>
+
+<table>
+  <tr>
+    <th>Scheme</th>
+    <th>Android</th>
+    <th>What's Signed</th>
+    <th>Key Feature</th>
+    <th>Weakness</th>
+  </tr>
+  <tr>
+    <td>v1 (JAR)</td>
+    <td>1.0+</td>
+    <td>Individual ZIP entries</td>
+    <td>Backward compatible</td>
+    <td>Unsigned ZIP metadata can be modified (Janus vulnerability)</td>
+  </tr>
+  <tr>
+    <td>v2</td>
+    <td>7.0+</td>
+    <td>Entire APK as binary blob</td>
+    <td>Tamper-proof, fast streaming verification</td>
+    <td>No key rotation</td>
+  </tr>
+  <tr>
+    <td>v3</td>
+    <td>9.0+</td>
+    <td>Entire APK + rotation proof</td>
+    <td>Key rotation via proof-of-rotation chain</td>
+    <td>Complex rotation management</td>
+  </tr>
+  <tr>
+    <td>v4</td>
+    <td>11+</td>
+    <td>Merkle tree of 4KB blocks</td>
+    <td>Incremental install (stream before full download)</td>
+    <td>Requires v2/v3 as backing signature</td>
+  </tr>
+</table>
+
+<h3>Install-Time Verification Pipeline</h3>
+
+<pre><code>// When a new APK is being installed, PMS runs a multi-stage verification:
+
+// Stage 1: Signature Verification (mandatory)
+// ApkSignatureVerifier.verify(apkPath, minSchemeVersion)
+//   → Checks v4 → v3 → v2 → v1 in order
+//   → Extracts signing certificates
+//   → For updates: verifies new cert matches existing (or valid rotation chain)
+
+// Stage 2: Package Verification (optional, but enabled by default)
+// PMS broadcasts ACTION_PACKAGE_NEEDS_VERIFICATION
+//   → Google Play Protect (com.android.vending) receives this
+//   → Scans APK for malware, policy violations
+//   → Responds with VERIFICATION_ALLOW or VERIFICATION_REJECT
+//   → If no response within timeout (default 10s) → install proceeds
+
+// VerifyingSession manages the verification state machine:
+class VerifyingSession {
+    val requiredVerifierUid: Int      // Play Store UID
+    val sufficientVerifiers: List     // Additional verifiers
+    var verificationState: Int        // PENDING → ALLOWED / REJECTED
+    val timeoutMs: Long               // Verification timeout
+
+    // If verifier doesn't respond in time:
+    // Settings.Global.PACKAGE_VERIFIER_TIMEOUT → default 10000ms
+    // PMS proceeds with install (fail-open by default)
+}
+
+// Stage 3: Permission Review (Android 6.0+ with runtime permissions)
+// For apps targeting SDK 22 or below running on Android 6+:
+//   → All dangerous permissions are granted at install (compat mode)
+// For apps targeting SDK 23+:
+//   → Dangerous permissions are NOT granted at install
+//   → Must be requested at runtime</code></pre>
+
+<h3>Shared UID — Legacy and Deprecation</h3>
+
+<pre><code>// sharedUserId allows multiple packages signed with the same certificate
+// to run in the same Linux process and share data directories.
+
+// Manifest declaration:
+// &lt;manifest android:sharedUserId="com.example.shared" ...&gt;
+
+// How it works:
+// - PMS assigns the same Linux UID to all packages with matching sharedUserId
+// - They can access each other's files directly (same UID = same file permissions)
+// - They CAN run in the same process (if also sharing android:process)
+
+// Used extensively by AOSP:
+// - android.uid.system (UID 1000) — Settings, SystemUI, etc.
+// - android.uid.phone (UID 1001) — Phone, TelephonyProvider
+// - com.google.uid.shared — various Google apps
+
+// Why it's deprecated (Android 13+):
+// 1. Security: any compromise of one app exposes all shared-UID apps
+// 2. Complexity: PMS must track shared permission sets, shared signing certs
+// 3. Performance: shared UID packages can't be independently optimized
+// 4. Migration pain: once declared, sharedUserId can NEVER be removed
+//    (changing UID would lose access to all existing data)
+
+// Android 13 added: android:sharedUserMaxSdkVersion="32"
+// Allows new installs to skip sharedUserId on Android 13+ while
+// preserving it for existing installs (gradual migration)</code></pre>
+
+<!-- ============================================================ -->
+<h2>7. Mainline Modules and APEX</h2>
+
+<p>Project Mainline (Android 10+) fundamentally changed how system components are updated. Some packages are no longer traditional APKs in <code>/system/</code> — they're APEX modules mounted at boot and updatable via Play.</p>
+
+<h3>APEX Architecture</h3>
+
+<pre><code>// APEX = Android Pony EXpress — a container format for system modules
+// Unlike APKs (Dalvik bytecode + resources), APEX can contain:
+// - Native shared libraries (.so)
+// - Java libraries (JAR/DEX)
+// - Configuration files
+// - Entire filesystem images
+
+// APEX file structure:
+// my_module.apex
+// ├── apex_manifest.json     (name, version)
+// ├── apex_payload.img       (ext4 filesystem image)
+// │   ├── lib/               (native libraries)
+// │   ├── javalib/           (JAR files)
+// │   ├── etc/               (config files)
+// │   └── bin/               (executables)
+// └── META-INF/              (APK-compatible signing)
+
+// Boot-time mounting:
+// 1. apexd (native daemon) scans /system/apex/ and /data/apex/
+// 2. For each APEX, mounts apex_payload.img at /apex/&lt;name&gt;/
+// 3. If an updated version exists in /data/apex/, it takes precedence
+// 4. The mount is a loop device → dm-verity verified
+
+// Key Mainline modules:
+// com.android.conscrypt      → TLS/SSL (Conscrypt)
+// com.android.media          → Media codecs, extractors
+// com.android.media.swcodec  → Software codecs
+// com.android.networking.tethering → Tethering
+// com.android.wifi           → Wi-Fi stack
+// com.android.art            → ART runtime itself (!)</code></pre>
+
+<h3>PMS and APEX Integration</h3>
+
+<pre><code>// PMS handles APEX packages differently from regular APKs:
+
+// 1. Scanning: APEX packages are NOT scanned by PMS's normal scan path.
+//    ApexManager (backed by apexd) provides the list of active APEX modules.
+//    PMS queries ApexManager during boot to register APEX-provided packages.
+
+// 2. Updates: APEX updates come through Play Store but use a different path:
+//    Play Store → StagingManager → apexd (not PackageInstallerService)
+//    The update is staged and applied on next reboot (APEX can't hot-swap).
+
+// 3. Rollback: APEX supports automatic rollback:
+//    If a device bootloops after an APEX update, the bootloader increments
+//    a rollback counter → apexd falls back to the pre-update version.
+
+// 4. Package visibility: APEX-provided Java libraries appear as shared
+//    libraries in PMS. Apps declare &lt;uses-library&gt; to access them.
+
+// ApexManager interface:
+interface ApexManager {
+    fun getActiveApexInfos(): List&lt;ApexInfo&gt;
+    fun getStagedApexInfos(): List&lt;ApexInfo&gt;
+    fun submitStagedSession(sessionInfo: ApexSessionInfo): ApexInfoList
+    fun markStagedSessionReady(sessionId: Int)
+    fun markStagedSessionSuccessful(sessionId: Int)
+    fun revertActiveSessions()
+}
+
+// Impact on PMS:
+// - Some system components that were in /system/framework/ are now in /apex/
+// - ClassLoader paths must include /apex/&lt;module&gt;/javalib/
+// - PMS must coordinate with ApexManager for version queries
+// - dumpsys package shows APEX packages with special "apex" install reason</code></pre>
+
+<!-- ============================================================ -->
+<h2>8. Staff-Level Corner Cases</h2>
+
+<h3>packages.xml Corruption</h3>
+
+<pre><code>// packages.xml is written atomically, but corruption can still occur:
+// - Power loss during write (even with fsync, storage controller may lie)
+// - Storage hardware failure (bit rot on flash)
+// - Full /data partition (write truncated)
+
+// PMS defense:
+// 1. Write to packages.xml.tmp
+// 2. fsync(fd)
+// 3. rename(packages.xml.tmp → packages.xml)  // atomic on ext4/f2fs
+// 4. fsync(parent directory)
+
+// If packages.xml is corrupt at boot:
+// PMS tries packages-backup.xml (previous version)
+// If both corrupt → PMS reconstructs from APK scanning
+//   BUT: loses all runtime permission grants, preferred activities,
+//   disabled components, per-user state → effectively a soft factory reset
+
+// Staff insight: this is why OEMs test power-loss scenarios during OTA updates.
+// A corrupt packages.xml during an A/B OTA can brick the new slot.</code></pre>
+
+<h3>Signature Mismatch on Update</h3>
+
+<pre><code>// INSTALL_FAILED_UPDATE_INCOMPATIBLE — one of the most common install failures
+
+// Scenario: App v1 signed with key A is installed.
+//           App v2 signed with key B attempts to install as an update.
+// PMS rejects: signing certificate doesn't match.
+
+// This is INTENTIONAL — prevents malicious updates.
+// But it causes real problems:
+// 1. Developer lost their signing key → can never update, must use new package name
+// 2. CI/CD pipeline uses wrong keystore → update rejected on test devices
+// 3. System app OTA: /system/app/ has key A, /data/app/ overlay has key B
+
+// v3 signing scheme key rotation:
+// App can include a proof-of-rotation: chain from old key → new key
+// PMS verifies the chain and accepts the new key as a valid successor
+// BUT: the old key must sign the rotation proof — if the old key is lost,
+// rotation is impossible.
+
+// Google Play App Signing:
+// Play Store holds the upload key AND the app signing key
+// Developer signs with upload key → Play re-signs with app signing key
+// If upload key is compromised → developer can request key reset
+// The app signing key (held by Play) never changes</code></pre>
+
+<h3>Package Visibility (Android 11+)</h3>
+
+<pre><code>// Before Android 11: any app could call getInstalledPackages() and see
+// every installed app. This was a privacy concern (app fingerprinting).
+
+// Android 11+ enforces package visibility:
+// Apps can only see:
+// 1. Their own package
+// 2. Packages they interact with (bound services, content providers)
+// 3. Packages declared in &lt;queries&gt; in their manifest
+// 4. Packages matching an intent filter they declare
+
+// Manifest declaration:
+// &lt;queries&gt;
+//     &lt;package android:name="com.example.other" /&gt;
+//     &lt;intent&gt;
+//         &lt;action android:name="android.intent.action.SEND" /&gt;
+//         &lt;data android:mimeType="image/*" /&gt;
+//     &lt;/intent&gt;
+//     &lt;provider android:authorities="com.example.provider" /&gt;
+// &lt;/queries&gt;
+
+// QUERY_ALL_PACKAGES permission:
+// Normal permission that grants visibility to all packages.
+// Play Store policy restricts its use — only allowed for:
+// launchers, accessibility apps, device management, security apps, etc.
+
+// PMS enforcement:
+// PackageManagerService.filterAppAccess(callingUid, targetPkg)
+//   → checks if callingUid has visibility to targetPkg
+//   → if not, the target package appears as "not installed"
+//   → queryIntentActivities() also filters results by visibility
+
+// Impact on developers:
+// - startActivity() for an intent that matches a non-visible app → ActivityNotFoundException
+// - Must declare &lt;queries&gt; for any package they interact with
+// - PackageManager.getPackageInfo() returns NameNotFoundException for non-visible packages</code></pre>
+
+<h3>Hidden API Enforcement</h3>
+
+<pre><code>// Android 9+ restricts access to non-SDK interfaces (hidden APIs).
+// PMS enforces this via HiddenApiEnforcementPolicy.
+
+// API surfaces:
+// @SystemApi     → available to privileged system apps (allowlisted)
+// @TestApi       → available only in test builds
+// @hide          → internal, no stability guarantee
+
+// Restriction levels (greylist system):
+// - Allowlist (whitelist): freely accessible
+// - Light greylist: accessible but logged (may be restricted in future)
+// - Dark greylist: blocked for targetSdk >= threshold
+// - Blacklist: always blocked
+
+// PMS role:
+// When an app is loaded, PMS sets the hidden API enforcement policy
+// based on the app's targetSdkVersion:
+// - targetSdk < 28 → lenient (most hidden APIs accessible)
+// - targetSdk >= 28 → dark greylist blocked
+// - targetSdk >= 30 → stricter enforcement
+
+// Runtime enforcement:
+// ART checks the access flag on every reflection call / JNI lookup:
+// Class.forName("android.app.ActivityThread")
+//   .getDeclaredMethod("currentApplication")  // ← may be blocked
+// If blocked → NoSuchMethodException (as if the method doesn't exist)
+
+// Developer workaround (for debugging only):
+// adb shell settings put global hidden_api_policy 1  // disable enforcement</code></pre>
+
+<h3>dexopt Trade-offs</h3>
+
+<pre><code>// dexopt (DEX optimization via dex2oat) is coordinated by PMS + installd.
+// The compilation filter determines the trade-off:
+
+// Compilation filters:
+// verify          → only verify bytecode, interpret at runtime (fast install)
+// quicken         → verify + inline trivial operations (deprecated)
+// speed-profile   → AOT compile hot methods from profile (best balance)
+// speed           → AOT compile everything (largest output, longest compile)
+// everything      → compile + include debug info (testing only)
+
+// When dexopt runs:
+// 1. At install time: speed-profile (if profile available) or verify
+// 2. Background optimization (bg-dexopt-job):
+//    - Runs when device is idle + charging
+//    - Uses accumulated runtime profiles
+//    - Recompiles with speed-profile for better performance
+// 3. After OTA update:
+//    - All apps need re-dexopt (ART format may have changed)
+//    - "Optimizing apps" screen during first boot after OTA
+
+// Staff consideration:
+// speed-profile is almost always the right choice:
+// - 60-80% of the performance of full AOT (speed filter)
+// - 30-50% of the disk space
+// - Baseline Profiles provide the initial profile for Play-distributed apps
+//   so even first launch benefits from AOT-compiled hot paths
+
+// dumpsys package dexopt — shows dexopt state for all packages
+// cmd package compile -m speed-profile -f &lt;package&gt; — force recompile</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — PMS as the Trust Anchor</div>
+  <p>PMS is the <strong>trust anchor</strong> for the entire Android security model. Every permission check, every intent resolution, every app-to-app interaction ultimately traces back to PMS's knowledge of package identities (signing certificates) and granted permissions. A subtle bug in PMS's signature verification or permission checking has system-wide security implications. The <a href="https://source.android.com/docs/security/bulletin">Android Security Bulletins</a> regularly include PMS-related CVEs — for example, the Janus vulnerability (CVE-2017-13156) exploited v1 signing's inability to protect ZIP metadata, allowing a DEX file to be prepended to a valid APK. This is why Google moved aggressively to v2/v3 signing and why <code>minSignatureSchemeVersion</code> exists. At L6, you should understand that PMS's security posture is not just about code correctness — it's about the <em>entire chain</em>: signing scheme → certificate pinning in packages.xml → UID assignment → Linux kernel DAC → SELinux MAC.</p>
+</div>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — The Computer Snapshot as a Scalability Pattern</div>
+  <p>The Android 12 <code>Computer</code> snapshot model is a textbook example of solving read-write contention at scale. Before this change, PMS's global lock was the single biggest source of lock contention in <code>system_server</code> — every <code>resolveIntent()</code>, <code>getPackageInfo()</code>, and <code>checkPermission()</code> call from every app competed for the same lock. The snapshot model (essentially MVCC — Multi-Version Concurrency Control, the same pattern used by databases like PostgreSQL) made reads lock-free while mutations remain serialized. The trade-off is memory: each snapshot duplicates the package state. On a device with 300 packages, a snapshot is ~2-4MB. PMS invalidates and recreates the snapshot on every mutation (install, permission grant, component enable/disable), so high-frequency mutations (e.g., rapid permission toggling in tests) can cause GC pressure from snapshot churn. In a Staff interview, connecting PMS's internal architecture to database concurrency patterns demonstrates systems-thinking beyond Android.</p>
+</div>
+
+<h3>Essential Debugging Commands</h3>
+
+<pre><code>// Package inspection:
+// adb shell dumpsys package &lt;packagename&gt;
+//   → Shows EVERYTHING: version, signatures, permissions, components,
+//     install time, update time, dexopt state, shared libraries, etc.
+
+// Permission state:
+// adb shell dumpsys package permissions
+// adb shell pm list permissions -d -g   // dangerous permissions by group
+
+// Intent resolution debugging:
+// adb shell pm resolve-activity --brief &lt;intent&gt;
+// adb shell dumpsys package resolvers   // all registered intent filters
+
+// App links verification:
+// adb shell pm get-app-links &lt;package&gt;
+// adb shell pm verify-app-links --re-verify &lt;package&gt;
+
+// Package visibility:
+// adb shell dumpsys package queries     // who can see whom
+
+// dexopt state:
+// adb shell dumpsys package dexopt
+// adb shell cmd package compile -m speed-profile -f &lt;package&gt;
+
+// Install debugging:
+// adb shell pm install -r -t --full &lt;apk&gt;  // reinstall, allow test, full install
+// adb shell pm list packages -f             // list packages with APK paths
+// adb shell pm path &lt;package&gt;               // show APK path
+
+// APEX:
+// adb shell pm list packages --apex-only
+// adb shell cmd apexservice getActivePackages</code></pre>
+
+<!-- ============================================================ -->
+<h2>9. Computer Snapshot Invalidation</h2>
+
+<p>The <code>Computer</code> snapshot model (Section 1) provides lock-free reads, but the invalidation and rebuild cost is non-trivial. Understanding when and why snapshots are recreated is critical for diagnosing performance issues in PMS.</p>
+
+<h3>Invalidation Triggers</h3>
+
+<pre><code>// The Computer snapshot is recreated on EVERY mutation to package state:
+// - Package install / uninstall / update
+// - Permission grant / revoke
+// - Component enable / disable
+// - Package visibility change
+// - Shared library update
+// - APEX module activation
+
+// The invalidation call:
+// PackageManagerService.invalidatePackageInfoCache()
+//   → schedules snapshot rebuild
+//   → next call to snapshotComputer() creates a new ComputerEngine
+
+// Internally:
+private fun invalidateComputer() {
+    // Atomically swap the snapshot reference
+    mComputer = ComputerEngine(
+        mSettings.snapshot(),       // deep copy of Settings
+        mPackages.snapshot(),       // deep copy of package map
+        mComponentResolver.snapshot() // deep copy of intent resolvers
+    )
+}
+
+// Cost per rebuild:
+// - ~1-5ms for 200 packages (Pixel-class hardware)
+// - ~2-4MB allocation per snapshot
+// - Old snapshot becomes garbage → GC pressure</code></pre>
+
+<h3>Snapshot Churn Problem</h3>
+
+<pre><code>// High-frequency mutations cause rapid snapshot churn:
+// Example: automated test suite that toggles permissions rapidly
+//   grantRuntimePermission("com.test", "CAMERA", user0)     // → rebuild
+//   revokeRuntimePermission("com.test", "CAMERA", user0)    // → rebuild
+//   grantRuntimePermission("com.test", "LOCATION", user0)   // → rebuild
+//   // ... 100 times in a loop
+
+// Each rebuild allocates ~2-4MB → 200-400MB of garbage in seconds
+// This triggers frequent GC pauses in system_server
+
+// Mitigation strategies:
+// 1. Batch mutations: PMS internally batches some operations
+//    (e.g., multi-package install commits all at once)
+// 2. Lazy snapshot: the snapshot isn't rebuilt immediately —
+//    it's marked dirty and rebuilt on next read
+// 3. Structural sharing: some snapshot components share
+//    unchanged subtrees with the previous snapshot</code></pre>
+
+<h3>PackageManagerLocal API</h3>
+
+<pre><code>// The modern API for lock-free package queries:
+// Source: frameworks/base/services/core/java/com/android/server/pm/
+//         PackageManagerLocal.java
+
+// PackageManagerLocal.withFilteredSnapshot() provides a scoped snapshot
+// that automatically applies package visibility filtering:
+
+val pmLocal = LocalManagerRegistry.getManager(PackageManagerLocal::class.java)
+pmLocal.withFilteredSnapshot(callingUid, callingUserId) { snapshot ->
+    // All queries on this snapshot are:
+    // 1. Lock-free (no mLock contention)
+    // 2. Visibility-filtered (caller only sees allowed packages)
+    // 3. Consistent (point-in-time snapshot)
+    val pkgState = snapshot.getPackageState("com.example.app")
+    val resolvedIntent = snapshot.resolveIntent(intent, flags)
+}</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff Insight — MVCC Pattern Recognition</div>
+<p>The <code>Computer</code> snapshot is essentially <strong>MVCC</strong> (Multi-Version Concurrency Control) — the same pattern PostgreSQL uses for transaction isolation. Reads see a consistent snapshot without blocking writes; writes are serialized and publish new snapshots atomically. The trade-off is identical too: memory overhead from maintaining multiple versions, and GC pressure from discarding old snapshots. In a Staff interview, connecting PMS's internal architecture to database concurrency patterns demonstrates systems-level thinking. You might propose optimizations like <strong>structural sharing</strong> (only copy changed subtrees, like persistent data structures in functional programming) or <strong>snapshot pooling</strong> (reuse snapshot objects to reduce allocation).</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>10. VerifyingSession & Fail-Open Behavior</h2>
+
+<p>When an APK is installed, PMS sends it to registered verifiers (most commonly Google Play Protect) before allowing the install to proceed. The verification system has a deliberate — and controversial — fail-open design.</p>
+
+<h3>Verification Flow</h3>
+
+<pre><code>// When PMS receives a new APK for installation:
+
+// 1. PMS creates a VerifyingSession
+val session = VerifyingSession(
+    verificationId = nextId++,
+    installerUid = callingUid,
+    packageUri = apkUri,
+    requiredVerifierUid = playStoreUid,  // com.android.vending
+    timeoutMs = Settings.Global.PACKAGE_VERIFIER_TIMEOUT  // default: 10-60s
+)
+
+// 2. PMS broadcasts ACTION_PACKAGE_NEEDS_VERIFICATION
+//    → Only sent to the required verifier (Play Protect)
+//    → Intent extras include: package URI, verification ID, installer info
+
+// 3. Play Protect scans the APK:
+//    → Checks against known malware signatures
+//    → Runs ML-based threat detection
+//    → Checks developer reputation and policy compliance
+
+// 4. Play Protect responds:
+//    PackageManager.verifyPendingInstall(verificationId, VERIFICATION_ALLOW)
+//    // or VERIFICATION_REJECT
+
+// 5. PMS proceeds based on response:
+//    ALLOW → continue installation pipeline
+//    REJECT → abort with INSTALL_FAILED_VERIFICATION_FAILURE</code></pre>
+
+<h3>The Fail-Open Design</h3>
+
+<pre><code>// If the verifier doesn't respond within the timeout:
+// PMS proceeds with the installation (fail-open).
+
+// PackageVerificationState tracks the state machine:
+class PackageVerificationState {
+    var state: Int = VERIFICATION_PENDING
+    // VERIFICATION_PENDING → waiting for verifier response
+    // VERIFICATION_ALLOWED → verifier approved
+    // VERIFICATION_REJECTED → verifier rejected
+    // VERIFICATION_TIMED_OUT → no response → treated as ALLOWED
+}
+
+// The timeout handler:
+// mHandler.postDelayed({
+//     if (state == VERIFICATION_PENDING) {
+//         state = VERIFICATION_TIMED_OUT
+//         proceedWithInstall()  // fail-open!
+//     }
+// }, timeoutMs)
+
+// Timeout configuration:
+// Settings.Global.PACKAGE_VERIFIER_TIMEOUT
+// Default: 10000ms (10 seconds) on most devices
+// Some OEMs increase to 60000ms (60 seconds)
+// Can be queried: adb shell settings get global package_verifier_timeout</code></pre>
+
+<div class="callout danger">
+<div class="callout-label">Security Trade-off</div>
+<p>The fail-open behavior is a <strong>deliberate security trade-off</strong>. Blocking installs on a slow or unreachable verifier would break the user experience — imagine a user on a plane trying to sideload an APK and being blocked indefinitely. But it means a compromised network that blocks Play Protect responses (e.g., DNS poisoning to prevent the verifier from reaching Google's servers) could allow malicious APK installation to proceed unverified. Enterprise MDM solutions can change this to fail-closed via <code>Settings.Global.PACKAGE_VERIFIER_DEFAULT_RESPONSE</code> = <code>VERIFICATION_REJECT</code>.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>11. installd IPC</h2>
+
+<p><code>installd</code> is a native daemon that runs as <strong>root</strong> (UID 0). PMS delegates all privileged file operations to it via a Binder interface, maintaining strict privilege separation.</p>
+
+<h3>Why a Separate Daemon?</h3>
+
+<pre><code>// PMS runs as UID 1000 (system) inside system_server.
+// It CANNOT perform these operations directly:
+// - mkdir /data/data/com.example.app/ with UID 10123 ownership
+// - chown files to arbitrary app UIDs
+// - Execute dex2oat with specific capabilities
+// - Create oat directories with correct SELinux labels
+
+// installd runs as UID 0 (root) and handles all privileged file I/O.
+// Communication: PMS → IInstalld.aidl (Binder IPC)
+
+// Source: frameworks/native/cmds/installd/
+// AIDL: frameworks/native/cmds/installd/binder/android/os/IInstalld.aidl</code></pre>
+
+<h3>Key installd Operations</h3>
+
+<table>
+<tr><th>Method</th><th>Purpose</th><th>Privilege Required</th></tr>
+<tr><td><code>createAppData()</code></td><td>Create <code>/data/data/&lt;pkg&gt;/</code> with correct UID/GID and SELinux context</td><td>root (mkdir + chown)</td></tr>
+<tr><td><code>destroyAppData()</code></td><td>Remove all app data directories</td><td>root (rm across UIDs)</td></tr>
+<tr><td><code>fixupAppData()</code></td><td>Fix ownership/permissions after backup restore</td><td>root (chown)</td></tr>
+<tr><td><code>dexopt()</code></td><td>Fork + exec <code>dex2oat</code> for AOT compilation</td><td>root (exec + write to oat dir)</td></tr>
+<tr><td><code>moveCompleteApp()</code></td><td>Atomic rename of staging directory to final path</td><td>root (rename across dirs)</td></tr>
+<tr><td><code>createOatDir()</code></td><td>Create <code>oat/</code> directory for compiled code</td><td>root (mkdir + SELinux label)</td></tr>
+<tr><td><code>linkNativeLibraryDirectory()</code></td><td>Symlink native libs to app's lib directory</td><td>root (symlink)</td></tr>
+</table>
+
+<h3>dex2oat Compilation Filters</h3>
+
+<pre><code>// installd's dexopt() invokes dex2oat — the AOT compiler.
+// The compilation filter determines the trade-off between
+// install time, disk space, and runtime performance.
+
+// Filters (from fastest install to best runtime):
+// verify        → only verify bytecode correctness
+//                  No optimization, interpreted at runtime
+//                  Install: ~1s, Output: ~0 extra bytes
+//
+// speed-profile → AOT compile only hot methods from a profile
+//                  Best balance of install time and performance
+//                  Install: ~5-15s, Output: ~30-50% of full AOT
+//                  Profile sources: Baseline Profile, cloud profile, runtime
+//
+// speed         → AOT compile ALL methods
+//                  Best runtime performance, longest install
+//                  Install: ~15-60s, Output: largest .odex file
+//
+// everything    → compile all methods + include debug info
+//                  Testing/profiling only, not used in production
+
+// Google Play default: speed-profile
+// Uses cloud profiles (aggregated from millions of devices) to identify
+// hot methods. Even first launch benefits from pre-compiled hot paths.
+
+// dex2oat output files:
+// .odex  → compiled native code (ELF format)
+// .vdex  → verified DEX bytecode (for methods not AOT-compiled)
+// .art   → app image (pre-initialized classes for faster startup)</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff Insight — installd as a Security Boundary</div>
+<p>The PMS ↔ installd split is a textbook example of <strong>privilege separation</strong>. If an attacker compromises PMS (running as UID 1000), they still can't directly manipulate app data directories or execute arbitrary code as root — they'd need to exploit the <code>IInstalld</code> Binder interface, which validates all inputs. The <code>dexopt()</code> path is particularly sensitive: <code>dex2oat</code> processes untrusted DEX bytecode, so it runs with reduced capabilities and a restrictive SELinux domain (<code>installd_dex2oat</code>). A bug in <code>dex2oat</code> that allows code execution would be contained by SELinux — it can't access arbitrary files or network. This defense-in-depth is why Android's install pipeline has survived decades of security scrutiny.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>12. Incremental Installation (v4 Signing)</h2>
+
+<p>APK Signature Scheme v4 enables <strong>incremental/streaming installation</strong> — the app can start running before the full APK is downloaded. This is critical for large apps (games can exceed 2GB).</p>
+
+<h3>How It Works</h3>
+
+<pre><code>// v4 signing produces a separate .idsig file containing a Merkle tree:
+// - The APK is divided into 4KB pages
+// - Each page has a SHA-256 hash
+// - Hashes are organized in a Merkle tree (binary hash tree)
+// - The root hash is signed with the developer's key
+
+// APK file:        [page0][page1][page2]...[pageN]
+// .idsig file:     [root_hash][level1_hashes][leaf_hashes]
+//                   └── signed by developer key
+
+// The .idsig file is small (~0.1% of APK size) and downloaded first.
+// The APK pages are downloaded on-demand as the app accesses them.</code></pre>
+
+<h3>Kernel Support: IncFS</h3>
+
+<pre><code>// Incremental File System (incfs) is a Linux kernel module (Android 12+):
+// - Mounts the APK as a virtual filesystem
+// - Tracks which 4KB pages have been downloaded
+// - When a read hits an undownloaded page:
+//   a. The read BLOCKS (the calling thread sleeps)
+//   b. incfs requests the page from the data loader (adb or Play Store)
+//   c. When the page arrives, it's verified against the Merkle tree hash
+//   d. If hash matches → page is stored and the read completes
+//   e. If hash doesn't match → I/O error (tampered data)
+
+// Alternative: fs-verity (for non-incremental but verified reads)
+// fs-verity verifies pages on-demand using a Merkle tree but requires
+// the full file to be present. incfs extends this to partial files.
+
+// Installation command:
+// adb install --incremental large_game.apk
+// → adb sends .idsig first, then streams APK pages as needed
+// → The app appears in the launcher almost immediately
+// → First launch may block briefly while critical pages download</code></pre>
+
+<h3>Use Cases and Limitations</h3>
+
+<pre><code>// Primary use cases:
+// 1. Large games (1-2GB+) — start playing while downloading
+// 2. Development builds — faster iteration with large APKs
+// 3. Play Store — streaming install for faster time-to-first-launch
+
+// Limitations:
+// - Requires Android 12+ with incfs kernel module
+// - v4 signature must be backed by v2 or v3 signature
+// - If network drops during incremental install:
+//   reads to undownloaded pages fail with I/O error
+//   → app may crash if it accesses undownloaded resources
+// - Not all OEMs enable incfs (kernel config dependent)
+// - dexopt must wait for relevant DEX pages to download</code></pre>
+
+<div class="callout warn">
+<div class="callout-label">Edge Case — Network Failure</div>
+<p>If the network drops during an incremental install, reads to undownloaded pages <strong>block indefinitely</strong> (with a configurable timeout) and eventually fail with an I/O error. This means the app can crash mid-use if it tries to load a resource (image, native library, DEX class) that hasn't been downloaded yet. The Play Store mitigates this by prioritizing critical pages (DEX code, native libs, launch-path resources) and downloading them first, but edge cases remain — especially for apps with large asset bundles loaded lazily.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>13. Version Evolution Timeline</h2>
+
+<table>
+<tr><th>Version</th><th>Change</th><th>Impact</th></tr>
+<tr><td>Android 10</td><td>PermissionManagerService split</td><td>Permissions managed separately from packages; cleaner separation of concerns</td></tr>
+<tr><td>Android 11</td><td>Package visibility</td><td>Apps can't see all installed packages; <code>&lt;queries&gt;</code> required in manifest</td></tr>
+<tr><td>Android 11</td><td>APK Signature Scheme v4</td><td>Incremental installation via Merkle tree page verification</td></tr>
+<tr><td>Android 12</td><td>Computer snapshot model</td><td>Lock-free reads via MVCC; <code>resolveIntent()</code> latency dropped ~20x</td></tr>
+<tr><td>Android 12</td><td>Shared UID deprecation</td><td><code>sharedUserId</code> deprecated; migration via <code>sharedUserMaxSdkVersion</code></td></tr>
+<tr><td>Android 12</td><td>Incremental File System (incfs)</td><td>Kernel support for streaming APK installation</td></tr>
+<tr><td>Android 13</td><td>Per-app language</td><td>PMS stores per-app locale preferences; <code>LocaleManager</code> API</td></tr>
+<tr><td>Android 14</td><td>Credential-protected storage</td><td>Package data access restricted until user unlocks device</td></tr>
+</table>
+
+<!-- ============================================================ -->
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  &larr; <a href="03-window-manager-internals.html">03 &mdash; WMS Internals</a> &nbsp;|&nbsp;
+  <a href="05-system-server-boot.html">05 &mdash; Boot Sequence &rarr;</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a>
+</div>
+
+</body>
+</html>

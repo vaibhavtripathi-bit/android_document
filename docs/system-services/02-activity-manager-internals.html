@@ -1,0 +1,1740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 — AMS &amp; ATMS Internals — Process Management, Broadcasts, ContentProviders, Instrumentation</title>
+<style>
+  :root { --bg: #ffffff; --surface: #f7f8fa; --surface2: #edeef2; --border: #d4d7e0; --text: #1e2028; --text-dim: #5c6070; --accent: #2563eb; --accent2: #7c3aed; --green: #16803c; --red: #dc2626; --orange: #c2410c; --yellow: #a16207; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); font-size: 1.08rem; line-height: 1.75; padding: 2rem; max-width: 920px; margin: 0 auto; }
+  h1 { font-size: 2.2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.6rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.25rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; color: var(--text); }
+  .nav a.active { background: var(--accent); color: #fff; }
+  code { background: #f0f1f5; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #c7254e; border: 1px solid #e2e4ea; }
+  pre { background: #fafbfc; border: 1px solid #d4d7e0; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 1rem; line-height: 1.7; }
+  pre code { color: #2e3440; border: none; background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: #f0f4ff; padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: #f5f0ff; }
+  .callout.warn { border-left-color: var(--orange); background: #fff7ed; }
+  .callout.danger { border-left-color: var(--red); background: #fef2f2; }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--bg); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+  .tag { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+  .tag.deprecated { background: rgba(248,113,113,0.15); color: var(--red); }
+  .tag.current { background: rgba(74,222,128,0.15); color: var(--green); }
+  .tag.caution { background: rgba(251,191,36,0.15); color: var(--yellow); }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-system-server-boot.html">01 system_server Boot</a>
+  <a class="active" href="02-activity-manager-internals.html">02 AMS Internals</a>
+  <a href="03-window-manager-internals.html">03 WMS Internals</a>
+  <a href="04-package-manager-internals.html">04 PMS Internals</a>
+  <a href="05-system-ui-notifications.html">05 SystemUI &amp; Notifications</a>
+  <a href="06-power-connectivity.html">06 Power &amp; Connectivity</a>
+  <a href="07-system-design-patterns.html">07 Design Patterns</a>
+  <a href="08-interview-qa.html">08 Interview Q&amp;A</a>
+</div>
+
+<h1>AMS &amp; ATMS Internals</h1>
+<p class="subtitle">Process management, broadcast dispatch, ContentProvider lifecycle, instrumentation, and the critical code paths inside Android's most important system services</p>
+
+<!-- ============================================================ -->
+<h2>1. AMS vs ATMS — The Android 10 Split</h2>
+
+<p>Before Android 10 (Q), <code>ActivityManagerService</code> was a monolithic god-class — over 25,000 lines managing processes, activities, broadcasts, services, content providers, and tasks. The Android 10 refactor extracted activity and task management into a separate <code>ActivityTaskManagerService</code>.</p>
+
+<h3>Why the Split Happened</h3>
+<ul>
+  <li><strong>Lock contention</strong> — AMS's <code>synchronized(this)</code> lock was a global bottleneck. Every operation (process management, activity transitions, broadcast dispatch) competed for the same lock.</li>
+  <li><strong>Separation of concerns</strong> — Activity lifecycle and task management are logically distinct from process lifecycle and broadcast dispatch.</li>
+  <li><strong>Multi-display / foldables</strong> — ATMS manages per-display task stacks, which required a cleaner abstraction than the monolithic AMS could offer.</li>
+  <li><strong>Testability</strong> — Smaller classes with defined boundaries are easier to unit test in AOSP.</li>
+</ul>
+
+<h3>Responsibility Split</h3>
+
+<table>
+  <tr>
+    <th>Responsibility</th>
+    <th>AMS (ActivityManagerService)</th>
+    <th>ATMS (ActivityTaskManagerService)</th>
+  </tr>
+  <tr>
+    <td>Process lifecycle</td>
+    <td>ProcessRecord, start/kill processes</td>
+    <td>—</td>
+  </tr>
+  <tr>
+    <td>OOM adjustment</td>
+    <td>OomAdjuster, updateOomAdjLocked()</td>
+    <td>—</td>
+  </tr>
+  <tr>
+    <td>Broadcast dispatch</td>
+    <td>BroadcastQueue, BroadcastRecord</td>
+    <td>—</td>
+  </tr>
+  <tr>
+    <td>ContentProvider lifecycle</td>
+    <td>ContentProviderHelper</td>
+    <td>—</td>
+  </tr>
+  <tr>
+    <td>Service lifecycle</td>
+    <td>ActiveServices</td>
+    <td>—</td>
+  </tr>
+  <tr>
+    <td>Instrumentation</td>
+    <td>InstrumentationReporter</td>
+    <td>—</td>
+  </tr>
+  <tr>
+    <td>Activity lifecycle</td>
+    <td>—</td>
+    <td>ClientLifecycleManager, ActivityRecord</td>
+  </tr>
+  <tr>
+    <td>Task management</td>
+    <td>—</td>
+    <td>Task, RootWindowContainer</td>
+  </tr>
+  <tr>
+    <td>Recent tasks</td>
+    <td>—</td>
+    <td>RecentTasks, TaskPersister</td>
+  </tr>
+  <tr>
+    <td>Multi-window / PiP</td>
+    <td>—</td>
+    <td>TaskFragment, PinnedTaskController</td>
+  </tr>
+</table>
+
+<h3>Cross-Service Communication</h3>
+
+<p>AMS and ATMS live in the same process (<code>system_server</code>) but need to call each other frequently. They use <strong>internal interfaces</strong> registered via <code>LocalServices</code> — direct Java method calls, no Binder IPC:</p>
+
+<pre><code>// ATMS exposes ActivityTaskManagerInternal to AMS
+LocalServices.addService(
+    ActivityTaskManagerInternal::class.java,
+    atmsInternalImpl
+)
+
+// AMS exposes ActivityManagerInternal to ATMS
+LocalServices.addService(
+    ActivityManagerInternal::class.java,
+    amsInternalImpl
+)
+
+// Usage from AMS when it needs activity info:
+val atmi = LocalServices.getService(ActivityTaskManagerInternal::class.java)
+val topActivity = atmi.getTopActivity()
+
+// Usage from ATMS when it needs process info:
+val ami = LocalServices.getService(ActivityManagerInternal::class.java)
+ami.killProcess(pid, reason)</code></pre>
+
+<div class="callout">
+  <div class="callout-label">Cross-Reference</div>
+  <p>For a deep dive into the ATMS side — <code>ActivityRecord</code>, <code>ClientTransaction</code>, <code>TransactionExecutor</code>, and the activity lifecycle state machine — see the <a href="../lifecycle-navigation/01-activity-lifecycle.html">Lifecycle &amp; Navigation series</a>. This document focuses on the AMS side: processes, broadcasts, providers, and instrumentation.</p>
+</div>
+
+<h3>The Lock Hierarchy</h3>
+
+<p>Post-split, the locking changed from a single <code>synchronized(this)</code> on AMS to a more granular scheme:</p>
+
+<pre><code>// Pre-Android 10: everything under one lock
+synchronized(this) { // "this" = AMS instance
+    // ALL operations: process, activity, broadcast, provider
+}
+
+// Post-Android 10:
+// ATMS uses WindowManagerGlobalLock (mGlobalLock)
+// AMS uses its own lock for process/broadcast/provider operations
+// Lock ordering: mGlobalLock → AMS lock (never the reverse)
+
+// mGlobalLock is shared between ATMS and WMS
+// because activity transitions and window operations are tightly coupled</code></pre>
+
+<!-- ============================================================ -->
+<h2>2. Process Management</h2>
+
+<h3>ProcessRecord — The In-Memory Process Representation</h3>
+
+<p>Every running app process is tracked by a <code>ProcessRecord</code> in AMS. This is the single most important data structure for understanding how Android manages app processes.</p>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/am/ProcessRecord.java
+
+class ProcessRecord {
+    // Identity
+    val info: ApplicationInfo       // Package/app metadata
+    val processName: String         // e.g., "com.example.app"
+    val uid: Int                    // Linux UID (unique per app)
+    var pid: Int                    // Linux PID (assigned after fork)
+
+    // Binder connection to the app process
+    var thread: IApplicationThread? // Proxy to ActivityThread in the app
+    // null until attachApplicationLocked() completes
+
+    // Component tracking
+    val activities: ArrayList<ActivityRecord>
+    val services: ArraySet<ServiceRecord>
+    val executingServices: ArraySet<ServiceRecord>  // Currently running onStart/onBind
+    val connections: ArrayMap<IBinder, ConnectionRecord>
+    val receivers: ArraySet<ReceiverList>
+    val pubProviders: ArrayMap<String, ContentProviderRecord>
+
+    // OOM adjustment state
+    var curAdj: Int = UNKNOWN_ADJ           // Current computed adj
+    var setAdj: Int = UNKNOWN_ADJ           // Last value written to kernel
+    var curProcState: Int                    // PROCESS_STATE_* constant
+    var curCapability: Int                   // PROCESS_CAPABILITY_* flags
+    var killedByAm: Boolean = false          // Killed intentionally by AMS
+    var killed: Boolean = false              // Process is dead
+
+    // Crash/ANR tracking
+    var crashHandler: CrashHandler?
+    var lastCrashTime: Long
+    var crashCount: Int
+    var anrAnnotation: String?
+
+    // Timing
+    var lastActivityTime: Long              // Last time an Activity was in foreground
+    var lastProviderTime: Long              // Last time a provider was used
+    var curRawAdj: Int                      // Raw adj before clamping
+}</code></pre>
+
+<h3>ProcessList — The Process Registry</h3>
+
+<p><code>ProcessList</code> manages all <code>ProcessRecord</code> instances and is responsible for starting new processes:</p>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/am/ProcessList.java
+
+class ProcessList {
+    // All known processes, indexed by name+uid
+    val mProcessNames: ProcessMap<ProcessRecord>
+
+    // Processes indexed by PID (after fork)
+    val mPidsSelfLocked: SparseArray<ProcessRecord>
+
+    // Isolated processes (for WebView, etc.)
+    val mIsolatedProcesses: SparseArray<ProcessRecord>
+
+    // The critical method: start a new app process
+    fun startProcessLocked(
+        processName: String,
+        info: ApplicationInfo,
+        knownToBeDead: Boolean,
+        intentFlags: Int,
+        hostingRecord: HostingRecord,  // Why we're starting (activity, service, etc.)
+        zygotePolicyFlags: Int,
+        allowWhileBooting: Boolean,
+        isolated: Boolean
+    ): ProcessRecord? {
+        // 1. Check if process already exists
+        // 2. Create or reuse ProcessRecord
+        // 3. Request Zygote to fork via ZygoteProcess.start()
+        // 4. Return ProcessRecord (pid not yet assigned — fork is async)
+    }
+}</code></pre>
+
+<h3>Process States and oom_adj Scoring</h3>
+
+<table>
+  <tr>
+    <th>oom_adj</th>
+    <th>Constant</th>
+    <th>Process State</th>
+    <th>Example</th>
+  </tr>
+  <tr>
+    <td><strong>-1000</strong></td>
+    <td>NATIVE_ADJ</td>
+    <td>Native system daemon</td>
+    <td>zygote, surfaceflinger</td>
+  </tr>
+  <tr>
+    <td><strong>-900</strong></td>
+    <td>SYSTEM_ADJ</td>
+    <td>system_server</td>
+    <td>system_server itself</td>
+  </tr>
+  <tr>
+    <td><strong>-800</strong></td>
+    <td>PERSISTENT_PROC_ADJ</td>
+    <td>Persistent app</td>
+    <td>Phone, SystemUI</td>
+  </tr>
+  <tr>
+    <td><strong>0</strong></td>
+    <td>FOREGROUND_APP_ADJ</td>
+    <td>Foreground activity / FGS</td>
+    <td>Currently visible app</td>
+  </tr>
+  <tr>
+    <td><strong>100</strong></td>
+    <td>VISIBLE_APP_ADJ</td>
+    <td>Visible but not focused</td>
+    <td>Activity behind a dialog</td>
+  </tr>
+  <tr>
+    <td><strong>200</strong></td>
+    <td>PERCEPTIBLE_APP_ADJ</td>
+    <td>Perceptible to user</td>
+    <td>Playing audio, has FGS type</td>
+  </tr>
+  <tr>
+    <td><strong>225</strong></td>
+    <td>PERCEPTIBLE_LOW_APP_ADJ</td>
+    <td>Low-perceptible</td>
+    <td>Bound by a perceptible process</td>
+  </tr>
+  <tr>
+    <td><strong>300</strong></td>
+    <td>BACKUP_APP_ADJ</td>
+    <td>Hosting backup agent</td>
+    <td>BackupManagerService target</td>
+  </tr>
+  <tr>
+    <td><strong>500</strong></td>
+    <td>SERVICE_ADJ</td>
+    <td>Running a started service</td>
+    <td>Service started &lt;30 min ago</td>
+  </tr>
+  <tr>
+    <td><strong>600</strong></td>
+    <td>HOME_APP_ADJ</td>
+    <td>Launcher</td>
+    <td>Home/Launcher app</td>
+  </tr>
+  <tr>
+    <td><strong>700</strong></td>
+    <td>PREVIOUS_APP_ADJ</td>
+    <td>Previous foreground app</td>
+    <td>Last app user interacted with</td>
+  </tr>
+  <tr>
+    <td><strong>800</strong></td>
+    <td>SERVICE_B_ADJ</td>
+    <td>Aged service</td>
+    <td>Service running &gt;30 min</td>
+  </tr>
+  <tr>
+    <td><strong>900–999</strong></td>
+    <td>CACHED_APP_*_ADJ</td>
+    <td>Cached / empty</td>
+    <td>No active components</td>
+  </tr>
+</table>
+
+<h3>updateOomAdjLocked() — The Critical Recalculation</h3>
+
+<p>This is the single most performance-critical method in all of AMS. It recalculates the oom_adj score for every process whenever any component state changes.</p>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/am/OomAdjuster.java
+
+// Simplified logic of updateOomAdjLocked():
+fun updateOomAdjLocked(app: ProcessRecord): Boolean {
+    var adj = CACHED_APP_MAX_ADJ  // Start at lowest priority
+
+    // 1. Check for foreground activity
+    if (app.activities.any { it.isVisible }) {
+        adj = FOREGROUND_APP_ADJ
+    }
+
+    // 2. Check for foreground service
+    if (app.hasForegroundServices()) {
+        adj = minOf(adj, PERCEPTIBLE_APP_ADJ)
+    }
+
+    // 3. Check for executing service (onStartCommand running)
+    if (app.executingServices.isNotEmpty()) {
+        adj = minOf(adj, FOREGROUND_APP_ADJ)
+    }
+
+    // 4. Check for recent service (&lt;30 min)
+    if (app.services.isNotEmpty() && !isServiceBProcess(app)) {
+        adj = minOf(adj, SERVICE_ADJ)
+    }
+
+    // 5. Check for active content provider clients
+    if (app.pubProviders.isNotEmpty()) {
+        for (provider in app.pubProviders.values) {
+            for (conn in provider.connections) {
+                // Elevate based on client's importance
+                adj = minOf(adj, conn.client.curAdj + 1)
+            }
+        }
+    }
+
+    // 6. Check for bound service clients (transitive dependency)
+    for (sr in app.services) {
+        for (conn in sr.getConnections()) {
+            val client = conn.binding.client
+            // The binding flags matter:
+            // BIND_ABOVE_CLIENT → adj = client adj - 1
+            // BIND_IMPORTANT → adj = client adj
+            // BIND_NOT_FOREGROUND → don't elevate to FG
+            adj = computeBindingAdj(adj, conn, client)
+        }
+    }
+
+    // 7. Write to kernel if changed
+    if (adj != app.setAdj) {
+        ProcessList.setOomAdj(app.pid, app.uid, adj)
+        // Writes to /proc/{pid}/oom_score_adj
+        app.setAdj = adj
+    }
+    return true
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — updateOomAdjLocked() Performance</div>
+  <p><code>updateOomAdjLocked()</code> is called <strong>hundreds of times per second</strong> on a busy device — every activity start/stop, service bind/unbind, broadcast delivery, and provider access triggers a recalculation. The method walks the entire process list and follows transitive binding chains (process A binds to B which binds to C). In AOSP, this is the #1 source of lock contention in AMS. Android 12 introduced <code>OomAdjuster</code> as a separate class (extracted from AMS) with optimizations: partial updates (only recalculate affected processes), caching of intermediate results, and batching of <code>/proc</code> writes. A Staff Engineer should know that adding a new component type that affects oom_adj is extremely risky — it can degrade system-wide responsiveness.</p>
+</div>
+
+<h3>The LMK/lmkd Interaction</h3>
+
+<div class="diagram-container">
+<pre><code>  AMS (Java, system_server)              lmkd (native daemon)           Kernel
+  ─────────────────────────              ──────────────────────         ──────
+  updateOomAdjLocked()
+    │
+    ├─ Compute adj for each process
+    │
+    ├─ ProcessList.setOomAdj(pid, adj)
+    │    │
+    │    └─ writeLmkd(LMK_PROCPRIO,      ──→  Receives via socket
+    │       pid, uid, adj)                     Updates internal tables
+    │                                          │
+    │                                          ├─ PSI monitor triggers
+    │                                          │   (memory pressure detected)
+    │                                          │
+    │                                          ├─ Find highest-adj process
+    │                                          │   with sufficient RSS
+    │                                          │
+    │                                          └─ kill(pid, SIGKILL)  ──→  Process killed
+    │                                                                      No callback
+    │                                                                      No onDestroy()
+    │
+    ├─ Process death detected via
+    │  Binder DeathRecipient
+    │
+    └─ cleanUpApplicationRecordLocked()
+       Remove ProcessRecord, notify ATMS</code></pre>
+</div>
+
+<h3>Process Start Flow</h3>
+
+<pre><code>// Full flow: app component needs to start → process doesn't exist yet
+
+// 1. AMS determines a new process is needed
+//    (e.g., startActivity() for an app that isn't running)
+AMS.startProcessLocked(processName, appInfo, ...)
+
+// 2. ProcessList sends request to Zygote
+ZygoteProcess.start(
+    "android.app.ActivityThread",  // Entry point class
+    processName,
+    uid, gid,
+    runtimeFlags,
+    zygotePolicyFlags
+)
+// → Writes to Zygote's LocalSocket
+
+// 3. Zygote forks
+Zygote.forkAndSpecialize(uid, gid, ...)
+// → fork() syscall, COW memory from Zygote
+// → Child specializes: sets UID, drops capabilities, applies SELinux context
+
+// 4. Child process starts
+ActivityThread.main()
+// → Looper.prepareMainLooper()
+// → new ActivityThread()
+// → thread.attach(false)  // false = not system_server
+
+// 5. attach() calls back to AMS via Binder
+AMS.attachApplicationLocked(IApplicationThread thread, pid)
+// → AMS now has a Binder proxy to the new process
+// → ProcessRecord.thread = thread
+
+// 6. AMS sends pending work to the process
+//    (see Section 6 for details)</code></pre>
+
+<h3>ProcessRecord.thread — The IApplicationThread Proxy</h3>
+
+<p><code>ProcessRecord.thread</code> is the Binder proxy that AMS uses to send commands <em>to</em> the app process. It implements <code>IApplicationThread</code>, which has methods like:</p>
+
+<pre><code>// IApplicationThread — AMS's handle into the app process
+interface IApplicationThread {
+    fun scheduleTransaction(transaction: ClientTransaction)
+    fun scheduleLaunchActivity(...)
+    fun scheduleCreateService(token: IBinder, info: ServiceInfo, ...)
+    fun scheduleReceiver(intent: Intent, info: ActivityInfo, ...)
+    fun scheduleBindService(token: IBinder, intent: Intent, rebind: Boolean)
+    fun bindApplication(processName: String, appInfo: ApplicationInfo, ...)
+    fun scheduleTrimMemory(level: Int)
+    fun dumpHeap(managed: Boolean, path: String, fd: ParcelFileDescriptor)
+    // ... many more
+}
+
+// In the app process, this is implemented by ActivityThread.ApplicationThread
+// which is an inner class of ActivityThread — the "main" class of every app</code></pre>
+
+<!-- ============================================================ -->
+<h2>3. Broadcast Dispatch Internals</h2>
+
+<h3>BroadcastQueue and BroadcastRecord</h3>
+
+<p>AMS manages broadcast delivery through <code>BroadcastQueue</code> objects. Each queue holds a list of <code>BroadcastRecord</code> entries representing pending broadcasts.</p>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/am/BroadcastRecord.java
+
+class BroadcastRecord {
+    val intent: Intent                    // The broadcast intent
+    val callerApp: ProcessRecord?         // Who sent it
+    val callerPackage: String
+    val receivers: List<Any>              // BroadcastFilter (dynamic) or ResolveInfo (manifest)
+    val ordered: Boolean                  // Ordered vs parallel
+    val sticky: Boolean                   // Sticky broadcast
+    val resultCode: Int                   // For ordered: propagated result
+    val resultData: String?
+    val resultExtras: Bundle?
+    var nextReceiver: Int = 0             // Index of next receiver to deliver to
+    var dispatchTime: Long                // When dispatch started
+    var receiverTime: Long                // When current receiver started processing
+    var finishTime: Long                  // When delivery completed
+}
+
+// Source: frameworks/base/services/core/java/com/android/server/am/BroadcastQueue.java
+
+class BroadcastQueue {
+    val mParallelBroadcasts: ArrayList<BroadcastRecord>  // Delivered simultaneously
+    val mOrderedBroadcasts: ArrayList<BroadcastRecord>   // Delivered sequentially
+    val mHandler: BroadcastHandler                        // Processes delivery on handler thread
+}</code></pre>
+
+<h3>Parallel vs Ordered Delivery</h3>
+
+<div class="diagram-container">
+<svg viewBox="0 0 860 340" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif">
+  <!-- Parallel -->
+  <text x="200" y="24" fill="#2563eb" font-size="14" font-weight="700" text-anchor="middle">Parallel Broadcast</text>
+  <rect x="130" y="36" width="140" height="32" rx="6" fill="var(--surface)" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="200" y="57" fill="#1e2028" font-size="11" text-anchor="middle">sendBroadcast(intent)</text>
+
+  <line x1="200" y1="68" x2="200" y2="95" stroke="#2563eb" stroke-width="1.2"/>
+  <text x="200" y="90" fill="#5c6070" font-size="9" text-anchor="middle">AMS enqueues</text>
+
+  <line x1="200" y1="100" x2="80" y2="130" stroke="#2563eb" stroke-width="1.2"/>
+  <line x1="200" y1="100" x2="200" y2="130" stroke="#2563eb" stroke-width="1.2"/>
+  <line x1="200" y1="100" x2="320" y2="130" stroke="#2563eb" stroke-width="1.2"/>
+
+  <rect x="30" y="130" width="100" height="28" rx="5" fill="#f0f4ff" stroke="#2563eb"/>
+  <text x="80" y="149" fill="#1e2028" font-size="10" text-anchor="middle">Receiver A</text>
+  <rect x="150" y="130" width="100" height="28" rx="5" fill="#f0f4ff" stroke="#2563eb"/>
+  <text x="200" y="149" fill="#1e2028" font-size="10" text-anchor="middle">Receiver B</text>
+  <rect x="270" y="130" width="100" height="28" rx="5" fill="#f0f4ff" stroke="#2563eb"/>
+  <text x="320" y="149" fill="#1e2028" font-size="10" text-anchor="middle">Receiver C</text>
+
+  <text x="200" y="180" fill="#16803c" font-size="10" text-anchor="middle">All receive simultaneously, no ordering guarantee</text>
+
+  <!-- Ordered -->
+  <text x="640" y="24" fill="#7c3aed" font-size="14" font-weight="700" text-anchor="middle">Ordered Broadcast</text>
+  <rect x="565" y="36" width="150" height="32" rx="6" fill="var(--surface)" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="640" y="57" fill="#1e2028" font-size="11" text-anchor="middle">sendOrderedBroadcast()</text>
+
+  <line x1="640" y1="68" x2="640" y2="100" stroke="#7c3aed" stroke-width="1.2"/>
+
+  <rect x="580" y="100" width="120" height="28" rx="5" fill="#f5f0ff" stroke="#7c3aed"/>
+  <text x="640" y="119" fill="#1e2028" font-size="10" text-anchor="middle">Receiver A (pri=100)</text>
+  <line x1="640" y1="128" x2="640" y2="145" stroke="#7c3aed" stroke-width="1.2"/>
+  <text x="720" y="141" fill="#5c6070" font-size="8">result / abort?</text>
+
+  <rect x="580" y="148" width="120" height="28" rx="5" fill="#f5f0ff" stroke="#7c3aed"/>
+  <text x="640" y="167" fill="#1e2028" font-size="10" text-anchor="middle">Receiver B (pri=50)</text>
+  <line x1="640" y1="176" x2="640" y2="193" stroke="#7c3aed" stroke-width="1.2"/>
+  <text x="720" y="189" fill="#5c6070" font-size="8">result / abort?</text>
+
+  <rect x="580" y="196" width="120" height="28" rx="5" fill="#f5f0ff" stroke="#7c3aed"/>
+  <text x="640" y="215" fill="#1e2028" font-size="10" text-anchor="middle">Receiver C (pri=0)</text>
+  <line x1="640" y1="224" x2="640" y2="245" stroke="#7c3aed" stroke-width="1.2"/>
+
+  <rect x="580" y="248" width="120" height="28" rx="5" fill="#fff7ed" stroke="#c2410c"/>
+  <text x="640" y="267" fill="#c2410c" font-size="10" text-anchor="middle">Final result</text>
+
+  <text x="640" y="300" fill="#7c3aed" font-size="10" text-anchor="middle">Sequential: each must finish before next starts</text>
+  <text x="640" y="315" fill="#dc2626" font-size="10" text-anchor="middle">abortBroadcast() stops the chain</text>
+</svg>
+</div>
+
+<h3>BroadcastFilter vs ResolveInfo</h3>
+
+<table>
+  <tr>
+    <th>Type</th>
+    <th>Registration</th>
+    <th>Receiver Object</th>
+    <th>Lifecycle</th>
+  </tr>
+  <tr>
+    <td><strong>BroadcastFilter</strong> (dynamic)</td>
+    <td><code>registerReceiver()</code> at runtime</td>
+    <td>In-memory <code>BroadcastReceiver</code> instance</td>
+    <td>Lives until <code>unregisterReceiver()</code> or process death</td>
+  </tr>
+  <tr>
+    <td><strong>ResolveInfo</strong> (manifest)</td>
+    <td><code>&lt;receiver&gt;</code> in AndroidManifest.xml</td>
+    <td>PMS resolves at broadcast time</td>
+    <td>Process may need to be started to deliver</td>
+  </tr>
+</table>
+
+<h3>Broadcast ANR Timeouts</h3>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/am/BroadcastConstants.java
+
+// Foreground broadcasts: 10 seconds
+val BROADCAST_FG_TIMEOUT = 10 * 1000L
+
+// Background broadcasts: 60 seconds
+val BROADCAST_BG_TIMEOUT = 60 * 1000L
+
+// If a receiver doesn't call goAsync().finish() or return from
+// onReceive() within the timeout, AMS triggers a broadcast ANR:
+// 1. Logs "Timeout of broadcast" to logcat
+// 2. Skips the stuck receiver, moves to next
+// 3. For ordered broadcasts: propagates current result to next receiver
+// 4. Reports ANR to the stuck app's process</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Interview Gotcha — goAsync()</div>
+  <p><code>BroadcastReceiver.goAsync()</code> returns a <code>PendingResult</code> that lets you move work off the main thread, but the <strong>ANR timeout still applies</strong>. You get the same 10s/60s window — <code>goAsync()</code> just lets you use that time on a background thread instead of blocking the main thread. You must call <code>pendingResult.finish()</code> when done. If you need more than 60 seconds, you must delegate to a Service or WorkManager.</p>
+</div>
+
+<h3>Implicit Broadcast Restrictions (Android 8+)</h3>
+
+<p>Starting with Android 8 (Oreo), most implicit broadcasts are <strong>not delivered to manifest-declared receivers</strong>. Only dynamically registered receivers receive them. This was a critical change to reduce background process launches.</p>
+
+<pre><code>// Exempt implicit broadcasts (still delivered to manifest receivers):
+// ACTION_BOOT_COMPLETED, ACTION_LOCALE_CHANGED, ACTION_USB_ACCESSORY_ATTACHED,
+// ACTION_HEADSET_PLUG, ACTION_CONNECTION_STATE_CHANGED (Bluetooth),
+// and a few dozen others listed in the framework
+
+// Non-exempt: ACTION_POWER_CONNECTED, ACTION_SCREEN_ON, CONNECTIVITY_ACTION, etc.
+// These only reach registerReceiver() receivers
+
+// Why? Before Android 8, a single CONNECTIVITY_ACTION broadcast could wake up
+// hundreds of apps that declared <receiver> for it in their manifest.
+// Each app's process had to be started just to deliver the broadcast.</code></pre>
+
+<h3>Android 14: BroadcastModernQueue</h3>
+
+<p>Android 14 introduced <code>BroadcastModernQueue</code>, a ground-up rewrite of the broadcast dispatch infrastructure:</p>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/am/BroadcastQueueModernImpl.java
+
+// Key changes from legacy BroadcastQueue:
+// 1. Per-process delivery queues instead of global ordered/parallel queues
+//    → A slow receiver in process A doesn't block delivery to process B
+// 2. Concurrent delivery to multiple processes
+//    → Legacy: one ordered broadcast at a time across ALL processes
+//    → Modern: parallel delivery to different processes, ordered within each
+// 3. Prioritized urgent broadcasts (e.g., PHONE_STATE)
+//    → Can jump ahead of pending non-urgent broadcasts
+// 4. Better ANR attribution
+//    → Tracks exactly which process is slow, not just "broadcast timed out"
+// 5. Deferred delivery for cached processes
+//    → Don't wake a cached process just for a broadcast; deliver when it wakes</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Broadcast Storms</div>
+  <p>A single <code>sendBroadcast()</code> can trigger delivery to <strong>hundreds of receivers</strong> across dozens of processes. In production, broadcast storms are a real problem: an app sends <code>ACTION_SOMETHING</code>, which wakes 50 processes, each of which does work that triggers more broadcasts. The legacy <code>BroadcastQueue</code> serialized ordered broadcasts globally — one slow receiver blocked <em>all</em> ordered broadcasts system-wide. <code>BroadcastModernQueue</code> fixes this by isolating delivery per-process, but the fundamental problem remains: broadcasts are a fan-out mechanism with no backpressure. At Google scale, the guidance is to prefer direct Binder calls or <code>JobScheduler</code> over broadcasts for inter-component communication.</p>
+</div>
+
+<h3>Sticky Broadcasts</h3>
+
+<p><span class="tag deprecated">Deprecated API 21</span> — Sticky broadcasts (<code>sendStickyBroadcast()</code>) are cached by AMS and replayed to any future <code>registerReceiver()</code> call matching the intent. They still exist in AOSP (e.g., <code>ACTION_BATTERY_CHANGED</code>) but are deprecated for third-party use due to security concerns — any app can read or overwrite them.</p>
+
+<!-- ============================================================ -->
+<h2>4. ContentProvider Lifecycle</h2>
+
+<h3>The Initialization Trap</h3>
+
+<p>ContentProviders are initialized <strong>before</strong> <code>Application.onCreate()</code>. This is one of the most important (and surprising) ordering guarantees in Android:</p>
+
+<pre><code>// App process startup order:
+// 1. Zygote forks
+// 2. ActivityThread.main()
+// 3. ActivityThread.handleBindApplication()
+//    a. Create Application instance
+//    b. installContentProviders()     ← Providers initialized HERE
+//       → ContentProvider.onCreate()  ← BEFORE Application.onCreate()!
+//    c. Application.onCreate()        ← After all providers are ready
+//    d. Deliver pending components (Activities, Services, etc.)
+
+// This means: if your ContentProvider.onCreate() depends on
+// Application.onCreate() initialization, it will fail.
+// Libraries like Firebase, WorkManager, and AndroidX Startup
+// exploit this ordering by using ContentProviders as auto-init hooks.</code></pre>
+
+<h3>ContentProviderRecord in AMS</h3>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/am/ContentProviderRecord.java
+
+class ContentProviderRecord {
+    val info: ProviderInfo                // Manifest metadata
+    val name: ComponentName               // authority → component mapping
+    val appInfo: ApplicationInfo
+    var proc: ProcessRecord?              // Hosting process
+    var provider: IContentProvider?       // Binder to the actual provider instance
+    val connections: ArrayList<ContentProviderConnection>
+    var externalProcessNoHandleCount: Int  // External process references
+    var launchingApp: ProcessRecord?       // Process being started for this provider
+}
+
+// ContentProviderConnection tracks each client's reference
+class ContentProviderConnection {
+    val provider: ContentProviderRecord
+    val client: ProcessRecord
+    var stableCount: Int = 0    // Stable references: provider death kills client
+    var unstableCount: Int = 0  // Unstable references: provider death is survivable
+    var waiting: Boolean        // Client is waiting for provider to publish
+}</code></pre>
+
+<h3>Provider Publishing Flow</h3>
+
+<div class="diagram-container">
+<pre><code>  App Process                                    AMS (system_server)
+  ───────────                                    ──────────────────
+  ActivityThread.handleBindApplication()
+    │
+    ├─ installContentProviders(providers)
+    │    │
+    │    ├─ For each provider:
+    │    │    ClassLoader.loadClass(providerName)
+    │    │    provider.attachInfo(context, info)
+    │    │    provider.onCreate()
+    │    │
+    │    └─ ActivityThread.installProvider()
+    │         │
+    │         └─ Creates ContentProviderHolder
+    │            with IContentProvider binder
+    │
+    └─ AMS.publishContentProviders(              ──→  AMS receives list
+         appThread, providerList)                     │
+                                                      ├─ For each provider:
+                                                      │    ContentProviderRecord.provider = binder
+                                                      │    Notify waiting clients
+                                                      │
+                                                      └─ Waiting clients unblock
+                                                         (they called acquireProvider earlier)</code></pre>
+</div>
+
+<h3>acquireProvider() / releaseProvider() — Reference Counting</h3>
+
+<pre><code>// When an app calls contentResolver.query(uri, ...):
+// 1. ContentResolver looks up the authority
+// 2. Calls ActivityThread.acquireProvider(authority)
+//    → If provider is in same process: return local reference
+//    → If remote: AMS.getContentProvider(callingPackage, authority)
+//      → AMS finds or starts the provider process
+//      → Returns IContentProvider binder proxy
+// 3. Query executes via Binder IPC to the provider process
+// 4. ContentResolver calls releaseProvider() when done
+
+// Reference counting matters for process lifecycle:
+// - stableCount > 0: provider death kills the CLIENT process too
+//   (because the client may have an open Cursor with stale data)
+// - unstableCount > 0: provider death is survivable
+//   (client gets DeadObjectException, can retry)
+
+// ContentResolver.query() uses UNSTABLE provider by default (since API 16)
+// ContentResolver.insert/update/delete use STABLE provider</code></pre>
+
+<div class="callout danger">
+  <div class="callout-label">ContentProvider Deadlock</div>
+  <p>A classic deadlock scenario: Process A's ContentProvider calls Process B's ContentProvider, which calls back to Process A's ContentProvider. Both processes are waiting for each other on their Binder threads. AMS cannot detect this because the deadlock happens at the Binder layer, not the AMS lock layer. The only resolution is a timeout (ANR) or process kill. Avoid cross-provider calls in production code — use a mediator pattern or async callbacks instead.</p>
+</div>
+
+<h3>Multi-Process Providers</h3>
+
+<pre><code>// android:multiprocess="true" in manifest
+// → Provider is instantiated in EACH client process (no IPC needed)
+// → Faster, but each instance has its own state
+// → Rarely used: only makes sense for read-only, stateless providers
+
+// android:multiprocess="false" (default)
+// → Single instance in the provider's own process
+// → All clients talk to it via Binder IPC
+// → Consistent state, but IPC overhead per call</code></pre>
+
+<h3>ContentProviderHelper</h3>
+
+<p>In modern AOSP, provider lifecycle management is delegated to <code>ContentProviderHelper</code> — a helper class extracted from AMS to reduce the god-class problem:</p>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/am/ContentProviderHelper.java
+
+class ContentProviderHelper(val service: ActivityManagerService) {
+    fun getContentProvider(caller: IApplicationThread, authority: String, ...): ContentProviderHolder
+    fun publishContentProviders(caller: IApplicationThread, providers: List<ContentProviderHolder>)
+    fun removeContentProvider(connection: IBinder, stable: Boolean)
+    fun getContentProviderExternal(authority: String, userId: Int, ...): ContentProviderHolder
+    // Handles provider death, process cleanup, waiting client notification
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2>5. Instrumentation</h2>
+
+<h3>The Instrumentation Class</h3>
+
+<p><code>Instrumentation</code> is the hook point through which the system creates Activities, calls lifecycle methods, and dispatches input events. Every app process has exactly one <code>Instrumentation</code> instance, held by <code>ActivityThread</code>.</p>
+
+<pre><code>// Source: frameworks/base/core/java/android/app/Instrumentation.java
+
+// Key methods that ActivityThread delegates to:
+class Instrumentation {
+    // Activity creation — called by ActivityThread.performLaunchActivity()
+    fun newActivity(cl: ClassLoader, className: String, intent: Intent): Activity
+
+    // Lifecycle callbacks — ActivityThread calls these, not the Activity directly
+    fun callActivityOnCreate(activity: Activity, savedInstanceState: Bundle?)
+    fun callActivityOnStart(activity: Activity)
+    fun callActivityOnResume(activity: Activity)
+    fun callActivityOnPause(activity: Activity)
+    fun callActivityOnStop(activity: Activity)
+    fun callActivityOnDestroy(activity: Activity)
+
+    // Application creation
+    fun newApplication(cl: ClassLoader, className: String, context: Context): Application
+    fun callApplicationOnCreate(app: Application)
+
+    // Input event dispatch
+    fun sendKeySync(event: KeyEvent)
+    fun sendPointerSync(event: MotionEvent)
+
+    // Activity monitoring
+    fun addMonitor(monitor: ActivityMonitor): Unit
+    fun waitForMonitor(monitor: ActivityMonitor): Activity
+}</code></pre>
+
+<h3>How ActivityThread Uses Instrumentation</h3>
+
+<pre><code>// Inside ActivityThread.performLaunchActivity():
+fun performLaunchActivity(r: ActivityClientRecord): Activity {
+    // 1. Create the Activity via Instrumentation
+    val activity = mInstrumentation.newActivity(
+        cl, component.className, r.intent
+    )
+
+    // 2. Create/get the Application
+    val app = r.packageInfo.makeApplication(false, mInstrumentation)
+
+    // 3. Attach the Activity (sets base context, window, etc.)
+    activity.attach(context, this, mInstrumentation, ...)
+
+    // 4. Call onCreate via Instrumentation
+    mInstrumentation.callActivityOnCreate(activity, r.state)
+
+    return activity
+}
+
+// The Instrumentation indirection is what makes testing possible:
+// Replace the default Instrumentation with a test one that can
+// intercept Activity creation, lifecycle calls, and input events.</code></pre>
+
+<h3>am instrument — Starting Instrumented Tests</h3>
+
+<pre><code>// Command line:
+// am instrument -w com.example.test/androidx.test.runner.AndroidJUnitRunner
+
+// What happens:
+// 1. AMS receives the instrument request
+// 2. AMS starts the TARGET app's process (not a separate test process)
+// 3. AMS tells the process to use the TEST Instrumentation class
+//    instead of the default one
+// 4. The test Instrumentation takes over:
+//    - Runs test methods
+//    - Can create Activities, send input, assert state
+//    - Reports results back to AMS via IInstrumentationWatcher
+
+// InstrumentationInfo in AMS tracks active instrumentations:
+class InstrumentationInfo {
+    val targetPackage: String       // App being tested
+    val targetProcesses: String     // Which processes to instrument
+    val sourceDir: String           // Test APK path
+    val handleProfiling: Boolean    // Whether to profile
+    val functionalTest: Boolean     // Functional vs unit test
+}</code></pre>
+
+<h3>Espresso and UIAutomator Under the Hood</h3>
+
+<pre><code>// Espresso:
+// - Runs IN-PROCESS with the app (same Instrumentation)
+// - Uses Instrumentation.addMonitor() to intercept Activity launches
+// - Uses Instrumentation.runOnMainSync() to execute assertions on UI thread
+// - IdlingResource: hooks into Instrumentation's message queue
+//   to wait for async work before asserting
+
+// UIAutomator:
+// - Runs in a SEPARATE instrumentation process
+// - Uses AccessibilityService APIs to interact with ANY app's UI
+// - Can cross app boundaries (unlike Espresso)
+// - Slower: goes through accessibility framework → WindowManager → app
+
+// Both ultimately rely on Instrumentation for:
+// - Process lifecycle control (start/stop the app)
+// - Input injection (sendPointerSync, sendKeySync)
+// - Activity monitoring (waitForMonitor)</code></pre>
+
+<!-- ============================================================ -->
+<h2>6. App Process Attachment</h2>
+
+<h3>attachApplicationLocked() — The Handshake</h3>
+
+<p>When a newly forked process calls <code>ActivityThread.attach()</code>, it triggers a Binder call back to AMS. <code>attachApplicationLocked()</code> is where AMS completes the handshake and sends all pending work to the new process.</p>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+
+fun attachApplicationLocked(thread: IApplicationThread, callingPid: Int) {
+    // 1. Find the ProcessRecord (created earlier by startProcessLocked)
+    val app = mPidsSelfLocked.get(callingPid)
+        ?: throw SecurityException("No process record for pid $callingPid")
+
+    // 2. Store the Binder proxy
+    app.thread = thread
+    app.curAdj = INVALID_ADJ  // Will be recalculated
+
+    // 3. Tell the process about itself (bindApplication)
+    thread.bindApplication(
+        processName = app.processName,
+        appInfo = app.info,
+        providers = app.pubProviders.values.toList(),  // ContentProviders to install
+        instrumentationName = app.instrumentationClass,
+        profilerInfo = app.profilerInfo,
+        config = mConfiguration,                        // Current device config
+        compatInfo = app.compat,
+        services = getCommonServicesLocked(),            // Cached service binders
+        coreSettings = coreSettings,
+        buildSerial = Build.SERIAL,
+        autofillOptions = ...,
+        contentCaptureOptions = ...,
+        disabledCompatChanges = ...,
+        serializedSystemFontMap = ...
+    )
+
+    // 4. Deliver pending Activities (via ATMS)
+    val atm = LocalServices.getService(ActivityTaskManagerInternal::class.java)
+    val didSomething = atm.attachApplication(app.getWindowProcessController())
+
+    // 5. Deliver pending Services
+    mServices.attachApplicationLocked(app, processName)
+
+    // 6. Deliver pending Broadcasts
+    sendPendingBroadcastsLocked(app)
+
+    // 7. Deliver pending Backup agent
+    mBackupTargets.get(app.userId)?.let { backupTarget ->
+        if (backupTarget.processName == processName) {
+            thread.scheduleCreateBackupAgent(...)
+        }
+    }
+
+    // 8. Update OOM adj now that we know what the process is doing
+    updateOomAdjLocked(app, OOM_ADJ_REASON_PROCESS_BEGIN)
+}</code></pre>
+
+<h3>The Race Condition: Fork vs Attach</h3>
+
+<div class="diagram-container">
+<pre><code>  Timeline
+  ────────────────────────────────────────────────────────────────
+
+  AMS                          Zygote                    New Process
+  ───                          ──────                    ───────────
+  startProcessLocked()
+    │
+    ├─ Creates ProcessRecord
+    │  (pid = 0, thread = null)
+    │
+    ├─ ZygoteProcess.start() ──→ fork()
+    │                              │
+    │                              ├──────────────────→ Child starts
+    │                              │                    ActivityThread.main()
+    │                              │                       │
+    │  Meanwhile, AMS may receive  │                       │
+    │  MORE requests for this      │                       │
+    │  process (e.g., bindService) │                       │
+    │  → Queued in ProcessRecord   │                       │
+    │                              │                       │
+    │                              │                    attach(false)
+    │                              │                       │
+    │  ←──────────────────────────────────────────────── AMS.attachApplication()
+    │                                                      │
+    ├─ app.thread = thread                                 │
+    ├─ Deliver ALL queued work:                            │
+    │  - Pending Activities                                │
+    │  - Pending Services                                  │
+    │  - Pending Broadcasts                                │
+    │  - ContentProviders                                  │
+    └─ updateOomAdjLocked()
+
+  Gap: Between fork() and attachApplication(), the process EXISTS
+  but AMS cannot communicate with it (thread == null).
+  Any component requests during this gap are QUEUED in ProcessRecord.</code></pre>
+</div>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — The Attach Window</div>
+  <p>The gap between <code>fork()</code> and <code>attachApplicationLocked()</code> is typically 50–200ms on modern devices, but can be much longer on low-end hardware or during boot (when dozens of processes start simultaneously). During this window, AMS queues all pending work. If the process takes too long to attach (>10 seconds), AMS considers it a "process not responding" situation and may kill it. This is a common source of startup failures on slow devices — the process is alive but hasn't attached yet, and AMS times out. The <code>PROC_START_TIMEOUT</code> constant controls this (10 seconds by default, 120 seconds during boot).</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Recent Tasks and Task Management (ATMS)</h2>
+
+<h3>RecentTasks — The In-Memory List</h3>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/wm/RecentTasks.java
+
+class RecentTasks {
+    val mTasks: ArrayList<Task>  // Ordered by recency (most recent first)
+
+    // Limits:
+    // - Default max: ~50 tasks (varies by device RAM)
+    // - Per-app limit: prevents one app from flooding recents
+    // - Excluded tasks: FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+
+    fun addTask(task: Task) {
+        // 1. Remove any existing entry for the same task
+        // 2. Add to front of list
+        // 3. Trim if over limit
+        // 4. Schedule persistence
+    }
+
+    fun trimForTaskLocked(task: Task, trimmed: Boolean) {
+        // Remove oldest tasks when limit exceeded
+        // Affiliated tasks (task groups) are trimmed together
+    }
+}</code></pre>
+
+<h3>Task Persistence</h3>
+
+<pre><code>// Tasks survive reboots — they're persisted to disk
+// Location: /data/system/recent_tasks/
+
+// Each task is serialized as XML:
+// /data/system/recent_tasks/123_task.xml
+// Contains: taskId, baseIntent, affinities, userId, timestamps
+
+// TaskPersister runs on a background HandlerThread
+// Source: frameworks/base/services/core/java/com/android/server/wm/TaskPersister.java
+
+class TaskPersister {
+    val mWriteQueue: ArrayList<WriteQueueItem>
+    val mLazyTaskWriterThread: LazyTaskWriterThread
+
+    // Batches writes: waits INTER_WRITE_DELAY_MS (500ms) between flushes
+    // to avoid excessive disk I/O during rapid task changes
+
+    fun saveTask(task: Task) {
+        // Serialize to XML
+        // Add to write queue
+        // LazyTaskWriterThread picks up and writes to disk
+    }
+
+    fun saveImage(image: Bitmap, filePath: String) {
+        // Task snapshots (screenshots for Recents UI)
+        // Stored as compressed JPEG alongside task XML
+    }
+}</code></pre>
+
+<h3>Task Snapshots</h3>
+
+<pre><code>// When a task goes to background, the system captures a screenshot
+// for the Recents (Overview) screen.
+
+// Source: frameworks/base/services/core/java/com/android/server/wm/TaskSnapshotController.java
+
+// Snapshot capture:
+// 1. WMS captures the task's surface via SurfaceControl.screenshot()
+// 2. Bitmap is scaled down (reduced resolution for memory)
+// 3. Stored in /data/system_ce/{userId}/snapshots/{taskId}.proto
+// 4. Low-res thumbnail also kept in memory for quick display
+
+// Privacy: FLAG_SECURE prevents snapshot capture
+// → Recents shows a blank/branded placeholder instead
+
+// Android 12+: TaskSnapshotPersister uses proto format
+// instead of raw bitmaps for better compression</code></pre>
+
+<h3>Task Trimming</h3>
+
+<pre><code>// ATMS limits the number of recent tasks to prevent unbounded growth:
+
+// Global limit: based on device RAM
+//   Low RAM devices: ~20 tasks
+//   Normal devices: ~50 tasks
+//   High RAM devices: ~100 tasks
+
+// Per-app limit: max tasks per package
+//   Default: MAX_TASKS_PER_APP = 5
+//   Apps can request more via android:maxRecents in manifest (up to 50)
+
+// Trimming strategy:
+// 1. When a new task is added and we're over the limit
+// 2. Remove the OLDEST task that isn't:
+//    - Currently visible
+//    - Pinned (PiP)
+//    - The home task
+//    - An affiliated task of a kept task
+// 3. Remove associated snapshots and persisted XML</code></pre>
+
+<!-- ============================================================ -->
+<h2>8. Staff-Level Corner Cases</h2>
+
+<h3>forceStopPackage() — The Nuclear Option</h3>
+
+<pre><code>// When the user "Force Stops" an app (Settings → App → Force Stop),
+// or when AMS calls forceStopPackageLocked() internally:
+
+fun forceStopPackageLocked(packageName: String, userId: Int) {
+    // 1. Kill ALL processes for this package
+    killPackageProcessesLocked(packageName, ...)
+
+    // 2. Remove ALL components:
+    //    - Cancel all pending broadcasts TO this package
+    //    - Remove all ContentProvider connections
+    //    - Stop all Services
+    //    - Finish all Activities
+    //    - Remove from Recent Tasks
+
+    // 3. Cancel external registrations:
+    //    - AlarmManager: cancel all alarms
+    //    - JobScheduler: cancel all jobs
+    //    - SyncManager: cancel all syncs
+    //    - NotificationManager: cancel all notifications
+
+    // 4. Set the "stopped" flag in PackageManager
+    //    → App won't receive ANY implicit broadcasts until
+    //      the user manually launches it again
+    //    → This is the FLAG_STOPPED state
+
+    // 5. Clear pending intents (PendingIntent)
+
+    // This is the ONLY way to truly stop a misbehaving app.
+    // Even after force stop, the app can be restarted by:
+    // - User tapping the icon
+    // - Another app sending an explicit intent
+    // - FCM high-priority message (on some OEMs)
+}</code></pre>
+
+<h3>AMS Lock Contention</h3>
+
+<pre><code>// The global lock (mGlobalLock, shared between ATMS and WMS) is the
+// single biggest performance bottleneck in system_server.
+
+// Operations that hold mGlobalLock:
+// - Activity start/stop/pause/resume
+// - Window add/remove/resize
+// - Configuration changes
+// - Task management
+// - Display management
+
+// Operations that hold AMS's own lock:
+// - Process start/kill
+// - Broadcast dispatch
+// - OOM adj recalculation
+// - ContentProvider management
+
+// Deadlock risk: if code holds AMS lock and tries to acquire mGlobalLock
+// while another thread holds mGlobalLock and tries to acquire AMS lock.
+// AOSP enforces a strict lock ordering: mGlobalLock → AMS lock (never reverse).
+// Violations are caught by LockGuard in debug builds.</code></pre>
+
+<h3>system_server Binder Thread Pool Exhaustion</h3>
+
+<div class="callout danger">
+  <div class="callout-label">Critical — 31 Threads for Everything</div>
+  <p>system_server has a Binder thread pool of <strong>31 threads</strong>, shared across ALL 100+ system services. When all 31 threads are busy handling app requests (e.g., during boot when dozens of apps start simultaneously), new Binder calls from apps <strong>block</strong> until a thread frees up. This manifests as system-wide hangs: apps freeze, touch events stop being dispatched, and the Watchdog may trigger. Common culprits: (1) a system service making a synchronous Binder call to an app process that's slow to respond (holding a system_server Binder thread hostage), (2) ContentProvider queries that do disk I/O on the Binder thread, (3) PackageManager scanning during app install. The mitigation is to never make synchronous calls from system_server to app processes — use <code>oneway</code> Binder calls or post to a handler thread.</p>
+</div>
+
+<h3>Broadcast Storm Cascade</h3>
+
+<pre><code>// Scenario: App A sends broadcast X
+// → 50 receivers wake up
+// → 10 of them send broadcast Y in onReceive()
+// → Each Y has 20 receivers
+// → Some of those send broadcast Z...
+
+// Result: exponential fan-out, hundreds of processes started,
+// massive memory pressure, lmkd killing spree, system lag
+
+// AMS mitigations:
+// 1. Implicit broadcast restrictions (Android 8+)
+// 2. Background process limits (Android 8+)
+// 3. BroadcastModernQueue per-process isolation (Android 14)
+// 4. Deferred delivery to cached processes (Android 14)
+// 5. Rate limiting: AMS can delay broadcasts to apps that
+//    consume too much broadcast time (AOSP has experimental code for this)</code></pre>
+
+<h3>updateOomAdjLocked() and Transitive Bindings</h3>
+
+<pre><code>// The most subtle corner case in OOM adj calculation:
+// transitive binding chains.
+
+// Process A (foreground activity, adj=0)
+//   └─ binds to Process B (service, BIND_ABOVE_CLIENT)
+//       └─ binds to Process C (service, BIND_IMPORTANT)
+//           └─ binds to Process D (service, default flags)
+
+// OOM adj propagation:
+// A: adj=0 (foreground)
+// B: adj=-1 (BIND_ABOVE_CLIENT → above client's adj)
+//    → Clamped to 0 (can't go below FOREGROUND_APP_ADJ for non-system)
+// C: adj=0 (BIND_IMPORTANT → same as client B)
+// D: adj=1 (default binding → client adj + 1)
+
+// The problem: if A stops, ALL of B, C, D lose their elevated adj.
+// A single Activity finish can cascade oom_adj changes across
+// dozens of processes. This is why updateOomAdjLocked() must
+// walk the entire dependency graph on every state change.</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight — Why AMS Is Android's Achilles' Heel</div>
+  <p>AMS (combined with ATMS) is the single most complex subsystem in Android. It manages the lifecycle of every component in every app, computes process priorities for the entire system, dispatches all broadcasts, and mediates all ContentProvider access. Despite the Android 10 split, the core challenge remains: <strong>global state with fine-grained locking</strong>. Every optimization in AMS (batched oom_adj updates, per-process broadcast queues, deferred delivery) is a response to the fundamental tension between correctness (every state change must be reflected immediately) and performance (recalculating everything on every change is too expensive). In interviews, demonstrating understanding of this tension — and the specific mechanisms AMS uses to manage it — is what separates L6 from L5 answers.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. lmkd and PSI (Pressure Stall Information)</h2>
+
+<p><code>lmkd</code> (Low Memory Killer Daemon) is the userspace process that decides which app processes to kill when the device is under memory pressure. It replaced the in-kernel LMK driver starting with Android 9.</p>
+
+<h3>9.1 AMS → lmkd Communication</h3>
+
+<div class="diagram-container">
+<pre><code>  AMS (system_server)                    lmkd (native daemon)              Kernel
+  ─────────────────────                  ────────────────────              ──────
+  updateOomAdjLocked()
+    │
+    ├─ Compute adj for process
+    │
+    ├─ ProcessList.setOomAdj(pid, adj)
+    │    │
+    │    └─ Write to /proc/{pid}/oom_score_adj  ────────────────────────→  Kernel stores score
+    │    │
+    │    └─ LmkdConnection.sendLmkProcPrio()  ──→  lmkd receives
+    │       (via Unix socket)                       │
+    │                                               ├─ Updates internal
+    │                                               │  process priority table
+    │                                               │
+    │                                               │  PSI monitor triggers:
+    │                                               │  "memory stall > threshold"
+    │                                               │
+    │                                               ├─ Select victim:
+    │                                               │  highest oom_adj first
+    │                                               │  (999 → 900 → ... → 0)
+    │                                               │
+    │                                               └─ kill(pid, SIGKILL)  ──→  Process dies
+    │                                                  No onDestroy()
+    │                                                  No callback to app
+    │
+    ├─ Binder DeathRecipient fires
+    │  (detects process death)
+    │
+    └─ cleanUpApplicationRecordLocked()</code></pre>
+</div>
+
+<h3>9.2 PSI vs Legacy Mode</h3>
+
+<table>
+  <tr>
+    <th>Aspect</th>
+    <th>Legacy Mode (pre-Android 10)</th>
+    <th>PSI Mode (Android 10+)</th>
+  </tr>
+  <tr>
+    <td>Trigger mechanism</td>
+    <td>Poll <code>/proc/meminfo</code> for free memory thresholds</td>
+    <td>Kernel PSI reports actual memory stall time</td>
+  </tr>
+  <tr>
+    <td>Responsiveness</td>
+    <td>Slow — polling interval limits reaction time</td>
+    <td>Fast — event-driven, reacts to actual pressure</td>
+  </tr>
+  <tr>
+    <td>Accuracy</td>
+    <td>Crude — free memory doesn't reflect actual pressure (page cache, etc.)</td>
+    <td>Precise — measures how much time tasks spend waiting for memory</td>
+  </tr>
+  <tr>
+    <td>Kill decision</td>
+    <td>Kill when free memory drops below fixed thresholds</td>
+    <td>Kill when stall time exceeds configured thresholds</td>
+  </tr>
+  <tr>
+    <td>Configuration</td>
+    <td><code>ro.lmk.low</code>, <code>ro.lmk.medium</code>, <code>ro.lmk.critical</code> (MB thresholds)</td>
+    <td><code>ro.lmk.psi_partial_stall_ms</code>, <code>ro.lmk.psi_complete_stall_ms</code></td>
+  </tr>
+</table>
+
+<pre><code>// PSI thresholds (typical values):
+// ro.lmk.psi_partial_stall_ms = 70    — partial stall: some tasks waiting for memory
+// ro.lmk.psi_complete_stall_ms = 700  — complete stall: ALL tasks waiting for memory
+
+// Kill order is strictly by oom_adj:
+// CACHED_APP_MAX_ADJ (999) → killed first
+// CACHED_APP_MIN_ADJ (900) → killed next
+// ...descending...
+// FOREGROUND_APP_ADJ (0)   → killed last (only under extreme pressure)
+// SYSTEM_ADJ (-900)        → system_server: killing this triggers runtime restart
+// NATIVE_ADJ (-1000)       → never killed by lmkd (Zygote, surfaceflinger)</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">L6 Insight — Why PSI Is Superior</div>
+  <p>PSI-based lmkd is more responsive than legacy because it reacts to <em>actual memory pressure</em>, not just free memory thresholds. A device can have low free memory but no pressure (because the page cache is reclaimable). Conversely, a device can have "enough" free memory but high pressure (because of heavy I/O causing page faults). PSI captures the ground truth: how much time tasks actually spend stalled waiting for memory. This results in fewer unnecessary kills (better user experience) and faster response to genuine pressure (fewer OOM crashes).</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>10. ActiveServices &amp; ServiceRecord</h2>
+
+<p><code>ActiveServices</code> is the AMS helper class responsible for managing all bound and started services across the system. It's the service equivalent of what <code>OomAdjuster</code> is for process priority.</p>
+
+<h3>10.1 ServiceRecord — In-Memory Service Representation</h3>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/am/ServiceRecord.java
+
+class ServiceRecord {
+    val name: ComponentName               // e.g., com.example/.MyService
+    val serviceInfo: ServiceInfo          // Manifest metadata
+    var app: ProcessRecord?               // Hosting process (null if not yet started)
+    var intent: Intent.FilterComparison   // The intent used to start/bind
+
+    // Binding state
+    val bindings: ArrayMap&lt;Intent.FilterComparison, IntentBindRecord&gt;
+    val connections: ArrayMap&lt;IBinder, ArrayList&lt;ConnectionRecord&gt;&gt;
+
+    // Lifecycle state
+    var startRequested: Boolean = false   // startService() was called
+    var stopIfKilled: Boolean = false     // onStartCommand returned START_NOT_STICKY
+    var callStart: Boolean = false        // Needs onStartCommand delivery
+    var lastStartId: Int = 0             // Most recent startId
+
+    // Foreground service state
+    var isForeground: Boolean = false
+    var foregroundId: Int = 0
+    var foregroundNoti: Notification? = null
+    var fgRequired: Boolean = false       // Must call startForeground() within 10s
+
+    // Timing
+    var createRealTime: Long              // When service was created
+    var executingStart: Long              // When current onStart/onBind began
+    var executeFg: Boolean                // Executing in foreground priority
+}</code></pre>
+
+<h3>10.2 Service Lifecycle Through ActiveServices</h3>
+
+<pre><code>// startService() flow through AMS:
+// 1. App calls Context.startService(intent)
+// 2. AMS.startService() → ActiveServices.startServiceLocked()
+//    - Resolve the service component via PMS
+//    - Create or find existing ServiceRecord
+//    - Check permissions, background restrictions
+// 3. ActiveServices.bringUpServiceLocked()
+//    - If process not running: start it via ProcessList.startProcessLocked()
+//    - If process running: proceed to step 4
+// 4. ActiveServices.realStartServiceLocked()
+//    - app.thread.scheduleCreateService(token, serviceInfo)
+//    - app.thread.scheduleServiceArgs(token, startId, intent)
+//    → App process: ActivityThread.handleCreateService()
+//    → App process: Service.onCreate() → Service.onStartCommand()</code></pre>
+
+<h3>10.3 Service ANR Timeouts</h3>
+
+<table>
+  <tr>
+    <th>Service Type</th>
+    <th>Timeout</th>
+    <th>Constant</th>
+  </tr>
+  <tr>
+    <td>Foreground service</td>
+    <td>20 seconds</td>
+    <td><code>SERVICE_TIMEOUT = 20_000L</code></td>
+  </tr>
+  <tr>
+    <td>Background service</td>
+    <td>200 seconds</td>
+    <td><code>SERVICE_BACKGROUND_TIMEOUT = 200_000L</code></td>
+  </tr>
+  <tr>
+    <td><code>startForeground()</code> call</td>
+    <td>10 seconds</td>
+    <td><code>SERVICE_START_FOREGROUND_TIMEOUT = 10_000L</code></td>
+  </tr>
+</table>
+
+<pre><code>// ActiveServices sets a timeout when dispatching work to a service:
+fun scheduleServiceTimeoutLocked(proc: ProcessRecord) {
+    val msg = mAm.mHandler.obtainMessage(
+        ActivityManagerService.SERVICE_TIMEOUT_MSG, proc
+    )
+    mAm.mHandler.sendMessageDelayed(
+        msg,
+        if (proc.executeFg) SERVICE_TIMEOUT else SERVICE_BACKGROUND_TIMEOUT
+    )
+}
+
+// If the service doesn't finish onStartCommand/onBind within the timeout:
+// → ANR dialog shown to user
+// → Process may be killed</code></pre>
+
+<h3>10.4 FGS Timeout (Android 14+)</h3>
+
+<div class="callout warn">
+  <div class="callout-label">Android 14 — Foreground Service Type Timeouts</div>
+  <p>Android 14 introduced maximum runtime limits for certain foreground service types. <code>dataSync</code> and <code>mediaProcessing</code> FGS types have a ~6-hour timeout. When the timeout fires, the system calls <code>Service.onTimeout()</code>, giving the service a chance to clean up before being stopped. If the service doesn't stop itself, the system force-stops it. This prevents apps from running indefinite foreground services under the guise of "data sync."</p>
+</div>
+
+<pre><code>// bringDownServiceLocked() — stopping a service:
+// Called when:
+// 1. All bindings released AND stopSelf() called (for started+bound services)
+// 2. stopService() called (for started-only services)
+// 3. Process dies
+// 4. Force stop
+// 5. FGS timeout (Android 14+)
+
+fun bringDownServiceLocked(r: ServiceRecord) {
+    // 1. Disconnect all bindings
+    for (ibr in r.bindings.values) {
+        for (cr in ibr.connections) {
+            cr.conn.connected(r.name, null, true)  // Notify clients of disconnect
+        }
+    }
+    // 2. Tell the app process to destroy the service
+    r.app?.thread?.scheduleStopService(r)
+    // 3. Remove from ActiveServices tracking
+    // 4. Update oom_adj for the hosting process
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2>11. ContentProvider Death &amp; Client Recovery</h2>
+
+<p>ContentProvider death handling is one of the most nuanced areas of AMS — the behavior depends on whether the client holds a <em>stable</em> or <em>unstable</em> reference to the provider.</p>
+
+<h3>11.1 Stable vs Unstable Provider References</h3>
+
+<div class="diagram-container">
+<pre><code>  Provider Process Dies
+  ═════════════════════
+
+  ┌─────────────────────┐
+  │  Provider Process    │
+  │  (hosting MyProvider)│
+  │                      │
+  │  ☠ Process killed    │
+  └──────────┬──────────┘
+             │
+     ┌───────┴───────┐
+     │               │
+     ▼               ▼
+  Stable Client   Unstable Client
+  ┌──────────┐    ┌──────────────┐
+  │ Client A │    │  Client B    │
+  │          │    │              │
+  │ ALSO     │    │ Gets         │
+  │ KILLED   │    │ DeadObject-  │
+  │ by AMS   │    │ Exception    │
+  │          │    │ → can retry  │
+  └──────────┘    └──────────────┘
+
+  Stable: insert/update/delete (default)
+  Unstable: query() since API 16</code></pre>
+</div>
+
+<pre><code>// Why the distinction?
+// Stable reference: client depends on provider's transactional state.
+//   If provider dies mid-transaction, client's state is inconsistent.
+//   Safest to kill the client too and let it restart fresh.
+//
+// Unstable reference: client can handle provider death gracefully.
+//   A query() result is read-only — if provider dies, client just gets
+//   DeadObjectException and can retry the query.
+
+// ContentResolver uses unstable providers for query() by default:
+// ContentResolver.query() → acquireUnstableProvider() → IContentProvider.query()
+// ContentResolver.insert() → acquireProvider() (STABLE) → IContentProvider.insert()</code></pre>
+
+<h3>11.2 AMS Cleanup on Provider Death</h3>
+
+<pre><code>// When a provider process dies, AMS calls:
+fun removeDyingProviderLocked(proc: ProcessRecord, cpr: ContentProviderRecord) {
+    // 1. Mark provider as dead
+    cpr.provider = null
+
+    // 2. Handle stable connections — kill those clients
+    for (conn in cpr.connections) {
+        if (conn.stableCount > 0) {
+            // Client has stable reference → must die too
+            if (conn.client != proc) {  // Don't kill the already-dead provider process
+                conn.client.thread?.let {
+                    // Kill the client process
+                    Process.killProcess(conn.client.pid)
+                }
+            }
+        }
+        // 3. Set dead flag for unstable connections
+        conn.dead = true
+    }
+
+    // 4. If provider was being launched, notify waiting clients
+    if (cpr.launchingApp == proc) {
+        cpr.launchingApp = null
+        cpr.notifyAll()  // Wake up threads waiting in getContentProvider()
+    }
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">L6 Insight — MediaStore Uses Unstable Providers</div>
+  <p>MediaStore uses <code>acquireUnstableContentProvider()</code> because the media scanner process (<code>com.android.providers.media</code>) can crash without killing the gallery app. If the gallery held a stable reference, a media scanner crash would kill the gallery — terrible UX. With unstable references, the gallery gets a <code>DeadObjectException</code>, shows an error, and retries when the media scanner restarts. This pattern is critical for any app that queries ContentProviders hosted in potentially unstable processes.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>12. cleanUpApplicationRecordLocked() — Process Death Cleanup</h2>
+
+<p>When a process dies — whether killed by lmkd, crashed, or force-stopped — AMS must clean up all state associated with it. <code>cleanUpApplicationRecordLocked()</code> is the comprehensive cleanup method that handles this.</p>
+
+<h3>12.1 The Cleanup Cascade</h3>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java
+
+fun cleanUpApplicationRecordLocked(
+    app: ProcessRecord,
+    restarting: Boolean,
+    allowRestart: Boolean,
+    index: Int,
+    replacingPid: Boolean
+) {
+    // 1. ACTIVITIES — remove all ActivityRecords
+    //    Delegates to ATMS: WindowProcessController.clearActivities()
+    //    → Finishes all activities, removes from task stacks
+    //    → May trigger task removal if last activity in task
+
+    // 2. SERVICES — clean up all ServiceRecords
+    mServices.killServicesLocked(app, allowRestart)
+    //    → Stops all started services
+    //    → Disconnects all bound services
+    //    → Notifies clients via onServiceDisconnected()
+    //    → May restart services with START_STICKY
+
+    // 3. BROADCASTS — remove pending broadcast deliveries
+    //    → Cancel any broadcasts queued for this process
+    //    → If process was current receiver in ordered broadcast,
+    //      skip to next receiver
+
+    // 4. CONTENT PROVIDERS — clean up all ContentProviderRecords
+    for (cpr in app.pubProviders.values) {
+        removeDyingProviderLocked(app, cpr)
+        //    → Kill stable clients (see Section 11)
+        //    → Notify unstable clients
+    }
+
+    // 5. RECEIVERS — unregister all dynamic BroadcastReceivers
+    for (rl in app.receivers) {
+        removeReceiverLocked(rl)
+    }
+
+    // 6. ALARMS — cancel pending alarms
+    //    AlarmManagerService.removeLocked(app.uid)
+
+    // 7. JOBS — cancel pending jobs
+    //    JobSchedulerService.cancelJobsForUid(app.uid)
+
+    // 8. NOTIFICATIONS — remove notifications if process was force-stopped
+    //    (not on normal death — notifications survive process death)
+
+    // 9. OOM ADJ — recalculate for ALL processes that had bindings
+    //    to the dead process. A single death can trigger cascading
+    //    oom_adj changes across dozens of other processes.
+    updateOomAdjLocked(OOM_ADJ_REASON_PROCESS_END)
+
+    // 10. SEND BROADCAST — if force-stopped:
+    //     Send ACTION_PACKAGE_RESTARTED so other apps can clean up
+    //     their references to this package
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">L6 Insight — Cascading State Changes</div>
+  <p><code>cleanUpApplicationRecordLocked()</code> is one of the most complex methods in AMS. A single process death can trigger cascading state changes across dozens of other processes: bound service clients get <code>onServiceDisconnected()</code>, stable ContentProvider clients are killed, oom_adj is recalculated for every process that had a binding to the dead process, and ordered broadcast chains are advanced. In extreme cases (e.g., a process that hosts providers used by 20 other apps), a single death can cause a "death cascade" where multiple processes are killed and restarted in rapid succession. This is why AMS batches oom_adj updates — processing each death individually would cause O(n&sup2;) recalculations.</p>
+</div>
+
+<h3>12.2 Process Restart After Death</h3>
+
+<pre><code>// After cleanup, AMS may restart the process if:
+// 1. It had a Service with START_STICKY or START_REDELIVER_INTENT
+//    → ActiveServices schedules a restart after a backoff delay
+//    → Delay increases with each crash: 1s → 4s → 16s → ... (exponential)
+//    → Max delay: 60 seconds
+
+// 2. It had a persistent flag (android:persistent="true")
+//    → Restarted immediately (only for system apps)
+
+// 3. It's needed for a pending component (Activity, broadcast, etc.)
+//    → Restarted on demand when the component is next requested
+
+// AMS does NOT restart processes that:
+// - Were force-stopped by the user
+// - Had only cached/empty state (no active components)
+// - Crashed too many times (crash loop detection)</code></pre>
+
+<!-- ============================================================ -->
+<h2>13. Broadcast ANR Attribution</h2>
+
+<p>Broadcast ANR attribution is more nuanced than most developers realize. Understanding exactly <em>who</em> gets blamed for a broadcast timeout is critical for debugging production ANRs.</p>
+
+<h3>13.1 ANR Timeout Rules</h3>
+
+<table>
+  <tr>
+    <th>Broadcast Type</th>
+    <th>Timeout</th>
+    <th>ANR Attributed To</th>
+  </tr>
+  <tr>
+    <td>Foreground broadcast</td>
+    <td>10 seconds</td>
+    <td>The <strong>receiving</strong> process (not the sender)</td>
+  </tr>
+  <tr>
+    <td>Background broadcast</td>
+    <td>60 seconds</td>
+    <td>The <strong>receiving</strong> process (not the sender)</td>
+  </tr>
+  <tr>
+    <td>Ordered broadcast</td>
+    <td>Per-receiver timeout</td>
+    <td>The <strong>current receiver</strong> in the chain (<code>BroadcastRecord.curReceiver</code>)</td>
+  </tr>
+</table>
+
+<h3>13.2 The Dispatch Loop</h3>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/am/BroadcastQueue.java
+
+fun processNextBroadcastLocked(fromMsg: Boolean, skipOomAdj: Boolean) {
+    // 1. Deliver all parallel broadcasts first (no timeout per-receiver)
+    while (mParallelBroadcasts.isNotEmpty()) {
+        val r = mParallelBroadcasts.removeAt(0)
+        for (i in 0 until r.receivers.size) {
+            deliverToRegisteredReceiverLocked(r, r.receivers[i] as BroadcastFilter, false, i)
+        }
+    }
+
+    // 2. Process ordered broadcasts one receiver at a time
+    val r = mOrderedBroadcasts.firstOrNull() ?: return
+
+    // 3. Check for timeout on current receiver
+    if (r.receiverTime + mConstants.TIMEOUT > now) {
+        // Still within timeout — wait
+        return
+    }
+
+    // 4. TIMEOUT — current receiver is too slow
+    broadcastTimeoutLocked(false)
+    //    → Logs ANR for the RECEIVING process
+    //    → Skips to next receiver
+    //    → Current result propagated to next receiver
+}</code></pre>
+
+<h3>13.3 The goAsync() Trap</h3>
+
+<div class="callout danger">
+  <div class="callout-label">goAsync() Does NOT Extend the Timeout</div>
+  <p>A common misconception: <code>BroadcastReceiver.goAsync()</code> does <strong>not</strong> give you more time. It returns a <code>PendingResult</code> that lets you move processing off the main thread, but the same 10s/60s ANR timeout still applies. If you call <code>goAsync()</code> and never call <code>PendingResult.finish()</code>, the broadcast queue blocks until the timeout fires, then:</p>
+  <ul>
+    <li>ANR is attributed to your process</li>
+    <li>For ordered broadcasts: the entire chain is stalled — no other receiver gets the broadcast until your timeout expires</li>
+    <li>The broadcast queue skips your receiver and moves to the next one</li>
+  </ul>
+</div>
+
+<pre><code>// The goAsync() leak pattern:
+class LeakyReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        val pending = goAsync()  // Get PendingResult
+
+        thread {
+            doLongWork()
+            // BUG: forgot to call pending.finish()
+            // → Broadcast queue blocks for 10s/60s
+            // → ANR attributed to THIS process
+            // → For ordered broadcasts: blocks ALL subsequent receivers
+        }
+    }
+}
+
+// Correct pattern:
+class CorrectReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        val pending = goAsync()
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                doWork()
+            } finally {
+                pending.finish()  // ALWAYS call finish()
+            }
+        }
+    }
+}</code></pre>
+
+<h3>13.4 Ordered Broadcast Starvation</h3>
+
+<pre><code>// Edge case: ordered broadcast with many receivers
+// Receiver A (priority=100): takes 9 seconds (just under timeout)
+// Receiver B (priority=50):  takes 9 seconds
+// Receiver C (priority=0):   takes 9 seconds
+
+// Total time: 27 seconds for ONE broadcast to complete
+// No individual receiver ANRs (each is under 10s)
+// But the broadcast queue is blocked for 27 seconds
+// Other ordered broadcasts are STARVED
+
+// This is why BroadcastModernQueue (Android 14) uses per-process queues:
+// Slow receivers in Process A don't block delivery to Process B</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">L6 Insight — Debugging Broadcast ANRs in Production</div>
+  <p>When investigating broadcast ANRs from crash reports, check: (1) <code>traces.txt</code> for the receiving process's main thread stack — it shows what the receiver was doing when the timeout fired, (2) <code>dumpsys activity broadcasts</code> to see the current broadcast queue state and which receiver is active, (3) the <code>BroadcastRecord.dispatchTime</code> vs <code>receiverTime</code> to distinguish between "receiver is slow" (long gap between receiverTime and now) vs "dispatch is slow" (long gap between dispatchTime and receiverTime — indicates the process was being started). A common false positive: the ANR is attributed to Receiver B, but the real culprit is Receiver A which took 9.9 seconds, leaving Receiver B only 0.1 seconds before the cumulative timeout fires.</p>
+</div>
+
+<!-- ============================================================ -->
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); display: flex; justify-content: space-between; color: var(--text-dim); font-size: 0.85rem;">
+  <span>&larr; <a href="01-system-server-boot.html">01 — system_server Boot</a></span>
+  <span><a href="03-window-manager-internals.html">03 — WMS Internals</a> &rarr;</span>
+</div>
+
+</body>
+</html>

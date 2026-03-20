@@ -1,0 +1,1346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 — WindowManagerService Internals — Window Hierarchy, Surfaces, Input, Transitions</title>
+<style>
+  :root { --bg: #ffffff; --surface: #f7f8fa; --surface2: #edeef2; --border: #d4d7e0; --text: #1e2028; --text-dim: #5c6070; --accent: #2563eb; --accent2: #7c3aed; --green: #16803c; --red: #dc2626; --orange: #c2410c; --yellow: #a16207; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); font-size: 1.08rem; line-height: 1.75; padding: 2rem; max-width: 920px; margin: 0 auto; }
+  h1 { font-size: 2.2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.6rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.25rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; color: var(--text); }
+  .nav a.active { background: var(--accent); color: #fff; }
+  code { background: #f0f1f5; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.9em; color: #c7254e; border: 1px solid #e2e4ea; }
+  pre { background: #fafbfc; border: 1px solid #d4d7e0; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 1rem; line-height: 1.7; }
+  pre code { color: #2e3440; border: none; background: none; padding: 0; }
+  .callout { border-left: 4px solid var(--accent); background: #f0f4ff; padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: #f5f0ff; }
+  .callout.warn { border-left-color: var(--orange); background: #fff7ed; }
+  .callout.danger { border-left-color: var(--red); background: #fef2f2; }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--bg); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-ams-atms-internals.html">01 AMS / ATMS</a>
+  <a href="02-activity-launch-flow.html">02 Activity Launch</a>
+  <a class="active" href="03-window-manager-internals.html">03 WMS Internals</a>
+  <a href="04-pms-package-resolution.html">04 PMS &amp; Packages</a>
+  <a href="05-system-server-boot.html">05 system_server Boot</a>
+  <a href="06-content-providers-internals.html">06 ContentProviders</a>
+  <a href="07-broadcast-internals.html">07 Broadcasts</a>
+  <a href="08-interview-qa.html">08 Interview Q&amp;A</a>
+</div>
+
+<h1>03 — WindowManagerService Internals</h1>
+<p class="subtitle">The system service that manages every window on every display — hierarchy, surfaces, input dispatch, transitions, insets, and the global lock that governs it all</p>
+
+<!-- ============================================================ -->
+<h2>1. WMS Architecture Overview</h2>
+
+<p><code>WindowManagerService</code> (WMS) runs inside <code>system_server</code> and is the single authority over <strong>all</strong> windows on all displays. Every pixel you see on an Android screen — Activities, dialogs, toasts, the status bar, the keyboard — is a window managed by WMS.</p>
+
+<pre><code>// WMS is created during system_server boot (SystemServer.java):
+//   startOtherServices() {
+//       wm = WindowManagerService.main(context, inputManager, ...);
+//       ServiceManager.addService(Context.WINDOW_SERVICE, wm);
+//   }
+//
+// WMS holds the global lock (mGlobalLock) shared with ATMS.
+// Almost every WMS operation acquires this lock.
+// Source: frameworks/base/services/core/java/com/android/server/wm/
+
+// Key responsibilities:
+// 1. Maintain the window hierarchy (which windows exist, their z-order)
+// 2. Allocate and manage SurfaceControl for each window
+// 3. Relay layout information so windows know their size/position
+// 4. Coordinate with InputManagerService for input dispatch
+// 5. Drive window transitions and animations
+// 6. Manage window insets (status bar, nav bar, IME, cutout)
+// 7. Handle multi-display window placement</code></pre>
+
+<h3>The Window Hierarchy</h3>
+
+<p>WMS organizes windows in a tree structure. Every class in this tree extends <code>WindowContainer</code>, which provides child management, z-ordering, and surface hierarchy operations:</p>
+
+<div class="diagram-container">
+<pre style="background: none; border: none; margin: 0; padding: 0; font-size: 0.92rem; line-height: 1.6;">
+WindowManagerService
+ └── RootWindowContainer                    ← root of the entire tree
+      ├── DisplayContent (#0 — built-in)    ← one per physical/virtual display
+      │    ├── DisplayArea.Root
+      │    │    ├── DisplayArea (ABOVE_TASKS)
+      │    │    │    ├── WindowToken (StatusBar)
+      │    │    │    │    └── WindowState (status_bar)
+      │    │    │    └── WindowToken (NavigationBar)
+      │    │    │         └── WindowState (navigation_bar)
+      │    │    │
+      │    │    ├── DisplayArea (DEFAULT_TASK_DISPLAY_AREA)
+      │    │    │    ├── Task (stack #1)
+      │    │    │    │    └── Task (leaf task)
+      │    │    │    │         └── ActivityRecord (= WindowToken)
+      │    │    │    │              └── WindowState (app window)
+      │    │    │    │                   └── WindowState (sub-window: popup)
+      │    │    │    └── Task (stack #2)
+      │    │    │         └── ...
+      │    │    │
+      │    │    └── DisplayArea (BELOW_TASKS)
+      │    │         └── WindowToken (Wallpaper)
+      │    │              └── WindowState (wallpaper)
+      │    │
+      │    ├── ImeContainer
+      │    │    └── WindowToken (InputMethod)
+      │    │         └── WindowState (IME window)
+      │    │
+      │    └── OverlayDisplayAdapter (if mirroring)
+      │
+      └── DisplayContent (#1 — virtual/external)
+           └── ... (same structure)
+</pre>
+</div>
+
+<h3>Core Classes</h3>
+
+<pre><code>// WindowContainer — abstract base for every node in the tree
+// Provides: addChild(), removeChild(), forAllWindows(), assignLayer()
+// Each WindowContainer has a SurfaceControl that forms the surface tree
+
+// WindowState — the per-window metadata object
+class WindowState extends WindowContainer&lt;WindowState&gt; {
+    final WindowManager.LayoutParams mAttrs;  // type, flags, format
+    final IWindow mClient;                    // Binder to the app's ViewRootImpl
+    int mBaseLayer;                           // z-order base (derived from window type)
+    int mSubLayer;                            // sub-window offset within parent
+    final Rect mRequestedFrame;               // what the app asked for
+    final Rect mFrame;                        // what WMS assigned
+    boolean mHasSurface;                      // whether a surface is allocated
+    WindowSurfaceController mWinAnimator;     // manages the SurfaceControl
+    InsetsState mRequestedInsetsState;        // insets the app sees
+}
+
+// WindowToken — groups related windows
+// For Activities, ActivityRecord extends WindowToken
+// For system windows (toast, status bar), a plain WindowToken is used
+
+// ActivityRecord — extends WindowToken
+// Links the activity lifecycle (ATMS) to the window hierarchy (WMS)
+// Contains: starting window state, letterbox config, transition info
+
+// DisplayContent — one per display, holds the full window tree for that display
+// Contains: DisplayPolicy, DisplayRotation, InsetsStateController</code></pre>
+
+<div class="callout">
+<div class="callout-label">Key Insight</div>
+<code>ActivityRecord extends WindowToken</code> is a deliberate design choice. It means Activities <em>are</em> window tokens — there's no separate lookup table mapping activities to their windows. This was refactored in Android 10 (project "WM Unification") to merge the previously separate AMS and WMS hierarchies into a single tree.
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Window Types and Layers</h2>
+
+<p>Every window has a <em>type</em> (set in <code>WindowManager.LayoutParams.type</code>) that determines its z-order layer and the permissions required to create it.</p>
+
+<table>
+<tr><th>Category</th><th>Type Range</th><th>Examples</th><th>Permission</th></tr>
+<tr><td>Application</td><td>1–99</td><td><code>TYPE_BASE_APPLICATION</code> (1), <code>TYPE_APPLICATION</code> (2), <code>TYPE_APPLICATION_STARTING</code> (3)</td><td>None (app's own token)</td></tr>
+<tr><td>Sub-window</td><td>1000–1999</td><td><code>TYPE_APPLICATION_PANEL</code> (1000), <code>TYPE_APPLICATION_MEDIA</code> (1001), <code>TYPE_APPLICATION_ATTACHED_DIALOG</code> (1003)</td><td>None (parent must exist)</td></tr>
+<tr><td>System</td><td>2000–2999</td><td><code>TYPE_STATUS_BAR</code> (2000), <code>TYPE_NAVIGATION_BAR</code> (2019), <code>TYPE_TOAST</code> (2005), <code>TYPE_INPUT_METHOD</code> (2011)</td><td><code>INTERNAL_SYSTEM_WINDOW</code> or specific</td></tr>
+<tr><td>System overlay</td><td>2010+</td><td><code>TYPE_SYSTEM_ALERT</code> (2003), <code>TYPE_APPLICATION_OVERLAY</code> (2038)</td><td><code>SYSTEM_ALERT_WINDOW</code></td></tr>
+</table>
+
+<h3>Z-Order Calculation</h3>
+
+<pre><code>// Z-ordering is determined by two values:
+//   mBaseLayer — derived from window type via WindowManagerPolicy
+//   mSubLayer  — offset for sub-windows relative to parent
+
+// WindowManagerPolicy.getWindowLayerFromTypeLw(type, canAddInternalSystemWindow):
+//   TYPE_WALLPAPER            → layer 1
+//   TYPE_BASE_APPLICATION     → layer 2
+//   TYPE_APPLICATION          → layer 2
+//   TYPE_APPLICATION_PANEL    → layer 2  (sub-window, mSubLayer differentiates)
+//   TYPE_TOAST                → layer 8
+//   TYPE_INPUT_METHOD         → layer 13
+//   TYPE_STATUS_BAR           → layer 15
+//   TYPE_NAVIGATION_BAR       → layer 17
+//   TYPE_SYSTEM_ALERT         → layer 9
+//   TYPE_APPLICATION_OVERLAY  → layer 12
+
+// The actual z-order in the surface tree is set by:
+//   WindowContainer.assignLayer(SurfaceControl.Transaction t, int layer)
+//
+// For app windows within the same Task, z-order follows insertion order.
+// DisplayArea boundaries enforce that system windows always appear
+// above/below task windows regardless of individual layer values.
+
+// Sub-window layers (relative to parent):
+//   TYPE_APPLICATION_PANEL          → mSubLayer = 1  (above parent)
+//   TYPE_APPLICATION_MEDIA          → mSubLayer = -2 (below parent)
+//   TYPE_APPLICATION_MEDIA_OVERLAY  → mSubLayer = -1 (below parent, above media)
+//   TYPE_APPLICATION_ATTACHED_DIALOG → mSubLayer = 1 (above parent)</code></pre>
+
+<h3>DisplayPolicy</h3>
+
+<p><code>DisplayPolicy</code> (formerly <code>PhoneWindowManager</code> in the WMS context) makes policy decisions about window placement, visibility, and system UI behavior. It decides:</p>
+
+<ul>
+<li>Which system bars are visible and where they're placed</li>
+<li>How windows interact with the status bar and navigation bar</li>
+<li>Fullscreen and immersive mode behavior</li>
+<li>Keyguard (lock screen) window policy</li>
+<li>Screen rotation and orientation lock</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2>3. SurfaceControl and the Surface Hierarchy</h2>
+
+<p>Every <code>WindowContainer</code> in the WMS tree has a corresponding <code>SurfaceControl</code> — a handle to a layer in SurfaceFlinger. The surface tree mirrors the window tree:</p>
+
+<pre><code>// SurfaceControl — a reference to a SurfaceFlinger layer
+// Created via SurfaceControl.Builder:
+//   new SurfaceControl.Builder(session)
+//       .setName("WindowState{com.example/.MainActivity}")
+//       .setParent(parentSurfaceControl)
+//       .setBufferSize(width, height)
+//       .build()
+
+// SurfaceControl.Transaction — batched surface operations
+// All surface mutations go through transactions for atomicity:
+val t = SurfaceControl.Transaction()
+t.setPosition(surfaceControl, x, y)
+t.setBufferSize(surfaceControl, width, height)
+t.setVisibility(surfaceControl, true)
+t.setLayer(surfaceControl, zOrder)
+t.setAlpha(surfaceControl, 0.8f)
+t.setCrop(surfaceControl, cropRect)
+t.apply()  // commits all changes atomically to SurfaceFlinger
+
+// Why transactions matter:
+// Without batching, setting position then size would cause a visible
+// glitch between the two operations. Transactions ensure atomicity.</code></pre>
+
+<h3>WindowSurfaceController</h3>
+
+<pre><code>// WindowSurfaceController manages the SurfaceControl for a WindowState.
+// It handles:
+//   - Surface creation and destruction
+//   - Position/size updates via SurfaceControl.Transaction
+//   - Surface visibility (show/hide)
+//   - Surface format and flags
+
+// Lifecycle:
+// 1. createSurfaceLocked() — called when window first needs a surface
+//    Creates the SurfaceControl, sets initial properties
+// 2. setSurfaceBoundariesLocked() — updates position/size during relayout
+// 3. hide() / show() — visibility changes
+// 4. destroySurfaceLocked() — cleanup when window is removed</code></pre>
+
+<h3>Leash Surfaces and SurfaceAnimator</h3>
+
+<pre><code>// A "leash" is an intermediate SurfaceControl inserted between a
+// window's parent and the window itself. It's used for animations.
+
+// Normal hierarchy:
+//   ParentSurface → WindowSurface
+
+// During animation:
+//   ParentSurface → LeashSurface → WindowSurface
+//                    ↑ animator controls this
+
+// Why leashes?
+// The animator manipulates the leash (position, scale, alpha) without
+// touching the window's own surface properties. When the animation ends,
+// the leash is removed and the window reparents back to the original parent.
+// This prevents animation state from "leaking" into the window's real state.
+
+// SurfaceAnimator drives animations:
+class SurfaceAnimator {
+    // startAnimation() — creates a leash, starts the animation adapter
+    // onAnimationFinished() — removes leash, reparents window back
+    // transferAnimation() — hands off animation to another container
+    //   (used when an activity finishes during a transition)
+}
+
+// Animation adapters:
+//   LocalAnimationAdapter — runs animation on system_server (legacy)
+//   RemoteAnimationAdapter — delegates to an app or SystemUI
+//   SurfaceAnimationRunner — executes ValueAnimator on a separate thread</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff Insight — Surface Tree Debugging</div>
+<p><code>dumpsys SurfaceFlinger --list</code> prints every layer in the surface tree. Cross-reference this with <code>dumpsys window</code> to verify the WMS window tree matches the SurfaceFlinger layer tree. Mismatches indicate leaked surfaces — a window was removed from WMS but its SurfaceControl wasn't destroyed. This is a real production issue: leaked surfaces consume GPU memory and SurfaceFlinger composition time. In AOSP, <code>WindowState.destroySurface()</code> has multiple code paths (normal removal, process death, surface error) and bugs in any path cause leaks.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Window Addition and Removal</h2>
+
+<h3>addWindow() — Creating a Window</h3>
+
+<pre><code>// Entry point: WindowManagerService.addWindow()
+// Called when ViewRootImpl.setView() triggers Session.addToDisplayAsUser()
+
+// Simplified flow:
+fun addWindow(session: Session, client: IWindow, attrs: LayoutParams,
+              viewVisibility: Int, displayId: Int, ...) {
+
+    // 1. Permission check
+    //    System window types (>= FIRST_SYSTEM_WINDOW) require either:
+    //    - INTERNAL_SYSTEM_WINDOW (signature-level, for system apps)
+    //    - SYSTEM_ALERT_WINDOW (for TYPE_APPLICATION_OVERLAY)
+    //    Toast windows (TYPE_TOAST) are special-cased: allowed without
+    //    permission but limited to the app's own UID
+
+    // 2. Find or create WindowToken
+    //    For app windows: token must already exist (created by ATMS
+    //    when the Activity was launched)
+    //    For system windows: WMS creates a new WindowToken
+
+    // 3. Validate the token
+    //    TYPE_APPLICATION windows must have an ActivityRecord token
+    //    Sub-windows must find their parent WindowState
+
+    // 4. Create WindowState
+    val win = WindowState(this, session, client, token, attrs, ...)
+    //    WindowState constructor computes mBaseLayer from the type
+
+    // 5. Policy check
+    //    DisplayPolicy.adjustWindowParamsLw() — may modify layout params
+    //    DisplayPolicy.prepareAddWindowLw() — can reject the window
+
+    // 6. Register the window
+    mWindowMap.put(client.asBinder(), win)  // global IBinder → WindowState map
+    token.addWindow(win)                    // add to parent token
+
+    // 7. Assign input channel
+    //    Creates a socket pair: one end for InputDispatcher, one for the app
+    win.openInputChannel(outInputChannel)
+
+    // 8. Assign layers and request layout
+    //    Triggers a full relayout pass
+    displayContent.assignWindowLayers(transaction)
+}</code></pre>
+
+<h3>removeWindow() — Destroying a Window</h3>
+
+<pre><code>// Triggered by ViewRootImpl.die() → Session.remove() → WMS.removeWindow()
+
+// Simplified flow:
+fun removeWindow(session: Session, client: IWindow) {
+    val win = mWindowMap.get(client.asBinder()) ?: return
+
+    // 1. Remove from parent token
+    win.removeIfPossible()
+    //    If an exit animation is playing, removal is deferred
+    //    until the animation completes (removeImmediately() later)
+
+    // 2. Destroy surface
+    win.destroySurface()
+    //    Releases the SurfaceControl → SurfaceFlinger destroys the layer
+
+    // 3. Close input channel
+    win.mInputChannel?.dispose()
+
+    // 4. Recalculate focus
+    //    The focused window may have changed
+    updateFocusedWindowLocked()
+
+    // 5. Recalculate insets
+    //    If the removed window was an inset source (e.g., IME),
+    //    all other windows need updated insets
+    displayContent.insetsStateController.onWindowRemoved(win)
+
+    // 6. Remove from global map
+    mWindowMap.remove(client.asBinder())
+}</code></pre>
+
+<h3>relayoutWindow() — The Hot Path</h3>
+
+<pre><code>// relayoutWindow() is called whenever a window's size, position,
+// visibility, or surface needs updating. This is the MOST FREQUENTLY
+// called WMS method — it runs every frame during animations.
+
+// Entry: IWindowSession.relayout() → WMS.relayoutWindow()
+
+fun relayoutWindow(session: Session, client: IWindow,
+                   attrs: LayoutParams, requestedWidth: Int,
+                   requestedHeight: Int, viewVisibility: Int, ...) {
+
+    // 1. Update window attributes if changed
+    // 2. Compute new window frame (position + size)
+    //    WindowLayout.computeFrames() — considers display bounds,
+    //    insets, gravity, requested size, compatibility mode
+    // 3. Create or update surface
+    //    If the window is becoming visible and has no surface → create
+    //    If size changed → resize the surface buffer
+    // 4. Send updated frame and insets back to the app
+    //    The app's ViewRootImpl uses this to trigger measure/layout/draw
+    // 5. Apply surface transaction
+    //    Position, size, visibility, crop — all in one transaction
+}
+
+// Performance: relayoutWindow() acquires mGlobalLock, computes layout,
+// and applies a SurfaceControl.Transaction. During window animations,
+// this runs 60-120 times per second PER ANIMATING WINDOW.</code></pre>
+
+<div class="callout warn">
+<div class="callout-label">Performance Warning</div>
+<code>relayoutWindow()</code> holds <code>mGlobalLock</code> for its entire duration. During complex animations with multiple windows (e.g., split-screen transition), this creates significant lock contention. This is why Android 12+ moved animation execution to Shell transitions — the animation runs on a separate thread in SystemUI, only calling back to WMS for the final state commit.
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Input Dispatch</h2>
+
+<p>WMS is the bridge between <code>InputManagerService</code> (which receives raw events from the kernel) and the app windows that consume them.</p>
+
+<h3>The Full Input Pipeline</h3>
+
+<div class="diagram-container">
+<pre style="background: none; border: none; margin: 0; padding: 0; font-size: 0.92rem; line-height: 1.6;">
+  Linux Kernel (/dev/input/eventN)
+       │
+       ▼
+  InputReader (native thread)
+  Reads raw events, classifies device type (touch, key, etc.)
+  Applies input mapping, produces MotionEvent / KeyEvent
+       │
+       ▼
+  InputDispatcher (native thread)
+  Determines target window via hit-testing or focus
+  Sends event through InputChannel (Unix socket pair)
+       │
+       ├── ANR detection: tracks pending events per window
+       │   If app doesn't acknowledge within 5s → ANR
+       │
+       ▼
+  InputChannel (socket pair)
+  One end in InputDispatcher (server), one in app process (client)
+       │
+       ▼
+  App Process: InputEventReceiver (on Looper thread)
+  Receives event, posts to Choreographer for batching
+       │
+       ▼
+  ViewRootImpl.deliverInputEvent()
+       │
+       ▼
+  InputStage pipeline (in ViewRootImpl):
+    NativePreImeInputStage → ViewPreImeInputStage →
+    ImeInputStage → EarlyPostImeInputStage →
+    NativePostImeInputStage → ViewPostImeInputStage →
+    SyntheticInputStage
+       │
+       ▼
+  View.dispatchTouchEvent() / View.dispatchKeyEvent()
+</pre>
+</div>
+
+<h3>Hit Testing</h3>
+
+<pre><code>// InputDispatcher.findTouchedWindowAtLocked() determines which window
+// receives a touch event:
+
+// 1. Walk the window list top-to-bottom (highest z-order first)
+// 2. For each window, check:
+//    a. Is the window visible? (InputWindowInfo.visible)
+//    b. Is the touch point within the window's touchable region?
+//       (InputWindowInfo.touchableRegion — may be smaller than the frame
+//        due to FLAG_NOT_TOUCH_MODAL or custom touchable regions)
+//    c. Does the window have FLAG_NOT_TOUCHABLE? → skip
+//    d. Does the window have FLAG_NOT_FOCUSABLE? → skip for key events
+// 3. First matching window wins
+
+// Special cases:
+// - FLAG_NOT_TOUCH_MODAL: window only receives touches within its bounds
+//   (default for most windows). Without this flag, the window receives
+//   ALL touches even outside its bounds.
+// - FLAG_WATCH_OUTSIDE_TOUCH: window receives ACTION_OUTSIDE for touches
+//   that land on other windows (used by dropdown menus to dismiss)
+// - Obscured touch rejection: if a window is covered by another window
+//   from a different UID, the touch may be filtered (tapjacking protection)</code></pre>
+
+<h3>Focus Management</h3>
+
+<pre><code>// WMS maintains the "focused window" — the window that receives key events
+// and IME input. Focus is recalculated whenever windows are added, removed,
+// or change visibility.
+
+// InputMonitor.updateInputWindowsLw():
+//   Builds the complete window list with input properties and sends it
+//   to InputDispatcher via InputManagerService.setInputWindows()
+//
+//   This is called after EVERY window hierarchy change.
+//   InputDispatcher uses this list for hit-testing and focus routing.
+
+// Focus calculation (simplified):
+// 1. Find the top-most focusable window in the focused app's task
+// 2. A window is focusable if:
+//    - It's visible
+//    - It doesn't have FLAG_NOT_FOCUSABLE
+//    - Its app is not frozen (e.g., during config change)
+// 3. If no focusable window exists, focus goes to the next app in z-order
+
+// The focused window is critical for:
+// - Key event delivery (hardware keys, keyboard input)
+// - IME visibility and targeting
+// - Accessibility focus tracking</code></pre>
+
+<h3>ANR Detection in InputDispatcher</h3>
+
+<pre><code>// InputDispatcher tracks dispatched-but-unacknowledged events per window.
+// The app must call InputEventReceiver.finishInputEvent() to acknowledge.
+
+// ANR triggers:
+// 1. Key event: no focused window, or focused window hasn't consumed
+//    the previous key event within 5 seconds
+// 2. Touch event: touched window hasn't consumed the previous touch
+//    event within 5 seconds
+// 3. No focused window for a key event (focus timeout)
+
+// When ANR fires:
+//   InputDispatcher → InputManagerService.notifyANR()
+//   → ActivityManagerService.inputDispatchingTimedOut()
+//   → Shows the "App isn't responding" dialog
+
+// The 5-second timeout is hardcoded in InputDispatcher.cpp:
+//   constexpr nsecs_t DEFAULT_INPUT_DISPATCHING_TIMEOUT = 5000 * 1000000LL;</code></pre>
+
+<!-- ============================================================ -->
+<h2>6. Window Transitions and Animations</h2>
+
+<h3>Shell Transitions (Android 12+)</h3>
+
+<pre><code>// The modern transition system decouples animation from WMS.
+// WMS collects what changed; SystemUI's Shell library animates it.
+
+// Architecture:
+//   WMS (TransitionController)
+//     ↕ Binder IPC
+//   SystemUI Shell (Transitions)
+//     → uses SurfaceControl.Transaction to animate surfaces
+
+// Transition lifecycle:
+// 1. COLLECT — WMS detects window changes (open, close, resize, move)
+//    TransitionController.collectExistingOpenTransition()
+//    Participants are added: the windows/tasks involved
+//
+// 2. READY — all participants have drawn their first frame
+//    WMS calls Transitions.onTransitionReady() in Shell
+//
+// 3. PLAY — Shell creates animation (fade, slide, shared element)
+//    Shell manipulates SurfaceControl leashes directly
+//    No mGlobalLock needed during animation playback
+//
+// 4. FINISH — Shell calls back to WMS
+//    WMS applies the final state (visibility, z-order)
+//    Leashes are removed, surfaces reparented
+
+// Why Shell transitions are better:
+// - Animation runs in SystemUI process, not system_server
+// - No mGlobalLock contention during animation
+// - SystemUI can customize animations without modifying WMS
+// - Easier to implement complex multi-window transitions</code></pre>
+
+<h3>Legacy Transitions (pre-Android 12)</h3>
+
+<pre><code>// AppTransition — the old animation system, still partially used
+// Animations run inside system_server on the animation thread
+
+// AppTransition states:
+//   IDLE → TIMEOUT_SET → READY → RUNNING → IDLE
+
+// When an activity opens/closes:
+// 1. AppTransition.prepareAppTransitionLocked(TRANSIT_OPEN/CLOSE)
+// 2. WMS waits for the new window to draw (or timeout after 5s)
+// 3. AppTransition.goodToGo() → starts the animation
+// 4. Animation runs via WindowAnimator on the animation thread
+// 5. On completion, final state is applied
+
+// Remote animations (Android 9+):
+// Apps can provide their own transition via RemoteAnimationAdapter
+// Used by Launcher for the app-open animation:
+//   val adapter = RemoteAnimationAdapter(runner, duration, statusBarDelay)
+//   ActivityOptions.makeRemoteAnimation(adapter)</code></pre>
+
+<h3>TransitionController Internals</h3>
+
+<pre><code>// TransitionController orchestrates transitions across multiple windows.
+// A single transition can involve many participants:
+//   - Opening activity's window
+//   - Closing activity's window
+//   - The task container
+//   - Wallpaper (if transitioning to/from launcher)
+//   - Navigation bar (may need to animate color change)
+
+// Transition merging:
+// If a new transition starts while one is playing, they may merge.
+// Example: user rapidly taps back → close transition merges with
+// the previous close transition to avoid visual glitches.
+
+// Transition types (Transition.java):
+//   TRANSIT_OPEN, TRANSIT_CLOSE
+//   TRANSIT_TO_FRONT, TRANSIT_TO_BACK
+//   TRANSIT_CHANGE (bounds change, e.g., entering split-screen)
+//   TRANSIT_KEYGUARD_GOING_AWAY
+//   TRANSIT_PIP</code></pre>
+
+<!-- ============================================================ -->
+<h2>7. Display Management</h2>
+
+<pre><code>// DisplayContent — represents one display in the WMS hierarchy
+// Each display has its own:
+//   - Window tree (tasks, activities, system windows)
+//   - DisplayPolicy (system bar behavior)
+//   - DisplayRotation (orientation management)
+//   - InsetsStateController (insets for that display)
+//   - InputMonitor (input window list for that display)
+
+// Display creation flow:
+// 1. DisplayManagerService detects a new display (physical or virtual)
+// 2. DMS calls WMS.onDisplayAdded(displayId)
+// 3. WMS creates a DisplayContent and adds it to RootWindowContainer
+// 4. DisplayContent initializes its DisplayArea tree:
+//    Root → ABOVE_TASKS / DEFAULT_TASK_DISPLAY_AREA / BELOW_TASKS
+// 5. DisplayPolicy is created for the new display</code></pre>
+
+<h3>Virtual Displays</h3>
+
+<pre><code>// Virtual displays are used for:
+// - Screen recording / screen sharing (MediaProjection)
+// - Chromecast / Miracast (Presentation API)
+// - Android Auto projected display
+// - Multi-window on foldables (in some implementations)
+
+// Creation:
+val virtualDisplay = displayManager.createVirtualDisplay(
+    "ScreenCapture",
+    width, height, densityDpi,
+    surface,  // SurfaceFlinger renders to this surface
+    DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
+)
+
+// WMS treats virtual displays like physical ones — windows can be
+// placed on them, they have their own DisplayContent, and input
+// can be routed to them.
+
+// Security concern: VIRTUAL_DISPLAY_FLAG_SECURE prevents screenshots
+// and screen recording of content on that display (e.g., DRM video)</code></pre>
+
+<h3>Foldable Display Handling</h3>
+
+<pre><code>// Foldable devices trigger display change events when folding/unfolding:
+// 1. DisplayManagerService detects the physical display change
+// 2. WMS receives onDisplayChanged() — display size/density may change
+// 3. This triggers a Configuration change for all activities on that display
+// 4. DisplayArea tree may reorganize (e.g., split areas for tabletop mode)
+
+// Continuity: the goal is to keep the user's task visible across the fold.
+// WMS preserves the task stack and re-layouts windows for the new display size.
+// Activities that don't handle configChanges are recreated.
+// Activities that DO handle configChanges receive onConfigurationChanged().
+
+// Tabletop mode (half-folded):
+// The DisplayArea tree can split into two regions:
+//   Top half → app content
+//   Bottom half → controls / media player
+// This is managed by DisplayAreaPolicy and device-specific configuration.</code></pre>
+
+<!-- ============================================================ -->
+<h2>8. Window Insets</h2>
+
+<p>Window insets describe the regions of the screen occupied by system UI (status bar, navigation bar, IME, display cutout). The insets system was completely rewritten in Android 11.</p>
+
+<h3>InsetsState and InsetsSource</h3>
+
+<pre><code>// InsetsState — the complete insets state for a window
+// Contains an array of InsetsSource, one per inset type:
+//   - STATUS_BAR (top)
+//   - NAVIGATION_BAR (bottom or side)
+//   - IME (keyboard)
+//   - DISPLAY_CUTOUT (notch/hole-punch)
+//   - SYSTEM_GESTURES (edge gesture regions)
+//   - MANDATORY_SYSTEM_GESTURES (non-overridable gesture regions)
+//   - CAPTION_BAR (freeform window title bar)
+
+// Each InsetsSource has:
+class InsetsSource {
+    val type: Int           // which inset (STATUS_BAR, IME, etc.)
+    val frame: Rect         // the region this inset occupies
+    var isVisible: Boolean  // whether the inset is currently shown
+    // The "frame" is in screen coordinates.
+    // A window computes its usable area by subtracting visible inset frames.
+}
+
+// InsetsStateController (in WMS, per-display):
+// Tracks all inset sources for a display.
+// When a source changes (e.g., IME shows), it recomputes InsetsState
+// and dispatches it to all affected windows.</code></pre>
+
+<h3>InsetsController — The App Side</h3>
+
+<pre><code>// InsetsController is the app-side API for controlling insets.
+// Accessed via: window.insetsController (or WindowCompat.getInsetsController())
+
+// Show/hide system bars:
+val controller = WindowCompat.getInsetsController(window, view)
+controller.hide(WindowInsetsCompat.Type.systemBars())
+controller.show(WindowInsetsCompat.Type.ime())
+
+// Control behavior when hidden:
+controller.systemBarsBehavior =
+    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+
+// Under the hood:
+// 1. App calls InsetsController.hide(types)
+// 2. InsetsController sends a request to WMS via IWindowSession
+// 3. WMS updates the InsetsSource visibility
+// 4. WMS dispatches updated InsetsState to all affected windows
+// 5. Each window's ViewRootImpl applies the new insets via
+//    View.onApplyWindowInsets() / WindowInsetsAnimation callbacks</code></pre>
+
+<h3>Edge-to-Edge</h3>
+
+<pre><code>// "Edge-to-edge" means the app draws behind system bars.
+// The modern approach (Android 15+ default, backported via AndroidX):
+
+// Step 1: Tell the system the app handles insets itself
+WindowCompat.setDecorFitsSystemWindows(window, false)
+// Internally: sets LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+// and removes SYSTEM_UI_FLAG_LAYOUT_* flags
+
+// Step 2: Make system bars transparent
+window.statusBarColor = Color.TRANSPARENT
+window.navigationBarColor = Color.TRANSPARENT
+
+// Step 3: Handle insets in your layout
+ViewCompat.setOnApplyWindowInsetsListener(view) { v, insets ->
+    val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+    v.setPadding(systemBars.left, systemBars.top,
+                 systemBars.right, systemBars.bottom)
+    insets
+}
+
+// What happens internally:
+// 1. setDecorFitsSystemWindows(false) tells WMS to NOT shrink the
+//    window frame to avoid system bars
+// 2. WMS sends the full display frame as the window frame
+// 3. InsetsState is still sent — the app knows WHERE the bars are
+// 4. The app is responsible for padding/offsetting its own content
+
+// In Compose:
+Scaffold(
+    modifier = Modifier.windowInsetsPadding(WindowInsets.systemBars)
+) { paddingValues ->
+    // content with proper inset handling
+}</code></pre>
+
+<div class="callout">
+<div class="callout-label">WindowInsets API Evolution</div>
+<p>Pre-Android 11: <code>systemUiVisibility</code> flags (<code>SYSTEM_UI_FLAG_FULLSCREEN</code>, <code>SYSTEM_UI_FLAG_HIDE_NAVIGATION</code>, etc.) — a bitmask nightmare with 15+ flags and complex interactions. Android 11+: <code>WindowInsetsController</code> with simple <code>show()</code>/<code>hide()</code> methods and typed inset queries. The old flags still work but are deprecated and internally translated to the new system.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Staff-Level Corner Cases</h2>
+
+<h3>The Global Lock Problem</h3>
+
+<pre><code>// WMS and ATMS share a single lock: mGlobalLock (WindowManagerGlobalLock)
+// This was introduced in Android 10 when AMS and WMS hierarchies merged.
+
+// The problem:
+// - ATMS operations (activity start, lifecycle transitions) hold mGlobalLock
+// - WMS operations (relayout, surface updates) hold mGlobalLock
+// - Input dispatch needs to read the window list (holds mGlobalLock briefly)
+// - Animation frame callbacks need layout info (hold mGlobalLock)
+
+// All of these contend on the SAME lock. On a busy system:
+//   Thread A: ATMS starting an activity → holds mGlobalLock
+//   Thread B: WMS relayoutWindow() → BLOCKED waiting for mGlobalLock
+//   Thread C: InputDispatcher updating windows → BLOCKED
+//   Thread D: Animation thread → BLOCKED
+
+// This is the #1 source of jank in system_server.
+// Mitigation strategies in AOSP:
+// 1. Shell transitions (move animation off the lock)
+// 2. Async surface operations (apply transactions without holding the lock)
+// 3. Read-only snapshots for InputDispatcher (copy window list under lock,
+//    InputDispatcher reads the copy without locking)
+// 4. Ongoing work to split the lock into finer-grained locks</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff Insight — mGlobalLock Contention as a System Design Question</div>
+<p>In an L6 interview, you might be asked: "How would you reduce jank caused by system_server lock contention?" The answer involves understanding that <code>mGlobalLock</code> serializes <em>all</em> window and activity operations. The key insight is separating read paths from write paths: InputDispatcher only needs a consistent snapshot of the window list (read), while activity launches mutate the hierarchy (write). Android's evolution has been moving toward this separation — Shell transitions moved animation reads out, and <code>InputMonitor</code> now builds a snapshot under the lock and hands it off. A staff engineer would propose further splitting: a reader-writer lock, or lock-free snapshots using immutable data structures for the window list, with copy-on-write semantics for mutations.</p>
+</div>
+
+<h3>Window Leaks</h3>
+
+<pre><code>// A "window leak" occurs when an app creates a window (via WindowManager.addView)
+// but never removes it. When the Activity is destroyed, ViewRootImpl detects
+// orphaned windows and throws WindowLeaked:
+
+// ViewRootImpl.die(immediate):
+//   if (mView != null && mAdded) {
+//       // Window still attached after Activity destroyed
+//       Log.e(TAG, "WindowLeaked: " + mView + " was originally added here",
+//              mLocation);  // mLocation = stack trace from addView()
+//   }
+
+// Common causes:
+// 1. Dialog.show() without Dialog.dismiss() before Activity.onDestroy()
+// 2. PopupWindow not dismissed
+// 3. Custom floating view added via WindowManager.addView()
+// 4. Toast with custom view (pre-Android 11, toasts were real windows)
+
+// The leak is in the app process (ViewRootImpl), but WMS also has the
+// WindowState. When the app process dies, WMS cleans up via:
+//   AppWindowToken.destroySurfaces() → removes all surfaces
+//   WindowState.removeIfPossible() → removes from hierarchy
+// But if the process is still alive, the leaked window persists.</code></pre>
+
+<h3>Overlay Attacks (TYPE_SYSTEM_ALERT)</h3>
+
+<pre><code>// TYPE_SYSTEM_ALERT (and TYPE_APPLICATION_OVERLAY on API 26+) creates
+// windows that float above other apps. This enables overlay attacks:
+
+// Attack scenario (StrandHogg-style):
+// 1. Malicious app creates an overlay matching the target app's UI
+// 2. Overlay captures user input (credentials, permissions)
+// 3. User thinks they're interacting with the real app
+
+// Android's defenses:
+// - API 23+: SYSTEM_ALERT_WINDOW requires runtime permission
+// - API 26+: TYPE_SYSTEM_ALERT deprecated, TYPE_APPLICATION_OVERLAY
+//   introduced with stricter z-ordering (below critical system windows)
+// - API 31+: apps targeting S+ can't create overlays that cover
+//   permission dialogs (FLAG_NOT_TOUCHABLE enforced)
+// - Touch filtering: if a touch passes through an overlay from a
+//   different UID, the underlying window receives FLAG_WINDOW_IS_OBSCURED
+//   in the MotionEvent, and can reject the touch
+
+// Detecting overlays:
+// MotionEvent.FLAG_WINDOW_IS_OBSCURED — set when an overlay is above
+// MotionEvent.FLAG_WINDOW_IS_PARTIALLY_OBSCURED — partial coverage
+// Apps handling sensitive input should check these flags.</code></pre>
+
+<h3>Multi-Display Edge Cases</h3>
+
+<pre><code>// Windows can move between displays (e.g., drag to external monitor):
+// 1. WMS removes the WindowState from the source DisplayContent
+// 2. Creates a new WindowState on the target DisplayContent
+// 3. The app receives a configuration change (display size/density differ)
+// 4. Surface is destroyed and recreated on the new display
+
+// Edge cases:
+// - IME follows the focused window: if focus moves to a different display,
+//   the IME window moves too (InputMethodManagerService coordinates this)
+// - Wallpaper is per-display: each DisplayContent has its own wallpaper token
+// - System bars are per-display: each display has its own DisplayPolicy
+// - Input routing: InputDispatcher maintains separate window lists per display
+//   A touch on display #1 only considers windows on display #1</code></pre>
+
+<h3>dumpsys window — The Essential Debug Tool</h3>
+
+<pre><code>// dumpsys window provides the complete WMS state:
+
+// Key sections:
+// $ adb shell dumpsys window displays
+//   → DisplayContent tree: all displays, their DisplayAreas, Tasks
+//
+// $ adb shell dumpsys window windows
+//   → Every WindowState: type, frame, visibility, surface, flags
+//   → Sorted by z-order (top to bottom)
+//
+// $ adb shell dumpsys window tokens
+//   → All WindowTokens and their child windows
+//
+// $ adb shell dumpsys window policy
+//   → DisplayPolicy state: system bar visibility, rotation, etc.
+//
+// $ adb shell dumpsys window transitions
+//   → Active and pending transitions
+//
+// $ adb shell dumpsys window input
+//   → Input-related window state: focus, input channels
+
+// Example output for a window:
+// Window #3 Window{abc1234 u0 com.example/.MainActivity}:
+//   mDisplayId=0 stackId=1 taskId=42
+//   mBaseLayer=21000 mSubLayer=0
+//   mFrame=[0,0][1080,2400]
+//   mShownPosition=[0,0]
+//   mHasSurface=true
+//   isVisible=true isFocused=true
+//   WindowStateAnimator:
+//     mSurface=Surface(name=com.example/.MainActivity)
+//     mDrawState=HAS_DRAWN</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff Insight — Debugging Production Window Issues</div>
+<p>When debugging window-related issues in production (e.g., a window not appearing, wrong z-order, input not reaching the right window), the workflow is: (1) <code>dumpsys window windows</code> to see the full window list and verify your window exists with correct visibility and frame, (2) <code>dumpsys window input</code> to verify the focused window and input channel state, (3) <code>dumpsys SurfaceFlinger</code> to verify the surface exists and has the correct layer, (4) <code>dumpsys input</code> to see InputDispatcher's view of the window list and any pending/dropped events. The gap between what WMS thinks (dumpsys window) and what InputDispatcher thinks (dumpsys input) is where most input-routing bugs live.</p>
+</div>
+
+<h3>Deprecated vs Modern APIs</h3>
+
+<table>
+<tr><th>Deprecated</th><th>Modern Replacement</th><th>Why</th></tr>
+<tr><td><code>View.setSystemUiVisibility()</code></td><td><code>WindowInsetsController</code></td><td>Bitmask flags were error-prone and hard to compose</td></tr>
+<tr><td><code>TYPE_SYSTEM_ALERT</code></td><td><code>TYPE_APPLICATION_OVERLAY</code></td><td>Security: stricter z-ordering, can't cover critical UI</td></tr>
+<tr><td><code>AppTransition</code> animations</td><td>Shell transitions</td><td>Performance: animation off the global lock</td></tr>
+<tr><td><code>WindowManager.LayoutParams.softInputMode</code></td><td><code>WindowInsetsAnimationCompat</code></td><td>Smooth IME animation instead of abrupt resize/pan</td></tr>
+<tr><td><code>fitSystemWindows()</code></td><td><code>setOnApplyWindowInsetsListener()</code></td><td>Composable inset handling, not just boolean fit/no-fit</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>10. DisplayArea Hierarchy (Android 12+)</h2>
+
+<p>Android 12 replaced the flat window list with a <strong>tree-structured</strong> <code>DisplayArea</code> hierarchy. This enables flexible window organization for foldables, multi-display devices, and OEM customization.</p>
+
+<h3>The DisplayArea Tree</h3>
+
+<div class="diagram-container">
+<pre style="background: none; border: none; margin: 0; padding: 0; font-size: 0.92rem; line-height: 1.6;">
+DisplayContent (#0 — built-in display)
+ └── DisplayArea.Root
+      │
+      ├── DisplayArea (ABOVE_TASKS)              ← z-order above all app windows
+      │    ├── WindowToken (StatusBar)
+      │    │    └── WindowState (status_bar)
+      │    ├── WindowToken (NavigationBar)
+      │    │    └── WindowState (navigation_bar)
+      │    └── WindowToken (NotificationShade)
+      │         └── WindowState (shade)
+      │
+      ├── TaskDisplayArea (DEFAULT_TASK_DISPLAY_AREA)  ← all app Tasks live here
+      │    ├── Task (stack #1 — fullscreen)
+      │    │    └── Task (leaf) → ActivityRecord → WindowState
+      │    ├── Task (stack #2 — split-screen primary)
+      │    │    └── ...
+      │    └── Task (stack #3 — split-screen secondary)
+      │         └── ...
+      │
+      └── DisplayArea (BELOW_TASKS)              ← z-order below all app windows
+           └── WindowToken (Wallpaper)
+                └── WindowState (wallpaper)
+</pre>
+</div>
+
+<h3>Key DisplayArea Types</h3>
+
+<table>
+<tr><th>Type</th><th>Purpose</th><th>Contains</th></tr>
+<tr><td><code>DisplayArea.Root</code></td><td>Root of the tree for a display</td><td>All other DisplayAreas</td></tr>
+<tr><td><code>DisplayArea.Tokens</code></td><td>Holds non-Activity windows</td><td><code>WindowToken</code> for system windows (status bar, nav bar, toasts)</td></tr>
+<tr><td><code>TaskDisplayArea</code></td><td>Holds Activity tasks</td><td><code>Task</code> containers with <code>ActivityRecord</code> leaves</td></tr>
+<tr><td><code>DisplayAreaGroup</code></td><td>Groups DisplayAreas for coordinated operations</td><td>Used for split-screen, freeform grouping</td></tr>
+</table>
+
+<h3>DisplayAreaPolicy — OEM Customization</h3>
+
+<pre><code>// DisplayAreaPolicy defines HOW the DisplayArea tree is structured.
+// OEMs can provide a custom policy to reorganize the hierarchy.
+
+// Default policy (DisplayAreaPolicyBuilder):
+// Root → ABOVE_TASKS / DEFAULT_TASK_DISPLAY_AREA / BELOW_TASKS
+// This is sufficient for standard phones.
+
+// OEM customization examples:
+// - Foldable: separate TaskDisplayAreas for inner and outer screens
+// - Automotive: dedicated DisplayArea for instrument cluster vs infotainment
+// - Dual-screen: two TaskDisplayAreas, one per physical screen half
+
+// The policy is set per-display during DisplayContent initialization:
+// DisplayContent.configureSurfaces(Transaction t) {
+//     mDisplayAreaPolicy = DisplayAreaPolicy.Provider
+//         .fromResources(mWmService.mContext.getResources())
+//         .instantiate(this);
+// }
+
+// DisplayAreaGroup — coordinates operations across multiple DisplayAreas:
+// When entering split-screen, a DisplayAreaGroup ensures both halves
+// resize atomically and maintain consistent z-ordering boundaries.</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff Insight — Why DisplayArea Matters for Large Screens</div>
+<p>The flat window list worked fine when Android ran on single-screen phones. But foldables, tablets, and desktop modes need <em>regions</em> within a display where different sets of tasks live. <code>DisplayArea</code> provides this: a <code>TaskDisplayArea</code> is a bounded region where tasks can be placed, and the tree structure ensures system windows (status bar, nav bar) always appear at the correct z-order relative to app windows — regardless of how many task regions exist. Without this, implementing Activity Embedding or split-screen on foldables would require brittle z-order hacks.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>11. Window Layout Computation</h2>
+
+<p>Every time <code>relayoutWindow()</code> runs, WMS must compute the exact position and size of the window. This is the hot path that runs 60–120 times per second during animations.</p>
+
+<h3>WindowLayout.computeFrames()</h3>
+
+<pre><code>// Source: frameworks/base/services/core/java/com/android/server/wm/WindowLayout.java
+
+// computeFrames() calculates the final window frame given:
+// - Parent bounds (the containing DisplayArea or Task bounds)
+// - Requested size (what the app asked for via LayoutParams)
+// - Gravity (how to position within the parent)
+// - Insets (status bar, nav bar, IME, cutout)
+// - Compatibility mode (scaling for old apps)
+
+// Simplified logic:
+fun computeFrames(
+    attrs: WindowManager.LayoutParams,
+    parentBounds: Rect,
+    displayFrame: Rect,
+    compatScale: Float,
+    outFrame: Rect,          // → final window frame
+    outDisplayFrame: Rect,   // → available display area
+    outInsetsFrame: Rect     // → frame after insets applied
+) {
+    // Step 1: Resolve requested width/height
+    // MATCH_PARENT → use parent bounds
+    // WRAP_CONTENT → use requested size (from measure pass)
+    // Fixed value → use as-is
+
+    // Step 2: Apply gravity
+    // Gravity.apply(attrs.gravity, requestedWidth, requestedHeight,
+    //               parentBounds, outFrame)
+    // CENTER → centered in parent
+    // TOP|FILL_HORIZONTAL → full width, pinned to top
+    // BOTTOM|CENTER_HORIZONTAL → centered at bottom
+
+    // Step 3: Apply insets
+    // Subtract visible inset regions from the available frame
+    // Unless the window opts out (edge-to-edge)
+
+    // Step 4: Apply compatibility scaling
+    // For apps targeting old SDKs on high-density displays,
+    // WMS scales the frame and applies letterboxing
+}</code></pre>
+
+<h3>Frame Types on WindowState</h3>
+
+<table>
+<tr><th>Field</th><th>Meaning</th><th>When Used</th></tr>
+<tr><td><code>mFrame</code></td><td>Final computed frame (left, top, right, bottom) in screen coordinates</td><td>Surface positioning, hit testing</td></tr>
+<tr><td><code>mDisplayFrame</code></td><td>Portion of the display available to the window (excludes overscan)</td><td>Layout bounds for content</td></tr>
+<tr><td><code>mInsetsFrame</code></td><td>Frame after insets are applied (the "safe" area)</td><td>Content placement avoiding system bars</td></tr>
+<tr><td><code>mRequestedFrame</code></td><td>What the app originally requested</td><td>Comparison to detect size changes</td></tr>
+</table>
+
+<h3>Gravity and Positioning</h3>
+
+<pre><code>// Gravity determines how a window is positioned within its parent bounds.
+// Common gravity combinations for system windows:
+
+// Status bar:
+//   Gravity.TOP | Gravity.FILL_HORIZONTAL
+//   → pinned to top, stretches full width
+
+// Navigation bar (gesture nav):
+//   Gravity.BOTTOM | Gravity.FILL_HORIZONTAL
+//   → pinned to bottom, stretches full width
+
+// Dialog:
+//   Gravity.CENTER
+//   → centered both horizontally and vertically
+
+// Toast:
+//   Gravity.CENTER_HORIZONTAL | Gravity.BOTTOM
+//   → centered horizontally, offset from bottom
+
+// PiP window:
+//   Gravity.NO_GRAVITY (position set explicitly via x, y offsets)
+//   → WMS computes position based on PiP bounds and stash state</code></pre>
+
+<div class="callout staff">
+<div class="callout-label">Staff Insight — Layout Computation Performance</div>
+<p>Layout computation runs on <strong>every</strong> <code>relayoutWindow()</code> call — which happens every frame during window animations. On a device running at 120Hz with 3 animating windows (e.g., split-screen transition), that's 360 <code>computeFrames()</code> calls per second, all under <code>mGlobalLock</code>. This is why the method is carefully optimized: no allocations, no floating-point math, pure integer rect arithmetic. Adding even a single object allocation to this path would cause measurable GC pressure during animations. When profiling system_server jank, <code>computeFrames()</code> and its callers are one of the first places to look.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>12. InputDispatcher Focus & Timeout</h2>
+
+<p><code>InputDispatcher</code> (native C++ code in <code>frameworks/native/services/inputflinger/</code>) is the component that decides which window receives each input event. Its focus management and ANR timeout logic are critical to understand.</p>
+
+<h3>Focus Window Per Display</h3>
+
+<pre><code>// InputDispatcher maintains a focused window for EACH display.
+// The focused window receives all key events and IME input for that display.
+
+// Focus is set by WMS via:
+// InputMonitor.updateInputWindowsLw()
+//   → builds InputWindowInfo list from the WMS window tree
+//   → calls InputManagerService.setInputWindows(displayId, windowInfoList)
+//   → InputDispatcher stores the window list and focused window per display
+
+// The window list includes for each window:
+// - InputWindowInfo.token (IBinder identifying the window)
+// - InputWindowInfo.frame (touchable bounds)
+// - InputWindowInfo.touchableRegion (may be smaller than frame)
+// - InputWindowInfo.visible
+// - InputWindowInfo.focusable
+// - InputWindowInfo.inputFeatures (e.g., SPY window for gestures)</code></pre>
+
+<h3>findFocusedWindowTargetLocked()</h3>
+
+<pre><code>// When a key event arrives, InputDispatcher calls:
+// findFocusedWindowTargetLocked(currentTime, entry, nextWakeupTime)
+
+// Logic:
+// 1. Get the focused window for the event's display
+// 2. If no focused window → wait (with timeout) for WMS to set one
+// 3. If focused window exists but has pending unacknowledged events:
+//    → Check if the timeout (5s) has elapsed
+//    → If elapsed → trigger ANR
+//    → If not → wait for the app to finish processing
+// 4. If focused window is ready → dispatch the event
+
+// The 5s timeout is the INPUT_DISPATCHING_TIMEOUT:
+// constexpr nsecs_t DEFAULT_INPUT_DISPATCHING_TIMEOUT = 5000 * 1000000LL;
+// (defined in InputDispatcher.cpp)</code></pre>
+
+<h3>Focus Change Race Condition</h3>
+
+<pre><code>// There's an inherent race between WMS updating focus and InputDispatcher
+// receiving the update:
+
+// Timeline:
+// T0: User taps on App B (currently App A is focused)
+// T1: WMS processes the touch → determines App B should be focused
+// T2: WMS calls setInputWindows() with App B as focused
+// T3: InputDispatcher receives the update
+//
+// Between T0 and T3, key events still go to App A (the old focused window).
+// This is usually imperceptible (< 1 frame), but under heavy load
+// (mGlobalLock contention), the gap can grow to 50-100ms.
+//
+// Mitigation: InputDispatcher uses "focus transfer" — when focus changes,
+// any in-flight key events for the old window are cancelled (ACTION_CANCEL)
+// and re-dispatched to the new focused window.</code></pre>
+
+<h3>ANR Notification Flow</h3>
+
+<pre><code>// When InputDispatcher detects an ANR (5s timeout):
+
+// InputDispatcher (native)
+//   → InputDispatcher::onAnrLocked()
+//     → mPolicy->notifyANR(connection, reason)
+//       → InputManagerService.notifyANR() (JNI callback to Java)
+//         → ActivityManagerService.inputDispatchingTimedOut()
+//           → ProcessRecord.appNotResponding()
+//             → Dump traces (kill -3)
+//             → Show "App isn't responding" dialog
+//             → Log to dropbox for later analysis
+
+// The ANR dialog gives the user two choices:
+// "Wait" → resets the timeout, gives the app more time
+// "Close app" → force-stops the process</code></pre>
+
+<div class="callout danger">
+<div class="callout-label">Production Impact</div>
+<p>The 5-second input dispatching timeout is the <strong>most common ANR type</strong> in production — accounting for ~70% of all ANRs reported via Play Vitals. It's triggered whenever the main thread is blocked: database queries, synchronous network calls, heavy JSON parsing, lock contention, or even excessive <code>SharedPreferences.apply()</code> calls that queue up on the main thread's finalizer. Unlike broadcast ANRs (10s) or service ANRs (20s), the input ANR has the tightest timeout because users directly <em>feel</em> input unresponsiveness.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>13. Predictive Back Gesture</h2>
+
+<p>Android 13 introduced <strong>predictive back</strong>: the system shows a preview of the back destination <em>before</em> the user completes the back gesture. This requires deep coordination between WMS, the back animation system, and the app.</p>
+
+<h3>Architecture</h3>
+
+<pre><code>// The predictive back system involves:
+// 1. WMS — coordinates window surfaces for the animation
+// 2. BackAnimationController — orchestrates the animation lifecycle
+// 3. BackNavigationInfo — describes the back destination
+// 4. The app's OnBackAnimationCallback — optional custom animation
+
+// When the user starts a back gesture (swipe from edge):
+// InputDispatcher → SystemUI (gesture detection)
+//   → BackAnimationController.onBackGestureStarted()
+//     → WMS provides the current and destination window surfaces
+//     → Animation begins immediately (predictive preview)</code></pre>
+
+<h3>The Three Phases</h3>
+
+<pre><code>// Predictive back has three distinct phases:
+
+// Phase 1: onBackStarted(backEvent: BackEvent)
+//   Gesture begins. The system creates a temporary animation surface
+//   (separate from the window's actual surface) and starts showing
+//   the back destination preview.
+//   backEvent.touchX / touchY — initial touch position
+//   backEvent.progress — 0.0 (just started)
+
+// Phase 2: onBackProgressed(backEvent: BackEvent)
+//   Called continuously as the user's finger moves.
+//   backEvent.progress — 0.0 to 1.0 (how far the gesture has progressed)
+//   The app can use this to animate its own UI (e.g., shrink the card,
+//   reveal the previous screen underneath).
+
+// Phase 3a: onBackInvoked()
+//   User completed the gesture → navigate back.
+//   The animation finishes and the current screen is removed.
+
+// Phase 3b: onBackCancelled()
+//   User cancelled the gesture (moved finger back).
+//   The animation reverses and the current screen is restored.
+
+// Registration:
+// onBackPressedDispatcher.addCallback(
+//     owner = this,
+//     onBackPressedCallback = object : OnBackPressedCallback(true) {
+//         override fun handleOnBackStarted(backEvent: BackEvent) { ... }
+//         override fun handleOnBackProgressed(backEvent: BackEvent) { ... }
+//         override fun handleOnBackPressed() { ... }
+//         override fun handleOnBackCancelled() { ... }
+//     }
+// )</code></pre>
+
+<h3>WMS Surface Coordination</h3>
+
+<pre><code>// WMS creates temporary surfaces for the predictive back animation:
+
+// 1. Snapshot the current window → create a screenshot surface
+// 2. Prepare the destination window → either:
+//    a. The previous Activity in the back stack (cross-activity back)
+//    b. The home screen (back from root activity)
+//    c. A custom destination (app-defined)
+// 3. BackAnimationController manipulates both surfaces:
+//    - Current window: scale down, translate, fade out
+//    - Destination window: scale up, translate in, fade in
+// 4. On completion: remove temporary surfaces, apply final state
+
+// The temporary surfaces are critical — they prevent the animation
+// from interfering with the window's real surface state. If the user
+// cancels the gesture, the temporary surfaces are simply discarded.</code></pre>
+
+<div class="callout warn">
+<div class="callout-label">Compatibility Edge Case</div>
+<p>If an app doesn't opt into predictive back (no <code>OnBackAnimationCallback</code> registered and <code>android:enableOnBackInvokedCallback="false"</code> in the manifest), the system falls back to the legacy <code>onBackPressed()</code> behavior — no preview animation, immediate back navigation on gesture completion. During the transition period (Android 13–15), apps must explicitly opt in. Android 16+ is expected to enforce predictive back for all apps targeting that SDK level, which will break apps that override <code>onBackPressed()</code> without migrating to the callback API.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>14. TaskFragment (Android 12L)</h2>
+
+<p><code>TaskFragment</code> enables <strong>Activity Embedding</strong> — showing two Activities side-by-side within a single Task on large screens. It's a container in the WMS hierarchy between <code>Task</code> and <code>ActivityRecord</code>.</p>
+
+<h3>Hierarchy Position</h3>
+
+<div class="diagram-container">
+<pre style="background: none; border: none; margin: 0; padding: 0; font-size: 0.92rem; line-height: 1.6;">
+TaskDisplayArea
+ └── Task (root task)
+      ├── TaskFragment (left pane — 50% width)
+      │    └── ActivityRecord (ListActivity)
+      │         └── WindowState
+      │
+      └── TaskFragment (right pane — 50% width)
+           └── ActivityRecord (DetailActivity)
+                └── WindowState
+
+Without Activity Embedding (traditional):
+TaskDisplayArea
+ └── Task
+      └── ActivityRecord (only one visible at a time)
+           └── WindowState
+</pre>
+</div>
+
+<h3>TaskFragmentOrganizer API</h3>
+
+<pre><code>// TaskFragmentOrganizer is the app-side API for controlling
+// how Activities are arranged within TaskFragments.
+
+// The Jetpack WindowManager library uses this internally:
+// SplitController → TaskFragmentOrganizer → WMS
+
+// Split rules define which Activities should be embedded:
+// SplitPairRule — two specific Activities side-by-side
+val splitPairRule = SplitPairRule.Builder(
+    setOf(SplitPairFilter(
+        ComponentName(this, ListActivity::class.java),
+        ComponentName(this, DetailActivity::class.java),
+        null  // intent action filter
+    ))
+)
+    .setMinWidthDp(600)         // minimum width to split
+    .setMinSmallestWidthDp(600) // minimum smallest width
+    .setSplitRatio(0.33f)       // 1/3 + 2/3 split
+    .setFinishPrimaryWithSecondary(SplitRule.FinishBehavior.NEVER)
+    .setFinishSecondaryWithPrimary(SplitRule.FinishBehavior.ALWAYS)
+    .build()
+
+// SplitPlaceholderRule — show a placeholder until the detail Activity launches
+val placeholderRule = SplitPlaceholderRule.Builder(
+    setOf(ActivityFilter(ComponentName(this, ListActivity::class.java), null)),
+    Intent(this, PlaceholderActivity::class.java)
+)
+    .setMinWidthDp(600)
+    .build()
+
+// Register rules:
+RuleController.getInstance(this).addRule(splitPairRule)
+RuleController.getInstance(this).addRule(placeholderRule)</code></pre>
+
+<h3>WMS Management of TaskFragments</h3>
+
+<pre><code>// WMS manages TaskFragment as a WindowContainer in the hierarchy:
+// - TaskFragment extends WindowContainer
+// - It sits between Task and ActivityRecord
+// - Each TaskFragment has its own bounds (a sub-region of the Task)
+// - WMS computes layout for each TaskFragment independently
+
+// Key operations:
+// createTaskFragment(token, ownerToken, bounds)
+//   → WMS creates a new TaskFragment within the specified Task
+// reparentActivityToTaskFragment(activityToken, taskFragmentToken)
+//   → moves an ActivityRecord into a TaskFragment
+// deleteTaskFragment(token)
+//   → removes the TaskFragment, reparents Activities back to Task
+
+// Surface hierarchy:
+// Task SurfaceControl
+//   ├── TaskFragment SurfaceControl (left, cropped to left bounds)
+//   │    └── ActivityRecord SurfaceControl
+//   └── TaskFragment SurfaceControl (right, cropped to right bounds)
+//        └── ActivityRecord SurfaceControl</code></pre>
+
+<div class="callout warn">
+<div class="callout-label">Collapse Behavior</div>
+<p>When a <code>TaskFragment</code> is too narrow (e.g., phone in portrait, or the user resizes a freeform window below the <code>minWidthDp</code> threshold), the split <strong>collapses to single-Activity mode</strong>. The secondary Activity is either finished or moved to the back of the stack, depending on the <code>FinishBehavior</code> configured in the split rule. This transition must be seamless — WMS animates the collapse using Shell transitions, and the remaining Activity receives a configuration change for the new (full-width) bounds. Testing this collapse/expand cycle across configuration changes is critical for large-screen apps.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>15. Version Evolution Timeline</h2>
+
+<table>
+<tr><th>Version</th><th>Change</th><th>Impact</th></tr>
+<tr><td>Android 10</td><td>ATMS split from AMS</td><td><code>mGlobalLock</code> shared with WMS; unified window + activity hierarchy</td></tr>
+<tr><td>Android 11</td><td>WindowInsets rewrite</td><td><code>InsetsController</code> replaces <code>systemUiVisibility</code> flags; typed inset queries</td></tr>
+<tr><td>Android 12</td><td>Shell transitions</td><td>Animations moved out of WMS global lock to SystemUI process</td></tr>
+<tr><td>Android 12</td><td>DisplayArea hierarchy</td><td>Tree-structured window organization replaces flat list; OEM-configurable</td></tr>
+<tr><td>Android 12L</td><td>TaskFragment</td><td>Activity Embedding for large screens; two Activities side-by-side in one Task</td></tr>
+<tr><td>Android 13</td><td>Predictive back</td><td>Back animation preview; <code>OnBackAnimationCallback</code> API</td></tr>
+<tr><td>Android 14</td><td>Edge-to-edge enforcement</td><td>Apps must handle insets explicitly; system bars transparent by default</td></tr>
+<tr><td>Android 15</td><td>Edge-to-edge mandatory</td><td>All apps targeting SDK 35 draw behind system bars; no opt-out</td></tr>
+</table>
+
+<!-- ============================================================ -->
+
+<div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  <a href="02-activity-launch-flow.html">← 02 — Activity Launch Flow</a> &nbsp;|&nbsp;
+  <a href="index.html">Back to Index</a> &nbsp;|&nbsp;
+  <a href="04-pms-package-resolution.html">04 — PMS &amp; Package Resolution →</a>
+</div>
+
+</body>
+</html>

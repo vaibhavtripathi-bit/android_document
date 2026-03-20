@@ -1,0 +1,1796 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 — App-Platform Interaction — The Boundary Between App Code and System Services</title>
+<style>
+  :root { --bg: #ffffff; --surface: #f7f8fa; --surface2: #edeef2; --border: #d4d7e0; --text: #1e2028; --text-dim: #5c6070; --accent: #2563eb; --accent2: #7c3aed; --green: #16803c; --red: #dc2626; --orange: #c2410c; --yellow: #a16207; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.75; padding: 2rem; max-width: 920px; margin: 0 auto; font-size: 1.08rem; }
+  h1 { font-size: 2.2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.6rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.25rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; color: var(--text); }
+  .nav a.active { background: var(--accent); color: #fff; }
+  code { background: #f0f1f5; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.88em; color: #c7254e; border: 1px solid #e2e4ea; }
+  pre { background: #fafbfc; border: 1px solid #d4d7e0; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 1rem; line-height: 1.7; }
+  pre code { background: none; padding: 0; color: #2e3440; border: none; }
+  .callout { border-left: 4px solid var(--accent); background: #f0f4ff; padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: #f5f0ff; }
+  .callout.warn { border-left-color: var(--orange); background: #fff7ed; }
+  .callout.danger { border-left-color: var(--red); background: #fef2f2; }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.95rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--bg); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="01-system-server-boot.html">01 system_server Boot</a>
+  <a href="02-activity-manager-internals.html">02 AMS Internals</a>
+  <a href="03-window-manager-internals.html">03 WMS Internals</a>
+  <a href="04-package-manager-internals.html">04 PMS Internals</a>
+  <a href="05-other-services.html">05 Other Services</a>
+  <a href="06-service-patterns.html">06 Service Patterns</a>
+  <a class="active" href="07-app-platform-interaction.html">07 App-Platform Interaction</a>
+  <a href="08-interview-qa.html">08 Interview Q&amp;A</a>
+</div>
+
+<h1>07 — App-Platform Interaction</h1>
+<p class="subtitle">The boundary between app code and system services — how Context.getSystemService() resolves to a Binder proxy, how Manager classes abstract IPC, and how the platform controls what apps can reach</p>
+
+<!-- ============================================================ -->
+<h2>1. Context.getSystemService() — The App's Entry Point</h2>
+
+<p>Every Android app interacts with the platform through a single gateway: <code>Context.getSystemService()</code>. This deceptively simple call hides a multi-layered resolution chain that spans from a static registry in the app process, through Binder IPC, to the system_server.</p>
+
+<div class="diagram-container">
+<pre><code>  getSystemService("alarm") — Full Resolution Chain
+  ════════════════════════════════════════════════════
+
+  App Code
+  ┌────────────────────────────────────────────────────────────────┐
+  │  val am = context.getSystemService(Context.ALARM_SERVICE)      │
+  │           as AlarmManager                                      │
+  └───────────────────────────┬────────────────────────────────────┘
+                              │
+                              ▼
+  ContextImpl.getSystemService(name)
+  ┌────────────────────────────────────────────────────────────────┐
+  │  return SystemServiceRegistry.getSystemService(this, name)     │
+  └───────────────────────────┬────────────────────────────────────┘
+                              │
+                              ▼
+  SystemServiceRegistry (static map: String → ServiceFetcher)
+  ┌────────────────────────────────────────────────────────────────┐
+  │  val fetcher = SYSTEM_SERVICE_FETCHERS["alarm"]                │
+  │  return fetcher.getService(ctx)   // CachedServiceFetcher      │
+  └───────────────────────────┬────────────────────────────────────┘
+                              │
+                              ▼
+  CachedServiceFetcher.getService(ctx)
+  ┌────────────────────────────────────────────────────────────────┐
+  │  // Check ContextImpl.mServiceCache[index]                     │
+  │  if (cached != null) return cached                             │
+  │                                                                │
+  │  // First access — create the manager                          │
+  │  val binder = ServiceManager.getService("alarm")               │
+  │  val service = IAlarmManager.Stub.asInterface(binder)          │
+  │  val manager = AlarmManager(service, ctx)                      │
+  │  mServiceCache[index] = manager                                │
+  │  return manager                                                │
+  └───────────────────────────┬────────────────────────────────────┘
+                              │ Binder IPC (handle 0 → servicemanager)
+                              ▼
+  servicemanager (native daemon)
+  ┌────────────────────────────────────────────────────────────────┐
+  │  Look up "alarm" → return IBinder handle for AlarmManagerSvc   │
+  └───────────────────────────┬────────────────────────────────────┘
+                              │ Binder driver creates BpBinder proxy
+                              ▼
+  App process now holds a proxy to AlarmManagerService in system_server</code></pre>
+</div>
+
+<h3>1.1 SystemServiceRegistry — The Static Factory Map</h3>
+
+<p><code>SystemServiceRegistry</code> is a static class initialized once per process. It maps service name strings to <code>ServiceFetcher</code> factory lambdas. Every system service the SDK exposes is registered here at class-load time.</p>
+
+<pre><code>// frameworks/base/core/java/android/app/SystemServiceRegistry.java
+
+object SystemServiceRegistry {
+
+    // The master map: service name → factory
+    private val SYSTEM_SERVICE_FETCHERS =
+        ArrayMap&lt;String, ServiceFetcher&lt;*&gt;&gt;()
+
+    // The reverse map: manager class → service name
+    private val SYSTEM_SERVICE_NAMES =
+        ArrayMap&lt;Class&lt;*&gt;, String&gt;()
+
+    init {
+        // Registered at class-load time via static block
+        // ~120 services registered here
+
+        registerService(
+            Context.ALARM_SERVICE,
+            AlarmManager::class.java,
+            CachedServiceFetcher { ctx -&gt;
+                val binder = ServiceManager.getService(Context.ALARM_SERVICE)
+                val service = IAlarmManager.Stub.asInterface(binder)
+                AlarmManager(service, ctx)
+            }
+        )
+
+        registerService(
+            Context.ACTIVITY_SERVICE,
+            ActivityManager::class.java,
+            CachedServiceFetcher { ctx -&gt;
+                ActivityManager(ctx)
+            }
+        )
+
+        registerService(
+            Context.WINDOW_SERVICE,
+            WindowManager::class.java,
+            CachedServiceFetcher { ctx -&gt;
+                // WindowManager is special — it's per-Display
+                ctx.display?.let { display -&gt;
+                    WindowManagerImpl(ctx)
+                }
+            }
+        )
+
+        // ... 117 more registrations
+    }
+
+    fun &lt;T&gt; getSystemService(ctx: ContextImpl, name: String): T? {
+        val fetcher = SYSTEM_SERVICE_FETCHERS[name] ?: return null
+        @Suppress("UNCHECKED_CAST")
+        return fetcher.getService(ctx) as? T
+    }
+}</code></pre>
+
+<h3>1.2 ServiceFetcher Variants</h3>
+
+<p>Not all services are created equal. The registry uses three fetcher strategies depending on whether the service needs per-Context state, is a true singleton, or is created once per process.</p>
+
+<table>
+  <tr>
+    <th>Fetcher Type</th>
+    <th>Caching</th>
+    <th>Example Services</th>
+    <th>When Used</th>
+  </tr>
+  <tr>
+    <td><code>CachedServiceFetcher</code></td>
+    <td>Per-Context (stored in <code>ContextImpl.mServiceCache[]</code>)</td>
+    <td><code>AlarmManager</code>, <code>NotificationManager</code>, <code>ConnectivityManager</code></td>
+    <td>Service needs Context reference (most common)</td>
+  </tr>
+  <tr>
+    <td><code>StaticServiceFetcher</code></td>
+    <td>Singleton — one instance shared across all Contexts</td>
+    <td><code>InputMethodManager</code>, <code>AccessibilityManager</code></td>
+    <td>Service is truly global, no per-Context state</td>
+  </tr>
+  <tr>
+    <td><code>StaticApplicationContextServiceFetcher</code></td>
+    <td>Singleton — created with Application context</td>
+    <td><code>ConnectivityManager</code> (Android 12+)</td>
+    <td>Prevents Context leaks from Activity references</td>
+  </tr>
+</table>
+
+<pre><code>// CachedServiceFetcher — the most common pattern
+
+abstract class CachedServiceFetcher&lt;T&gt; : ServiceFetcher&lt;T&gt; {
+    private val cacheIndex: Int = sServiceCacheSize++
+
+    override fun getService(ctx: ContextImpl): T? {
+        val cache = ctx.mServiceCache
+        val gates = ctx.mServiceInitializationStateArray
+
+        var service = cache[cacheIndex] as? T
+        if (service != null) return service  // Cache hit
+
+        // Prevent double-init with a gate (compare-and-swap)
+        if (gates[cacheIndex].compareAndSet(
+                ContextImpl.STATE_UNINITIALIZED,
+                ContextImpl.STATE_INITIALIZING
+            )) {
+            try {
+                service = createService(ctx)
+                cache[cacheIndex] = service
+                gates[cacheIndex].set(ContextImpl.STATE_READY)
+            } catch (e: Exception) {
+                gates[cacheIndex].set(ContextImpl.STATE_NOT_FOUND)
+                throw e
+            }
+        } else {
+            // Another thread is initializing — spin-wait
+            while (gates[cacheIndex].get() == ContextImpl.STATE_INITIALIZING) {
+                Thread.yield()
+            }
+            service = cache[cacheIndex] as? T
+        }
+        return service
+    }
+
+    abstract fun createService(ctx: ContextImpl): T
+}
+
+// StaticServiceFetcher — true singleton
+
+abstract class StaticServiceFetcher&lt;T&gt; : ServiceFetcher&lt;T&gt; {
+    @Volatile private var cachedInstance: T? = null
+
+    override fun getService(ctx: ContextImpl): T {
+        cachedInstance?.let { return it }
+        synchronized(this) {
+            cachedInstance?.let { return it }
+            val instance = createService()
+            cachedInstance = instance
+            return instance
+        }
+    }
+
+    abstract fun createService(): T
+}</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Interview Trap — Context Type Matters</div>
+  <p><code>getSystemService()</code> returns different objects depending on the Context. <code>WindowManager</code> obtained from an Activity context is bound to that Activity's window and display. <code>WindowManager</code> from Application context uses the default display. Calling <code>applicationContext.getSystemService(LAYOUT_INFLATER_SERVICE)</code> returns a LayoutInflater without the Activity's theme — inflated views will use the default theme. This is a common source of subtle UI bugs.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. ServiceManager — The Binder Directory</h2>
+
+<p><code>ServiceManager</code> is the phone book of Android IPC. It's the very first Binder service registered in the system — assigned handle 0 in the Binder driver, which means every process can reach it without needing to look it up first.</p>
+
+<h3>2.1 The Native servicemanager Daemon</h3>
+
+<p>The actual directory is maintained by a native C++ daemon (<code>servicemanager</code>) started by <code>init</code> before Zygote. The Java <code>ServiceManager</code> class is a thin wrapper that sends Binder transactions to this daemon.</p>
+
+<pre><code>// The native servicemanager process lifecycle:
+//
+// 1. init starts servicemanager (defined in servicemanager.rc)
+//    → PID ~2, runs as UID 1000 (system)
+//    → Registers itself as the "context manager" with the Binder driver
+//    → This gives it the special handle 0
+//
+// 2. servicemanager opens /dev/binder and calls:
+//    ioctl(fd, BINDER_SET_CONTEXT_MGR_EXT, &obj)
+//    → The kernel Binder driver now routes all handle-0 transactions here
+//
+// 3. servicemanager enters its event loop:
+//    → Waits for addService / getService / listServices transactions
+//    → Maintains an internal map: name (String) → IBinder handle
+//
+// 4. SELinux enforcement:
+//    → Every addService/getService call is checked against SELinux policy
+//    → service_contexts file maps service names to SELinux labels
+//    → Example: "alarm" → u:object_r:alarm_service:s0
+//    → An app can only getService() if its SELinux domain has
+//      "find" permission for that service's label</code></pre>
+
+<h3>2.2 Java ServiceManager API</h3>
+
+<pre><code>// frameworks/base/core/java/android/os/ServiceManager.java
+
+object ServiceManager {
+
+    // Look up a service by name — returns null if not registered
+    fun getService(name: String): IBinder? {
+        // Check local cache first
+        val cached = sCache[name]
+        if (cached != null) return cached
+
+        // IPC to native servicemanager
+        return Binder.allowBlocking(
+            rawGetService(name)
+        )
+    }
+
+    // Blocking wait — used during boot when services start in order
+    fun waitForService(name: String): IBinder {
+        // Calls getService() in a loop with exponential backoff
+        // Logs a warning every 5 seconds
+        // Used by system services that depend on other services
+        // NOT intended for app use
+    }
+
+    // Register a service — called by system services during onStart()
+    fun addService(name: String, service: IBinder,
+                   allowIsolated: Boolean = false,
+                   dumpPriority: Int = DUMP_FLAG_PRIORITY_DEFAULT) {
+        // IPC to native servicemanager
+        // servicemanager checks:
+        //   1. SELinux policy: does the caller have "add" permission?
+        //   2. Is the name already registered? (no duplicates)
+        //   3. Is the caller running in system_server? (most services)
+        getIServiceManager().addService(name, service, allowIsolated, dumpPriority)
+    }
+
+    // Enumerate all registered services
+    fun listServices(): Array&lt;String&gt; {
+        // Returns ~150+ service names on a typical device
+        // Useful for debugging: adb shell service list
+    }
+
+    // Callback when a service is registered or dies
+    fun registerForNotifications(
+        name: String,
+        callback: IServiceCallback
+    ) {
+        // Used by services that need to react to other services
+        // appearing or dying (e.g., after a HAL crash)
+    }
+}</code></pre>
+
+<div class="diagram-container">
+<pre><code>  ServiceManager — Handle 0 in the Binder Driver
+  ════════════════════════════════════════════════
+
+  ┌─────────────────────┐     ┌─────────────────────┐
+  │    App Process       │     │   system_server      │
+  │                      │     │                      │
+  │  ServiceManager      │     │  AMS.setSystemProcess│
+  │   .getService(       │     │   ServiceManager     │
+  │     "activity")      │     │    .addService(      │
+  │         │            │     │      "activity",     │
+  │         │            │     │       this)           │
+  └─────────┼────────────┘     └──────────┼───────────┘
+            │                             │
+            │  Binder transaction         │  Binder transaction
+            │  to handle 0               │  to handle 0
+            ▼                             ▼
+  ┌──────────────────────────────────────────────────────┐
+  │              Binder Driver (kernel)                    │
+  │                                                       │
+  │  Handle 0 → servicemanager process                    │
+  └────────────────────────┬──────────────────────────────┘
+                           │
+                           ▼
+  ┌──────────────────────────────────────────────────────┐
+  │            servicemanager (native daemon)              │
+  │                                                       │
+  │  Internal Map:                                        │
+  │  ┌──────────────────┬──────────────────────────────┐  │
+  │  │ "activity"       │ → IBinder handle to AMS      │  │
+  │  │ "alarm"          │ → IBinder handle to AlarmSvc │  │
+  │  │ "window"         │ → IBinder handle to WMS      │  │
+  │  │ "package"        │ → IBinder handle to PMS      │  │
+  │  │ "notification"   │ → IBinder handle to NMS      │  │
+  │  │ ... (~150 more)  │                              │  │
+  │  └──────────────────┴──────────────────────────────┘  │
+  │                                                       │
+  │  SELinux check on every add/get:                      │
+  │  service_contexts: "activity" → alarm_service:s0      │
+  │  Policy: allow untrusted_app alarm_service:find       │
+  └───────────────────────────────────────────────────────┘</code></pre>
+</div>
+
+<div class="callout staff">
+  <div class="callout-label">L6 Insight — ServiceManager Caching and the Binder Proxy Lifecycle</div>
+  <p>The Java <code>ServiceManager</code> maintains a local <code>sCache</code> (a <code>HashMap&lt;String, IBinder&gt;</code>) to avoid repeated IPC to the native servicemanager. But this cache is <em>never invalidated</em> during normal operation — it assumes system services don't die. If <code>system_server</code> crashes and restarts, all cached proxies become stale <code>DeadObjectException</code> bombs. This is acceptable because a system_server crash triggers a runtime restart that kills all app processes anyway. However, for HAL services (registered via <code>hwservicemanager</code>), the proxy <em>can</em> become stale if the HAL process crashes independently. Apps using <code>Camera2</code> or <code>MediaCodec</code> must handle <code>DeadObjectException</code> from HAL proxies — the Manager classes do this internally with <code>DeathRecipient</code> callbacks that reconnect on death.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Manager Classes — The App-Facing API</h2>
+
+<p>Apps never interact with raw AIDL proxies directly. Each system service has a corresponding <strong>Manager</strong> class that wraps the Binder proxy and provides a clean, versioned, Kotlin/Java-friendly API.</p>
+
+<h3>3.1 What Managers Do</h3>
+
+<table>
+  <tr>
+    <th>Responsibility</th>
+    <th>Example</th>
+  </tr>
+  <tr>
+    <td>Wrap AIDL proxy with clean API</td>
+    <td><code>AlarmManager.setExactAndAllowWhileIdle()</code> wraps <code>IAlarmManager.set()</code> with correct flags</td>
+  </tr>
+  <tr>
+    <td>Argument validation</td>
+    <td><code>NotificationManager.notify()</code> validates channel ID exists before IPC</td>
+  </tr>
+  <tr>
+    <td>Exception translation</td>
+    <td>Converts <code>RemoteException</code> to <code>RuntimeException</code> or swallows it (rethrow as <code>RuntimeException</code> since system_server death is unrecoverable)</td>
+  </tr>
+  <tr>
+    <td>Client-side caching</td>
+    <td><code>PackageManager.getInstalledPackages()</code> may cache results to avoid repeated IPC</td>
+  </tr>
+  <tr>
+    <td>Binder death handling</td>
+    <td><code>LocationManager</code> re-registers listeners if the location service restarts</td>
+  </tr>
+  <tr>
+    <td>Backward compatibility</td>
+    <td><code>NotificationManager.createNotificationChannel()</code> is a no-op below API 26</td>
+  </tr>
+  <tr>
+    <td>Thread safety</td>
+    <td>Managers are generally thread-safe — the underlying Binder proxy handles synchronization</td>
+  </tr>
+</table>
+
+<h3>3.2 Anatomy of a Manager Class</h3>
+
+<pre><code>// Simplified AlarmManager showing the Manager pattern
+
+class AlarmManager(
+    private val service: IAlarmManager,  // AIDL proxy
+    private val context: Context
+) {
+
+    // Clean API that hides AIDL complexity
+    fun setExactAndAllowWhileIdle(
+        type: Int,
+        triggerAtMillis: Long,
+        operation: PendingIntent
+    ) {
+        // Argument validation — fail fast in the app process
+        require(triggerAtMillis &gt;= 0) { "Invalid trigger time" }
+
+        try {
+            // Delegate to AIDL proxy → Binder IPC → system_server
+            service.set(
+                context.packageName,
+                type,
+                triggerAtMillis,
+                0,          // windowMillis (exact = 0)
+                0,          // interval
+                FLAG_ALLOW_WHILE_IDLE or FLAG_STANDALONE,
+                operation,
+                null,       // listener
+                null,       // listenerTag
+                null        // workSource
+            )
+        } catch (e: RemoteException) {
+            // system_server is dead — nothing we can do
+            throw e.rethrowFromSystemServer()
+        }
+    }
+
+    // Cancellation wraps the proxy call
+    fun cancel(operation: PendingIntent) {
+        try {
+            service.remove(operation, null)
+        } catch (e: RemoteException) {
+            throw e.rethrowFromSystemServer()
+        }
+    }
+
+    // Some Managers provide listener-based async APIs
+    fun setExact(
+        type: Int,
+        triggerAtMillis: Long,
+        tag: String,
+        listener: OnAlarmListener,
+        handler: Handler?
+    ) {
+        val listenerWrapper = ListenerWrapper(listener)
+        try {
+            service.set(
+                context.packageName,
+                type,
+                triggerAtMillis,
+                0, 0, 0,
+                null,             // no PendingIntent
+                listenerWrapper,  // Binder callback
+                tag,
+                null
+            )
+        } catch (e: RemoteException) {
+            throw e.rethrowFromSystemServer()
+        }
+    }
+}</code></pre>
+
+<h3>3.3 Singleton vs Per-Context Managers</h3>
+
+<pre><code>// Most Managers are per-Context (CachedServiceFetcher):
+// Each Activity/Service gets its own AlarmManager, NotificationManager, etc.
+// The Manager holds a reference to the Context that created it.
+
+// Some Managers are singletons (StaticServiceFetcher):
+// InputMethodManager — one per process, manages the soft keyboard
+// AccessibilityManager — one per process, manages accessibility state
+
+// Why the distinction?
+// Per-Context: Manager behavior depends on the Context
+//   → NotificationManager needs the calling package name from Context
+//   → WindowManager needs the Activity's window token
+//   → LayoutInflater needs the Activity's theme
+//
+// Singleton: Manager is truly process-global
+//   → InputMethodManager: one keyboard per process
+//   → AccessibilityManager: accessibility state is global
+
+// Android 12+ trend: migrating from per-Context to singleton
+// using StaticApplicationContextServiceFetcher to prevent
+// Activity Context leaks in long-lived Manager references</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. System API Boundaries</h2>
+
+<p>Android's API surface is layered. Not every method on a system service is available to all apps. Understanding these layers is critical for L6 because it explains <em>why</em> certain APIs exist and who can use them.</p>
+
+<table>
+  <tr>
+    <th>API Level</th>
+    <th>Annotation</th>
+    <th>Who Can Access</th>
+    <th>Stability Guarantee</th>
+    <th>Example</th>
+  </tr>
+  <tr>
+    <td>Public SDK</td>
+    <td>(none — default)</td>
+    <td>All apps</td>
+    <td>Full backward compatibility</td>
+    <td><code>AlarmManager.set()</code></td>
+  </tr>
+  <tr>
+    <td>System API</td>
+    <td><code>@SystemApi</code></td>
+    <td>Privileged apps (system partition, platform-signed)</td>
+    <td>Stable across releases, may evolve</td>
+    <td><code>ActivityManager.forceStopPackage()</code></td>
+  </tr>
+  <tr>
+    <td>Module Library API</td>
+    <td><code>@SystemApi(client=MODULE_LIBRARIES)</code></td>
+    <td>Mainline modules only</td>
+    <td>Stable within module boundary</td>
+    <td>Networking stack internals</td>
+  </tr>
+  <tr>
+    <td>Module App API</td>
+    <td><code>@SystemApi(client=MODULE_APPS)</code></td>
+    <td>Apps bundled with Mainline modules</td>
+    <td>Stable within module boundary</td>
+    <td>Permission controller APIs</td>
+  </tr>
+  <tr>
+    <td>Test API</td>
+    <td><code>@TestApi</code></td>
+    <td>Test builds only (userdebug/eng)</td>
+    <td>No stability guarantee</td>
+    <td><code>ActivityManager.forceStopPackage()</code> in tests</td>
+  </tr>
+  <tr>
+    <td>Hidden API</td>
+    <td><code>@hide</code> (Javadoc)</td>
+    <td>Framework internals only</td>
+    <td>None — can change any time</td>
+    <td><code>ActivityManagerService.dumpStackTraces()</code></td>
+  </tr>
+</table>
+
+<pre><code>// How the API boundary is enforced at build time:
+
+// 1. The Android SDK (android.jar) only contains public + @SystemApi methods
+//    → Apps compiled against the SDK simply can't reference @hide methods
+
+// 2. For @SystemApi access, apps must:
+//    a. Be installed in /system/priv-app/ (privileged app)
+//    b. Hold the required signature-level permission
+//    c. Compile against the full framework (not the SDK stub)
+
+// 3. At runtime, the actual framework classes contain ALL methods
+//    → Reflection can reach @hide methods (this is the problem)
+//    → Android 9+ added runtime restrictions (next section)
+
+// Example: the difference between SDK and full framework
+
+// In android.jar (SDK stub):
+class ActivityManager {
+    fun getRunningAppProcesses(): List&lt;RunningAppProcessInfo&gt;  // public
+    // forceStopPackage() is NOT here — it's @SystemApi
+    // getProcessPss() is NOT here — it's @hide
+}
+
+// In the actual framework on device:
+class ActivityManager {
+    fun getRunningAppProcesses(): List&lt;RunningAppProcessInfo&gt;  // public
+    @SystemApi
+    fun forceStopPackage(packageName: String)  // system apps only
+    /** @hide */
+    fun getProcessPss(pids: IntArray): LongArray  // internal only
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2>5. Hidden API Restrictions</h2>
+
+<p>Before Android 9, apps could freely use reflection to access <code>@hide</code> APIs. This created a massive compatibility problem: apps broke on every Android upgrade because internal APIs changed. Android 9 introduced a graduated enforcement system.</p>
+
+<h3>5.1 The Greylist System</h3>
+
+<pre><code>// Hidden APIs are categorized into lists based on usage and risk:
+
+// ┌──────────────────────────────────────────────────────────────┐
+// │ List              │ Behavior                                  │
+// ├──────────────────────────────────────────────────────────────┤
+// │ Whitelist         │ Public SDK — always accessible             │
+// │ Light greylist    │ @UnsupportedAppUsage — allowed but warned  │
+// │                   │ (logcat warning, may be blocked later)     │
+// │ Dark greylist     │ Blocked for apps targeting ≥ certain SDK   │
+// │                   │ (greylist-max-o: blocked if targetSdk ≥ 28)│
+// │ Blacklist         │ Always blocked — throws exception          │
+// └──────────────────────────────────────────────────────────────┘
+
+// The lists are defined in:
+// frameworks/base/config/hiddenapi-greylist.txt
+// frameworks/base/config/hiddenapi-greylist-max-o.txt
+// frameworks/base/config/hiddenapi-greylist-max-p.txt
+// etc.</code></pre>
+
+<h3>5.2 Enforcement Mechanism</h3>
+
+<pre><code>// The enforcement happens in ART (the runtime), not in the framework:
+
+// 1. When an app calls Class.getDeclaredMethod() or Field.get():
+//    → ART intercepts the reflection call
+//    → Checks the target member against the hidden API lists
+//    → Checks the calling app's targetSdkVersion
+
+// 2. The check flow:
+//    App calls Method.invoke() on a @hide method
+//        │
+//        ▼
+//    ART: hiddenapi::ShouldDenyAccessToMember()
+//        │
+//        ├── Is caller exempt? (system app, platform-signed, test build)
+//        │   → YES: allow
+//        │
+//        ├── Is member on the whitelist?
+//        │   → YES: allow
+//        │
+//        ├── Is member on the light greylist?
+//        │   → Log warning, allow (for now)
+//        │
+//        ├── Is member on dark greylist for this targetSdk?
+//        │   → Block: throw NoSuchMethodException / NoSuchFieldException
+//        │
+//        └── Is member on the blacklist?
+//            → Block: throw NoSuchMethodException / NoSuchFieldException
+
+// 3. The policy is stored in the app's runtime flags:
+//    HiddenApiEnforcementPolicy.ENABLED  → full enforcement
+//    HiddenApiEnforcementPolicy.DISABLED → no enforcement (system apps)
+//    Set by PMS based on the app's signing certificate and install location</code></pre>
+
+<h3>5.3 Evolution of Enforcement</h3>
+
+<table>
+  <tr>
+    <th>Android Version</th>
+    <th>Enforcement Level</th>
+    <th>Key Change</th>
+  </tr>
+  <tr>
+    <td>8.x (Oreo)</td>
+    <td>None</td>
+    <td>All reflection allowed</td>
+  </tr>
+  <tr>
+    <td>9 (Pie)</td>
+    <td>Warning + partial block</td>
+    <td>Light greylist warns; dark greylist blocks for targetSdk ≥ 28</td>
+  </tr>
+  <tr>
+    <td>10</td>
+    <td>Stricter greylist</td>
+    <td><code>greylist-max-o</code> blocked for targetSdk ≥ 29; more APIs moved to blacklist</td>
+  </tr>
+  <tr>
+    <td>11</td>
+    <td>Tighter</td>
+    <td><code>greylist-max-p</code> blocked; JNI access to hidden APIs also restricted</td>
+  </tr>
+  <tr>
+    <td>12</td>
+    <td>Near-complete</td>
+    <td>Most light greylist APIs moved to dark greylist or blacklist</td>
+  </tr>
+  <tr>
+    <td>13+</td>
+    <td>Full enforcement</td>
+    <td>Very few greylist exceptions remain; <code>@UnsupportedAppUsage</code> sunset</td>
+  </tr>
+</table>
+
+<pre><code>// Detecting hidden API usage in your app:
+
+// 1. veridex — static analysis tool (runs on APK)
+//    $ veridex --dex-file=app.apk
+//    Output: lists every hidden API your app references
+//    Categories: blacklist, dark-greylist, light-greylist
+
+// 2. StrictMode (runtime detection)
+//    StrictMode.VmPolicy.Builder()
+//        .detectNonSdkApiUsage()
+//        .penaltyLog()
+//        .build()
+//    Logs every hidden API access to logcat
+
+// 3. adb shell settings put global hidden_api_policy 1
+//    Forces enforcement regardless of targetSdk (for testing)
+//    0 = disabled, 1 = just warn, 2 = dark greylist enforced, 3 = all enforced</code></pre>
+
+<div class="callout danger">
+  <div class="callout-label">Real-World Breakage</div>
+  <p>The hidden API restrictions broke thousands of apps. Notable examples: apps using <code>ActivityThread.currentApplication()</code> (light greylist, later blocked), apps accessing <code>View.mListenerInfo</code> for click interception, and apps calling <code>Telephony.Sms.moveMessageToFolder()</code> (hidden API). The <code>@UnsupportedAppUsage</code> annotation was Google's compromise — it marked APIs that were widely used and gave developers time to migrate. But each Android release shrinks the greylist further.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Mainline Modules — Updatable Platform Components</h2>
+
+<p>Project Mainline (Android 10+) fundamentally changed how the platform evolves. Instead of waiting for OEM OTA updates, Google can push security patches and behavior changes directly through Google Play.</p>
+
+<h3>6.1 Architecture</h3>
+
+<div class="diagram-container">
+<pre><code>  Mainline Module Architecture
+  ════════════════════════════
+
+  Google Play Store
+       │
+       │ Module updates (APK or APEX)
+       ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │                    Module Installer                       │
+  │  (PackageManagerService + ApexManager)                    │
+  │                                                          │
+  │  APK modules: installed like regular apps                │
+  │  APEX modules: mounted at /apex/<name>/ at boot          │
+  └────────────┬──────────────────────┬──────────────────────┘
+               │                      │
+       ┌───────┴───────┐      ┌───────┴───────┐
+       │  APK Modules   │      │  APEX Modules  │
+       │                │      │                │
+       │ DocumentsUI    │      │ Conscrypt      │
+       │ Permission     │      │  (TLS/crypto)  │
+       │  Controller    │      │ Media codecs   │
+       │ CaptivePortal  │      │  (extractors)  │
+       │  Login         │      │ DNS resolver   │
+       │ ExtServices    │      │ NNAPI runtime  │
+       │                │      │ ART runtime    │
+       │ (Standard APK  │      │ Tethering      │
+       │  install path) │      │ WiFi           │
+       └────────────────┘      │ Networking     │
+                               │ Statsd         │
+                               │ Time Zone Data │
+                               │                │
+                               │ (Native code + │
+                               │  Java libs,    │
+                               │  mounted at    │
+                               │  boot)         │
+                               └────────────────┘</code></pre>
+</div>
+
+<h3>6.2 APEX Packages</h3>
+
+<pre><code>// APEX (Android Pony EXpress) is the packaging format for native modules.
+// Unlike APKs, APEX packages can contain:
+//   - Native shared libraries (.so)
+//   - Java libraries (JAR/DEX)
+//   - Configuration files
+//   - Precompiled binaries
+
+// APEX lifecycle:
+// 1. Downloaded via Google Play (as a special update)
+// 2. Verified (APK signature + dm-verity for the payload)
+// 3. Staged for next boot
+// 4. At boot: ApexManager mounts the APEX at /apex/&lt;name&gt;/
+//    → Old version at /apex/&lt;name&gt;@&lt;old_version&gt;/
+//    → New version at /apex/&lt;name&gt;@&lt;new_version&gt;/ (active)
+
+// Example: Conscrypt module
+// /apex/com.android.conscrypt/
+//   ├── javalib/conscrypt.jar      → TLS provider
+//   ├── lib64/libcrypto.so         → BoringSSL
+//   ├── lib64/libssl.so            → SSL library
+//   └── apex_manifest.json         → version, dependencies
+
+// Key constraint: APEX modules can only replace code, not data.
+// They can't modify /data — only /apex mount points.
+// This means module updates are atomic and rollback-safe.</code></pre>
+
+<h3>6.3 Impact on App Developers</h3>
+
+<pre><code>// Before Mainline: behavior changes only arrived with OS updates
+// After Mainline: behavior changes can arrive ANY TIME via module updates
+
+// This creates a new compatibility challenge:
+
+// 1. TLS behavior changes (Conscrypt module)
+//    → A Conscrypt update could change TLS version defaults
+//    → Your app's network calls might fail if you hardcoded TLS 1.2
+//    → Mitigation: use NetworkSecurityConfig, don't hardcode TLS versions
+
+// 2. Media codec changes
+//    → A media module update could fix a codec bug but change behavior
+//    → Your app's video playback might break
+//    → Mitigation: handle MediaCodec errors gracefully, test with CTS
+
+// 3. DNS resolver changes
+//    → DNS-over-HTTPS behavior might change
+//    → Your app's DNS resolution timing could change
+//    → Mitigation: don't assume DNS resolution time
+
+// 4. Permission controller changes
+//    → Permission grant UI might change
+//    → Your app's permission flow might look different
+//    → Mitigation: use the standard permission APIs, don't customize UI
+
+// Querying installed modules:
+val pm = context.packageManager
+val modules: List&lt;ModuleInfo&gt; = pm.getInstalledModules(0)
+for (module in modules) {
+    Log.d("Modules", "${module.name} — ${module.packageName}")
+    // e.g., "Conscrypt Module" — "com.android.conscrypt"
+    // e.g., "Media Framework" — "com.android.media"
+}</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">The New Fragmentation</div>
+  <p>Mainline was designed to reduce fragmentation, but it introduces a new kind: <strong>module version fragmentation</strong>. Two devices running Android 13 might have different Conscrypt versions, different media codec versions, and different networking stack versions. Your app can no longer assume that "Android 13 = consistent behavior." The mitigation is to code defensively, use Jetpack abstractions where possible, and test against a range of module versions.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Jetpack Libraries as Platform Abstraction</h2>
+
+<p>Many Jetpack libraries exist specifically to abstract away the differences between system service APIs across Android versions. They provide a stable API surface that works from API 21+ while internally dispatching to the correct system service.</p>
+
+<h3>7.1 Abstraction Layers</h3>
+
+<table>
+  <tr>
+    <th>Jetpack Library</th>
+    <th>Wraps System Service</th>
+    <th>Why Needed</th>
+  </tr>
+  <tr>
+    <td><code>WorkManager</code></td>
+    <td><code>JobScheduler</code> (23+), <code>AlarmManager</code> + <code>BroadcastReceiver</code> (pre-23), GCM (pre-21)</td>
+    <td>Background work API changed 4 times across OS versions</td>
+  </tr>
+  <tr>
+    <td><code>CameraX</code></td>
+    <td><code>Camera2</code> API → <code>CameraService</code> (HAL)</td>
+    <td>Camera2 is complex, device-specific quirks need workarounds</td>
+  </tr>
+  <tr>
+    <td><code>BiometricPrompt</code></td>
+    <td><code>BiometricManager</code> (28+), <code>FingerprintManager</code> (23-27)</td>
+    <td>Biometric API was completely redesigned in API 28</td>
+  </tr>
+  <tr>
+    <td><code>WindowManager</code> (Jetpack)</td>
+    <td><code>DisplayManager</code> + <code>WindowMetrics</code></td>
+    <td>Foldable/multi-display support varies wildly across OEMs</td>
+  </tr>
+  <tr>
+    <td><code>NotificationCompat</code></td>
+    <td><code>NotificationManager</code></td>
+    <td>Notification API changed significantly in API 26 (channels) and 33 (permission)</td>
+  </tr>
+  <tr>
+    <td><code>ActivityCompat</code></td>
+    <td><code>ActivityManager</code> + permission APIs</td>
+    <td>Runtime permissions (API 23), permission rationale, predictive back</td>
+  </tr>
+</table>
+
+<h3>7.2 How WorkManager Abstracts the Platform</h3>
+
+<pre><code>// WorkManager is the canonical example of Jetpack platform abstraction.
+// It provides ONE API but dispatches to DIFFERENT system services:
+
+// Internal delegation chain:
+class WorkManagerImpl : WorkManager() {
+
+    // Scheduler selection based on API level and device
+    private fun createSchedulers(): List&lt;Scheduler&gt; {
+        val schedulers = mutableListOf&lt;Scheduler&gt;()
+
+        if (Build.VERSION.SDK_INT &gt;= 23) {
+            // API 23+: Use JobScheduler (preferred)
+            // → Wraps IJobScheduler via JobScheduler Manager
+            schedulers.add(SystemJobScheduler(context, this))
+        }
+
+        // Always add the greedy scheduler as fallback
+        // → Uses AlarmManager + BroadcastReceiver
+        schedulers.add(GreedyScheduler(context, this))
+
+        return schedulers
+    }
+}
+
+// SystemJobScheduler internally:
+class SystemJobScheduler(context: Context, workManager: WorkManagerImpl) {
+    private val jobScheduler =
+        context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+
+    fun schedule(workSpec: WorkSpec) {
+        // Convert WorkRequest constraints → JobInfo constraints
+        val jobInfoBuilder = JobInfo.Builder(jobId, componentName)
+            .setRequiredNetworkType(mapNetworkType(workSpec.constraints))
+            .setRequiresCharging(workSpec.constraints.requiresCharging)
+            .setRequiresBatteryNotLow(workSpec.constraints.requiresBatteryNotLow)
+            // ...
+
+        jobScheduler.schedule(jobInfoBuilder.build())
+        // → IPC to JobSchedulerService in system_server
+    }
+}</code></pre>
+
+<h3>7.3 The Abstraction Cost</h3>
+
+<pre><code>// Jetpack abstractions are not free. Trade-offs:
+
+// 1. Behavior differences from raw API
+//    WorkManager adds its own retry/backoff logic on top of JobScheduler's
+//    → A WorkRequest might execute at different times than a raw JobInfo
+//    → WorkManager's 10-minute minimum periodic interval vs
+//       JobScheduler's 15-minute minimum
+
+// 2. Additional indirection
+//    CameraX → Camera2 → CameraService (HAL) → kernel driver
+//    vs.
+//    Camera2 → CameraService (HAL) → kernel driver
+//    → Extra layer means extra latency for camera open/close
+
+// 3. Dependency size
+//    WorkManager pulls in Room (for persistence), Lifecycle, etc.
+//    → Adds ~300KB to APK size (after R8 optimization)
+
+// 4. Debugging complexity
+//    When a WorkManager job fails, you need to understand:
+//    → WorkManager's internal state machine
+//    → The underlying JobScheduler behavior
+//    → Doze/App Standby bucket interactions
+//    → The system service's rate limiting
+
+// When to use raw system APIs instead of Jetpack:
+// - You need precise control over timing (AlarmManager.setExact)
+// - You need HAL-specific features (Camera2 manual controls)
+// - APK size is critical (games, instant apps)
+// - You only support recent API levels (no backward compat needed)</code></pre>
+
+<!-- ============================================================ -->
+<h2>8. App Process and System Service Threading</h2>
+
+<p>Understanding the threading model of app-to-system-service calls is essential for avoiding ANRs and jank. Every system service call from an app is a <strong>synchronous Binder transaction</strong> by default.</p>
+
+<h3>8.1 The Synchronous Call Model</h3>
+
+<div class="diagram-container">
+<pre><code>  App → System Service Threading Model
+  ══════════════════════════════════════
+
+  App Process                              system_server
+  ┌──────────────────────┐                ┌──────────────────────┐
+  │                      │                │                      │
+  │  Main Thread         │   Binder IPC   │  Binder Thread Pool  │
+  │  ┌────────────────┐  │  ───────────►  │  ┌────────────────┐  │
+  │  │ am.getRunning   │  │  (BLOCKED)    │  │ Binder:xxx_1   │  │
+  │  │ AppProcesses() │  │               │  │  → AMS.get...() │  │
+  │  │                │  │               │  │  → acquire lock  │  │
+  │  │  ⏳ waiting... │  │               │  │  → query state   │  │
+  │  │                │  │  ◄───────────  │  │  → return result │  │
+  │  │ result = [...]  │  │   response    │  └────────────────┘  │
+  │  └────────────────┘  │               │                      │
+  │                      │               │  31 threads total     │
+  │  If system_server    │               │  (sMaxBinderThreads)  │
+  │  is busy, this       │               │                      │
+  │  thread BLOCKS       │               │  If all 31 are busy,  │
+  │  until a Binder      │               │  new calls QUEUE      │
+  │  thread is free      │               │                      │
+  └──────────────────────┘                └──────────────────────┘</code></pre>
+</div>
+
+<h3>8.2 Why This Causes ANRs</h3>
+
+<pre><code>// Common ANR pattern: system service call on main thread
+
+class MyActivity : AppCompatActivity() {
+
+    override fun onResume() {
+        super.onResume()
+
+        // BAD: synchronous Binder call on main thread
+        val pm = packageManager
+        val packages = pm.getInstalledPackages(PackageManager.GET_META_DATA)
+        // → IPC to PackageManagerService
+        // → PMS acquires its internal lock
+        // → PMS iterates all packages (could be 200+)
+        // → Serializes result into Parcel
+        // → Returns via Binder
+        // Total time: 50-500ms depending on device and package count
+        // If PMS lock is contended: could be SECONDS
+
+        // BAD: multiple system service calls in sequence
+        val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+        val memInfo = ActivityManager.MemoryInfo()
+        am.getMemoryInfo(memInfo)  // IPC #1
+        val processes = am.runningAppProcesses  // IPC #2
+        val tasks = am.getRunningTasks(10)  // IPC #3
+        // Each call is a separate Binder transaction
+        // Total: 3 round-trips × latency per call
+    }
+}
+
+// GOOD: move system service calls off the main thread
+
+class MyActivity : AppCompatActivity() {
+
+    override fun onResume() {
+        super.onResume()
+
+        lifecycleScope.launch(Dispatchers.Default) {
+            val packages = packageManager
+                .getInstalledPackages(PackageManager.GET_META_DATA)
+            // Process on background thread
+
+            withContext(Dispatchers.Main) {
+                // Update UI with results
+                updatePackageList(packages)
+            }
+        }
+    }
+}</code></pre>
+
+<h3>8.3 StrictMode Detection</h3>
+
+<pre><code>// StrictMode can detect slow Binder calls on the main thread
+
+class MyApplication : Application() {
+    override fun onCreate() {
+        super.onCreate()
+
+        if (BuildConfig.DEBUG) {
+            StrictMode.setThreadPolicy(
+                StrictMode.ThreadPolicy.Builder()
+                    .detectCustomSlowCalls()  // Custom slow call detection
+                    .penaltyLog()
+                    .penaltyFlashScreen()     // Red border flash
+                    .build()
+            )
+
+            // VM policy for detecting leaked resources
+            StrictMode.setVmPolicy(
+                StrictMode.VmPolicy.Builder()
+                    .detectNonSdkApiUsage()   // Hidden API detection
+                    .penaltyLog()
+                    .build()
+            )
+        }
+    }
+}
+
+// StrictMode output for a slow Binder call:
+// D/StrictMode: StrictMode policy violation: android.os.StrictMode$StrictModeViolation
+//   at android.os.Binder.transact(Binder.java:1083)
+//   at android.content.pm.IPackageManager$Stub$Proxy.getInstalledPackages(...)
+//   at android.app.ApplicationPackageManager.getInstalledPackages(...)
+//   at com.example.MyActivity.onResume(MyActivity.kt:42)</code></pre>
+
+<h3>8.4 Async Alternatives</h3>
+
+<pre><code>// Some system services provide async/callback-based APIs
+// to avoid blocking the calling thread:
+
+// 1. ConnectivityManager — callback-based network monitoring
+val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+val request = NetworkRequest.Builder()
+    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    .build()
+cm.registerNetworkCallback(request, object : ConnectivityManager.NetworkCallback() {
+    override fun onAvailable(network: Network) { /* async callback */ }
+    override fun onLost(network: Network) { /* async callback */ }
+})
+// Callback arrives on a Binder thread — post to main if needed
+
+// 2. LocationManager — listener-based
+val lm = getSystemService(LOCATION_SERVICE) as LocationManager
+lm.requestLocationUpdates(
+    LocationManager.GPS_PROVIDER,
+    1000L,  // min time ms
+    10f,    // min distance meters
+    object : LocationListener {
+        override fun onLocationChanged(location: Location) {
+            // Arrives on the calling thread's Looper (if it has one)
+            // or on a Binder thread
+        }
+    },
+    Looper.getMainLooper()  // Specify which Looper to deliver on
+)
+
+// 3. PackageManager — since Android 13, some queries return via callback
+//    to avoid blocking on large result sets
+
+// 4. SensorManager — always callback-based
+val sm = getSystemService(SENSOR_SERVICE) as SensorManager
+sm.registerListener(
+    object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) { /* async */ }
+        override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) {}
+    },
+    sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER),
+    SensorManager.SENSOR_DELAY_NORMAL,
+    handler  // Deliver on this Handler's thread
+)</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">L6 Insight — The Binder Thread Pool Starvation Cascade</div>
+  <p>system_server's 31 Binder threads serve <em>all</em> apps simultaneously. When a system service acquires a lock in its Binder thread handler and that lock is held by the main thread (which is itself waiting on another Binder call), you get a <strong>cross-thread deadlock that starves the entire thread pool</strong>. Here's the cascade: App A calls <code>PackageManager.getInstalledPackages()</code> → PMS Binder thread acquires <code>mPackages</code> lock → PMS main thread is doing a package scan holding the same lock → Binder thread blocks → 30 more Binder calls from other apps pile up → all 31 threads exhausted → <em>every app on the device</em> hangs on any system service call → Watchdog fires after 60s → runtime restart. This is why system service implementations must never hold locks across Binder calls and must minimize lock scope. Google's internal code review guidelines for system services mandate lock-ordering documentation and prohibit nested lock acquisition across service boundaries.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Staff-Level Corner Cases</h2>
+
+<h3>9.1 getSystemService() Before Application.onCreate()</h3>
+
+<pre><code>// Some services aren't fully available during early app initialization.
+// This catches developers who call getSystemService() in static
+// initializers or ContentProvider.onCreate().
+
+// ContentProvider.onCreate() runs BEFORE Application.onCreate():
+//
+// App process start sequence:
+// 1. ActivityThread.handleBindApplication()
+// 2. Application object created
+// 3. ContentProvider.onCreate() for ALL declared providers
+// 4. Application.onCreate()
+//
+// In ContentProvider.onCreate():
+// ✅ getSystemService(ALARM_SERVICE) — works (AlarmManager is ready)
+// ✅ getSystemService(CONNECTIVITY_SERVICE) — works
+// ⚠️ getSystemService(ACTIVITY_SERVICE) — works but limited
+//     (process isn't fully registered with AMS yet)
+// ❌ getSystemService(SEARCH_SERVICE) — may fail
+//     (SearchManager needs Activity context)
+
+// The safest pattern: defer system service access to lazy initialization
+class MyContentProvider : ContentProvider() {
+
+    private val alarmManager by lazy {
+        context!!.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+    }
+
+    override fun onCreate(): Boolean {
+        // Don't call getSystemService() here unless absolutely necessary
+        return true
+    }
+}</code></pre>
+
+<h3>9.2 Binder Death and DeadObjectException</h3>
+
+<pre><code>// If system_server crashes, every Binder proxy in every app becomes invalid.
+// Any subsequent call throws DeadObjectException.
+
+// But system_server crashes are rare. More common: HAL service death.
+// Camera HAL, Media HAL, Sensor HAL — these run in separate processes
+// and CAN crash independently.
+
+// How Manager classes handle death:
+
+// Pattern 1: Reconnect on death (CameraManager)
+class CameraManager {
+    private var cameraService: ICameraService? = null
+
+    private val deathRecipient = IBinder.DeathRecipient {
+        // HAL process died — clear cached proxy
+        synchronized(lock) {
+            cameraService = null
+        }
+        // Next camera operation will re-acquire the proxy
+    }
+
+    private fun getCameraService(): ICameraService {
+        synchronized(lock) {
+            cameraService?.let { return it }
+
+            val binder = ServiceManager.getService("media.camera")
+                ?: throw CameraAccessException(CameraAccessException.CAMERA_DISCONNECTED)
+
+            binder.linkToDeath(deathRecipient, 0)
+            val service = ICameraService.Stub.asInterface(binder)
+            cameraService = service
+            return service
+        }
+    }
+}
+
+// Pattern 2: Rethrow as RuntimeException (most Managers)
+class AlarmManager {
+    fun set(type: Int, triggerAtMillis: Long, operation: PendingIntent) {
+        try {
+            service.set(/* ... */)
+        } catch (e: RemoteException) {
+            // system_server dead — rethrow; app will be killed anyway
+            throw e.rethrowFromSystemServer()
+        }
+    }
+}
+
+// RemoteException.rethrowFromSystemServer() wraps the exception:
+// → If the dead service IS system_server: throws RuntimeException
+//    (because the app process will be killed momentarily anyway)
+// → If it's a different service: rethrows as-is</code></pre>
+
+<h3>9.3 TransactionTooLargeException</h3>
+
+<pre><code>// The Binder transaction buffer is 1MB per process (shared across
+// ALL concurrent transactions). Exceeding it throws
+// TransactionTooLargeException.
+
+// Common triggers:
+// 1. Passing large Bitmaps via Intent extras
+//    → Solution: use FileProvider or content:// URIs
+//
+// 2. onSaveInstanceState() with too much data
+//    → The saved state is passed to AMS via Binder
+//    → Solution: keep saved state &lt; 50KB, use ViewModel for large data
+//
+// 3. getInstalledPackages() with GET_META_DATA on a device with 200+ apps
+//    → The result Parcel can exceed 1MB
+//    → Solution: use GET_META_DATA only when needed, paginate if possible
+
+// The 1MB limit is SHARED across all concurrent transactions:
+// If Thread A is mid-transaction using 500KB,
+// Thread B only has 500KB left for its transaction.
+// This makes the exception non-deterministic and hard to reproduce.
+
+// Debugging:
+// adb shell dumpsys activity processes | grep "Transaction"
+// Look for: "!@TransactionTooLargeException: data parcel size XXXXX bytes"
+
+// Android 8+: the exception includes the parcel size in the message
+// Android 11+: onSaveInstanceState() logs a warning if state &gt; 32KB</code></pre>
+
+<h3>9.4 System Service Rate Limiting</h3>
+
+<pre><code>// System services protect themselves from misbehaving apps
+// with various rate-limiting mechanisms:
+
+// 1. Location — throttled by app standby bucket
+//    Active bucket: full-rate updates
+//    Working set: reduced rate
+//    Frequent: further reduced
+//    Rare: very infrequent
+//    Restricted (Android 12+): no background location at all
+
+// 2. Alarms — throttled starting Android 12
+//    Apps can only set a limited number of exact alarms
+//    Must declare SCHEDULE_EXACT_ALARM permission
+//    System can defer non-exact alarms during Doze
+
+// 3. Notifications — rate limited per channel
+//    Posting too many notifications too quickly → some silently dropped
+//    Toast rate limiting: max 5 toasts per 20 seconds per UID
+
+// 4. JobScheduler — limited by app standby bucket
+//    Active: 10 minutes of execution per 10 minutes
+//    Working set: 10 minutes per 2 hours
+//    Frequent: 10 minutes per 8 hours
+//    Rare: 10 minutes per 24 hours
+
+// 5. Broadcast delivery — prioritized
+//    Foreground apps get broadcasts first
+//    Background apps may have broadcasts deferred
+//    Implicit broadcasts restricted to manifest receivers (Android 8+)
+
+// 6. WakeLock acquisition — monitored
+//    Long-held wakelocks trigger battery blame
+//    System can force-release wakelocks from misbehaving apps</code></pre>
+
+<h3>9.5 RECEIVER_EXPORTED / RECEIVER_NOT_EXPORTED (Android 13+)</h3>
+
+<pre><code>// Android 13 (API 33) requires explicit export declaration
+// for dynamically registered BroadcastReceivers.
+
+// Before Android 13:
+context.registerReceiver(receiver, intentFilter)
+// → Implicitly exported — any app can send broadcasts to this receiver
+// → Security risk: malicious apps can trigger your receiver
+
+// Android 13+:
+// Must specify RECEIVER_EXPORTED or RECEIVER_NOT_EXPORTED
+
+// For receivers that should only receive system broadcasts:
+context.registerReceiver(
+    receiver,
+    intentFilter,
+    Context.RECEIVER_NOT_EXPORTED  // Only system + same-app can reach it
+)
+
+// For receivers that need broadcasts from other apps:
+context.registerReceiver(
+    receiver,
+    intentFilter,
+    Context.RECEIVER_EXPORTED  // Any app can send broadcasts to it
+)
+
+// If you don't specify on Android 13+:
+// → SecurityException: "Need to specify RECEIVER_EXPORTED or
+//    RECEIVER_NOT_EXPORTED when registering receiver"
+
+// Protected broadcasts (ACTION_BOOT_COMPLETED, ACTION_BATTERY_CHANGED, etc.)
+// are always safe with RECEIVER_NOT_EXPORTED because only the system
+// can send them. Using RECEIVER_EXPORTED for these is unnecessary
+// but not harmful.
+
+// Compat library:
+// ContextCompat.registerReceiver(context, receiver, filter, flags)
+// Handles the flag requirement on 33+ and ignores it on older versions</code></pre>
+
+<h3>9.6 The veridex Tool — Hidden API Migration</h3>
+
+<pre><code>// veridex is Google's static analysis tool for detecting hidden API usage.
+// Essential for apps migrating away from @hide APIs.
+
+// Usage:
+// $ appcompat.sh --dex-file=app.apk --imprecise
+//
+// Output:
+// #1: Linking greylist Landroid/app/ActivityThread;-&gt;currentApplication()
+//     type: Landroid/app/Application;
+//     in: Lcom/example/MyUtils;-&gt;getApp()Landroid/app/Application;
+//
+// #2: Linking blacklist Landroid/view/View;-&gt;mListenerInfo:
+//     Landroid/view/View$ListenerInfo;
+//     in: Lcom/example/ClickInterceptor;-&gt;intercept(Landroid/view/View;)V
+//
+// Summary:
+//   2 greylist references
+//   1 blacklist reference
+//   0 greylist-max-o references
+
+// Migration strategies for common hidden APIs:
+
+// ActivityThread.currentApplication() → ProcessLifecycleOwner or
+//   Application reference passed via DI
+
+// View.mListenerInfo → View.getOnClickListener() (added in API 15)
+//   or custom touch delegate
+
+// Telephony.Sms.moveMessageToFolder() → ContentResolver operations
+//   with Telephony.Sms.CONTENT_URI
+
+// Settings.Secure.ANDROID_ID via reflection → Settings.Secure.getString()
+//   (this was always public, apps just used reflection by mistake)</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">L6 Insight — Mainline Module Updates as the New Fragmentation Vector</div>
+  <p>At Google scale, Mainline module updates are tested against a matrix of device configurations before rollout. But the combinatorial explosion of module versions creates a testing challenge that didn't exist before. Consider: a device running Android 13 with Conscrypt v42, Media v38, and Networking v45 might behave differently from the same Android 13 with Conscrypt v44, Media v38, and Networking v47. Google uses <strong>staged rollouts</strong> (1% → 10% → 50% → 100%) and <strong>automatic rollback</strong> (if crash rate exceeds threshold) to mitigate this. For app developers, the implication is that you can no longer reproduce a user's exact platform configuration by just knowing their Android version — you also need module versions. <code>PackageManager.getModuleInfo()</code> and <code>Build.VERSION.SECURITY_PATCH</code> together give you the full picture, and crash reporting tools (Firebase Crashlytics) now include module versions in crash reports.</p>
+</div>
+
+<h3>9.7 Putting It All Together — The Full Call Stack</h3>
+
+<div class="diagram-container">
+<pre><code>  Complete App → Platform Call Stack
+  ════════════════════════════════════
+
+  App Code (Kotlin)
+  ─────────────────
+  val am = context.getSystemService(ALARM_SERVICE) as AlarmManager
+  am.setExactAndAllowWhileIdle(RTC_WAKEUP, triggerTime, pendingIntent)
+       │
+       ▼
+  AlarmManager.setExactAndAllowWhileIdle()          [Manager layer]
+  → Validates arguments
+  → Calls mService.set(pkg, type, trigger, 0, 0, flags, pi, ...)
+       │
+       ▼
+  IAlarmManager.Stub.Proxy.set()                    [AIDL proxy]
+  → Serializes args into Parcel
+  → Calls mRemote.transact(SET_TRANSACTION, data, reply, 0)
+       │
+       ▼
+  BinderProxy.transact()                            [Binder framework]
+  → Calls transactNative() → JNI → IPCThreadState::transact()
+       │
+       ▼
+  Binder Driver (kernel)                            [/dev/binder]
+  → Copies Parcel data to target process (one-copy via mmap)
+  → Wakes a Binder thread in system_server
+       │
+       ▼
+  IAlarmManager.Stub.onTransact()                   [AIDL stub]
+  → Deserializes Parcel → calls set() on the real implementation
+       │
+       ▼
+  AlarmManagerService.set()                         [System service]
+  → Validates caller permissions (AppOps check)
+  → Checks app standby bucket for alarm throttling
+  → Acquires internal lock
+  → Stores alarm in internal data structure
+  → Programs the kernel alarm timer via /dev/alarm or timerfd
+  → Returns (Binder thread sends reply Parcel back)
+       │
+       ▼
+  App's calling thread unblocks with the result</code></pre>
+</div>
+
+<!-- ============================================================ -->
+
+<div class="callout">
+  <div class="callout-label">Key Takeaways for Interview</div>
+  <ul>
+    <li><strong>getSystemService()</strong> resolves through <code>SystemServiceRegistry</code> → <code>CachedServiceFetcher</code> → <code>ServiceManager</code> → Binder proxy → Manager object</li>
+    <li><strong>ServiceManager</strong> is handle 0 in the Binder driver — the universal directory; SELinux enforces access per service name</li>
+    <li><strong>Manager classes</strong> wrap AIDL proxies with validation, caching, death handling, and backward compatibility</li>
+    <li><strong>API boundaries</strong>: Public SDK → @SystemApi → @TestApi → @hide; hidden API restrictions enforce this at runtime via ART</li>
+    <li><strong>Mainline modules</strong> (APEX/APK) enable platform updates via Google Play but introduce module version fragmentation</li>
+    <li><strong>Jetpack libraries</strong> abstract system service differences across OS versions at the cost of an extra layer</li>
+    <li><strong>All system service calls are synchronous Binder IPC</strong> — never call potentially slow services on the main thread</li>
+    <li><strong>TransactionTooLargeException</strong>: 1MB shared buffer per process; keep Parcels small, use content URIs for large data</li>
+    <li><strong>Android 13+</strong>: dynamic BroadcastReceivers must declare RECEIVER_EXPORTED or RECEIVER_NOT_EXPORTED</li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<h2>10. ServiceManager Cache Invalidation &amp; HAL Death</h2>
+
+<p><code>ServiceManager</code> caches Binder proxies in a static <code>sCache</code> (<code>HashMap&lt;String, IBinder&gt;</code>) to avoid repeated IPC to the native <code>servicemanager</code> daemon. But what happens when the target service dies?</p>
+
+<h3>10.1 System Service Death — Non-Issue</h3>
+
+<p>For system services running in <code>system_server</code>, a crash kills the entire process. Since all app processes depend on system_server, Zygote kills them all and re-forks system_server. When apps restart, they get fresh <code>sCache</code> entries — stale proxies are never observed because the entire Java heap is gone.</p>
+
+<h3>10.2 HAL Service Death — The Real Problem</h3>
+
+<p>HAL processes (camera, media, sensors) run in <strong>separate processes</strong> and can crash independently of system_server. When a HAL dies:</p>
+
+<ol>
+  <li><code>servicemanager</code> detects the death (the HAL's Binder node is destroyed in the kernel driver)</li>
+  <li><code>servicemanager</code> removes the registration — the next <code>getService()</code> call will block until the HAL restarts and re-registers</li>
+  <li>But the app's cached <code>Manager</code> object still holds the <strong>dead Binder proxy</strong></li>
+  <li>Any call on that proxy throws <code>DeadObjectException</code></li>
+</ol>
+
+<pre><code>// The death notification mechanism
+
+val binder: IBinder = ServiceManager.getService("media.camera")
+
+// Register for death notification
+binder.linkToDeath(object : IBinder.DeathRecipient {
+    override fun binderDied() {
+        // HAL process crashed — the proxy is now dead
+        // Clear any cached references
+        synchronized(lock) {
+            cachedCameraService = null
+        }
+        // Next operation will re-acquire via getService()
+    }
+}, 0)
+
+// Recovery pattern for app code:
+fun safeCameraOperation() {
+    try {
+        cameraManager.openCamera(cameraId, callback, handler)
+    } catch (e: DeadObjectException) {
+        // HAL died — clear cached manager, re-acquire
+        cameraManager = context.getSystemService(Context.CAMERA_SERVICE)
+            as CameraManager
+        // Retry after a delay (HAL needs time to restart)
+        handler.postDelayed({ safeCameraOperation() }, 1000)
+    }
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">L6 Insight — Built-in Reconnection in Manager Classes</div>
+  <p>Some Manager classes (e.g., <code>CameraManager</code>, <code>MediaCodecList</code>) have built-in reconnection logic — they register <code>DeathRecipient</code> on the HAL's IBinder and automatically re-bind when the HAL restarts. This is why <code>CameraManager.openCamera()</code> can throw <code>CameraAccessException(CAMERA_DISCONNECTED)</code> instead of a raw <code>DeadObjectException</code> — the Manager detects the death and translates it into a domain-specific exception. Understanding this pattern is critical for designing robust Manager wrappers: always register <code>DeathRecipient</code>, always clear cached proxies on death, and always provide a domain-specific error path for clients.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>11. ContextImpl Double-Init Race</h2>
+
+<p><code>CachedServiceFetcher.getService()</code> uses a gate mechanism to prevent double initialization when multiple threads call <code>getSystemService()</code> simultaneously for the same service.</p>
+
+<h3>11.1 The Gate Mechanism</h3>
+
+<pre><code>// ContextImpl maintains a per-service-index state array:
+// mServiceInitializationStateArray: AtomicInteger[]
+
+// States:
+// STATE_UNINITIALIZED (0) — no thread has started creating this service
+// STATE_INITIALIZING  (1) — a thread is currently in createService()
+// STATE_READY         (2) — service is created and cached
+// STATE_NOT_FOUND     (3) — createService() threw an exception
+
+// The race scenario:
+//
+// Thread A                          Thread B
+// ────────                          ────────
+// getService("alarm")               getService("alarm")
+//   │                                 │
+//   ▼                                 ▼
+// CAS(UNINITIALIZED → INITIALIZING)  CAS fails (already INITIALIZING)
+//   │                                 │
+//   ▼                                 ▼
+// createService(ctx)                 spin-wait: while(INITIALIZING) yield()
+//   │                                 │
+//   ▼                                 │ (blocked)
+// cache[index] = manager             │
+// state = READY                       │
+//   │                                 ▼
+//   │                               state == READY → return cache[index]
+//   ▼
+// return manager</code></pre>
+
+<h3>11.2 The Exception Edge Case</h3>
+
+<p>If Thread A's <code>createService()</code> throws an exception, the gate transitions to <code>STATE_NOT_FOUND</code>. Thread B, which was spin-waiting, unblocks and finds <code>cache[index]</code> is null — it returns null to the caller. Subsequent calls will also see <code>STATE_NOT_FOUND</code> and return null without retrying.</p>
+
+<pre><code>// What happens when createService() fails:
+//
+// Thread A: CAS(UNINITIALIZED → INITIALIZING) ✓
+// Thread A: createService() throws ServiceNotFoundException
+// Thread A: state = NOT_FOUND (in catch block)
+// Thread A: exception propagates to caller
+//
+// Thread B: was spinning on INITIALIZING
+// Thread B: sees NOT_FOUND → exits spin
+// Thread B: cache[index] is null → returns null
+//
+// Thread C (later): sees NOT_FOUND → returns null immediately
+//
+// The service is permanently "not found" for this Context.
+// Only creating a new Context would reset the state.</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">L6 Insight — Concurrent Initialization Pattern</div>
+  <p>This is a classic double-checked locking pattern adapted for service initialization with three states instead of two. The <code>compareAndSet</code> on <code>AtomicInteger</code> replaces <code>synchronized</code> for the fast path (cache hit), while the spin-wait with <code>Thread.yield()</code> handles the contention case. The trade-off: spin-waiting wastes CPU cycles but avoids the overhead of a <code>wait()/notify()</code> mechanism for what is typically a very short initialization. Understanding this pattern demonstrates knowledge of concurrent initialization beyond basic synchronization — interviewers look for awareness of CAS operations, spin-wait trade-offs, and failure-state propagation in concurrent systems.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>12. @SystemApi Enforcement</h2>
+
+<p><code>@SystemApi</code> methods exist in the real framework on every device but are deliberately excluded from the public SDK stubs that apps compile against. The enforcement is <strong>asymmetric</strong> — strong at compile time, weaker at runtime.</p>
+
+<h3>12.1 Compile-Time Enforcement</h3>
+
+<pre><code>// The public SDK (android.jar) is a stub JAR containing only:
+//   - Public methods (no annotation)
+//   - @SystemApi methods are EXCLUDED from the stubs
+//
+// When your app compiles against android.jar:
+//   ActivityManager.forceStopPackage("com.example")
+//   → Compile error: "Cannot resolve method 'forceStopPackage'"
+//   → The method simply doesn't exist in the stubs
+//
+// For system apps that need @SystemApi access:
+//   - Compile against the full framework (system-api stubs)
+//   - Must be installed in /system/priv-app/
+//   - Must be signed with the platform key (or hold signature permissions)</code></pre>
+
+<h3>12.2 Runtime Enforcement</h3>
+
+<pre><code>// At runtime, the real framework classes contain ALL methods:
+//   - Public, @SystemApi, @TestApi, and @hide methods all exist
+//
+// An app using reflection CAN call @SystemApi methods:
+//   val method = ActivityManager::class.java
+//       .getDeclaredMethod("forceStopPackage", String::class.java)
+//   method.invoke(activityManager, "com.example")
+//
+// BUT: hidden API restrictions (Android 9+) block this:
+//   - @SystemApi methods are on the greylist/blacklist
+//   - ART intercepts the reflection call
+//   - Throws NoSuchMethodException for blacklisted methods
+//
+// Exceptions — who CAN access @SystemApi at runtime:
+//   1. System apps in /system/priv-app/
+//   2. Apps signed with the platform signing key
+//   3. Apps with HiddenApiEnforcementPolicy.DISABLED
+//   4. Shell (UID 2000) — for adb commands</code></pre>
+
+<h3>12.3 priv-app Permissions</h3>
+
+<pre><code>// Privileged apps must also have their permissions whitelisted:
+// /etc/permissions/privapp-permissions-platform.xml
+//
+// &lt;privapp-permissions package="com.android.settings"&gt;
+//     &lt;permission name="android.permission.MANAGE_USERS"/&gt;
+//     &lt;permission name="android.permission.WRITE_SECURE_SETTINGS"/&gt;
+//     &lt;permission name="android.permission.FORCE_STOP_PACKAGES"/&gt;
+// &lt;/privapp-permissions&gt;
+//
+// Without this whitelist entry, even a priv-app can't use the permission.
+// Android 9+ enforces this strictly — missing entries cause boot-time errors.</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">L6 Insight — Asymmetric Enforcement</div>
+  <p>The enforcement is intentionally asymmetric: compile-time enforcement is strong (methods don't exist in stubs — you literally can't reference them), but runtime enforcement relies on hidden API restrictions which have exemptions for privileged apps. This design allows the platform to expose powerful APIs to system apps while keeping them invisible to third-party developers. The implication for app developers: don't rely on reflection to access @SystemApi methods — the hidden API restrictions will block you, and the greylist/blacklist evolves with each Android release. For platform engineers: always pair @SystemApi with a permission check in the service implementation — the annotation alone is not a security boundary.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>13. veridex Migration Workflow</h2>
+
+<p><code>veridex</code> is Google's static analysis tool for detecting hidden API usage in APKs. It scans dex bytecode for references to non-SDK APIs and reports them with severity levels.</p>
+
+<h3>13.1 Running veridex</h3>
+
+<pre><code>// Basic usage:
+$ ./veridex --dex-file=app.apk
+
+// Output:
+// #1: Linking greylist Landroid/app/ActivityThread;
+//         →currentApplication()Landroid/app/Application;
+//     in: Lcom/example/MyUtils;→getApp()Landroid/app/Application;
+//
+// #2: Linking blacklist Landroid/view/View;→mListenerInfo:
+//         Landroid/view/View$ListenerInfo;
+//     in: Lcom/example/ClickInterceptor;→intercept(Landroid/view/View;)V
+//
+// Summary:
+//   2 greylist references
+//   1 blacklist reference
+//   0 greylist-max-o references
+
+// Severity levels:
+// ┌─────────────────────┬───────────────────────────────────────────┐
+// │ Level               │ Meaning                                   │
+// ├─────────────────────┼───────────────────────────────────────────┤
+// │ whitelist           │ Public SDK — safe                         │
+// │ greylist            │ Warning — may be blocked in future        │
+// │ greylist-max-o      │ Blocked for targetSdk ≥ 26 (Oreo)        │
+// │ greylist-max-p      │ Blocked for targetSdk ≥ 28 (Pie)         │
+// │ greylist-max-q      │ Blocked for targetSdk ≥ 29 (Q)           │
+// │ blacklist           │ Always blocked — throws exception         │
+// └─────────────────────┴───────────────────────────────────────────┘</code></pre>
+
+<h3>13.2 Migration Workflow</h3>
+
+<pre><code>// Step 1: Run veridex on your APK
+$ ./veridex --dex-file=app-release.apk &gt; veridex-report.txt
+
+// Step 2: Triage the report
+//   - blacklist: MUST fix — these will crash on affected API levels
+//   - greylist-max-*: MUST fix before raising targetSdk
+//   - greylist: SHOULD fix — will be blocked in future releases
+
+// Step 3: Replace hidden API calls with public alternatives
+//   ActivityThread.currentApplication()
+//     → Pass Application via DI, or use ProcessLifecycleOwner
+//
+//   View.mListenerInfo (field access)
+//     → View.getOnClickListener() (public since API 15)
+//
+//   Telephony.Sms.moveMessageToFolder()
+//     → ContentResolver operations with Telephony.Sms.CONTENT_URI
+
+// Step 4: If no public alternative exists
+//   → File a feature request on the Android issue tracker
+//   → Google tracks these to prioritize SDK API additions
+
+// Step 5: Test with strict enforcement
+$ adb shell settings put global hidden_api_policy 1
+// 0 = disabled, 1 = just warn, 2 = dark greylist enforced, 3 = all enforced
+
+// The appcompat.sh wrapper script:
+$ appcompat.sh --dex-file=app.apk --imprecise
+// Formats veridex output for easier triage with categorized sections</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">L6 Insight — Google's Play Store Enforcement</div>
+  <p>Google runs <code>veridex</code> on all Play Store apps and sends pre-launch warnings to developers whose apps use hidden APIs that will be blocked in the next Android release. This is how they drive migration before tightening restrictions — developers get 6-12 months of warnings before an API moves from greylist to blacklist. For large apps with extensive hidden API usage, the migration can take multiple release cycles. The strategic approach: run <code>veridex</code> as part of your CI pipeline, fail the build on any blacklist reference, and treat greylist references as tech debt to be resolved before the next targetSdk bump.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>14. Android 14+ Platform Changes</h2>
+
+<p>Each Android version tightens the contract between apps and the platform. Understanding the evolution helps predict future restrictions and design forward-compatible apps.</p>
+
+<h3>14.1 Key Platform Changes (Android 13–15)</h3>
+
+<table>
+  <tr>
+    <th>Change</th>
+    <th>Version</th>
+    <th>Impact</th>
+    <th>Migration</th>
+  </tr>
+  <tr>
+    <td><code>POST_NOTIFICATIONS</code> permission</td>
+    <td>Android 13 (API 33)</td>
+    <td>Apps must request runtime permission to post notifications</td>
+    <td>Add permission request flow; handle denial gracefully</td>
+  </tr>
+  <tr>
+    <td><code>RECEIVER_EXPORTED</code> / <code>RECEIVER_NOT_EXPORTED</code></td>
+    <td>Android 13–14</td>
+    <td>Dynamic receivers must declare export status; Android 14 enforces for all apps</td>
+    <td>Audit all <code>registerReceiver()</code> calls; add the flag</td>
+  </tr>
+  <tr>
+    <td>Foreground service types</td>
+    <td>Android 14 (API 34)</td>
+    <td>Must declare <code>foregroundServiceType</code> in manifest</td>
+    <td>Add type attribute: <code>camera</code>, <code>location</code>, <code>dataSync</code>, etc.</td>
+  </tr>
+  <tr>
+    <td><code>USE_EXACT_ALARM</code> permission</td>
+    <td>Android 14</td>
+    <td>Alarm clock apps can use exact alarms without user approval</td>
+    <td>Use instead of <code>SCHEDULE_EXACT_ALARM</code> for clock/timer apps</td>
+  </tr>
+  <tr>
+    <td>Photo Picker</td>
+    <td>Android 13+</td>
+    <td><code>ACTION_PICK_IMAGES</code> replaces <code>READ_MEDIA_IMAGES</code> for selecting photos</td>
+    <td>Use <code>PickVisualMedia</code> ActivityResult contract</td>
+  </tr>
+  <tr>
+    <td>Edge-to-edge enforcement</td>
+    <td>Android 15 (API 35)</td>
+    <td>Apps targeting 15 must handle insets — no default padding</td>
+    <td>Use <code>WindowInsets</code> API; test with <code>WindowInsetsCompat</code></td>
+  </tr>
+  <tr>
+    <td>Predictive back</td>
+    <td>Android 14–15</td>
+    <td>System back gesture shows preview; apps must opt in</td>
+    <td>Use <code>OnBackPressedCallback</code>; enable <code>android:enableOnBackInvokedCallback</code></td>
+  </tr>
+</table>
+
+<h3>14.2 The Pattern of Tightening</h3>
+
+<pre><code>// The platform-app contract tightens in a predictable pattern:
+//
+// Phase 1: New behavior introduced, opt-in via targetSdk
+//   Android 13: POST_NOTIFICATIONS required for targetSdk 33+
+//   Android 13: RECEIVER_EXPORTED optional for targetSdk 33
+//
+// Phase 2: Enforcement broadened
+//   Android 14: RECEIVER_EXPORTED required for ALL dynamic receivers
+//   Android 14: foregroundServiceType required for targetSdk 34+
+//
+// Phase 3: No escape — enforced for all apps
+//   Android 15: edge-to-edge enforced for targetSdk 35+
+//   Future: likely enforced for all apps in Android 16+
+//
+// Prediction strategy:
+//   1. Watch the "behavior changes for all apps" section in each release
+//   2. Anything that's "opt-in for targetSdk N" will become mandatory
+//      for targetSdk N+1 or N+2
+//   3. Design your app to handle the restriction NOW, even if you
+//      haven't raised targetSdk yet</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">L6 Insight — Forward-Compatible Design</div>
+  <p>Each Android version tightens the platform-app contract — understanding the evolution helps predict future restrictions. The pattern is consistent: introduce a new restriction gated on <code>targetSdkVersion</code>, give developers 1-2 releases to migrate, then enforce for all apps. Staff engineers should design apps that are forward-compatible by default: always declare export status on receivers, always specify foreground service types, always handle insets explicitly, and always request permissions before using restricted features. This proactive approach means your app doesn't break when you raise <code>targetSdkVersion</code> — a common source of regressions in large codebases where the targetSdk bump touches hundreds of behaviors simultaneously.</p>
+</div>
+
+<!-- ============================================================ -->
+<p style="margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.95rem;">
+  Prev: <a href="06-service-patterns.html">06 — Service Patterns</a> &nbsp;|&nbsp;
+  Next: <a href="08-interview-qa.html">08 — Interview Q&amp;A →</a> &nbsp;|&nbsp;
+  <a href="index.html">← Back to System Services Index</a>
+</p>
+
+</body>
+</html>

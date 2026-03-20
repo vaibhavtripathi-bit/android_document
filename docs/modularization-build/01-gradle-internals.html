@@ -1,0 +1,1231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 — Gradle Build System Internals — Lifecycle, Task Graph, Caching, and What an Architect Must Know</title>
+<style>
+  :root { --bg: #ffffff; --surface: #f7f8fa; --surface2: #edeef2; --border: #d4d7e0; --text: #1e2028; --text-dim: #5c6070; --accent: #2563eb; --accent2: #7c3aed; --green: #16803c; --red: #dc2626; --orange: #c2410c; --yellow: #a16207; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.75; padding: 2rem; max-width: 920px; margin: 0 auto; font-size: 1.08rem; }
+  h1 { font-size: 2.2rem; margin-bottom: 0.5rem; color: var(--accent); }
+  h2 { font-size: 1.6rem; margin: 2.5rem 0 1rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.25rem; margin: 1.5rem 0 0.75rem; color: var(--green); }
+  p { margin-bottom: 1rem; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 1rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.35rem 0.75rem; border-radius: 6px; font-size: 0.85rem; color: var(--text); }
+  .nav a.active { background: var(--accent); color: #fff; }
+  code { background: #f0f1f5; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.88em; color: #c7254e; border: 1px solid #e2e4ea; }
+  pre { background: #fafbfc; border: 1px solid #d4d7e0; border-radius: 8px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 1rem; line-height: 1.7; }
+  pre code { background: none; padding: 0; color: #2e3440; border: none; }
+  .callout { border-left: 4px solid var(--accent); background: #f0f4ff; padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--accent2); background: #f5f0ff; }
+  .callout.warn { border-left-color: var(--orange); background: #fff7ed; }
+  .callout.danger { border-left-color: var(--red); background: #fef2f2; }
+  .callout-label { font-weight: 700; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .callout.staff .callout-label { color: var(--accent2); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.danger .callout-label { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.95rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border: 1px solid var(--border); }
+  th { background: var(--surface2); color: var(--accent); font-weight: 600; }
+  td { background: var(--bg); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; } li { margin-bottom: 0.35rem; }
+  footer { margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--border); font-size: 0.95rem; color: var(--text-dim); display: flex; justify-content: space-between; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a class="active" href="01-gradle-internals.html">01 Gradle Internals</a>
+  <a href="02-module-architecture.html">02 Module Architecture</a>
+  <a href="03-modularization-strategies.html">03 Modularization Strategies</a>
+  <a href="04-dependency-management.html">04 Dependency Management</a>
+  <a href="05-build-performance.html">05 Build Performance</a>
+  <a href="06-convention-plugins.html">06 Convention Plugins</a>
+  <a href="07-common-problems.html">07 Common Problems</a>
+  <a href="08-interview-qa.html">08 Interview Q&amp;A</a>
+</div>
+
+<h1>01 — Gradle Build System Internals</h1>
+<p class="subtitle">The three-phase lifecycle, task DAG, AGP internals, dependency resolution, daemon mechanics, incremental builds, build cache, configuration cache — everything an Android Architect must know about how Gradle actually works under the hood</p>
+
+<!-- ============================================================ -->
+<h2>1. Gradle Build Lifecycle — The Three Phases</h2>
+
+<p>Every Gradle invocation — whether <code>./gradlew assembleDebug</code> or <code>./gradlew help</code> — passes through exactly three phases, in strict order. Understanding these phases is the foundation of every build optimization and the root cause of most build performance problems.</p>
+
+<h3>Phase 1: Initialization</h3>
+
+<p>Gradle evaluates <code>settings.gradle.kts</code> to determine which projects participate in the build. For each included project, Gradle creates a <code>Project</code> instance (but does <em>not</em> evaluate its build script yet).</p>
+
+<pre><code>// settings.gradle.kts
+rootProject.name = "MyApp"
+
+include(":app")
+include(":core:data")
+include(":core:domain")
+include(":core:ui")
+include(":feature:home")
+include(":feature:search")
+include(":feature:profile")</code></pre>
+
+<p>Key internals during initialization:</p>
+<ul>
+  <li><code>Settings</code> object is created — this is the receiver for <code>settings.gradle.kts</code></li>
+  <li><code>includeBuild()</code> calls register composite builds (evaluated in their own Gradle invocation)</li>
+  <li>The <code>gradle.properties</code> file is loaded (JVM args, feature flags, project properties)</li>
+  <li>The Gradle Daemon is selected or started (more in Section 6)</li>
+</ul>
+
+<h3>Phase 2: Configuration</h3>
+
+<p>Gradle evaluates <strong>every</strong> <code>build.gradle.kts</code> file for every included project. This is where plugins are applied, dependencies are declared, tasks are registered, and the <strong>task graph</strong> (a directed acyclic graph) is constructed.</p>
+
+<div class="callout danger">
+  <div class="callout-label">Critical Performance Fact</div>
+  <strong>ALL modules are configured on EVERY build</strong>, even if you're only building <code>:app</code>. Running <code>./gradlew :app:assembleDebug</code> still configures <code>:feature:search</code>, <code>:core:ui</code>, and every other module. This is why expensive operations in build scripts (network calls, file I/O, heavy computation) slow down <em>every single build</em>, including <code>./gradlew help</code>.
+</div>
+
+<h3>Phase 3: Execution</h3>
+
+<p>Gradle walks the task DAG and executes only the tasks required for the requested target, in topological order. Tasks whose inputs haven't changed are marked <code>UP-TO-DATE</code> and skipped. Tasks with cached outputs are marked <code>FROM-CACHE</code> and restored.</p>
+
+<h3>The Three Phases — Timing Diagram</h3>
+
+<div class="diagram-container">
+<pre><code>  ./gradlew :app:assembleDebug
+  │
+  ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  INITIALIZATION  (~0.5–2s)                                      │
+  │  ┌────────────────────────────────────────────────────────────┐  │
+  │  │ Evaluate settings.gradle.kts                              │  │
+  │  │ Discover projects: :app, :core:data, :core:domain, ...    │  │
+  │  │ Create Project instances (empty shells)                   │  │
+  │  │ Load gradle.properties, select/start Daemon               │  │
+  │  └────────────────────────────────────────────────────────────┘  │
+  └──────────────────────────────────────────────────────────────────┘
+  │
+  ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  CONFIGURATION  (~3–30s depending on project size)              │
+  │  ┌────────────────────────────────────────────────────────────┐  │
+  │  │ Evaluate ALL build.gradle.kts files                       │  │
+  │  │ Apply plugins (AGP, Kotlin, Hilt, etc.)                   │  │
+  │  │ Resolve dependency declarations (not downloads yet)       │  │
+  │  │ Register tasks → build the Task DAG                       │  │
+  │  │ Execute afterEvaluate {} callbacks                        │  │
+  │  └────────────────────────────────────────────────────────────┘  │
+  └──────────────────────────────────────────────────────────────────┘
+  │
+  ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  EXECUTION  (~10s–10min depending on what changed)              │
+  │  ┌────────────────────────────────────────────────────────────┐  │
+  │  │ Walk the DAG in topological order                         │  │
+  │  │ For each task:                                            │  │
+  │  │   Input hash unchanged? → UP-TO-DATE (skip)              │  │
+  │  │   Cache hit?            → FROM-CACHE (restore outputs)   │  │
+  │  │   Otherwise             → Execute the task action        │  │
+  │  │                                                           │  │
+  │  │ Parallel execution: --parallel runs independent tasks     │  │
+  │  │ on separate threads (one per module by default)           │  │
+  │  └────────────────────────────────────────────────────────────┘  │
+  └──────────────────────────────────────────────────────────────────┘</code></pre>
+</div>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Insight — Configuration Phase is the Hidden Tax</div>
+  In a 200-module project, the configuration phase alone can take 15–30 seconds. This runs on <em>every</em> build — even <code>./gradlew tasks</code>. The two most impactful optimizations are <strong>configuration avoidance</strong> (lazy task registration) and <strong>configuration cache</strong> (serializing the task graph). An L6 engineer should be able to explain why both exist and when each helps.
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Gradle's Core Model — Project, Task, Configuration</h2>
+
+<h3>Project</h3>
+
+<p>A <code>Project</code> represents a single module in the build. Each <code>build.gradle.kts</code> file is evaluated in the scope of its <code>Project</code> instance. Projects form a hierarchy: the root project contains subprojects.</p>
+
+<pre><code>// In any build.gradle.kts, `this` is the Project
+println(project.name)       // e.g., "app"
+println(project.path)       // e.g., ":app" or ":core:data"
+println(project.buildDir)   // e.g., /project/app/build</code></pre>
+
+<h3>Task</h3>
+
+<p>A <code>Task</code> is the fundamental unit of work. Every build operation — compiling Kotlin, merging resources, running dex, packaging the APK — is a task. Tasks declare:</p>
+
+<ul>
+  <li><strong>Inputs</strong> — files, properties, or other values the task reads</li>
+  <li><strong>Outputs</strong> — files or directories the task produces</li>
+  <li><strong>Dependencies</strong> — other tasks that must run first</li>
+  <li><strong>Actions</strong> — the actual work (lambdas or <code>@TaskAction</code> methods)</li>
+</ul>
+
+<h3>Task Graph (DAG)</h3>
+
+<p>Tasks declare dependencies on other tasks, forming a <strong>directed acyclic graph</strong>. Gradle executes tasks in topological order — a task only runs after all its dependencies have completed.</p>
+
+<div class="diagram-container">
+<pre><code>  assembleDebug
+  ├── packageDebug
+  │   ├── dexBuilderDebug
+  │   │   └── compileDebugKotlin
+  │   │       └── compileDebugAidl
+  │   ├── mergeDebugResources
+  │   │   └── processDebugResources
+  │   ├── mergeDebugAssets
+  │   └── mergeDebugJniLibFolders
+  └── validateSigningDebug
+
+  Execution order (topological sort):
+  compileDebugAidl → compileDebugKotlin → dexBuilderDebug ─┐
+  processDebugResources → mergeDebugResources ─────────────┤
+  mergeDebugAssets ─────────────────────────────────────────┼→ packageDebug → assembleDebug
+  mergeDebugJniLibFolders ─────────────────────────────────┤
+  validateSigningDebug ────────────────────────────────────┘</code></pre>
+</div>
+
+<h3>Lazy Task Registration — Configuration Avoidance</h3>
+
+<p>One of the most important performance concepts in modern Gradle:</p>
+
+<pre><code>// EAGER — task is created immediately during configuration
+// The action lambda is configured NOW, even if the task never runs
+tasks.create("myTask") {
+    doLast { println("Running") }
+}
+
+// LAZY — task is only created when needed (another task depends on it,
+// or it matches the requested target)
+tasks.register("myTask") {
+    doLast { println("Running") }
+}
+
+// Lazy reference to an existing task — does NOT trigger creation
+val compileTask = tasks.named("compileDebugKotlin")</code></pre>
+
+<p>The <code>Provider</code> / <code>Property</code> API extends this laziness to values:</p>
+
+<pre><code>abstract class MyTask : DefaultTask() {
+    @get:Input
+    abstract val message: Property&lt;String&gt;
+
+    @get:OutputFile
+    abstract val outputFile: RegularFileProperty
+
+    @TaskAction
+    fun execute() {
+        // Values resolved HERE (execution time), not during configuration
+        outputFile.get().asFile.writeText(message.get())
+    }
+}
+
+// Registration — no values resolved yet
+tasks.register&lt;MyTask&gt;("generateFile") {
+    message.set(provider { computeExpensiveValue() }) // deferred
+    outputFile.set(layout.buildDirectory.file("output.txt"))
+}</code></pre>
+
+<h3>Configuration — Named Dependency Buckets</h3>
+
+<p>A <code>Configuration</code> in Gradle is a named set of dependencies with specific visibility and scope semantics:</p>
+
+<table>
+  <tr>
+    <th>Configuration</th>
+    <th>Compile Classpath</th>
+    <th>Runtime Classpath</th>
+    <th>Transitive to Consumers</th>
+    <th>Use Case</th>
+  </tr>
+  <tr>
+    <td><code>implementation</code></td>
+    <td>Yes</td>
+    <td>Yes</td>
+    <td>No</td>
+    <td>Default — internal dependency</td>
+  </tr>
+  <tr>
+    <td><code>api</code></td>
+    <td>Yes</td>
+    <td>Yes</td>
+    <td>Yes</td>
+    <td>Dependency is part of your public API</td>
+  </tr>
+  <tr>
+    <td><code>compileOnly</code></td>
+    <td>Yes</td>
+    <td>No</td>
+    <td>No</td>
+    <td>Annotation processors, compile-time checks</td>
+  </tr>
+  <tr>
+    <td><code>runtimeOnly</code></td>
+    <td>No</td>
+    <td>Yes</td>
+    <td>No</td>
+    <td>SLF4J bindings, database drivers</td>
+  </tr>
+  <tr>
+    <td><code>testImplementation</code></td>
+    <td>Test only</td>
+    <td>Test only</td>
+    <td>No</td>
+    <td>JUnit, MockK, Turbine</td>
+  </tr>
+  <tr>
+    <td><code>ksp</code> / <code>kapt</code></td>
+    <td>Processor classpath</td>
+    <td>No</td>
+    <td>No</td>
+    <td>Annotation/symbol processing</td>
+  </tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>3. build.gradle.kts vs build.gradle — Kotlin DSL vs Groovy DSL</h2>
+
+<p>Gradle supports two scripting languages for build files. Google recommends Kotlin DSL for new Android projects (default in Android Studio since 2023).</p>
+
+<h3>Key Differences</h3>
+
+<table>
+  <tr>
+    <th>Aspect</th>
+    <th>Groovy DSL (<code>.gradle</code>)</th>
+    <th>Kotlin DSL (<code>.gradle.kts</code>)</th>
+  </tr>
+  <tr>
+    <td>Type safety</td>
+    <td>None — dynamic dispatch</td>
+    <td>Full — compile-time checked</td>
+  </tr>
+  <tr>
+    <td>IDE support</td>
+    <td>Limited auto-completion</td>
+    <td>Full auto-completion, navigation, refactoring</td>
+  </tr>
+  <tr>
+    <td>String quoting</td>
+    <td>Single or double quotes</td>
+    <td>Double quotes only</td>
+  </tr>
+  <tr>
+    <td>Method calls</td>
+    <td><code>implementation 'lib'</code> (no parens)</td>
+    <td><code>implementation("lib")</code> (parens required)</td>
+  </tr>
+  <tr>
+    <td>Property assignment</td>
+    <td><code>minSdk 24</code></td>
+    <td><code>minSdk = 24</code></td>
+  </tr>
+  <tr>
+    <td>First compilation</td>
+    <td>Faster (interpreted)</td>
+    <td>Slower (compiled to bytecode, then cached)</td>
+  </tr>
+  <tr>
+    <td>Subsequent builds</td>
+    <td>Similar</td>
+    <td>Similar (script classes cached)</td>
+  </tr>
+  <tr>
+    <td>Extension access</td>
+    <td><code>android { ... }</code> (magic)</td>
+    <td><code>android { ... }</code> (type-safe accessor generated)</td>
+  </tr>
+</table>
+
+<h3>Plugin Application — Legacy vs Modern</h3>
+
+<pre><code>// LEGACY: buildscript block — classpath declared in root, applied in modules
+// root build.gradle.kts
+buildscript {
+    repositories { google(); mavenCentral() }
+    dependencies {
+        classpath("com.android.tools.build:gradle:8.5.0")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.0")
+    }
+}
+
+// module build.gradle.kts
+apply(plugin = "com.android.application")
+
+// ─────────────────────────────────────────────────────────
+
+// MODERN: plugins block — resolved from Gradle Plugin Portal / repositories
+// root build.gradle.kts
+plugins {
+    id("com.android.application") version "8.5.0" apply false
+    id("org.jetbrains.kotlin.android") version "2.0.0" apply false
+}
+
+// module build.gradle.kts
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}</code></pre>
+
+<p>The <code>plugins { }</code> block is preferred because it enables Gradle to resolve plugins from the <code>pluginManagement { }</code> block in <code>settings.gradle.kts</code>, supports version catalogs, and allows Gradle to optimize plugin loading.</p>
+
+<h3>Migration Cheat Sheet — Groovy → Kotlin DSL</h3>
+
+<pre><code>// Groovy                          →  Kotlin DSL
+// ──────────────────────────────────────────────────────
+apply plugin: 'com.android.app'   →  plugins { id("com.android.application") }
+implementation 'com.lib:v1.0'     →  implementation("com.lib:v1.0")
+minSdkVersion 24                  →  minSdk = 24
+buildConfigField "String", ...    →  buildConfigField("String", ...)
+testInstrumentationRunner "..."   →  testInstrumentationRunner = "..."
+signingConfigs { debug { ... } }  →  signingConfigs { getByName("debug") { ... } }
+                                      // or: named("debug") { ... }
+def myVar = "value"               →  val myVar = "value"
+ext.myProp = "value"              →  extra["myProp"] = "value"</code></pre>
+
+<!-- ============================================================ -->
+<h2>4. Android Gradle Plugin (AGP) Internals</h2>
+
+<p>AGP is the plugin that makes Gradle understand Android. It is applied via <code>com.android.application</code> (for app modules) or <code>com.android.library</code> (for library modules), and it registers the vast majority of tasks in an Android build.</p>
+
+<h3>What AGP Does During Configuration</h3>
+
+<ol>
+  <li>Creates the <code>android { }</code> extension (<code>ApplicationExtension</code> or <code>LibraryExtension</code>)</li>
+  <li>Reads build types, product flavors, and dimensions → computes the <strong>variant matrix</strong></li>
+  <li>For each variant, registers dozens of tasks: compile, merge resources, AIDL, dex, package, lint, test</li>
+  <li>Configures dependency resolution for each variant's compile and runtime classpaths</li>
+  <li>Wires up the Kotlin compiler plugin (if Kotlin is applied)</li>
+</ol>
+
+<h3>Build Variants — The Cartesian Product</h3>
+
+<pre><code>android {
+    buildTypes {
+        getByName("debug") { ... }
+        getByName("release") { ... }
+    }
+    flavorDimensions += "tier"
+    productFlavors {
+        create("free") { dimension = "tier" }
+        create("paid") { dimension = "tier" }
+    }
+}
+
+// Resulting variants (buildType × flavor):
+// freeDebug, freeRelease, paidDebug, paidRelease
+// Each variant gets its OWN set of tasks:
+//   compileFreeDebugKotlin, compileFreeReleaseKotlin, ...
+//   mergePaidDebugResources, mergePaidReleaseResources, ...</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Insight — Variant Explosion</div>
+  AGP registers <strong>~80 tasks per variant</strong>. With 2 build types × 3 flavors × 2 dimensions, you get 12 variants → ~960 tasks <em>per module</em>. In a 50-module project, that's ~48,000 tasks registered during configuration. This is why minimizing unused flavors and dimensions is one of the highest-impact build optimizations. Use <code>variantFilter</code> (legacy) or the Variant API to disable variants you don't need.
+</div>
+
+<h3>The Variant API (AGP 7+)</h3>
+
+<p>The modern, type-safe way to manipulate variants and their artifacts:</p>
+
+<pre><code>androidComponents {
+    // Disable variants you don't need
+    beforeVariants(selector().withBuildType("release").withFlavor("tier" to "free")) {
+        it.enable = false
+    }
+
+    // Modify variant properties
+    onVariants(selector().withBuildType("debug")) { variant ->
+        variant.applicationId.set("com.example.debug")
+        variant.manifestPlaceholders.put("appLabel", "MyApp Debug")
+    }
+
+    // Transform artifacts
+    onVariants { variant ->
+        val mergedManifest = variant.artifacts.get(SingleArtifact.MERGED_MANIFEST)
+        // Use mergedManifest as input to a custom task
+    }
+}</code></pre>
+
+<h3>AGP Task Pipeline — What Happens During assembleDebug</h3>
+
+<div class="diagram-container">
+<pre><code>  ┌─────────────────────────────────────────────────────────────────┐
+  │                    AGP Task Pipeline                            │
+  │                                                                 │
+  │  Source Processing                                              │
+  │  ├── generateDebugBuildConfig     → BuildConfig.java            │
+  │  ├── compileDebugAidl             → AIDL → Java stubs          │
+  │  ├── generateDebugResValues       → generated resource values   │
+  │  └── processDebugManifest         → merged AndroidManifest.xml  │
+  │                                                                 │
+  │  Compilation                                                    │
+  │  ├── compileDebugKotlin           → .class files (kotlinc)      │
+  │  ├── compileDebugJavaWithJavac    → .class files (javac)        │
+  │  └── kspDebugKotlin               → KSP-generated sources       │
+  │                                                                 │
+  │  Resource Processing                                            │
+  │  ├── mergeDebugResources          → merged res/ (all modules)   │
+  │  ├── processDebugResources        → AAPT2 → R.jar + flat res   │
+  │  └── mergeDebugAssets             → merged assets/              │
+  │                                                                 │
+  │  Dexing                                                         │
+  │  ├── dexBuilderDebug              → .class → .dex (D8)         │
+  │  └── mergeDexDebug                → merged classes.dex          │
+  │                                                                 │
+  │  Packaging                                                      │
+  │  ├── mergeDebugJniLibFolders      → native .so files            │
+  │  ├── packageDebug                 → unsigned APK                │
+  │  ├── validateSigningDebug         → check keystore              │
+  │  └── assembleDebug                → signed debug APK            │
+  └─────────────────────────────────────────────────────────────────┘</code></pre>
+</div>
+
+<h3>AGP ↔ Gradle Version Compatibility</h3>
+
+<table>
+  <tr>
+    <th>AGP Version</th>
+    <th>Minimum Gradle</th>
+    <th>Recommended Gradle</th>
+    <th>Key Feature</th>
+  </tr>
+  <tr>
+    <td>8.0</td>
+    <td>8.0</td>
+    <td>8.0+</td>
+    <td>Namespace required, R8 full mode default</td>
+  </tr>
+  <tr>
+    <td>8.1</td>
+    <td>8.0</td>
+    <td>8.2+</td>
+    <td>Kotlin DSL default for new projects</td>
+  </tr>
+  <tr>
+    <td>8.2</td>
+    <td>8.2</td>
+    <td>8.4+</td>
+    <td>Baseline Profile Gradle plugin</td>
+  </tr>
+  <tr>
+    <td>8.3</td>
+    <td>8.4</td>
+    <td>8.6+</td>
+    <td>Configuration cache stable</td>
+  </tr>
+  <tr>
+    <td>8.4</td>
+    <td>8.6</td>
+    <td>8.7+</td>
+    <td>Kotlin 2.0 support</td>
+  </tr>
+  <tr>
+    <td>8.5</td>
+    <td>8.7</td>
+    <td>8.8+</td>
+    <td>Improved lint performance</td>
+  </tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>5. Dependency Resolution — How Gradle Picks Versions</h2>
+
+<p>Dependency resolution happens during the <strong>Configuration phase</strong>. When Gradle resolves a configuration (e.g., <code>debugCompileClasspath</code>), it builds a dependency graph, fetches metadata from repositories, and selects a single version for each module.</p>
+
+<h3>The Resolution Algorithm</h3>
+
+<ol>
+  <li>Gradle collects all declared dependencies (direct + transitive) into a graph</li>
+  <li>For each module that appears at multiple versions, Gradle applies <strong>conflict resolution</strong></li>
+  <li>Default strategy: <strong>highest version wins</strong> — if <code>:app</code> requests OkHttp 4.9 and <code>:core:data</code> requests OkHttp 4.12, Gradle selects 4.12 for the entire build</li>
+  <li>The resolved graph is used to construct compile and runtime classpaths</li>
+</ol>
+
+<h3>Inspecting the Dependency Graph</h3>
+
+<pre><code>// Full dependency tree for a specific configuration
+./gradlew :app:dependencies --configuration debugRuntimeClasspath
+
+// Dependency insight — why was a specific version selected?
+./gradlew :app:dependencyInsight --dependency okhttp --configuration debugRuntimeClasspath
+
+// Output shows:
+// com.squareup.okhttp3:okhttp:4.12.0
+//   Variant: ...
+//   Selection reasons:
+//     - By conflict resolution: between versions 4.9.3 and 4.12.0</code></pre>
+
+<h3>api vs implementation — The Classpath Boundary</h3>
+
+<div class="diagram-container">
+<pre><code>  :feature:home                :core:data                  :core:network
+  ┌─────────────┐             ┌─────────────┐             ┌─────────────┐
+  │             │ ──impl──→   │             │ ──api──→    │             │
+  │             │             │             │             │  OkHttp     │
+  │             │             │  Retrofit   │ ──impl──→   │  (exposed)  │
+  │             │             │  (hidden)   │             │             │
+  └─────────────┘             └─────────────┘             └─────────────┘
+
+  :feature:home sees:
+    ✓ :core:data (direct dependency)
+    ✓ :core:network (transitive via api)
+    ✓ OkHttp (transitive via api from :core:network)
+    ✗ Retrofit (hidden — :core:data used implementation)
+
+  Why this matters for builds:
+    If OkHttp's API changes → :feature:home MUST recompile (it's on the compile classpath)
+    If Retrofit's API changes → :feature:home does NOT recompile (not on its compile classpath)</code></pre>
+</div>
+
+<h3>Resolution Strategies</h3>
+
+<pre><code>configurations.all {
+    resolutionStrategy {
+        // Force a specific version globally
+        force("com.squareup.okhttp3:okhttp:4.12.0")
+
+        // Fail the build if there's a version conflict (instead of silently upgrading)
+        failOnVersionConflict()
+
+        // Prefer project modules over external artifacts
+        preferProjectModules()
+
+        // Cache dynamic versions for 10 minutes (default: 24 hours)
+        cacheDynamicVersionsFor(10, "minutes")
+    }
+}
+
+// Per-dependency version constraints
+dependencies {
+    implementation("com.squareup.okhttp3:okhttp") {
+        version {
+            strictly("4.12.0")  // MUST be exactly this version — fails if conflict
+            prefer("4.12.0")    // prefer this, but allow upgrade
+            require("4.10.+")   // any 4.10.x
+        }
+    }
+
+    // Exclude a transitive dependency
+    implementation("com.example:library:1.0") {
+        exclude(group = "org.unwanted", module = "transitive-dep")
+    }
+}
+
+// Module substitution — replace published artifact with local project
+configurations.all {
+    resolutionStrategy.dependencySubstitution {
+        substitute(module("com.mycompany:shared-lib"))
+            .using(project(":shared-lib"))
+            .because("Developing locally")
+    }
+}</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Watch Out — Version Catalogs Don't Enforce Versions</div>
+  A version catalog (<code>libs.versions.toml</code>) is a <em>declaration</em> convenience, not an enforcement mechanism. If module A uses <code>libs.okhttp</code> (4.12.0) and module B hard-codes <code>"com.squareup.okhttp3:okhttp:4.9.0"</code>, Gradle still resolves to 4.12.0 via conflict resolution — but silently. Use <code>failOnVersionConflict()</code> or a dependency locking file to catch these mismatches.
+</div>
+
+<!-- ============================================================ -->
+<h2>6. The Gradle Daemon</h2>
+
+<p>The Gradle Daemon is a long-running JVM process that persists between builds. It is the single biggest reason why the second build is dramatically faster than the first.</p>
+
+<h3>Cold vs Warm Builds</h3>
+
+<table>
+  <tr>
+    <th>Aspect</th>
+    <th>Cold (No Daemon)</th>
+    <th>Warm (Daemon Running)</th>
+  </tr>
+  <tr>
+    <td>JVM startup</td>
+    <td>~2–5 seconds</td>
+    <td>0 (already running)</td>
+  </tr>
+  <tr>
+    <td>Class loading</td>
+    <td>Load all Gradle + plugin classes</td>
+    <td>Already loaded in memory</td>
+  </tr>
+  <tr>
+    <td>JIT compilation</td>
+    <td>None — interpreted bytecode</td>
+    <td>Hot paths already JIT-compiled</td>
+  </tr>
+  <tr>
+    <td>File system cache</td>
+    <td>Cold OS page cache</td>
+    <td>Warm — recently accessed files in memory</td>
+  </tr>
+  <tr>
+    <td>Typical overhead</td>
+    <td>+5–15 seconds</td>
+    <td>~0</td>
+  </tr>
+</table>
+
+<h3>Daemon Lifecycle</h3>
+
+<pre><code>// Daemon starts automatically on first build (default behavior)
+./gradlew assembleDebug          // starts daemon if not running
+
+// Explicitly manage the daemon
+./gradlew --stop                 // kill all daemons for this Gradle version
+./gradlew --no-daemon            // run this build without a daemon
+./gradlew --status               // list running daemons
+
+// Daemon memory configuration — gradle.properties
+org.gradle.jvmargs=-Xmx4g -XX:+UseParallelGC -XX:MaxMetaspaceSize=512m
+
+// Daemon idle timeout (default: 3 hours)
+org.gradle.daemon.idletimeout=10800000</code></pre>
+
+<h3>Daemon Compatibility Rules</h3>
+
+<p>A daemon can only be reused if its JVM arguments match the requested build. If <code>gradle.properties</code> changes <code>org.gradle.jvmargs</code>, a <strong>new daemon</strong> is started (the old one idles and eventually expires). This means:</p>
+
+<ul>
+  <li>Different branches with different JVM args → multiple daemons → higher memory usage</li>
+  <li>Changing <code>-Xmx</code> frequently → daemon churn → slower builds</li>
+  <li>Standardize JVM args across the team to maximize daemon reuse</li>
+</ul>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Insight — Daemon Strategy on CI</div>
+  On CI with ephemeral containers (each build gets a fresh VM), the daemon provides <em>zero</em> benefit — it starts, runs one build, and is discarded. In this case, <code>--no-daemon</code> with a higher heap (<code>-Xmx6g</code>) can actually be faster because it avoids the daemon startup overhead and inter-process communication. However, if your CI uses <strong>persistent agents</strong> (reused across builds), keep the daemon — the warm JVM and JIT compilation provide significant speedups on subsequent builds.
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Incremental Builds</h2>
+
+<p>Incremental builds are the single most impactful build performance feature. Instead of re-executing every task, Gradle tracks task inputs and outputs and skips tasks whose inputs haven't changed.</p>
+
+<h3>How Input/Output Tracking Works</h3>
+
+<pre><code>// Gradle uses annotations to declare what a task reads and writes
+abstract class ProcessDataTask : DefaultTask() {
+
+    @get:InputFile
+    abstract val inputData: RegularFileProperty      // tracked input
+
+    @get:Input
+    abstract val configValue: Property&lt;String&gt;       // tracked input (scalar)
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty         // tracked output
+
+    @TaskAction
+    fun process() {
+        val data = inputData.get().asFile.readText()
+        outputDir.get().asFile.resolve("result.json").writeText(
+            transform(data, configValue.get())
+        )
+    }
+}
+
+// Build 1: Task executes, Gradle snapshots inputs → stores hash
+// Build 2: Gradle re-hashes inputs → same hash → UP-TO-DATE (skipped)
+// Build 3: inputData file changed → hash differs → task re-executes</code></pre>
+
+<h3>Task Outcome States</h3>
+
+<table>
+  <tr>
+    <th>Outcome</th>
+    <th>Meaning</th>
+    <th>Performance Impact</th>
+  </tr>
+  <tr>
+    <td><code>EXECUTED</code></td>
+    <td>Task ran its action</td>
+    <td>Full cost</td>
+  </tr>
+  <tr>
+    <td><code>UP-TO-DATE</code></td>
+    <td>Inputs unchanged since last execution</td>
+    <td>Near zero (hash check only)</td>
+  </tr>
+  <tr>
+    <td><code>FROM-CACHE</code></td>
+    <td>Outputs restored from build cache</td>
+    <td>I/O cost of restoring files</td>
+  </tr>
+  <tr>
+    <td><code>SKIPPED</code></td>
+    <td>Task was disabled or had an <code>onlyIf</code> that returned false</td>
+    <td>Zero</td>
+  </tr>
+  <tr>
+    <td><code>NO-SOURCE</code></td>
+    <td>Task's input files collection was empty</td>
+    <td>Zero</td>
+  </tr>
+</table>
+
+<h3>Kotlin Incremental Compilation</h3>
+
+<p>The Kotlin compiler has its own incremental compilation layer on top of Gradle's task-level incrementality:</p>
+
+<ul>
+  <li><strong>ABI change detection</strong>: Kotlin tracks the <em>Application Binary Interface</em> (public signatures) of each file. If a file's ABI changes (public function signature, class hierarchy), all files that depend on it are recompiled. If only the <em>implementation</em> changes (function body), only the changed file is recompiled.</li>
+  <li><strong>Classpath snapshot</strong>: Kotlin maintains a snapshot of the classpath. If a dependency's ABI changes, affected files are recompiled.</li>
+  <li><code>kotlin.incremental=true</code> (default since Kotlin 1.4) — enables incremental compilation</li>
+  <li><code>kotlin.incremental.usePreciseJavaTracking=true</code> — finer-grained tracking of Java→Kotlin dependencies</li>
+</ul>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Insight — The Incremental Build Killer</div>
+  Incremental builds are fragile. A single task that reads <em>all</em> source files as input (common with annotation processors using <code>kapt</code>) forces a full recompile whenever <em>any</em> file changes. This is why migrating from <code>kapt</code> to <code>ksp</code> is a high-priority build optimization — KSP supports true incremental processing, while most kapt processors do not. In a 200-module project, a non-incremental annotation processor can add 30+ seconds to every build.
+</div>
+
+<!-- ============================================================ -->
+<h2>8. Build Cache</h2>
+
+<p>While incremental builds avoid re-executing tasks when inputs haven't changed <em>locally</em>, the build cache goes further — it stores task outputs keyed by input hash, allowing outputs to be reused across <strong>clean builds</strong>, <strong>branch switches</strong>, and even <strong>different machines</strong>.</p>
+
+<h3>Local Build Cache</h3>
+
+<pre><code>// Enable in gradle.properties
+org.gradle.caching=true
+
+// Local cache location: ~/.gradle/caches/build-cache-1/
+// Cache entries are keyed by:
+//   hash(task class + task inputs + Gradle version + JVM version)
+
+// Example: after a clean build, switch branches, switch back
+// → all tasks are FROM-CACHE instead of EXECUTED</code></pre>
+
+<h3>Remote Build Cache</h3>
+
+<pre><code>// settings.gradle.kts
+buildCache {
+    local {
+        isEnabled = true
+        directory = file("${rootDir}/.gradle/build-cache")
+    }
+    remote&lt;HttpBuildCache&gt; {
+        url = uri("https://cache.mycompany.com/cache/")
+        isPush = System.getenv("CI") == "true"  // only CI pushes
+        credentials {
+            username = System.getenv("CACHE_USER") ?: ""
+            password = System.getenv("CACHE_PASS") ?: ""
+        }
+    }
+}</code></pre>
+
+<h3>Cache Key Composition</h3>
+
+<div class="diagram-container">
+<pre><code>  Cache Key = hash of:
+  ┌─────────────────────────────────────────────────────┐
+  │  Task implementation                                │
+  │  ├── Task class name + classpath hash               │
+  │  ├── Task action lambdas (bytecode hash)            │
+  │  │                                                   │
+  │  Task inputs                                        │
+  │  ├── Input files (content hash, not path)           │
+  │  ├── Input properties (serialized values)           │
+  │  ├── Classpath inputs (normalized jar hash)         │
+  │  │                                                   │
+  │  Build environment                                  │
+  │  ├── Gradle version                                 │
+  │  ├── JVM version + vendor                           │
+  │  └── Operating system (for native tasks)            │
+  └─────────────────────────────────────────────────────┘
+
+  Cache miss reasons (check with --build-cache --info):
+  • Input file changed → different content hash
+  • Task class changed → plugin upgrade
+  • Non-cacheable task → @CacheableTask not declared
+  • Absolute paths in inputs → breaks relocatability
+  • Cache evicted → LRU eviction when cache is full</code></pre>
+</div>
+
+<h3>Making Tasks Cacheable</h3>
+
+<pre><code>// A task must opt in to caching with @CacheableTask
+@CacheableTask
+abstract class GenerateApiClient : DefaultTask() {
+
+    // Inputs MUST use @PathSensitive to enable cache relocatability
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.RELATIVE)  // only relative path matters
+    abstract val specFile: RegularFileProperty
+
+    @get:Input
+    abstract val apiVersion: Property&lt;String&gt;
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @TaskAction
+    fun generate() { /* ... */ }
+}
+
+// Without @PathSensitive, the ABSOLUTE path is part of the cache key
+// → /Users/alice/project/spec.yaml ≠ /Users/bob/project/spec.yaml
+// → cache miss on every machine, defeating the remote cache</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Insight — Remote Cache ROI</div>
+  A remote build cache is transformative for large teams. When CI builds push cached outputs, a developer doing a clean build (after branch switch, git clean, or fresh checkout) can reuse 70–90% of task outputs from CI. A 10-minute clean build becomes 2 minutes. The ROI is enormous: for a team of 50 engineers each doing 10 builds/day, saving 8 minutes per clean build (assume 30% are clean) translates to <strong>~200 engineer-hours saved per month</strong>. This is a staff-level initiative worth driving.
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Configuration Cache</h2>
+
+<p>The configuration cache (stable since Gradle 8.1) is the next frontier of build performance. It caches the <em>entire task graph</em> from the Configuration phase, allowing subsequent builds to skip configuration entirely.</p>
+
+<h3>How It Works</h3>
+
+<div class="diagram-container">
+<pre><code>  First build (cache miss):
+  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+  │ Initialization│ ──→ │Configuration │ ──→ │  Execution   │
+  │   (~1s)      │     │   (~15s)     │     │   (~60s)     │
+  └──────────────┘     └──────┬───────┘     └──────────────┘
+                              │
+                              ▼ serialize task graph
+                     ┌─────────────────┐
+                     │ Configuration   │
+                     │ Cache (.gradle/ │
+                     │ configuration-  │
+                     │ cache/)         │
+                     └─────────────────┘
+
+  Subsequent build (cache hit):
+  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+  │ Initialization│ ──→ │  Deserialize │ ──→ │  Execution   │
+  │   (~1s)      │     │   (~0.5s)    │     │   (~60s)     │
+  └──────────────┘     └──────────────┘     └──────────────┘
+                        (skips ALL build
+                         script evaluation)</code></pre>
+</div>
+
+<h3>Enabling Configuration Cache</h3>
+
+<pre><code>// gradle.properties
+org.gradle.configuration-cache=true
+
+// Optional: max entries (default: varies by Gradle version)
+org.gradle.configuration-cache.max-problems=512
+
+// Run with reporting to see problems
+./gradlew assembleDebug --configuration-cache
+
+// First run: "Calculating task graph as no cached configuration is available"
+// Second run: "Reusing configuration cache"</code></pre>
+
+<h3>Configuration Cache Restrictions</h3>
+
+<p>The configuration cache imposes strict rules on what build scripts can do. These restrictions exist because the task graph must be serializable and reproducible:</p>
+
+<table>
+  <tr>
+    <th>Forbidden at Execution Time</th>
+    <th>Why</th>
+    <th>Fix</th>
+  </tr>
+  <tr>
+    <td><code>task.project</code></td>
+    <td><code>Project</code> is not serializable</td>
+    <td>Pass needed values as task <code>Property</code> inputs</td>
+  </tr>
+  <tr>
+    <td><code>System.getenv()</code> without declaring</td>
+    <td>Env vars are build inputs — must be tracked</td>
+    <td>Use <code>providers.environmentVariable("KEY")</code></td>
+  </tr>
+  <tr>
+    <td><code>File("...").readText()</code> in task action</td>
+    <td>File reads are undeclared inputs</td>
+    <td>Declare as <code>@InputFile</code></td>
+  </tr>
+  <tr>
+    <td><code>gradle.taskGraph.whenReady</code></td>
+    <td>Callback captures <code>Project</code> state</td>
+    <td>Use <code>Provider</code> API for deferred values</td>
+  </tr>
+  <tr>
+    <td>Shared mutable state between tasks</td>
+    <td>Tasks may run in parallel; state is not serialized</td>
+    <td>Use <code>BuildService</code> for shared state</td>
+  </tr>
+</table>
+
+<h3>Common Migration Issues</h3>
+
+<pre><code>// BROKEN: accessing Project at execution time
+tasks.register("printVersion") {
+    doLast {
+        println(project.version)  // ERROR: cannot access Project
+    }
+}
+
+// FIXED: capture the value during configuration as a Property
+tasks.register("printVersion") {
+    val ver = project.version.toString()  // captured during configuration
+    doLast {
+        println(ver)  // uses the captured value
+    }
+}
+
+// BETTER: use Provider API
+tasks.register("printVersion") {
+    val ver = provider { project.version.toString() }
+    doLast {
+        println(ver.get())
+    }
+}
+
+// BROKEN: reading environment variable without declaring it
+tasks.register("deploy") {
+    doLast {
+        val token = System.getenv("DEPLOY_TOKEN")  // undeclared input
+    }
+}
+
+// FIXED: use Gradle's provider
+tasks.register("deploy") {
+    val token = providers.environmentVariable("DEPLOY_TOKEN")
+    doLast {
+        println(token.get())
+    }
+}</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Migration Reality Check</div>
+  Enabling configuration cache in an existing large project is a multi-sprint effort. Third-party plugins (especially older Gradle plugins, some Hilt/Dagger processors, Firebase plugins) frequently violate configuration cache rules. Use <code>--configuration-cache-problems=warn</code> to identify all violations before enforcing. Expect 50–200 problems in a typical 100-module project. Fix your own build scripts first, then file issues against plugin authors.
+</div>
+
+<!-- ============================================================ -->
+<h2>10. Staff-Level Corner Cases &amp; Advanced Patterns</h2>
+
+<h3>allprojects / subprojects — The Configuration Coupling Anti-Pattern</h3>
+
+<pre><code>// root build.gradle.kts — ANTI-PATTERN
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+subprojects {
+    apply(plugin = "org.jetbrains.kotlin.android")
+
+    tasks.withType&lt;KotlinCompile&gt;().configureEach {
+        kotlinOptions.jvmTarget = "17"
+    }
+}
+
+// Problems:
+// 1. Couples ALL modules to the root build script — any change triggers full reconfiguration
+// 2. Applies Kotlin Android plugin to ALL subprojects (even pure JVM modules)
+// 3. Breaks configuration avoidance — tasks.withType<> eagerly realizes all matching tasks
+// 4. Breaks configuration cache — cross-project access
+//
+// BETTER: Use convention plugins (covered in doc 06)</code></pre>
+
+<h3>afterEvaluate — The Escape Hatch That Breaks Everything</h3>
+
+<pre><code>// afterEvaluate runs AFTER the project's build script is fully evaluated
+// Often used to access values set by plugins or other scripts
+afterEvaluate {
+    tasks.named("assembleDebug") {
+        doLast { println("Build complete: ${android.defaultConfig.versionName}") }
+    }
+}
+
+// Why it's problematic:
+// 1. Ordering is fragile — multiple afterEvaluate blocks run in registration order
+// 2. Breaks configuration cache (captures Project state)
+// 3. Defeats lazy task configuration (forces task realization)
+// 4. Makes build logic harder to reason about (deferred execution)
+//
+// BETTER: Use the Provider API or Variant API to defer value resolution</code></pre>
+
+<h3>Task Ordering — dependsOn vs mustRunAfter vs shouldRunAfter</h3>
+
+<pre><code>tasks.register("taskA") { doLast { println("A") } }
+tasks.register("taskB") { doLast { println("B") } }
+tasks.register("taskC") { doLast { println("C") } }
+
+// dependsOn: HARD dependency — B will always run A first, even if you only request B
+tasks.named("taskB") { dependsOn("taskA") }
+
+// mustRunAfter: SOFT ordering — if BOTH A and C are in the execution graph,
+// C runs after A. But requesting only C does NOT pull in A.
+tasks.named("taskC") { mustRunAfter("taskA") }
+
+// shouldRunAfter: OPTIONAL ordering — same as mustRunAfter but Gradle may
+// ignore it to break circular dependencies
+tasks.named("taskC") { shouldRunAfter("taskB") }
+
+// finalizedBy: reverse dependency — if A runs, B ALWAYS runs after it
+tasks.named("taskA") { finalizedBy("taskB") }</code></pre>
+
+<h3>Gradle's Classloader Hierarchy</h3>
+
+<div class="diagram-container">
+<pre><code>  ┌──────────────────────────────────────────────┐
+  │         Gradle Core Classloader              │
+  │  (Gradle API, Groovy, Kotlin stdlib)         │
+  └──────────────────┬───────────────────────────┘
+                     │
+  ┌──────────────────▼───────────────────────────┐
+  │      buildscript Classloader                 │
+  │  (plugins declared in buildscript { } or     │
+  │   plugins { } block — AGP, Kotlin, etc.)     │
+  └──────────────────┬───────────────────────────┘
+                     │
+  ┌──────────────────▼───────────────────────────┐
+  │      Project Script Classloader              │
+  │  (your build.gradle.kts code)                │
+  └──────────────────────────────────────────────┘
+
+  Conflict scenario:
+  Plugin A bundles Guava 30, Plugin B bundles Guava 31
+  → Both on the buildscript classpath → classloader conflict
+  → Fix: use constraints or exclude in buildscript dependencies</code></pre>
+</div>
+
+<h3>Build Scans — Deep Build Analysis</h3>
+
+<pre><code>// Generate a build scan (requires Gradle Enterprise plugin or --scan flag)
+./gradlew assembleDebug --scan
+
+// Build scan shows:
+// • Task execution timeline (Gantt chart)
+// • Configuration time breakdown per project
+// • Dependency resolution details + conflict resolution
+// • Build cache hit/miss rates + reasons
+// • Test results, deprecation warnings, resource usage
+// • Comparison between two builds (regression detection)</code></pre>
+
+<h3>Composite Builds — Developing Plugins Alongside the Project</h3>
+
+<pre><code>// settings.gradle.kts
+pluginManagement {
+    // Include a local plugin project — changes are picked up immediately
+    includeBuild("build-logic")
+}
+
+// build-logic/build.gradle.kts
+plugins {
+    `kotlin-dsl`
+}
+
+dependencies {
+    implementation("com.android.tools.build:gradle:8.5.0")
+    implementation("org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.0")
+}
+
+// build-logic/src/main/kotlin/my-convention.gradle.kts
+// Convention plugin — applied to modules that need it
+plugins {
+    id("com.android.library")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    compileSdk = 35
+    defaultConfig { minSdk = 24 }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+// module build.gradle.kts — clean, minimal
+plugins {
+    id("my-convention")  // all shared config comes from the convention plugin
+}
+
+dependencies {
+    implementation(project(":core:domain"))
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Insight — Composite Builds as the Foundation</div>
+  Composite builds (<code>includeBuild("build-logic")</code>) are the <strong>recommended</strong> way to share build logic in multi-module projects. Unlike <code>allprojects</code>/<code>subprojects</code>, convention plugins in a composite build are type-safe, independently testable, and don't break configuration avoidance or configuration cache. At Google-scale, this pattern is non-negotiable — it's the only way to maintain build scripts across hundreds of modules without them diverging into inconsistent configurations.
+</div>
+
+<h3>Putting It All Together — A Build Performance Checklist</h3>
+
+<table>
+  <tr>
+    <th>Optimization</th>
+    <th>Phase Affected</th>
+    <th>Typical Savings</th>
+    <th>Effort</th>
+  </tr>
+  <tr>
+    <td>Configuration cache</td>
+    <td>Configuration</td>
+    <td>5–30s per build</td>
+    <td>High (plugin compat)</td>
+  </tr>
+  <tr>
+    <td>Configuration avoidance (lazy tasks)</td>
+    <td>Configuration</td>
+    <td>2–10s per build</td>
+    <td>Medium</td>
+  </tr>
+  <tr>
+    <td>Remote build cache</td>
+    <td>Execution</td>
+    <td>50–80% on clean builds</td>
+    <td>Medium (infra)</td>
+  </tr>
+  <tr>
+    <td>Local build cache</td>
+    <td>Execution</td>
+    <td>30–60% on branch switches</td>
+    <td>Low (one flag)</td>
+  </tr>
+  <tr>
+    <td>Incremental compilation</td>
+    <td>Execution</td>
+    <td>60–90% on single-file changes</td>
+    <td>Low (default on)</td>
+  </tr>
+  <tr>
+    <td>kapt → KSP migration</td>
+    <td>Execution</td>
+    <td>20–40% on compile tasks</td>
+    <td>Medium</td>
+  </tr>
+  <tr>
+    <td>Reduce variant count</td>
+    <td>Configuration</td>
+    <td>Proportional to variants removed</td>
+    <td>Low</td>
+  </tr>
+  <tr>
+    <td>Parallel execution</td>
+    <td>Execution</td>
+    <td>20–50% (depends on DAG shape)</td>
+    <td>Low (one flag)</td>
+  </tr>
+  <tr>
+    <td>Gradle Daemon (warm)</td>
+    <td>All</td>
+    <td>5–15s per build</td>
+    <td>Zero (default)</td>
+  </tr>
+</table>
+
+<footer>
+  <a href="index.html">&larr; Back to Index</a>
+  <a href="02-module-architecture.html">Next: Module Architecture &rarr;</a>
+</footer>
+
+</body>
+</html>
