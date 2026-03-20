@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>06 — Convention Plugins, Build Variants &amp; Shared Build Logic</title>
+<title>06 — Convention Plugins — Build Variants &amp; Shared Build Logic</title>
 <style>
   :root { --bg: #ffffff; --surface: #f7f8fa; --surface2: #edeef2; --border: #d4d7e0; --text: #1e2028; --text-dim: #5c6070; --accent: #2563eb; --accent2: #7c3aed; --green: #16803c; --red: #dc2626; --orange: #c2410c; --yellow: #a16207; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -50,152 +50,180 @@
   <a href="08-interview-qa.html">08 Interview Q&amp;A</a>
 </div>
 
-<h1>Convention Plugins, Build Variants &amp; Shared Build Logic</h1>
-<p class="subtitle">Eliminating duplicated build configuration across modules with convention plugins, composite builds, version catalog integration, AGP variant API, custom tasks, and the staff-level patterns used in production-scale Android projects</p>
+<h1>Convention Plugins</h1>
+<p class="subtitle">Build variants, shared build logic, AGP extension API, custom tasks, and the convention plugin architecture used by Google's Now in Android and production-scale Android projects</p>
 
 <!-- ============================================================ -->
 <h2>1. The Problem: Duplicated Build Logic</h2>
 
-<p>In a modular Android project, every module's <code>build.gradle.kts</code> repeats the same boilerplate: <code>compileSdk</code>, <code>minSdk</code>, Kotlin compiler options, testing dependencies, Compose compiler configuration, R8 rules. Copy-pasting this across 50+ modules creates a maintenance nightmare.</p>
+<p>In a modular Android project, every module's <code>build.gradle.kts</code> repeats the same boilerplate: <code>compileSdk</code>, <code>minSdk</code>, Kotlin compiler options, test runner setup, ProGuard configuration, KSP wiring. In a 50-module project, that's 50 copies of the same configuration — each slightly different because someone forgot to update one of them.</p>
 
 <div class="diagram-container">
 <pre>
-:feature:home/build.gradle.kts        :feature:search/build.gradle.kts
-┌──────────────────────────────┐      ┌──────────────────────────────┐
-│ android {                    │      │ android {                    │
-│   compileSdk = 35            │      │   compileSdk = 35            │
-│   minSdk = 26                │      │   minSdk = 26                │
-│   kotlinOptions {            │      │   kotlinOptions {            │
-│     jvmTarget = "17"         │      │     jvmTarget = "17"         │
-│   }                          │      │   }                          │
-│   buildFeatures {            │      │   buildFeatures {            │
-│     compose = true           │      │     compose = true           │
-│   }                          │      │   }                          │
-│ }                            │      │ }                            │
-│ dependencies {               │      │ dependencies {               │
-│   // same testing deps...    │      │   // same testing deps...    │
-│ }                            │      │ }                            │
-└──────────────────────────────┘      └──────────────────────────────┘
-          × 50 modules = 50 places to update when compileSdk changes
+The Duplication Problem:
+
+  :feature:home/build.gradle.kts     :feature:profile/build.gradle.kts
+  ┌──────────────────────────────┐   ┌──────────────────────────────┐
+  │ compileSdk = 35              │   │ compileSdk = 35              │
+  │ minSdk = 26                  │   │ minSdk = 26                  │
+  │ jvmTarget = "17"             │   │ jvmTarget = "17"             │
+  │ testInstrumentationRunner =  │   │ testInstrumentationRunner =  │
+  │   "...HiltTestRunner"        │   │   "...HiltTestRunner"        │
+  │ consumerProguardFiles(...)   │   │ consumerProguardFiles(...)   │
+  │ ksp { ... }                  │   │ ksp { ... }                  │
+  └──────────────────────────────┘   └──────────────────────────────┘
+           × 50 modules = maintenance nightmare
+
+With Convention Plugins:
+
+  :feature:home/build.gradle.kts     :feature:profile/build.gradle.kts
+  ┌──────────────────────────────┐   ┌──────────────────────────────┐
+  │ plugins {                    │   │ plugins {                    │
+  │   id("myapp.android.feature")│   │   id("myapp.android.feature")│
+  │ }                            │   │ }                            │
+  │ // module-specific config    │   │ // module-specific config    │
+  └──────────────────────────────┘   └──────────────────────────────┘
+           All shared logic lives in ONE place
 </pre>
 </div>
 
-<p>The consequences are real:</p>
-<ul>
-  <li><strong>Inconsistency</strong> — one module on <code>minSdk 24</code>, another on <code>26</code>, a third on <code>21</code>. Nobody notices until a runtime crash.</li>
-  <li><strong>Upgrade friction</strong> — bumping <code>compileSdk</code> from 34 to 35 requires touching 50 files. Reviewers stop reading after the third file.</li>
-  <li><strong>Drift</strong> — new modules get slightly different configurations because the developer copied from a stale template.</li>
-</ul>
+<p>Three approaches have emerged to solve this:</p>
 
-<p>Three solutions exist, in order of increasing sophistication: <code>buildSrc</code>, precompiled script plugins, and convention plugins in a composite build.</p>
+<table>
+  <tr>
+    <th>Approach</th>
+    <th>Mechanism</th>
+    <th>Cache Impact</th>
+    <th>Verdict</th>
+  </tr>
+  <tr>
+    <td><code>buildSrc</code></td>
+    <td>Auto-compiled directory on build classpath</td>
+    <td>Any change invalidates entire build</td>
+    <td>Legacy — avoid for large projects</td>
+  </tr>
+  <tr>
+    <td>Convention plugins (composite build)</td>
+    <td>Included build with plugin classes</td>
+    <td>Only affected modules re-execute</td>
+    <td>Recommended — Google's approach</td>
+  </tr>
+  <tr>
+    <td>Precompiled script plugins</td>
+    <td><code>.gradle.kts</code> files compiled as plugins</td>
+    <td>Same as composite build</td>
+    <td>Good for simple cases</td>
+  </tr>
+</table>
 
 <!-- ============================================================ -->
 <h2>2. buildSrc — The Legacy Approach</h2>
 
-<p>Gradle automatically compiles anything in the <code>buildSrc/</code> directory at the project root and adds it to the build classpath. This lets you define shared constants, custom tasks, and even plugins.</p>
+<p>Gradle automatically compiles everything in the <code>buildSrc/</code> directory at the project root and adds it to the build classpath. This lets you define version constants, custom tasks, and plugins in Kotlin that are available in every <code>build.gradle.kts</code>.</p>
 
-<pre><code>// buildSrc/src/main/kotlin/Versions.kt
+<pre><code>// buildSrc/src/main/kotlin/Dependencies.kt
 object Versions {
     const val compileSdk = 35
     const val minSdk = 26
     const val targetSdk = 35
-    const val kotlin = "2.1.0"
-    const val compose = "1.7.6"
+    const val kotlin = "2.0.21"
+    const val compose = "1.7.5"
 }
 
-// Any module's build.gradle.kts can reference:
+object Libs {
+    const val coreKtx = "androidx.core:core-ktx:1.15.0"
+    const val composeUi = "androidx.compose.ui:ui:${Versions.compose}"
+}
+
+// Usage in any module's build.gradle.kts:
 android {
     compileSdk = Versions.compileSdk
-    defaultConfig {
-        minSdk = Versions.minSdk
-    }
+}
+dependencies {
+    implementation(Libs.coreKtx)
 }</code></pre>
 
-<h3>Why buildSrc Is an Anti-Pattern for Large Projects</h3>
-
 <div class="callout danger">
-  <div class="callout-label">Critical Problem</div>
-  <p>Any change to <strong>any file</strong> in <code>buildSrc/</code> invalidates the <strong>entire build</strong>. Every task in every module is marked as out-of-date and re-executes. Change a version constant? Full rebuild. Fix a typo in a comment? Full rebuild. This is because Gradle treats <code>buildSrc</code> as part of the build logic classpath — if the classpath changes, all tasks that depend on it (which is all of them) must re-run.</p>
+  <div class="callout-label">The buildSrc Problem</div>
+  <p><strong>Any change to <code>buildSrc</code> invalidates the entire build.</strong> Gradle considers <code>buildSrc</code> part of the build infrastructure. When its bytecode changes, every task in every module is considered out-of-date and re-executes. Change a version constant in <code>Dependencies.kt</code> → full rebuild of all 50 modules. On a large project, this turns a 30-second incremental build into a 5-minute full build.</p>
+  <p>Additionally, <code>buildSrc</code> is compiled <em>before</em> any project configuration begins. If it has compilation errors, you can't even run <code>./gradlew help</code>.</p>
 </div>
 
-<p>Additional problems:</p>
-<ul>
-  <li><code>buildSrc</code> is compiled <em>before</em> any project configuration — it adds a fixed cost to every build invocation, including <code>./gradlew help</code></li>
-  <li>No isolation — <code>buildSrc</code> classes are visible to all build scripts, creating implicit coupling</li>
-  <li>Breaks configuration cache in many scenarios because the entire build classpath changes</li>
-  <li>Cannot be shared across multiple projects (it's embedded in one repository)</li>
-</ul>
-
 <div class="callout staff">
-  <div class="callout-label">L6 Insight — buildSrc Is a Migration Target</div>
-  <p>If you inherit a project using <code>buildSrc</code>, migrating to a composite build (<code>build-logic/</code>) is one of the highest-ROI build improvements you can make. The migration is mechanical: move <code>buildSrc/src/</code> into <code>build-logic/convention/src/</code>, add a <code>settings.gradle.kts</code> and <code>build.gradle.kts</code> to <code>build-logic/</code>, and include it via <code>pluginManagement { includeBuild("build-logic") }</code>. The payoff is immediate: changes to build logic only invalidate modules that use the changed plugin, not the entire build. On a 50-module project, this can turn a 5-minute full rebuild into a 30-second incremental build.</p>
+  <div class="callout-label">L6 Insight — buildSrc Is an Anti-Pattern at Scale</div>
+  <p><code>buildSrc</code> was the standard approach before Gradle 6.x introduced composite builds. It's still fine for small projects (&lt;10 modules), but for anything at Google scale, it's an anti-pattern. The full-invalidation behavior means that a one-line version bump triggers a complete rebuild — destroying the value of incremental compilation, build cache, and configuration cache. The migration path is straightforward: move <code>buildSrc/</code> contents into a <code>build-logic/</code> included build. The effort is a few hours; the payoff is permanent.</p>
 </div>
 
 <!-- ============================================================ -->
 <h2>3. Convention Plugins — The Modern Approach</h2>
 
-<p>Convention plugins live in a separate Gradle project (typically <code>build-logic/</code>) that's included as a <strong>composite build</strong>. Each plugin encapsulates a specific build configuration pattern — "Android library module", "Compose feature module", "Kotlin-only module" — and modules opt in by applying the plugin.</p>
+<p>A convention plugin is a Gradle plugin that encapsulates shared build configuration. Instead of each module configuring itself, it applies a convention plugin that does the configuration. The plugins live in a <code>build-logic/</code> directory that is included as a <strong>composite build</strong>.</p>
 
-<h3>Project Structure</h3>
+<h3>Directory Structure</h3>
 
-<div class="diagram-container">
-<pre>
-project-root/
+<pre><code>project-root/
 ├── build-logic/
-│   ├── settings.gradle.kts          ← standalone Gradle project
+│   ├── settings.gradle.kts          ← declares repos for plugin dependencies
 │   └── convention/
-│       ├── build.gradle.kts         ← plugin project (depends on AGP, Kotlin plugin)
+│       ├── build.gradle.kts         ← the plugin project
 │       └── src/main/kotlin/
 │           ├── AndroidLibraryConventionPlugin.kt
 │           ├── AndroidApplicationConventionPlugin.kt
-│           ├── AndroidComposeConventionPlugin.kt
-│           ├── AndroidFeatureConventionPlugin.kt
-│           ├── JvmLibraryConventionPlugin.kt
-│           └── KotlinAndroid.kt     ← shared configuration helpers
+│           ├── KotlinLibraryConventionPlugin.kt
+│           └── AndroidFeatureConventionPlugin.kt
 ├── settings.gradle.kts              ← includes build-logic
 ├── app/
 │   └── build.gradle.kts             ← plugins { id("myapp.android.application") }
-├── feature/home/
-│   └── build.gradle.kts             ← plugins { id("myapp.android.feature") }
-└── core/domain/
-    └── build.gradle.kts             ← plugins { id("myapp.jvm.library") }
-</pre>
-</div>
+├── feature/
+│   └── home/
+│       └── build.gradle.kts         ← plugins { id("myapp.android.feature") }
+└── core/
+    └── domain/
+        └── build.gradle.kts         ← plugins { id("myapp.kotlin.library") }</code></pre>
 
-<h3>Wiring the Composite Build</h3>
+<h3>Root settings.gradle.kts</h3>
+
+<pre><code>// settings.gradle.kts (project root)
+pluginManagement {
+    includeBuild("build-logic")  // ← this is the key line
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode = RepositoriesMode.FAIL_ON_PROJECT_REPOS
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+include(":app")
+include(":feature:home")
+include(":feature:profile")
+include(":core:domain")
+include(":core:data")</code></pre>
+
+<h3>build-logic/settings.gradle.kts</h3>
 
 <pre><code>// build-logic/settings.gradle.kts
 dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        gradlePluginPortal()
     }
     versionCatalogs {
         create("libs") {
             from(files("../gradle/libs.versions.toml"))
         }
     }
-}
-
-rootProject.name = "build-logic"
-include(":convention")
-
-// Root settings.gradle.kts
-pluginManagement {
-    includeBuild("build-logic")
-    repositories {
-        google()
-        mavenCentral()
-        gradlePluginPortal()
-    }
 }</code></pre>
 
-<p>The key difference from <code>buildSrc</code>: changes to <code>build-logic/</code> only invalidate modules that apply the changed plugin. If you modify the Compose convention plugin, only Compose modules rebuild — pure Kotlin modules are unaffected.</p>
-
-<!-- ============================================================ -->
-<h2>4. Implementing Convention Plugins — Step by Step</h2>
-
-<h3>The Plugin Project</h3>
+<h3>build-logic/convention/build.gradle.kts</h3>
 
 <pre><code>// build-logic/convention/build.gradle.kts
 plugins {
@@ -205,8 +233,8 @@ plugins {
 dependencies {
     compileOnly(libs.android.gradlePlugin)
     compileOnly(libs.kotlin.gradlePlugin)
-    compileOnly(libs.compose.gradlePlugin)
     compileOnly(libs.ksp.gradlePlugin)
+    compileOnly(libs.compose.gradlePlugin)
 }
 
 gradlePlugin {
@@ -219,70 +247,26 @@ gradlePlugin {
             id = "myapp.android.library"
             implementationClass = "AndroidLibraryConventionPlugin"
         }
-        register("androidCompose") {
-            id = "myapp.android.compose"
-            implementationClass = "AndroidComposeConventionPlugin"
-        }
         register("androidFeature") {
             id = "myapp.android.feature"
             implementationClass = "AndroidFeatureConventionPlugin"
         }
-        register("jvmLibrary") {
-            id = "myapp.jvm.library"
-            implementationClass = "JvmLibraryConventionPlugin"
+        register("kotlinLibrary") {
+            id = "myapp.kotlin.library"
+            implementationClass = "KotlinLibraryConventionPlugin"
         }
     }
 }</code></pre>
 
-<h3>Shared Kotlin Configuration Helper</h3>
+<p>The <code>compileOnly</code> dependencies give the plugin code access to AGP, Kotlin, and KSP APIs without adding them to the runtime classpath of consuming modules. Each module applies the actual plugins through the convention plugin's <code>apply</code> method.</p>
 
-<pre><code>// build-logic/convention/src/main/kotlin/KotlinAndroid.kt
-import com.android.build.api.dsl.CommonExtension
-import org.gradle.api.Project
-import org.gradle.api.plugins.JavaPluginExtension
-import org.gradle.kotlin.dsl.configure
-import org.gradle.kotlin.dsl.dependencies
-import org.jetbrains.kotlin.gradle.dsl.JvmTarget
-import org.jetbrains.kotlin.gradle.dsl.KotlinAndroidProjectExtension
+<div class="callout">
+  <div class="callout-label">Why Composite Build &gt; buildSrc</div>
+  <p>When you change a convention plugin, Gradle recompiles only <code>build-logic/convention</code> and re-configures only the modules that apply the changed plugin. Other modules remain UP-TO-DATE. With <code>buildSrc</code>, the same change would invalidate every task in every module.</p>
+</div>
 
-internal fun Project.configureKotlinAndroid(
-    commonExtension: CommonExtension&lt;*, *, *, *, *, *&gt;,
-) {
-    val libs = versionCatalogs.named("libs")
-
-    commonExtension.apply {
-        compileSdk = libs.findVersion("compileSdk").get().toString().toInt()
-
-        defaultConfig {
-            minSdk = libs.findVersion("minSdk").get().toString().toInt()
-        }
-
-        compileOptions {
-            sourceCompatibility = JavaVersion.VERSION_17
-            targetCompatibility = JavaVersion.VERSION_17
-        }
-
-        testOptions {
-            unitTests.isIncludeAndroidResources = true
-        }
-    }
-
-    configure&lt;KotlinAndroidProjectExtension&gt; {
-        compilerOptions {
-            jvmTarget.set(JvmTarget.JVM_17)
-            freeCompilerArgs.addAll(
-                "-opt-in=kotlinx.coroutines.ExperimentalCoroutinesApi",
-            )
-        }
-    }
-}
-
-internal fun Project.configureKotlinJvm() {
-    configure&lt;JavaPluginExtension&gt; {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
-}</code></pre>
+<!-- ============================================================ -->
+<h2>4. Implementing Convention Plugins — Step by Step</h2>
 
 <h3>Android Library Convention Plugin</h3>
 
@@ -294,25 +278,38 @@ import org.gradle.kotlin.dsl.configure
 import org.gradle.kotlin.dsl.dependencies
 
 class AndroidLibraryConventionPlugin : Plugin&lt;Project&gt; {
-    override fun apply(target: Project) = with(target) {
-        val libs = versionCatalogs.named("libs")
-
-        pluginManager.apply("com.android.library")
-        pluginManager.apply("org.jetbrains.kotlin.android")
-
-        configure&lt;LibraryExtension&gt; {
-            configureKotlinAndroid(this)
-
-            defaultConfig {
-                testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-                consumerProguardFiles("consumer-rules.pro")
+    override fun apply(target: Project) {
+        with(target) {
+            with(pluginManager) {
+                apply("com.android.library")
+                apply("org.jetbrains.kotlin.android")
             }
-        }
 
-        dependencies {
-            add("testImplementation", libs.findLibrary("junit").get())
-            add("testImplementation", libs.findLibrary("truth").get())
-            add("androidTestImplementation", libs.findLibrary("androidx-test-ext").get())
+            extensions.configure&lt;LibraryExtension&gt; {
+                compileSdk = 35
+
+                defaultConfig {
+                    minSdk = 26
+                    testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+                    consumerProguardFiles("consumer-rules.pro")
+                }
+
+                compileOptions {
+                    sourceCompatibility = JavaVersion.VERSION_17
+                    targetCompatibility = JavaVersion.VERSION_17
+                }
+
+                buildFeatures {
+                    buildConfig = false
+                }
+            }
+
+            configureKotlinOptions()
+
+            dependencies {
+                add("testImplementation", libs.findLibrary("junit").get())
+                add("testImplementation", libs.findLibrary("truth").get())
+            }
         }
     }
 }</code></pre>
@@ -326,86 +323,123 @@ import org.gradle.api.Project
 import org.gradle.kotlin.dsl.configure
 
 class AndroidApplicationConventionPlugin : Plugin&lt;Project&gt; {
-    override fun apply(target: Project) = with(target) {
-        val libs = versionCatalogs.named("libs")
-
-        pluginManager.apply("com.android.application")
-        pluginManager.apply("org.jetbrains.kotlin.android")
-
-        configure&lt;ApplicationExtension&gt; {
-            configureKotlinAndroid(this)
-
-            defaultConfig {
-                targetSdk = libs.findVersion("targetSdk").get().toString().toInt()
-                versionCode = 1
-                versionName = "1.0.0"
-                testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    override fun apply(target: Project) {
+        with(target) {
+            with(pluginManager) {
+                apply("com.android.application")
+                apply("org.jetbrains.kotlin.android")
             }
 
-            buildTypes {
-                release {
-                    isMinifyEnabled = true
-                    isShrinkResources = true
-                    proguardFiles(
-                        getDefaultProguardFile("proguard-android-optimize.txt"),
-                        "proguard-rules.pro"
-                    )
+            extensions.configure&lt;ApplicationExtension&gt; {
+                compileSdk = 35
+
+                defaultConfig {
+                    minSdk = 26
+                    targetSdk = 35
+                    testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+                }
+
+                compileOptions {
+                    sourceCompatibility = JavaVersion.VERSION_17
+                    targetCompatibility = JavaVersion.VERSION_17
+                }
+
+                buildTypes {
+                    release {
+                        isMinifyEnabled = true
+                        isShrinkResources = true
+                        proguardFiles(
+                            getDefaultProguardFile("proguard-android-optimize.txt"),
+                            "proguard-rules.pro"
+                        )
+                    }
+                }
+
+                buildFeatures {
+                    buildConfig = true
                 }
             }
+
+            configureKotlinOptions()
         }
     }
 }</code></pre>
 
-<h3>JVM Library Convention Plugin</h3>
+<h3>Kotlin-Only (JVM) Convention Plugin</h3>
 
-<pre><code>// build-logic/convention/src/main/kotlin/JvmLibraryConventionPlugin.kt
+<pre><code>// build-logic/convention/src/main/kotlin/KotlinLibraryConventionPlugin.kt
 import org.gradle.api.Plugin
 import org.gradle.api.Project
+import org.gradle.api.plugins.JavaPluginExtension
+import org.gradle.kotlin.dsl.configure
 import org.gradle.kotlin.dsl.dependencies
 
-class JvmLibraryConventionPlugin : Plugin&lt;Project&gt; {
-    override fun apply(target: Project) = with(target) {
-        val libs = versionCatalogs.named("libs")
+class KotlinLibraryConventionPlugin : Plugin&lt;Project&gt; {
+    override fun apply(target: Project) {
+        with(target) {
+            with(pluginManager) {
+                apply("org.jetbrains.kotlin.jvm")
+            }
 
-        pluginManager.apply("org.jetbrains.kotlin.jvm")
+            extensions.configure&lt;JavaPluginExtension&gt; {
+                sourceCompatibility = JavaVersion.VERSION_17
+                targetCompatibility = JavaVersion.VERSION_17
+            }
 
-        configureKotlinJvm()
+            configureKotlinOptions()
 
-        dependencies {
-            add("testImplementation", libs.findLibrary("junit").get())
-            add("testImplementation", libs.findLibrary("truth").get())
-            add("testImplementation", libs.findLibrary("kotlinx-coroutines-test").get())
+            dependencies {
+                add("testImplementation", libs.findLibrary("junit").get())
+                add("testImplementation", libs.findLibrary("truth").get())
+            }
         }
     }
 }</code></pre>
 
-<h3>Consuming Convention Plugins</h3>
+<h3>Shared Kotlin Configuration Helper</h3>
 
-<pre><code>// feature/home/build.gradle.kts — entire file
+<pre><code>// build-logic/convention/src/main/kotlin/KotlinOptions.kt
+import org.gradle.api.Project
+import org.gradle.kotlin.dsl.withType
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
+
+internal fun Project.configureKotlinOptions() {
+    tasks.withType&lt;KotlinCompile&gt;().configureEach {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+            freeCompilerArgs.addAll(
+                "-opt-in=kotlinx.coroutines.ExperimentalCoroutinesApi",
+                "-opt-in=kotlinx.coroutines.FlowPreview",
+            )
+        }
+    }
+}
+
+internal val Project.libs
+    get() = extensions.getByType(
+        org.gradle.api.artifacts.VersionCatalogsExtension::class.java
+    ).named("libs")</code></pre>
+
+<p>With these plugins defined, a module's entire build file shrinks to:</p>
+
+<pre><code>// :feature:home/build.gradle.kts
 plugins {
     id("myapp.android.feature")
+}
+
+android {
+    namespace = "com.myapp.feature.home"
 }
 
 dependencies {
     implementation(project(":core:domain"))
     implementation(project(":core:ui"))
-}
-
-// core/domain/build.gradle.kts — entire file
-plugins {
-    id("myapp.jvm.library")
-}
-
-dependencies {
-    implementation(libs.kotlinx.coroutines.core)
 }</code></pre>
-
-<p>Module build files shrink from 40–60 lines to 5–10 lines. All shared configuration lives in one place.</p>
 
 <!-- ============================================================ -->
 <h2>5. Precompiled Script Plugins</h2>
 
-<p>An alternative to writing <code>Plugin&lt;Project&gt;</code> classes: place <code>.gradle.kts</code> files directly in <code>build-logic/convention/src/main/kotlin/</code>. The filename becomes the plugin ID.</p>
+<p>An alternative to writing <code>Plugin&lt;Project&gt;</code> classes: place <code>.gradle.kts</code> files in <code>build-logic/convention/src/main/kotlin/</code>. Gradle compiles them into plugin classes automatically. The file name becomes the plugin ID.</p>
 
 <pre><code>// build-logic/convention/src/main/kotlin/myapp.android.library.gradle.kts
 plugins {
@@ -428,233 +462,215 @@ android {
     }
 }
 
-kotlin {
-    compilerOptions {
-        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
-    }
-}
-
-dependencies {
-    "testImplementation"("junit:junit:4.13.2")
-}
-
-// Applied in modules the same way:
+// Applied in modules as:
 // plugins { id("myapp.android.library") }</code></pre>
 
-<h3>Class Plugins vs Precompiled Script Plugins</h3>
+<h3>Script Plugins vs Class Plugins</h3>
 
 <table>
   <tr>
     <th>Aspect</th>
-    <th>Class Plugin (<code>Plugin&lt;Project&gt;</code>)</th>
-    <th>Precompiled Script (<code>.gradle.kts</code>)</th>
+    <th>Precompiled Script Plugin</th>
+    <th>Plugin&lt;Project&gt; Class</th>
   </tr>
   <tr>
     <td>Syntax</td>
-    <td>Standard Kotlin class</td>
-    <td>Build script DSL (no class boilerplate)</td>
+    <td>Direct <code>build.gradle.kts</code> style</td>
+    <td>Kotlin class with <code>apply()</code> method</td>
   </tr>
   <tr>
     <td>Testability</td>
+    <td>Hard to unit test</td>
     <td>Testable with GradleRunner</td>
-    <td>Harder to unit test</td>
   </tr>
   <tr>
-    <td>Composition</td>
-    <td>Can call shared helper functions</td>
-    <td>Limited — can apply other plugins but can't share code easily</td>
+    <td>Flexibility</td>
+    <td>Limited — no constructor params, no inheritance</td>
+    <td>Full Kotlin: conditionals, composition, reuse</td>
   </tr>
   <tr>
-    <td>IDE support</td>
-    <td>Full autocomplete and navigation</td>
-    <td>Autocomplete can be unreliable</td>
+    <td>IDE Support</td>
+    <td>Weaker — some auto-complete issues</td>
+    <td>Full Kotlin IDE support</td>
   </tr>
   <tr>
-    <td>Version catalog access</td>
-    <td>Via <code>versionCatalogs.named("libs")</code></td>
-    <td>Direct <code>libs.xyz</code> accessor (auto-generated)</td>
+    <td>Registration</td>
+    <td>Automatic (file name = plugin ID)</td>
+    <td>Manual in <code>gradlePlugin { }</code> block</td>
   </tr>
   <tr>
-    <td>Speed to write</td>
-    <td>More boilerplate</td>
-    <td>Faster for simple configurations</td>
+    <td>Best For</td>
+    <td>Simple, static configuration</td>
+    <td>Complex logic, composition, testing</td>
   </tr>
 </table>
 
-<div class="callout">
-  <div class="callout-label">Recommendation</div>
-  <p>Use class plugins for anything non-trivial. Precompiled scripts are fine for simple, stable configurations (e.g., a Detekt or Spotless setup), but class plugins are easier to test, compose, and refactor. Google's Now in Android project uses class plugins exclusively.</p>
+<div class="callout warn">
+  <div class="callout-label">When to Use Which</div>
+  <p>Start with precompiled script plugins for simplicity. Migrate to class plugins when you need conditional logic (e.g., "apply Compose only if the module opts in"), composition (one plugin applying another), or testability. Most production projects end up with class plugins because the build logic inevitably grows beyond simple configuration.</p>
 </div>
 
 <!-- ============================================================ -->
-<h2>6. Version Catalog Integration in Convention Plugins</h2>
+<h2>6. Version Catalog Integration</h2>
 
-<p>Convention plugins should not hardcode versions — they should read from the project's version catalog (<code>libs.versions.toml</code>). This keeps all version management in one place while plugins handle configuration logic.</p>
+<p>Convention plugins should read versions and dependency coordinates from <code>libs.versions.toml</code> rather than hardcoding them. This keeps version management centralized while plugins handle structural configuration.</p>
 
-<pre><code>// gradle/libs.versions.toml
+<pre><code>// build-logic/convention/src/main/kotlin/KotlinOptions.kt
+internal val Project.libs
+    get() = extensions.getByType(
+        org.gradle.api.artifacts.VersionCatalogsExtension::class.java
+    ).named("libs")
+
+// Usage in a convention plugin:
+class AndroidLibraryConventionPlugin : Plugin&lt;Project&gt; {
+    override fun apply(target: Project) {
+        with(target) {
+            extensions.configure&lt;LibraryExtension&gt; {
+                val catalog = libs
+                compileSdk = catalog.findVersion("compileSdk")
+                    .get().toString().toInt()
+
+                defaultConfig {
+                    minSdk = catalog.findVersion("minSdk")
+                        .get().toString().toInt()
+                }
+            }
+
+            dependencies {
+                add("implementation",
+                    libs.findLibrary("androidx-core-ktx").get())
+                add("testImplementation",
+                    libs.findLibrary("junit").get())
+                add("androidTestImplementation",
+                    libs.findLibrary("androidx-test-ext-junit").get())
+            }
+        }
+    }
+}</code></pre>
+
+<pre><code># gradle/libs.versions.toml
 [versions]
 compileSdk = "35"
 minSdk = "26"
 targetSdk = "35"
-kotlin = "2.1.0"
+kotlin = "2.0.21"
+agp = "8.7.3"
+ksp = "2.0.21-1.0.28"
 compose-bom = "2024.12.01"
-retrofit = "2.11.0"
-hilt = "2.51.1"
 
 [libraries]
-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "compose-bom" }
-retrofit = { group = "com.squareup.retrofit2", name = "retrofit", version.ref = "retrofit" }
-hilt-android = { group = "com.google.dagger", name = "hilt-android", version.ref = "hilt" }
-hilt-compiler = { group = "com.google.dagger", name = "hilt-compiler", version.ref = "hilt" }
+android-gradlePlugin = { group = "com.android.tools.build", name = "gradle", version.ref = "agp" }
+kotlin-gradlePlugin = { group = "org.jetbrains.kotlin", name = "kotlin-gradle-plugin", version.ref = "kotlin" }
+ksp-gradlePlugin = { group = "com.google.devtools.ksp", name = "com.google.devtools.ksp.gradle.plugin", version.ref = "ksp" }
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version = "1.15.0" }
+junit = { group = "junit", name = "junit", version = "4.13.2" }
 
 [plugins]
-android-application = { id = "com.android.application", version = "8.7.3" }
-kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }</code></pre>
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }</code></pre>
 
-<h3>Accessing the Catalog from a Convention Plugin</h3>
-
-<pre><code>// Inside a Plugin&lt;Project&gt; class
-class AndroidComposeConventionPlugin : Plugin&lt;Project&gt; {
-    override fun apply(target: Project) = with(target) {
-        val libs = versionCatalogs.named("libs")
-
-        pluginManager.apply("org.jetbrains.kotlin.plugin.compose")
-
-        configure&lt;LibraryExtension&gt; {
-            buildFeatures {
-                compose = true
-            }
-        }
-
-        dependencies {
-            val bom = libs.findLibrary("compose-bom").get()
-            add("implementation", platform(bom))
-            add("implementation", libs.findLibrary("compose-ui").get())
-            add("implementation", libs.findLibrary("compose-material3").get())
-            add("implementation", libs.findLibrary("compose-ui-tooling-preview").get())
-            add("debugImplementation", libs.findLibrary("compose-ui-tooling").get())
-        }
-    }
-}
-
-// Extension property for cleaner access (define once, use everywhere)
-internal val Project.versionCatalogs
-    get() = extensions.getByType&lt;VersionCatalogsExtension&gt;()</code></pre>
-
-<div class="callout warn">
-  <div class="callout-label">Gotcha — Catalog Sharing</div>
-  <p>The <code>build-logic/</code> project is a separate Gradle build — it doesn't automatically see the root project's version catalog. You must explicitly share it via the <code>versionCatalogs { create("libs") { from(files("../gradle/libs.versions.toml")) } }</code> block in <code>build-logic/settings.gradle.kts</code>. Forgetting this results in "catalog 'libs' not found" errors.</p>
+<div class="callout">
+  <div class="callout-label">Sharing the Catalog with build-logic</div>
+  <p>The version catalog is defined in the main project's <code>gradle/libs.versions.toml</code>. To access it from <code>build-logic</code>, re-declare it in <code>build-logic/settings.gradle.kts</code> using <code>from(files("../gradle/libs.versions.toml"))</code>. This ensures both the main project and the convention plugins use the same versions.</p>
 </div>
 
 <!-- ============================================================ -->
 <h2>7. AGP Extension API — Variant Manipulation</h2>
 
-<p>The Android Gradle Plugin exposes a type-safe <code>androidComponents</code> extension for manipulating build variants. This is the modern replacement for the deprecated <code>variantFilter</code> API.</p>
+<p>The Android Gradle Plugin exposes a powerful extension API through <code>androidComponents { }</code>. This is the type-safe, stable API for manipulating build variants — far superior to the deprecated <code>variantFilter</code> approach.</p>
 
-<h3>Lifecycle: beforeVariants vs onVariants</h3>
+<h3>beforeVariants — Modify or Disable Variants</h3>
 
-<div class="diagram-container">
-<pre>
-AGP Variant API Lifecycle:
+<pre><code>// Disable variants you never build to reduce task count
+import com.android.build.api.variant.ApplicationAndroidComponentsExtension
 
-  ┌─────────────────────────────────┐
-  │  finalizeDsl { }                │  ← Last chance to modify the DSL
-  │  (android { } block is locked   │     (compileSdk, buildTypes, etc.)
-  │   after this point)             │
-  └───────────────┬─────────────────┘
-                  │
-  ┌───────────────▼─────────────────┐
-  │  beforeVariants { builder -&gt; }  │  ← Modify/disable variants BEFORE creation
-  │  • builder.enable = false       │     (variant objects don't exist yet)
-  │  • builder.minSdk = ...         │
-  └───────────────┬─────────────────┘
-                  │
-  ┌───────────────▼─────────────────┐
-  │  onVariants { variant -&gt; }      │  ← Read/modify finalized variants
-  │  • variant.buildConfigFields    │     (variant objects are created)
-  │  • variant.artifacts.use(...)   │
-  │  • variant.packaging            │
-  └─────────────────────────────────┘
-</pre>
-</div>
+class AndroidApplicationConventionPlugin : Plugin&lt;Project&gt; {
+    override fun apply(target: Project) {
+        with(target) {
+            // ... standard configuration ...
 
-<h3>Disabling Unused Variants</h3>
-
-<pre><code>// In a convention plugin — disable variants that no module needs
-androidComponents {
-    beforeVariants(selector().withBuildType("staging")) { variantBuilder -&gt;
-        variantBuilder.enable = false
-    }
-
-    // Disable specific flavor + build type combinations
-    beforeVariants(
-        selector()
-            .withFlavor("environment" to "qa")
-            .withBuildType("release")
-    ) { variantBuilder -&gt;
-        variantBuilder.enable = false
+            extensions.configure&lt;ApplicationAndroidComponentsExtension&gt; {
+                beforeVariants(selector().all()) { variantBuilder -&gt;
+                    // Disable all "staging + release" combinations
+                    if (variantBuilder.buildType == "release" &amp;&amp;
+                        variantBuilder.productFlavors.any { it.second == "staging" }
+                    ) {
+                        variantBuilder.enable = false
+                    }
+                }
+            }
+        }
     }
 }</code></pre>
 
-<h3>Adding BuildConfig Fields Per Variant</h3>
+<h3>onVariants — Configure Finalized Variants</h3>
 
-<pre><code>androidComponents {
+<pre><code>import com.android.build.api.variant.ApplicationAndroidComponentsExtension
+import com.android.build.api.variant.BuildConfigField
+
+extensions.configure&lt;ApplicationAndroidComponentsExtension&gt; {
     onVariants { variant -&gt;
+        // Add BuildConfig fields per variant
         variant.buildConfigFields.put(
             "API_BASE_URL",
-            com.android.build.api.variant.BuildConfigField(
+            BuildConfigField(
                 type = "String",
                 value = when {
-                    variant.name.contains("staging") -&gt; "\"https://staging.api.example.com\""
-                    variant.name.contains("production") -&gt; "\"https://api.example.com\""
-                    else -&gt; "\"https://dev.api.example.com\""
+                    variant.name.contains("staging") -&gt;
+                        "\"https://staging-api.myapp.com\""
+                    else -&gt;
+                        "\"https://api.myapp.com\""
                 },
                 comment = "Base URL for API calls"
             )
         )
-    }
-}</code></pre>
 
-<h3>Artifact Transformation</h3>
-
-<pre><code>// Transform the merged manifest — e.g., inject a build timestamp
-abstract class ManifestTransformTask : DefaultTask() {
-    @get:InputFile
-    abstract val mergedManifest: RegularFileProperty
-
-    @get:OutputFile
-    abstract val updatedManifest: RegularFileProperty
-
-    @TaskAction
-    fun transform() {
-        val content = mergedManifest.get().asFile.readText()
-        val updated = content.replace(
-            "&lt;/application&gt;",
-            """    &lt;meta-data android:name="build.commit" android:value="${gitCommit()}" /&gt;
-    &lt;/application&gt;"""
+        // Add a git commit hash to every variant
+        variant.buildConfigFields.put(
+            "GIT_HASH",
+            BuildConfigField(
+                type = "String",
+                value = "\"${getGitHash()}\"",
+                comment = "Git commit hash at build time"
+            )
         )
-        updatedManifest.get().asFile.writeText(updated)
     }
 }
 
-androidComponents {
+fun getGitHash(): String =
+    Runtime.getRuntime()
+        .exec("git rev-parse --short HEAD")
+        .inputStream.bufferedReader().readText().trim()</code></pre>
+
+<h3>Artifact Manipulation</h3>
+
+<pre><code>import com.android.build.api.artifact.SingleArtifact
+import com.android.build.api.variant.ApplicationAndroidComponentsExtension
+
+extensions.configure&lt;ApplicationAndroidComponentsExtension&gt; {
     onVariants { variant -&gt;
-        val manifestTask = tasks.register&lt;ManifestTransformTask&gt;(
-            "${variant.name}ManifestTransform"
-        )
+        // Wire a custom task to transform the merged manifest
+        val manifestUpdater = tasks.register&lt;ManifestVersionTask&gt;(
+            "${variant.name}UpdateManifest"
+        ) {
+            gitHash.set(provider { getGitHash() })
+        }
+
         variant.artifacts
-            .use(manifestTask)
+            .use(manifestUpdater)
             .wiredWithFiles(
-                ManifestTransformTask::mergedManifest,
-                ManifestTransformTask::updatedManifest
+                ManifestVersionTask::mergedManifest,
+                ManifestVersionTask::updatedManifest
             )
-            .toTransform(com.android.build.api.artifact.SingleArtifact.MERGED_MANIFEST)
+            .toTransform(SingleArtifact.MERGED_MANIFEST)
     }
 }</code></pre>
 
 <div class="callout staff">
-  <div class="callout-label">L6 Insight — Variant Explosion Is a Hidden Build Killer</div>
-  <p>Every variant multiplies the number of AGP tasks. A project with 2 build types × 3 flavors = 6 variants = roughly 6× the tasks AGP registers during configuration. With 50 modules, that's 300 variant configurations. If you only ever build <code>debug</code> and <code>release</code>, those extra 4 variants per module are pure waste. Aggressively disable unused variants in your convention plugins — it's one of the simplest ways to cut configuration time. The Now in Android project disables all non-essential variants in its convention plugins for exactly this reason.</p>
+  <div class="callout-label">L6 Insight — beforeVariants Is a Build Performance Lever</div>
+  <p>Every enabled variant causes AGP to register hundreds of tasks: compile, merge resources, process manifest, run lint, package, sign, etc. A project with 2 build types × 3 flavors = 6 variants = roughly 1,200 AGP tasks. If you only ever build <code>stagingDebug</code> and <code>productionRelease</code>, the other 4 variants are pure waste. Using <code>beforeVariants</code> to disable them eliminates their tasks entirely — reducing configuration time by 30–60% in flavor-heavy projects. This is one of the highest-ROI optimizations you can put in a convention plugin.</p>
 </div>
 
 <!-- ============================================================ -->
@@ -675,115 +691,141 @@ androidComponents {
   </tr>
   <tr>
     <td>Product flavor</td>
-    <td>App variations with different features/config</td>
-    <td><code>free</code>/<code>paid</code>, <code>staging</code>/<code>production</code></td>
+    <td>App variations with different features/branding</td>
+    <td><code>free</code>, <code>paid</code></td>
   </tr>
   <tr>
     <td>Flavor dimension</td>
     <td>Groups flavors into orthogonal axes</td>
-    <td><code>tier</code> (free/paid), <code>environment</code> (staging/prod)</td>
+    <td><code>tier</code> (free/paid), <code>env</code> (staging/prod)</td>
   </tr>
   <tr>
     <td>Variant</td>
-    <td>Cartesian product of build type × all dimensions</td>
-    <td><code>freeProductionDebug</code>, <code>paidStagingRelease</code></td>
+    <td>buildType × flavor₁ × flavor₂ × ...</td>
+    <td><code>freeStagingDebug</code></td>
   </tr>
 </table>
 
 <pre><code>android {
+    buildTypes {
+        debug {
+            isDebuggable = true
+            isMinifyEnabled = false
+            applicationIdSuffix = ".debug"
+        }
+        release {
+            isDebuggable = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+
     flavorDimensions += listOf("tier", "environment")
 
     productFlavors {
         create("free") {
             dimension = "tier"
             applicationIdSuffix = ".free"
+            buildConfigField("Boolean", "IS_PREMIUM", "false")
         }
         create("paid") {
             dimension = "tier"
+            buildConfigField("Boolean", "IS_PREMIUM", "true")
         }
         create("staging") {
             dimension = "environment"
-            applicationIdSuffix = ".staging"
+            buildConfigField("String", "API_URL",
+                "\"https://staging-api.myapp.com\"")
         }
         create("production") {
             dimension = "environment"
+            buildConfigField("String", "API_URL",
+                "\"https://api.myapp.com\"")
         }
     }
+}</code></pre>
 
-    buildTypes {
-        debug { /* ... */ }
-        release { isMinifyEnabled = true }
-    }
-}
-
-// Resulting variants (2 tiers × 2 environments × 2 build types = 8):
-// freeStagingDebug, freeStagingRelease,
-// freeProductionDebug, freeProductionRelease,
-// paidStagingDebug, paidStagingRelease,
-// paidProductionDebug, paidProductionRelease</code></pre>
-
-<h3>Source Sets Per Variant</h3>
+<h3>Variant Explosion</h3>
 
 <div class="diagram-container">
 <pre>
-src/
-├── main/              ← all variants
+2 build types × 2 tier flavors × 2 env flavors = 8 variants:
+
+  freeStagingDebug       freeStagingRelease
+  freeProductionDebug    freeProductionRelease
+  paidStagingDebug       paidStagingRelease
+  paidProductionDebug    paidProductionRelease
+
+Each variant generates ~200 AGP tasks → 8 × 200 = 1,600 tasks
+Add lint, test, androidTest → easily 2,000+ tasks
+
+If you only build 2 of these 8 variants, the other 6 are pure overhead.
+</pre>
+</div>
+
+<h3>Disabling Unused Variants</h3>
+
+<pre><code>androidComponents {
+    beforeVariants(selector().all()) { variantBuilder -&gt;
+        variantBuilder.enable = when {
+            // Only allow staging+debug and production+release
+            variantBuilder.buildType == "debug" &amp;&amp;
+                variantBuilder.productFlavors.any { it.second == "production" } -&gt; false
+            variantBuilder.buildType == "release" &amp;&amp;
+                variantBuilder.productFlavors.any { it.second == "staging" } -&gt; false
+            else -&gt; true
+        }
+    }
+}</code></pre>
+
+<h3>Source Sets per Variant</h3>
+
+<pre><code>src/
+├── main/              ← shared across all variants
 ├── debug/             ← debug build type only
 ├── release/           ← release build type only
 ├── free/              ← free flavor only
 ├── paid/              ← paid flavor only
 ├── staging/           ← staging flavor only
 ├── production/        ← production flavor only
-├── freeDebug/         ← free + debug combination
-├── paidProduction/    ← paid + production combination
-└── paidProductionRelease/  ← paid + production + release (most specific)
+├── freeStagingDebug/  ← specific variant combination
+└── paidProductionRelease/</code></pre>
 
-Merge order (most specific wins):
-  variant &gt; buildType &gt; flavor &gt; main
-</pre>
-</div>
-
-<h3>Per-Variant Configuration Values</h3>
-
-<pre><code>android {
-    productFlavors {
-        create("staging") {
-            dimension = "environment"
-            buildConfigField("String", "API_URL", "\"https://staging.api.example.com\"")
-            resValue("string", "app_name", "MyApp Staging")
-        }
-        create("production") {
-            dimension = "environment"
-            buildConfigField("String", "API_URL", "\"https://api.example.com\"")
-            resValue("string", "app_name", "MyApp")
-        }
-    }
-}</code></pre>
-
-<div class="callout warn">
-  <div class="callout-label">Variant Matching in Library Modules</div>
-  <p>Library modules don't need to declare the same flavors as the app module. AGP uses <strong>variant-aware dependency resolution</strong>: it matches the app's variant to the library's best-matching variant based on build type and flavor dimensions. If the library doesn't have a matching flavor, AGP falls back to the default. Use <code>matchingFallbacks</code> to control this: <code>create("staging") { matchingFallbacks += "debug" }</code>.</p>
-</div>
+<p>AGP merges source sets in priority order: variant-specific > build-type > flavor > main. Resources in more specific source sets override less specific ones.</p>
 
 <!-- ============================================================ -->
 <h2>9. Custom Gradle Tasks</h2>
 
 <h3>Lazy Task Registration</h3>
 
-<pre><code>// Always use register (lazy) instead of create (eager)
+<pre><code>// GOOD — lazy registration: task is only created when needed
 tasks.register&lt;GenerateBuildInfoTask&gt;("generateBuildInfo") {
-    gitCommit.set(provider { execGitCommand("rev-parse", "--short", "HEAD") })
-    buildTimestamp.set(provider { java.time.Instant.now().toString() })
-    outputFile.set(layout.buildDirectory.file("generated/build-info.json"))
+    gitHash.set(provider { getGitHash() })
+    buildTimestamp.set(provider { System.currentTimeMillis().toString() })
+    outputFile.set(layout.buildDirectory.file("generated/build-info.txt"))
+}
+
+// BAD — eager creation: task is instantiated during configuration
+tasks.create&lt;GenerateBuildInfoTask&gt;("generateBuildInfo") {
+    // configured immediately, even if this task is never executed
 }</code></pre>
 
 <h3>Custom Task with Proper Inputs/Outputs</h3>
 
-<pre><code>@CacheableTask
+<pre><code>import org.gradle.api.DefaultTask
+import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.provider.Property
+import org.gradle.api.tasks.*
+
+@CacheableTask
 abstract class GenerateBuildInfoTask : DefaultTask() {
 
     @get:Input
-    abstract val gitCommit: Property&lt;String&gt;
+    abstract val gitHash: Property&lt;String&gt;
 
     @get:Input
     abstract val buildTimestamp: Property&lt;String&gt;
@@ -794,79 +836,69 @@ abstract class GenerateBuildInfoTask : DefaultTask() {
     @TaskAction
     fun generate() {
         val info = buildString {
-            appendLine("{")
-            appendLine("""  "commit": "${gitCommit.get()}",""")
-            appendLine("""  "timestamp": "${buildTimestamp.get()}",""")
-            appendLine("""  "builtBy": "Gradle ${GradleVersion.current().version}" """)
-            appendLine("}")
+            appendLine("git.hash=${gitHash.get()}")
+            appendLine("build.timestamp=${buildTimestamp.get()}")
         }
         outputFile.get().asFile.writeText(info)
     }
 }
 
-// Helper to run git commands
-fun Project.execGitCommand(vararg args: String): String {
-    val output = java.io.ByteArrayOutputStream()
-    exec {
-        commandLine("git", *args)
-        standardOutput = output
-    }
-    return output.toString().trim()
+// Registration with wiring
+tasks.register&lt;GenerateBuildInfoTask&gt;("generateBuildInfo") {
+    gitHash.set(provider {
+        Runtime.getRuntime()
+            .exec("git rev-parse --short HEAD")
+            .inputStream.bufferedReader().readText().trim()
+    })
+    buildTimestamp.set(provider {
+        java.time.Instant.now().toString()
+    })
+    outputFile.set(layout.buildDirectory.file("generated/build-info.txt"))
 }</code></pre>
 
-<h3>Task Input/Output Annotations</h3>
+<h3>Key Annotations for Task Caching</h3>
 
 <table>
   <tr>
     <th>Annotation</th>
-    <th>Type</th>
     <th>Purpose</th>
+    <th>Cache Impact</th>
   </tr>
   <tr>
     <td><code>@Input</code></td>
-    <td>Scalar (String, Int, Boolean)</td>
-    <td>Simple value that affects output</td>
-  </tr>
-  <tr>
-    <td><code>@InputFile</code></td>
-    <td><code>RegularFileProperty</code></td>
-    <td>Single file input</td>
+    <td>Scalar value (String, Int, Boolean)</td>
+    <td>Value is part of cache key</td>
   </tr>
   <tr>
     <td><code>@InputFiles</code></td>
-    <td><code>ConfigurableFileCollection</code></td>
-    <td>Multiple file inputs</td>
+    <td>File-based inputs</td>
+    <td>File content hash is part of cache key</td>
   </tr>
   <tr>
-    <td><code>@InputDirectory</code></td>
-    <td><code>DirectoryProperty</code></td>
-    <td>Directory input (all files within)</td>
+    <td><code>@OutputFile</code> / <code>@OutputDirectory</code></td>
+    <td>Where the task writes results</td>
+    <td>Outputs are stored in cache</td>
   </tr>
   <tr>
-    <td><code>@OutputFile</code></td>
-    <td><code>RegularFileProperty</code></td>
-    <td>Single file output</td>
-  </tr>
-  <tr>
-    <td><code>@OutputDirectory</code></td>
-    <td><code>DirectoryProperty</code></td>
-    <td>Directory output</td>
-  </tr>
-  <tr>
-    <td><code>@PathSensitive</code></td>
-    <td>Modifier on file inputs</td>
-    <td>Controls whether absolute/relative path matters for cache key</td>
+    <td><code>@PathSensitive(RELATIVE)</code></td>
+    <td>Only relative paths matter</td>
+    <td>Enables cache hits across machines</td>
   </tr>
   <tr>
     <td><code>@CacheableTask</code></td>
-    <td>Class annotation</td>
-    <td>Opts task into build cache (not just UP-TO-DATE)</td>
+    <td>Opt in to build cache</td>
+    <td>Outputs can be restored from cache</td>
+  </tr>
+  <tr>
+    <td><code>@Incremental</code></td>
+    <td>Receive only changed files</td>
+    <td>Avoids reprocessing unchanged files</td>
   </tr>
 </table>
 
-<div class="callout">
-  <div class="callout-label">Configuration Avoidance</div>
-  <p>Use <code>Property&lt;T&gt;</code> and <code>Provider&lt;T&gt;</code> for all task inputs — never raw values. Properties are resolved lazily at execution time, not configuration time. This means the <code>provider { execGitCommand(...) }</code> call above only runs when the task actually executes, not when Gradle configures the build. For a 300-module project, this avoidance of unnecessary work during configuration is critical.</p>
+<div class="callout warn">
+  <div class="callout-label">Configuration Avoidance in Tasks</div>
+  <p>Use <code>Property&lt;T&gt;</code> and <code>Provider&lt;T&gt;</code> for all task inputs — never resolve values during configuration. The <code>provider { }</code> lambda is evaluated lazily at execution time. This is critical for configuration cache compatibility: Gradle serializes the task graph, and <code>Provider</code> values are serialized as lazy references, not resolved values.</p>
 </div>
 
 <!-- ============================================================ -->
@@ -874,80 +906,62 @@ fun Project.execGitCommand(vararg args: String): String {
 
 <h3>Plugin Classpath Isolation</h3>
 
-<p>Each plugin in a composite build runs in its own classloader. This means two convention plugins can depend on different versions of the same library without conflict — Gradle isolates them. However, this also means you can't share runtime objects between plugins; they communicate only through Gradle's extension and property mechanisms.</p>
+<p>Each Gradle plugin runs in its own classloader. This means two plugins can depend on different versions of the same library (e.g., Plugin A uses Guava 31, Plugin B uses Guava 33) without conflicts. However, this isolation breaks down when plugins share types through the project's build script — if both plugins expose a Guava type in their API, the build script sees two incompatible versions of the same class.</p>
 
-<pre><code>// build-logic/convention/build.gradle.kts
+<pre><code>// This is why convention plugins use compileOnly for AGP/Kotlin plugins:
 dependencies {
-    compileOnly(libs.android.gradlePlugin)  // AGP 8.7.3
-}
+    compileOnly(libs.android.gradlePlugin)  // available at compile time
+    // NOT implementation — would add AGP to the plugin's runtime classpath
+    // and potentially conflict with the version the project already has
+}</code></pre>
 
-// build-logic/analysis/build.gradle.kts
-dependencies {
-    compileOnly(libs.android.gradlePlugin)  // Could be a different version
-}
-// No conflict — each plugin project has its own classloader</code></pre>
+<h3>afterEvaluate — The Anti-Pattern</h3>
 
-<h3>Avoid afterEvaluate in Plugins</h3>
-
-<div class="callout danger">
-  <div class="callout-label">Anti-Pattern</div>
-  <p><code>afterEvaluate { }</code> in convention plugins is a code smell. It runs after the project's <code>build.gradle.kts</code> is fully evaluated, which means: (1) it breaks configuration cache because it creates ordering dependencies between projects, (2) it makes the build non-deterministic — the behavior depends on plugin application order, (3) it prevents Gradle from optimizing configuration. Use the AGP Variant API (<code>androidComponents { onVariants { } }</code>) instead — it provides proper lifecycle hooks that work with configuration cache.</p>
-</div>
-
-<pre><code>// BAD — breaks configuration cache, order-dependent
-class BadPlugin : Plugin&lt;Project&gt; {
-    override fun apply(target: Project) = with(target) {
-        afterEvaluate {
-            val android = extensions.getByType&lt;LibraryExtension&gt;()
-            android.buildTypes.forEach { buildType -&gt;
-                tasks.register("custom${buildType.name.capitalize()}Task") { /* ... */ }
-            }
-        }
+<pre><code>// BAD — breaks configuration cache, creates ordering dependencies
+project.afterEvaluate {
+    tasks.named("compileDebugKotlin") {
+        // This runs after ALL build scripts are evaluated
+        // Order depends on project evaluation order — fragile
     }
 }
 
-// GOOD — uses AGP's lifecycle API
-class GoodPlugin : Plugin&lt;Project&gt; {
-    override fun apply(target: Project) = with(target) {
-        pluginManager.withPlugin("com.android.library") {
-            configure&lt;LibraryExtension&gt; {
-                // Configure DSL directly — no afterEvaluate needed
-            }
-        }
-        extensions.getByType&lt;AndroidComponentsExtension&lt;*, *, *&gt;&gt;().apply {
-            onVariants { variant -&gt;
-                tasks.register("custom${variant.name}Task") { /* ... */ }
-            }
-        }
+// GOOD — use lazy configuration with providers
+tasks.named&lt;KotlinCompile&gt;("compileDebugKotlin") {
+    compilerOptions {
+        freeCompilerArgs.add(provider {
+            // Resolved at execution time, not evaluation time
+            "-Xcontext-receivers"
+        })
     }
 }</code></pre>
 
+<p><code>afterEvaluate</code> is a legacy escape hatch from the eager configuration era. It breaks configuration cache because it forces Gradle to evaluate the entire project before the block runs. In convention plugins, there is almost never a legitimate reason to use it — <code>Provider&lt;T&gt;</code> and lazy task configuration handle every use case better.</p>
+
 <h3>Convention Plugin Testing with GradleRunner</h3>
 
-<pre><code>class AndroidLibraryPluginTest {
+<pre><code>// build-logic/convention/src/test/kotlin/AndroidLibraryPluginTest.kt
+import org.gradle.testkit.runner.GradleRunner
+import org.gradle.testkit.runner.TaskOutcome
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+import java.io.File
+
+class AndroidLibraryPluginTest {
+
     @TempDir
     lateinit var testProjectDir: File
 
     @Test
-    fun `plugin applies AGP and Kotlin plugins`() {
-        // Set up a minimal project
-        File(testProjectDir, "settings.gradle.kts").writeText("""
-            rootProject.name = "test-project"
-        """.trimIndent())
-
+    fun `plugin applies without errors`() {
+        File(testProjectDir, "settings.gradle.kts").writeText("")
         File(testProjectDir, "build.gradle.kts").writeText("""
             plugins {
                 id("myapp.android.library")
             }
             android {
-                namespace = "com.example.test"
+                namespace = "com.test.library"
             }
         """.trimIndent())
-
-        File(testProjectDir, "src/main/AndroidManifest.xml").apply {
-            parentFile.mkdirs()
-            writeText("&lt;manifest /&gt;")
-        }
 
         val result = GradleRunner.create()
             .withProjectDir(testProjectDir)
@@ -955,126 +969,80 @@ class GoodPlugin : Plugin&lt;Project&gt; {
             .withPluginClasspath()
             .build()
 
-        assertThat(result.output).contains("compileDebugKotlin")
-        assertThat(result.output).contains("compileReleaseKotlin")
+        assert(result.task(":tasks")?.outcome == TaskOutcome.SUCCESS)
     }
 
     @Test
-    fun `plugin sets correct compileSdk`() {
+    fun `compileSdk is set to 35`() {
         // ... setup ...
         val result = GradleRunner.create()
             .withProjectDir(testProjectDir)
-            .withArguments("printCompileSdk")  // custom task that prints compileSdk
+            .withArguments("printCompileSdk")
             .withPluginClasspath()
             .build()
 
-        assertThat(result.output).contains("compileSdk=35")
+        assert(result.output.contains("compileSdk=35"))
     }
 }</code></pre>
 
 <h3>Plugin Marker Artifacts — How Plugin IDs Resolve</h3>
 
-<p>When you write <code>plugins { id("myapp.android.library") }</code>, Gradle resolves the ID to a plugin class through <strong>plugin marker artifacts</strong>. For convention plugins in a composite build, the <code>gradlePlugin { plugins { register(...) } }</code> block generates these markers automatically.</p>
-
 <div class="diagram-container">
 <pre>
-Resolution: plugins { id("myapp.android.library") }
+When you write: plugins { id("myapp.android.library") }
 
-  1. Gradle looks for a plugin marker artifact:
-     group = "myapp.android.library"
-     name  = "myapp.android.library.gradle.plugin"
+Gradle resolves the ID through this chain:
 
-  2. For composite builds, Gradle checks included builds first:
-     build-logic/convention registered "myapp.android.library"
-     → maps to AndroidLibraryConventionPlugin class
+  1. Check pluginManagement { } repositories
+  2. Look for a "plugin marker artifact":
+     Maven coordinates: myapp.android.library:myapp.android.library.gradle.plugin:VERSION
+     │
+     └─► This POM/module metadata points to the actual plugin JAR
+         (the one containing AndroidLibraryConventionPlugin.class)
 
-  3. For external plugins, Gradle checks pluginManagement repositories:
-     gradlePluginPortal(), google(), mavenCentral()
-     → downloads the marker POM → resolves the implementation JAR
+  3. For included builds (composite build):
+     Gradle skips Maven resolution entirely.
+     It matches the plugin ID against gradlePlugin { plugins { register(...) } }
+     in the included build's build.gradle.kts.
 
-  4. Plugin class is instantiated and apply(project) is called
+  4. The plugin class is loaded and apply(project) is called.
+
+This is why convention plugins in an included build don't need
+to be published — Gradle resolves them directly from source.
 </pre>
 </div>
 
 <h3>Composing Convention Plugins</h3>
 
-<p>Convention plugins can apply other convention plugins, creating a layered configuration system:</p>
-
-<pre><code>// AndroidFeatureConventionPlugin — composes library + compose + hilt
+<pre><code>// A feature plugin that composes library + compose + hilt plugins
 class AndroidFeatureConventionPlugin : Plugin&lt;Project&gt; {
-    override fun apply(target: Project) = with(target) {
-        pluginManager.apply("myapp.android.library")   // base Android config
-        pluginManager.apply("myapp.android.compose")    // Compose setup
-        pluginManager.apply("myapp.android.hilt")       // Hilt + KSP
+    override fun apply(target: Project) {
+        with(target) {
+            // Apply other convention plugins by ID
+            pluginManager.apply("myapp.android.library")
+            pluginManager.apply("myapp.android.compose")
+            pluginManager.apply("myapp.android.hilt")
 
-        val libs = versionCatalogs.named("libs")
-
-        dependencies {
-            add("implementation", project(":core:ui"))
-            add("implementation", project(":core:domain"))
-            add("implementation", libs.findLibrary("lifecycle-viewmodel-compose").get())
-            add("implementation", libs.findLibrary("hilt-navigation-compose").get())
+            dependencies {
+                add("implementation", project(":core:ui"))
+                add("implementation", project(":core:domain"))
+                add("implementation", libs.findLibrary("hilt-navigation-compose").get())
+                add("implementation", libs.findLibrary("lifecycle-viewmodel-compose").get())
+            }
         }
     }
-}
+}</code></pre>
 
-// Module build file becomes trivial:
-// plugins { id("myapp.android.feature") }
-// dependencies { implementation(project(":core:data")) }</code></pre>
+<p>This composition pattern means a feature module's build file is a single line: <code>id("myapp.android.feature")</code>. The convention plugin handles Android configuration, Compose setup, Hilt wiring, and common dependencies. Module-specific build files only declare what's unique to that module.</p>
 
 <div class="callout staff">
-  <div class="callout-label">L6 Insight — Convention Plugins Are Architecture Enforcement</div>
-  <p>Convention plugins aren't just about reducing boilerplate — they're an <strong>architectural enforcement mechanism</strong>. When a module applies <code>id("myapp.android.feature")</code>, it gets a specific, opinionated configuration: Compose enabled, Hilt wired, standard dependencies included, unused variants disabled. Developers can't accidentally create a feature module without Hilt, or with a different <code>minSdk</code>, or with Compose disabled. The plugin <em>is</em> the architecture. This is why Google's Now in Android project uses convention plugins — not to save keystrokes, but to make the wrong thing hard to do. In an interview, frame convention plugins as an architecture tool, not a build tool.</p>
+  <div class="callout-label">L6 Insight — Convention Plugins Are Your Build's Type System</div>
+  <p>Think of convention plugins as a type system for your build. Just as Kotlin's type system prevents you from passing a <code>String</code> where an <code>Int</code> is expected, convention plugins prevent you from misconfiguring a module. A module that applies <code>myapp.android.feature</code> is guaranteed to have the correct compileSdk, Kotlin options, Compose setup, and Hilt wiring — there's no way to forget one of them. At Google scale, this is how teams maintain consistency across hundreds of modules owned by dozens of teams. The convention plugin is the single source of truth for "what does it mean to be a feature module in this project?" When that definition changes (e.g., bumping compileSdk), you change one file and every module picks it up automatically.</p>
 </div>
 
-<h3>Composite Build vs buildSrc — Decision Matrix</h3>
-
-<table>
-  <tr>
-    <th>Criterion</th>
-    <th><code>buildSrc</code></th>
-    <th>Composite Build (<code>build-logic/</code>)</th>
-  </tr>
-  <tr>
-    <td>Cache invalidation</td>
-    <td>Any change → full rebuild</td>
-    <td>Only affected modules rebuild</td>
-  </tr>
-  <tr>
-    <td>Configuration cache</td>
-    <td>Often incompatible</td>
-    <td>Fully compatible</td>
-  </tr>
-  <tr>
-    <td>Compilation overhead</td>
-    <td>Compiled on every build</td>
-    <td>Compiled only when changed</td>
-  </tr>
-  <tr>
-    <td>Reusability</td>
-    <td>Single project only</td>
-    <td>Can be shared across projects via Git submodule or published artifact</td>
-  </tr>
-  <tr>
-    <td>IDE support</td>
-    <td>Good</td>
-    <td>Good (since Gradle 7+)</td>
-  </tr>
-  <tr>
-    <td>Setup complexity</td>
-    <td>Zero (just create the directory)</td>
-    <td>Requires <code>settings.gradle.kts</code> + <code>build.gradle.kts</code></td>
-  </tr>
-  <tr>
-    <td>Recommendation</td>
-    <td>Small projects (&lt;5 modules)</td>
-    <td><strong>Always for 10+ modules</strong></td>
-  </tr>
-</table>
-
 <div class="callout staff">
-  <div class="callout-label">L6 Insight — Convention Plugin Testing Is a Signal</div>
-  <p>In an interview, mentioning that you test convention plugins with <code>GradleRunner</code> is a strong staff-level signal. Most teams treat build logic as "infrastructure that just works" and never test it. But convention plugins are code that affects every module in the project — a bug in a convention plugin breaks the entire build. Testing that the plugin applies the correct SDK versions, enables the right features, and registers the expected tasks catches regressions before they reach 50 modules. It's the same principle as testing any other shared library.</p>
+  <div class="callout-label">L6 Insight — Composite Build Cache Granularity</div>
+  <p>A subtle but important difference between <code>buildSrc</code> and composite builds: <code>buildSrc</code> is part of the "build classpath" — Gradle hashes the entire <code>buildSrc</code> output as a single input to every task's cache key. Change one file in <code>buildSrc</code> → every cache key changes → full rebuild. With a composite build, each convention plugin is a separate artifact. Gradle tracks which modules apply which plugins. If you change <code>AndroidLibraryConventionPlugin</code>, only modules using <code>myapp.android.library</code> are invalidated. Modules using <code>myapp.kotlin.library</code> remain cached. This granularity is what makes composite builds scale to hundreds of modules.</p>
 </div>
 
 <footer>
