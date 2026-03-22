@@ -1,0 +1,1480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Code Signing &amp; Distribution — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Security &amp; Privacy</a><span class="sep">›</span>
+        Code Signing
+    </nav>
+
+    <h1>Code Signing &amp; Distribution</h1>
+    <p class="subtitle">The complete trust chain from Apple Root CA to your app binary — CMS signatures, provisioning profiles, entitlements embedding, AMFI enforcement, App Store re-signing, enterprise distribution pitfalls, and CI/CD code signing architecture for Staff-level iOS interviews.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#trust-chain">1. Code Signing Trust Chain</a></li>
+            <li><a href="#cms-signatures">2. CMS Signatures &amp; What Gets Signed</a></li>
+            <li><a href="#provisioning-profiles">3. Provisioning Profiles</a></li>
+            <li><a href="#entitlements">4. Entitlements Embedding &amp; AMFI Validation</a></li>
+            <li><a href="#app-store-review">5. App Store Review &amp; Distribution Pipeline</a></li>
+            <li><a href="#testflight">6. TestFlight Distribution</a></li>
+            <li><a href="#enterprise">7. Enterprise Distribution &amp; Abuse History</a></li>
+            <li><a href="#notarization">8. Notarization for macOS</a></li>
+            <li><a href="#codesign-internals">9. codesign Tool Internals</a></li>
+            <li><a href="#architect">10. Architect: Code Signing for Large Teams</a></li>
+        </ul>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 1: CODE SIGNING TRUST CHAIN                                -->
+    <!-- ================================================================== -->
+
+    <h2 id="trust-chain">1. Code Signing Trust Chain</h2>
+
+    <p>Every piece of executable code on iOS must be signed by a certificate that chains back to <strong>Apple's Root Certificate Authority</strong>. This is not optional — the XNU kernel refuses to map unsigned (or invalidly signed) executable pages into memory. This is the foundation of iOS's security model and the reason sideloading is impossible without jailbreaking or enterprise certificates.</p>
+
+    <h3>1.1 The Certificate Hierarchy</h3>
+
+    <p>Apple operates a three-level PKI (Public Key Infrastructure) for code signing:</p>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    APPLE CODE SIGNING TRUST CHAIN                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │              Apple Root CA (self-signed)                           │  │
+│  │  Subject: Apple Root CA                                           │  │
+│  │  Validity: ~2035  |  Key: 2048-bit RSA → 384-bit ECC (newer)     │  │
+│  │  Embedded in: iOS Secure Enclave trust store, macOS keychain      │  │
+│  └────────────────────────────┬──────────────────────────────────────┘  │
+│                               │ signs                                   │
+│                               ▼                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │     Apple Worldwide Developer Relations Certification Authority    │  │
+│  │  (Intermediate CA — "WWDR CA")                                    │  │
+│  │  Subject: Apple Worldwide Developer Relations CA - G3             │  │
+│  │  Validity: ~2030  |  Renewed periodically (G1 → G2 → G3 → G4)   │  │
+│  │  Purpose: Issues all developer certificates                       │  │
+│  └──────────┬────────────────────────────────┬───────────────────────┘  │
+│             │ signs                           │ signs                    │
+│             ▼                                 ▼                         │
+│  ┌──────────────────────────┐  ┌──────────────────────────────────┐    │
+│  │  Development Certificate │  │  Distribution Certificate        │    │
+│  │  CN: "iPhone Developer:  │  │  CN: "iPhone Distribution:       │    │
+│  │       John Doe (XXXXXX)" │  │       ACME Inc (YYYYYY)"         │    │
+│  │  Usage: Debug builds,    │  │  Usage: App Store, Ad Hoc,       │    │
+│  │         device testing    │  │         Enterprise distribution  │    │
+│  │  Validity: ~1 year        │  │  Validity: ~3 years              │    │
+│  └──────────────────────────┘  └──────────────────────────────────┘    │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Apple Distribution Certificate (post-Xcode 11)                   │  │
+│  │  CN: "Apple Distribution: ACME Inc (TEAMID)"                      │  │
+│  │  Unified cert for App Store + Ad Hoc + Enterprise                 │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>1.2 Certificate Contents</h3>
+
+    <p>Each developer certificate is an <strong>X.509 v3 certificate</strong> containing:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Field</th>
+                <th>Description</th>
+                <th>Example</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Subject CN</td>
+                <td>Developer or organization name</td>
+                <td><code>iPhone Distribution: ACME Inc (A1B2C3D4E5)</code></td>
+            </tr>
+            <tr>
+                <td>Subject OU</td>
+                <td>Team ID (10-char alphanumeric)</td>
+                <td><code>A1B2C3D4E5</code></td>
+            </tr>
+            <tr>
+                <td>Public Key</td>
+                <td>RSA 2048-bit (legacy) or ECC P-256</td>
+                <td>Embedded in certificate</td>
+            </tr>
+            <tr>
+                <td>Private Key</td>
+                <td>Stored in developer's Keychain (never leaves machine)</td>
+                <td>In login.keychain-db</td>
+            </tr>
+            <tr>
+                <td>Extensions</td>
+                <td>Key Usage, Extended Key Usage (Code Signing)</td>
+                <td><code>1.2.840.113635.100.6.1.2</code> (iPhone Dist)</td>
+            </tr>
+            <tr>
+                <td>Issuer</td>
+                <td>WWDR CA that signed this cert</td>
+                <td><code>Apple Worldwide Developer Relations CA - G3</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — CSR Process</div>
+        <p>When you create a certificate in Xcode or the Developer Portal, a <strong>Certificate Signing Request (CSR)</strong> is generated locally. The CSR contains your public key but <em>not</em> your private key. Apple's WWDR CA signs the CSR, producing your developer certificate. The private key never leaves your machine — this is why losing your Keychain means you need to revoke and recreate certificates. The CSR is a PKCS#10 structure encoded in PEM format.</p>
+    </div>
+
+    <h3>1.3 Certificate Types Comparison</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Certificate Type</th>
+                <th>Purpose</th>
+                <th>Limit per Team</th>
+                <th>Validity</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Apple Development</td>
+                <td>Debug builds on registered devices</td>
+                <td>Unlimited (per developer)</td>
+                <td>~1 year</td>
+            </tr>
+            <tr>
+                <td>Apple Distribution</td>
+                <td>App Store, Ad Hoc, Enterprise</td>
+                <td>3 per team</td>
+                <td>~3 years</td>
+            </tr>
+            <tr>
+                <td>iOS Development (legacy)</td>
+                <td>Debug builds (pre-Xcode 11)</td>
+                <td>Unlimited</td>
+                <td>~1 year</td>
+            </tr>
+            <tr>
+                <td>iOS Distribution (legacy)</td>
+                <td>App Store / Ad Hoc (pre-Xcode 11)</td>
+                <td>3 per team</td>
+                <td>~3 years</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 2: CMS SIGNATURES                                          -->
+    <!-- ================================================================== -->
+
+    <h2 id="cms-signatures">2. CMS Signatures &amp; What Gets Signed</h2>
+
+    <p>iOS code signing uses <strong>CMS (Cryptographic Message Syntax)</strong>, defined in RFC 5652. CMS is the successor to PKCS#7 and provides a standard way to digitally sign, authenticate, and encrypt data. In the context of code signing, CMS wraps the signature, the signing certificate, and the certificate chain into a single ASN.1 structure.</p>
+
+    <h3>2.1 What Gets Signed</h3>
+
+    <p>Code signing on iOS is <strong>not</strong> a simple hash-of-the-binary. It is a multi-layered process that covers every component of the app bundle:</p>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────┐
+│                    APP BUNDLE SIGNING ANATOMY                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  MyApp.app/                                                          │
+│  ├── MyApp  (Mach-O executable)                                      │
+│  │   ├── __TEXT segment ─────── hashed per 4KB page ──────┐          │
+│  │   ├── __DATA segment ─────── hashed per 4KB page ──────┤          │
+│  │   ├── __LINKEDIT segment                               │          │
+│  │   │   ├── Code Directory ◄── contains all page hashes ─┘          │
+│  │   │   ├── Entitlements (DER-encoded)                              │
+│  │   │   ├── Requirements blob                                       │
+│  │   │   └── CMS Signature ◄── signs the Code Directory hash        │
+│  │   └── LC_CODE_SIGNATURE load command → offset to __LINKEDIT      │
+│  │                                                                    │
+│  ├── Info.plist ──────────────── hash in _CodeSignature/             │
+│  ├── Assets.car ──────────────── hash in _CodeSignature/             │
+│  ├── Base.lproj/ ─────────────── hashes in _CodeSignature/           │
+│  ├── Frameworks/                                                      │
+│  │   └── MyFramework.framework ── independently signed               │
+│  ├── PlugIns/                                                         │
+│  │   └── Widget.appex ────────── independently signed                │
+│  ├── embedded.mobileprovision ── NOT signed by app signature         │
+│  └── _CodeSignature/                                                  │
+│      └── CodeResources ───────── plist of all resource hashes        │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>2.2 Page-Level Hashing</h3>
+
+    <p>The Mach-O executable is divided into <strong>4KB pages</strong> (matching the ARM page size). Each page is independently hashed (SHA-256 on modern systems, SHA-1 for legacy compatibility). These hashes are stored in the <strong>Code Directory</strong> — a data structure embedded in the <code>__LINKEDIT</code> segment.</p>
+
+    <p>This page-level granularity is critical: the kernel validates code pages <strong>lazily</strong>, on first access (page fault). When a page is faulted in, the kernel computes its hash and compares it against the Code Directory. If the hash doesn't match, the process is killed with <code>SIGKILL</code> (code 9). This means:</p>
+
+    <ul>
+        <li>The entire binary doesn't need to be verified at launch time — only pages that are actually executed</li>
+        <li>Any tampering with a single byte of executable code is detected when that page is accessed</li>
+        <li>The Code Directory itself is signed by the CMS signature, creating a chain: <strong>CMS → Code Directory → individual page hashes</strong></li>
+    </ul>
+
+    <h3>2.3 CMS Signature Structure</h3>
+
+    <pre><code><span class="comment">// Simplified CMS SignedData structure (ASN.1)</span>
+<span class="comment">// RFC 5652 Section 5</span>
+
+<span class="type">SignedData</span> ::= <span class="type">SEQUENCE</span> {
+    version          <span class="type">CMSVersion</span>,           <span class="comment">// 1 for basic</span>
+    digestAlgorithms <span class="type">SET OF DigestAlgorithmIdentifier</span>,  <span class="comment">// SHA-256</span>
+    encapContentInfo <span class="type">EncapsulatedContentInfo</span>,
+    certificates     [<span class="number">0</span>] <span class="type">IMPLICIT CertificateSet</span>,  <span class="comment">// signing cert + chain</span>
+    signerInfos      <span class="type">SET OF SignerInfo</span>
+}
+
+<span class="type">SignerInfo</span> ::= <span class="type">SEQUENCE</span> {
+    version            <span class="type">CMSVersion</span>,
+    sid                <span class="type">SignerIdentifier</span>,       <span class="comment">// issuer + serial number</span>
+    digestAlgorithm    <span class="type">DigestAlgorithmIdentifier</span>,  <span class="comment">// SHA-256</span>
+    signedAttrs        [<span class="number">0</span>] <span class="type">IMPLICIT SignedAttributes</span>,
+    signatureAlgorithm <span class="type">SignatureAlgorithmIdentifier</span>,  <span class="comment">// RSA/ECDSA</span>
+    signature          <span class="type">OCTET STRING</span>           <span class="comment">// the actual signature bytes</span>
+}</code></pre>
+
+    <h3>2.4 CodeResources — Resource Sealing</h3>
+
+    <p>Non-executable resources (images, nibs, plists, localization files) are hashed and recorded in <code>_CodeSignature/CodeResources</code>, a plist file. This file has two hash dictionaries:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Dictionary</th>
+                <th>Hash Algorithm</th>
+                <th>Purpose</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>files</code></td>
+                <td>SHA-1</td>
+                <td>Legacy compatibility (pre-iOS 11)</td>
+            </tr>
+            <tr>
+                <td><code>files2</code></td>
+                <td>SHA-256</td>
+                <td>Modern verification (iOS 11+)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <p>Resources can be marked with rules: <strong>required</strong> (must be present and match), <strong>optional</strong> (may be absent), or <strong>excluded</strong> (ignored during verification). The <code>_CodeSignature</code> directory itself and <code>embedded.mobileprovision</code> are excluded from resource sealing.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — Resource Modification After Signing</div>
+        <p>Any modification to a resource file after signing invalidates the signature. This is a common CI/CD issue: build scripts that modify <code>Info.plist</code> or inject configuration files <em>after</em> the signing step will produce an invalid bundle. Always perform all resource modifications <strong>before</strong> the code signing phase. In Xcode, the "Copy Bundle Resources" phase must come before "Code Signing."</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 3: PROVISIONING PROFILES                                   -->
+    <!-- ================================================================== -->
+
+    <h2 id="provisioning-profiles">3. Provisioning Profiles</h2>
+
+    <p>A provisioning profile is the <strong>glue</strong> that binds together a certificate, an app ID, a set of entitlements, and (optionally) a list of device UDIDs. It answers the question: "Is this specific app, signed by this specific developer, allowed to run on this specific device with these specific capabilities?"</p>
+
+    <h3>3.1 What's Inside a .mobileprovision File</h3>
+
+    <p>A <code>.mobileprovision</code> file is a <strong>CMS-signed property list</strong>. The outer layer is a CMS envelope signed by Apple's provisioning profile signing certificate. Inside is an XML plist with these keys:</p>
+
+    <pre><code><span class="comment">// Inspect a provisioning profile:</span>
+<span class="comment">// $ security cms -D -i /path/to/profile.mobileprovision</span>
+
+<span class="comment">// Key contents of the decoded plist:</span>
+{
+    <span class="string">"AppIDName"</span>:              <span class="string">"My App"</span>,
+    <span class="string">"ApplicationIdentifierPrefix"</span>: [<span class="string">"A1B2C3D4E5"</span>],  <span class="comment">// Team ID</span>
+    <span class="string">"CreationDate"</span>:           <span class="string">"2025-01-15T..."</span>,
+    <span class="string">"ExpirationDate"</span>:         <span class="string">"2026-01-15T..."</span>,
+    <span class="string">"Entitlements"</span>: {
+        <span class="string">"application-identifier"</span>: <span class="string">"A1B2C3D4E5.com.acme.myapp"</span>,
+        <span class="string">"keychain-access-groups"</span>: [<span class="string">"A1B2C3D4E5.*"</span>],
+        <span class="string">"get-task-allow"</span>:         <span class="keyword">true</span>,  <span class="comment">// Development only</span>
+        <span class="string">"aps-environment"</span>:        <span class="string">"development"</span>,
+        <span class="comment">// ... other entitlements</span>
+    },
+    <span class="string">"DeveloperCertificates"</span>:  [&lt;cert-data&gt;, ...],  <span class="comment">// DER-encoded X.509</span>
+    <span class="string">"Name"</span>:                   <span class="string">"My App Dev Profile"</span>,
+    <span class="string">"ProvisionedDevices"</span>:     [<span class="string">"abc123..."</span>, <span class="string">"def456..."</span>],  <span class="comment">// UDIDs</span>
+    <span class="string">"TeamIdentifier"</span>:         [<span class="string">"A1B2C3D4E5"</span>],
+    <span class="string">"TeamName"</span>:               <span class="string">"ACME Inc"</span>,
+    <span class="string">"TimeToLive"</span>:             <span class="number">365</span>,  <span class="comment">// days</span>
+    <span class="string">"UUID"</span>:                   <span class="string">"12345678-ABCD-..."</span>,
+    <span class="string">"Version"</span>:                <span class="number">1</span>,
+    <span class="string">"ProvisionsAllDevices"</span>:   <span class="keyword">true</span>  <span class="comment">// Enterprise only</span>
+}</code></pre>
+
+    <h3>3.2 The Four Profile Types</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Profile Type</th>
+                <th>Certificate</th>
+                <th>Devices</th>
+                <th>get-task-allow</th>
+                <th>Use Case</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Development</strong></td>
+                <td>Development cert</td>
+                <td>Specific UDIDs (up to 100)</td>
+                <td><code>true</code></td>
+                <td>Xcode debugging, on-device testing</td>
+            </tr>
+            <tr>
+                <td><strong>Ad Hoc</strong></td>
+                <td>Distribution cert</td>
+                <td>Specific UDIDs (up to 100)</td>
+                <td><code>false</code></td>
+                <td>Beta testing without TestFlight</td>
+            </tr>
+            <tr>
+                <td><strong>App Store</strong></td>
+                <td>Distribution cert</td>
+                <td>None (Apple re-signs)</td>
+                <td><code>false</code></td>
+                <td>App Store / TestFlight submission</td>
+            </tr>
+            <tr>
+                <td><strong>Enterprise</strong></td>
+                <td>Enterprise dist cert</td>
+                <td>None (ProvisionsAllDevices)</td>
+                <td><code>false</code></td>
+                <td>In-house distribution (no App Store)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>3.3 Development Profile</h3>
+
+    <p>A development profile ties together:</p>
+    <ul>
+        <li><strong>Developer certificate(s)</strong> — one or more development certs (each developer on the team can have their own)</li>
+        <li><strong>Device UDIDs</strong> — the specific physical devices registered in the Developer Portal (100 per device type per year)</li>
+        <li><strong>App ID</strong> — explicit (<code>com.acme.myapp</code>) or wildcard (<code>com.acme.*</code>)</li>
+        <li><strong>Entitlements</strong> — includes <code>get-task-allow: true</code>, which allows the debugger (lldb) to attach to the process</li>
+    </ul>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — get-task-allow</div>
+        <p>The <code>get-task-allow</code> entitlement grants the <code>task_for_pid()</code> Mach trap, which gives another process (the debugger) complete control over the target process's memory and execution. This is why it's only present in development profiles — a distribution build with <code>get-task-allow: true</code> would be a massive security hole, allowing any process to read the app's memory.</p>
+    </div>
+
+    <h3>3.4 Ad Hoc Profile</h3>
+
+    <p>Ad Hoc profiles use a <strong>distribution certificate</strong> but still require specific device UDIDs. The 100-device limit is per device type (100 iPhones + 100 iPads + 100 Apple TVs, etc.) and resets annually — but removing a device doesn't free up a slot until the next membership year.</p>
+
+    <h3>3.5 App Store Profile</h3>
+
+    <p>App Store profiles contain <strong>no device UDIDs</strong>. The app is signed with the developer's distribution certificate for upload, but Apple <strong>re-signs the binary</strong> with Apple's own distribution certificate before delivering it to users. The provisioning profile embedded in the final App Store binary is Apple's, not the developer's.</p>
+
+    <h3>3.6 Enterprise Profile</h3>
+
+    <p>Enterprise profiles set <code>ProvisionsAllDevices: true</code> instead of listing specific UDIDs. This allows the app to run on <em>any</em> iOS device — which is both the feature and the security risk. Enterprise certificates require an Apple Developer Enterprise Program membership ($299/year) and are intended exclusively for internal distribution within an organization.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — Profile Expiration</div>
+        <p>Provisioning profiles expire (typically after 1 year). When a profile expires, the app <strong>will not launch</strong> — iOS checks the profile's <code>ExpirationDate</code> at launch time. For enterprise apps, this means you must have a renewal and redistribution strategy. For App Store apps, Apple manages profile renewal during re-signing, so this is transparent to users.</p>
+    </div>
+
+    <h3>3.7 Inspecting Profiles</h3>
+
+    <pre><code><span class="comment"># Decode a provisioning profile (strips CMS envelope)</span>
+$ security cms -D -i embedded.mobileprovision
+
+<span class="comment"># List all installed profiles</span>
+$ ls ~/Library/MobileDevice/Provisioning\ Profiles/
+
+<span class="comment"># Find profile by app ID</span>
+$ <span class="keyword">for</span> f <span class="keyword">in</span> ~/Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision; <span class="keyword">do</span>
+    <span class="func">echo</span> <span class="string">"=== $f ==="</span>
+    security cms -D -i <span class="string">"$f"</span> | grep -A1 application-identifier
+  <span class="keyword">done</span>
+
+<span class="comment"># Extract certificates from profile</span>
+$ security cms -D -i profile.mobileprovision | \
+    plutil -extract DeveloperCertificates.0 raw -o cert.der -
+$ openssl x509 -inform DER -in cert.der -text -noout</code></pre>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 4: ENTITLEMENTS EMBEDDING & AMFI                           -->
+    <!-- ================================================================== -->
+
+    <h2 id="entitlements">4. Entitlements Embedding &amp; AMFI Validation</h2>
+
+    <p>Entitlements are key-value pairs that grant an app specific capabilities — push notifications, Keychain sharing, HealthKit access, etc. They exist in <strong>three places</strong>, and all three must be consistent for the app to function:</p>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   ENTITLEMENTS: THREE SOURCES OF TRUTH                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────────┐     ┌─────────────────────┐                   │
+│  │  1. .entitlements    │     │  2. Provisioning     │                   │
+│  │     file (Xcode)     │     │     Profile           │                   │
+│  │                      │     │                       │                   │
+│  │  Source of truth     │     │  Apple-signed          │                   │
+│  │  during development  │     │  allowed entitlements  │                   │
+│  │  Checked into SCM    │     │  (superset or match)   │                   │
+│  └──────────┬───────────┘     └───────────┬───────────┘                   │
+│             │                             │                               │
+│             │   Xcode embeds at           │   Embedded in app             │
+│             │   build time                │   bundle as                   │
+│             │                             │   embedded.mobileprovision    │
+│             ▼                             ▼                               │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  3. Binary Entitlements (in __LINKEDIT code signature)             │  │
+│  │                                                                    │  │
+│  │  DER-encoded entitlements blob embedded in the Mach-O binary's    │  │
+│  │  code signature. This is what the kernel actually reads.           │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                               │                                          │
+│                               ▼                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │                    AMFI (Apple Mobile File Integrity)               │  │
+│  │                                                                    │  │
+│  │  Kernel extension that validates at process launch:                │  │
+│  │  • Binary entitlements ⊆ Profile entitlements?                    │  │
+│  │  • Code signature valid?                                           │  │
+│  │  • Certificate chains to Apple Root CA?                            │  │
+│  │  • Profile not expired?                                            │  │
+│  │  • Device UDID in profile? (dev/ad-hoc only)                      │  │
+│  │                                                                    │  │
+│  │  If ANY check fails → process killed (SIGKILL, EXC_CRASH)        │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>4.1 AMFI — Apple Mobile File Integrity</h3>
+
+    <p><strong>AMFI</strong> is a kernel extension (<code>AppleMobileFileIntegrity.kext</code>) that acts as the enforcement layer for code signing on iOS. It hooks into the process creation path and performs validation before any app code executes:</p>
+
+    <ol>
+        <li><strong>Signature validation</strong> — verifies the CMS signature on the Code Directory, checks certificate chain to Apple Root CA</li>
+        <li><strong>Entitlement validation</strong> — ensures every entitlement claimed by the binary is also present in the provisioning profile (binary entitlements must be a <em>subset</em> of profile entitlements)</li>
+        <li><strong>Profile validation</strong> — checks the profile's CMS signature (signed by Apple), expiration date, and (for dev/ad-hoc) device UDID</li>
+        <li><strong>Runtime enforcement</strong> — on every page fault, verifies the page hash against the Code Directory</li>
+    </ol>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must Know — Entitlement Mismatch Debugging</div>
+        <p>The most common code signing failure in large teams is an <strong>entitlement mismatch</strong>: the binary requests an entitlement that the provisioning profile doesn't include. This manifests as a crash on launch with no useful error message. To debug: (1) extract binary entitlements with <code>codesign -d --entitlements :- MyApp.app</code>, (2) decode the profile with <code>security cms -D -i embedded.mobileprovision</code>, (3) diff the two entitlement sets. Automate this check in CI.</p>
+    </div>
+
+    <h3>4.2 Entitlement Encoding Formats</h3>
+
+    <p>Entitlements are embedded in the code signature in <strong>two formats</strong>:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Format</th>
+                <th>Magic Bytes</th>
+                <th>Used By</th>
+                <th>Purpose</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>XML plist</td>
+                <td><code>0xFADE7171</code></td>
+                <td>Legacy systems, <code>codesign -d --entitlements</code></td>
+                <td>Human-readable extraction</td>
+            </tr>
+            <tr>
+                <td>DER-encoded</td>
+                <td><code>0xFADE7172</code></td>
+                <td>AMFI kernel validation (iOS 15+)</td>
+                <td>Efficient kernel parsing</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <p>Starting with iOS 15, AMFI uses the <strong>DER-encoded</strong> entitlements for validation because parsing XML in the kernel is slow and error-prone. The DER format is a strict binary encoding that can be validated without a full XML parser.</p>
+
+    <h3>4.3 Extracting Entitlements</h3>
+
+    <pre><code><span class="comment"># Extract entitlements from a signed binary (XML format)</span>
+$ codesign -d --entitlements :- MyApp.app/MyApp
+
+<span class="comment"># Extract entitlements in DER format</span>
+$ codesign -d --entitlements :entitlements.der MyApp.app/MyApp
+
+<span class="comment"># Compare binary entitlements vs profile entitlements</span>
+$ <span class="func">diff</span> \
+    &lt;(codesign -d --entitlements :- MyApp.app/MyApp | plutil -convert xml1 -o - -) \
+    &lt;(security cms -D -i MyApp.app/embedded.mobileprovision | \
+      plutil -extract Entitlements xml1 -o - -)</code></pre>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 5: APP STORE REVIEW & DISTRIBUTION                         -->
+    <!-- ================================================================== -->
+
+    <h2 id="app-store-review">5. App Store Review &amp; Distribution Pipeline</h2>
+
+    <p>When you submit an app to the App Store, it goes through a multi-stage pipeline that involves automated analysis, human review, cryptographic re-signing, and optimization. Understanding this pipeline is critical for diagnosing submission failures and understanding what happens to your binary.</p>
+
+    <h3>5.1 The Complete Submission Pipeline</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    APP STORE SUBMISSION PIPELINE                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Developer Machine                                                      │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ 1. Archive (.xcarchive)                                          │   │
+│  │    • Release build, stripped symbols, bitcode (deprecated)       │   │
+│  │ 2. Export (.ipa)                                                 │   │
+│  │    • Signed with developer's distribution certificate            │   │
+│  │    • App Store provisioning profile embedded                     │   │
+│  │ 3. Upload via Xcode / altool / Transporter                      │   │
+│  └──────────────────────────────┬───────────────────────────────────┘   │
+│                                 │                                       │
+│                                 ▼                                       │
+│  Apple Processing (App Store Connect)                                   │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ 4. Automated Checks                                              │   │
+│  │    ├── Binary validation (Mach-O structure, architectures)       │   │
+│  │    ├── Code signature verification                               │   │
+│  │    ├── Entitlement validation (vs App ID capabilities)           │   │
+│  │    ├── Private API scanning (class-dump + symbol matching)       │   │
+│  │    ├── Info.plist validation (required keys, icon sizes)         │   │
+│  │    ├── SDK version checks (minimum deployment target)            │   │
+│  │    └── Export compliance (encryption usage)                      │   │
+│  │                                                                  │   │
+│  │ 5. App Thinning                                                  │   │
+│  │    ├── Slicing (device-specific asset variants)                  │   │
+│  │    ├── On-Demand Resources (tagged resources hosted by Apple)    │   │
+│  │    └── (Bitcode recompilation — deprecated in Xcode 14)         │   │
+│  │                                                                  │   │
+│  │ 6. Human Review                                                  │   │
+│  │    ├── UI/UX guideline compliance                                │   │
+│  │    ├── Content policy review                                     │   │
+│  │    ├── Functionality testing                                     │   │
+│  │    └── Metadata review (screenshots, description)                │   │
+│  │                                                                  │   │
+│  │ 7. FairPlay DRM Encryption                                       │   │
+│  │    ├── __TEXT segment encrypted with device-specific keys        │   │
+│  │    ├── LC_ENCRYPTION_INFO_64 load command updated                │   │
+│  │    └── Decryption key delivered via FairPlay at download time    │   │
+│  │                                                                  │   │
+│  │ 8. Re-signing with Apple's Distribution Certificate              │   │
+│  │    ├── Developer's signature stripped                             │   │
+│  │    ├── Apple signs with Apple iPhone Distribution cert            │   │
+│  │    └── Apple's provisioning profile embedded                     │   │
+│  └──────────────────────────────┬───────────────────────────────────┘   │
+│                                 │                                       │
+│                                 ▼                                       │
+│  App Store CDN → User Device                                            │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ 9. Download & Install                                            │   │
+│  │    ├── FairPlay decryption on device                             │   │
+│  │    ├── AMFI validates Apple's signature                          │   │
+│  │    └── App runs in sandbox                                       │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>5.2 FairPlay DRM Encryption</h3>
+
+    <p>Apple encrypts App Store binaries using <strong>FairPlay</strong>, the same DRM technology used for iTunes media. The encryption covers the <code>__TEXT</code> segment of the Mach-O binary (where executable code lives). Key details:</p>
+
+    <ul>
+        <li>The <code>LC_ENCRYPTION_INFO_64</code> load command in the Mach-O header indicates the encrypted range (offset and size) and the encryption system ID</li>
+        <li>The decryption key is unique per Apple ID and device, delivered via the FairPlay protocol during download</li>
+        <li>Decryption happens in-memory at load time — the on-disk binary remains encrypted</li>
+        <li>This is why tools like <code>class-dump</code> don't work directly on App Store binaries — you need to dump the decrypted memory image first</li>
+    </ul>
+
+    <h3>5.3 Private API Scanning</h3>
+
+    <p>Apple's automated review includes static analysis to detect usage of private (undocumented) APIs. The scanner:</p>
+
+    <ul>
+        <li>Runs <code>nm</code> and <code>otool</code> equivalents to extract all symbol references from the binary</li>
+        <li>Compares against a database of private selectors and C function symbols</li>
+        <li>Scans for dynamic invocations via <code>NSClassFromString</code>, <code>NSSelectorFromString</code>, <code>dlsym</code></li>
+        <li>Checks for obfuscated strings that decode to private API names</li>
+    </ul>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — Private API False Positives</div>
+        <p>The scanner can produce false positives if your code happens to use method names that collide with private APIs (e.g., a method named <code>_setTitle:</code>). If you receive a rejection for private API usage, check whether the flagged symbol is actually yours. You can use <code>nm -u MyApp | grep _privateSymbol</code> to verify. Renaming the method is usually the fastest fix.</p>
+    </div>
+
+    <h3>5.4 App Store Re-signing</h3>
+
+    <p>A critical detail many developers miss: the binary users download from the App Store is <strong>not signed with your certificate</strong>. Apple strips your signature and re-signs with <code>Apple iPhone Distribution</code> certificate. This means:</p>
+
+    <ul>
+        <li>Your distribution certificate could expire or be revoked after submission — already-distributed apps are unaffected</li>
+        <li>The Team ID in the app's entitlements is preserved (for Keychain access groups, App Groups, etc.)</li>
+        <li>You cannot verify App Store builds against your own certificate</li>
+    </ul>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 6: TESTFLIGHT                                              -->
+    <!-- ================================================================== -->
+
+    <h2 id="testflight">6. TestFlight Distribution</h2>
+
+    <p>TestFlight is Apple's official beta testing platform, integrated into App Store Connect. It provides a distribution mechanism that sits between development builds and App Store release.</p>
+
+    <h3>6.1 Internal vs External Testing</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Internal Testing</th>
+                <th>External Testing</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Testers</td>
+                <td>Up to 100 App Store Connect users (team members)</td>
+                <td>Up to 10,000 external testers via email or public link</td>
+            </tr>
+            <tr>
+                <td>Review Required</td>
+                <td>No — available immediately after processing</td>
+                <td>Yes — first build requires Beta App Review</td>
+            </tr>
+            <tr>
+                <td>Build Expiry</td>
+                <td>90 days from upload</td>
+                <td>90 days from upload</td>
+            </tr>
+            <tr>
+                <td>Groups</td>
+                <td>Automatic (all internal testers)</td>
+                <td>Custom groups with different builds</td>
+            </tr>
+            <tr>
+                <td>Feedback</td>
+                <td>Screenshots + text via TestFlight app</td>
+                <td>Screenshots + text via TestFlight app</td>
+            </tr>
+            <tr>
+                <td>Crash Reports</td>
+                <td>Available in App Store Connect</td>
+                <td>Available in App Store Connect</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>6.2 Build Processing</h3>
+
+    <p>When you upload a build for TestFlight, Apple performs a subset of the App Store review pipeline:</p>
+
+    <ol>
+        <li><strong>Binary validation</strong> — same automated checks as App Store (architectures, entitlements, Info.plist)</li>
+        <li><strong>App thinning</strong> — device-specific variants are generated</li>
+        <li><strong>FairPlay encryption</strong> — TestFlight builds are encrypted just like App Store builds</li>
+        <li><strong>Re-signing</strong> — Apple re-signs with a beta distribution certificate</li>
+        <li><strong>Beta entitlements</strong> — the <code>beta-reports-active</code> entitlement is injected, enabling the TestFlight feedback UI</li>
+    </ol>
+
+    <h3>6.3 TestFlight-Specific Behavior</h3>
+
+    <pre><code><span class="comment">// Detect if running in TestFlight</span>
+<span class="keyword">import</span> <span class="type">StoreKit</span>
+
+<span class="keyword">func</span> <span class="func">isTestFlight</span>() -> <span class="type">Bool</span> {
+    <span class="comment">// TestFlight builds have a sandbox receipt</span>
+    <span class="keyword">guard let</span> receiptURL = <span class="type">Bundle</span>.main.<span class="func">appStoreReceiptURL</span> <span class="keyword">else</span> {
+        <span class="keyword">return false</span>
+    }
+    <span class="keyword">return</span> receiptURL.lastPathComponent == <span class="string">"sandboxReceipt"</span>
+}
+
+<span class="comment">// Modern approach (iOS 16+)</span>
+<span class="keyword">func</span> <span class="func">currentEnvironment</span>() <span class="keyword">async</span> -> <span class="type">AppTransaction</span>.<span class="type">Environment</span>? {
+    <span class="keyword">guard case</span> .verified(<span class="keyword">let</span> transaction) = <span class="keyword">try</span>? <span class="keyword">await</span> <span class="type">AppTransaction</span>.<span class="func">shared</span> <span class="keyword">else</span> {
+        <span class="keyword">return nil</span>
+    }
+    <span class="keyword">return</span> transaction.environment  <span class="comment">// .sandbox, .production, .xcode</span>
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — TestFlight Strategy</div>
+        <ul>
+            <li>Use <strong>internal testing</strong> for daily builds — no review delay, immediate availability</li>
+            <li>Use <strong>external testing groups</strong> to segment beta users (e.g., "QA Team", "Stakeholders", "Power Users")</li>
+            <li>Set up <strong>automatic distribution</strong> in App Store Connect to push new builds to testers without manual intervention</li>
+            <li>Monitor the <strong>90-day expiry</strong> — set calendar reminders to upload refreshed builds before testers lose access</li>
+            <li>Use the <code>beta-reports-active</code> entitlement check to show in-app feedback prompts only in TestFlight builds</li>
+        </ul>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 7: ENTERPRISE DISTRIBUTION                                 -->
+    <!-- ================================================================== -->
+
+    <h2 id="enterprise">7. Enterprise Distribution &amp; Abuse History</h2>
+
+    <p>The Apple Developer Enterprise Program allows organizations to distribute proprietary apps directly to employees <strong>without going through the App Store</strong>. This is a powerful capability that has been both essential for legitimate enterprise use and systematically abused.</p>
+
+    <h3>7.1 How Enterprise Distribution Works</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   ENTERPRISE DISTRIBUTION FLOW                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Organization                                                           │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ 1. Build & Sign                                                  │   │
+│  │    • App signed with Enterprise Distribution certificate         │   │
+│  │    • Enterprise provisioning profile (ProvisionsAllDevices)      │   │
+│  │    • No device UDID restrictions                                 │   │
+│  └──────────────────────────────┬───────────────────────────────────┘   │
+│                                 │                                       │
+│                                 ▼                                       │
+│  Distribution Method (choose one)                                       │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐      │
+│  │ MDM Server   │  │ Internal     │  │ Direct Install           │      │
+│  │ (Jamf, etc.) │  │ Web Portal   │  │ (itms-services://)       │      │
+│  │              │  │              │  │                           │      │
+│  │ Push install │  │ Download     │  │ manifest.plist with      │      │
+│  │ silently     │  │ .ipa file    │  │ .ipa URL                 │      │
+│  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────────┘      │
+│         │                 │                      │                      │
+│         └─────────────────┼──────────────────────┘                      │
+│                           ▼                                             │
+│  Employee Device                                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ 2. Trust Prompt                                                  │   │
+│  │    Settings → General → VPN & Device Management                  │   │
+│  │    User must explicitly trust the enterprise developer           │   │
+│  │                                                                  │   │
+│  │ 3. AMFI Validation                                               │   │
+│  │    • Enterprise cert chains to Apple Root CA                     │   │
+│  │    • Profile has ProvisionsAllDevices                            │   │
+│  │    • No UDID check needed                                        │   │
+│  │    • Certificate not revoked (OCSP check)                        │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>7.2 The Enterprise Certificate Abuse Problem</h3>
+
+    <p>Enterprise certificates have been systematically abused to create <strong>third-party app stores</strong> that bypass the App Store entirely. Major incidents include:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Year</th>
+                <th>Incident</th>
+                <th>Impact</th>
+                <th>Apple's Response</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>2018</td>
+                <td>Facebook Research VPN (Onavo)</td>
+                <td>Collected user data via enterprise-distributed VPN app targeting teens</td>
+                <td>Revoked Facebook's enterprise cert, breaking all internal FB iOS apps</td>
+            </tr>
+            <tr>
+                <td>2019</td>
+                <td>Google Screenwise Meter</td>
+                <td>Similar data collection app distributed via enterprise cert</td>
+                <td>Revoked Google's enterprise cert temporarily</td>
+            </tr>
+            <tr>
+                <td>2015–present</td>
+                <td>TutuApp, AppValley, TweakBox</td>
+                <td>Third-party app stores distributing pirated and modified apps</td>
+                <td>Ongoing certificate revocations; apps rotate through new certs</td>
+            </tr>
+            <tr>
+                <td>2019</td>
+                <td>Illegal gambling apps</td>
+                <td>Thousands of gambling apps distributed via enterprise certs in China</td>
+                <td>Mass revocations, stricter enterprise program enrollment</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>7.3 Why Enterprise Certs Get Revoked</h3>
+
+    <ul>
+        <li><strong>Distribution to non-employees</strong> — the license agreement explicitly prohibits distributing to anyone outside the organization</li>
+        <li><strong>Public download links</strong> — making the IPA available on a public website is an immediate violation</li>
+        <li><strong>Reselling certificates</strong> — some entities sell access to enterprise certificates for sideloading</li>
+        <li><strong>Malware distribution</strong> — enterprise certs used to distribute spyware or surveillance tools</li>
+    </ul>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — Enterprise Certificate Revocation Blast Radius</div>
+        <p>When Apple revokes an enterprise certificate, <strong>every app signed with that certificate stops working immediately</strong>. This includes all legitimate internal apps. Facebook's 2019 incident broke their internal iOS apps (employee shuttle bus, cafeteria menu, beta versions of Facebook/Instagram) for over a day. Mitigation: use separate enterprise certificates for internal tools vs. any "gray area" distribution, and have a rapid re-signing capability.</p>
+    </div>
+
+    <h3>7.4 Apple's Countermeasures</h3>
+
+    <ul>
+        <li><strong>OCSP (Online Certificate Status Protocol)</strong> — iOS checks certificate revocation status online before launching enterprise apps</li>
+        <li><strong>Stricter enrollment</strong> — Enterprise Program now requires D-U-N-S number verification, longer approval times</li>
+        <li><strong>Device trust prompt</strong> — users must explicitly trust each enterprise developer in Settings (added in iOS 9)</li>
+        <li><strong>Managed distribution</strong> — Apple pushes organizations toward MDM-based distribution instead of direct install links</li>
+    </ul>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 8: NOTARIZATION FOR macOS                                  -->
+    <!-- ================================================================== -->
+
+    <h2 id="notarization">8. Notarization for macOS</h2>
+
+    <p>While iOS relies entirely on App Store distribution (or enterprise certs), macOS allows direct distribution of apps outside the Mac App Store. <strong>Notarization</strong> is Apple's mechanism to add a layer of trust to these directly-distributed apps without requiring App Store review.</p>
+
+    <h3>8.1 Notarization vs Code Signing vs App Store Review</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Code Signing</th>
+                <th>Notarization</th>
+                <th>App Store Review</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>What it verifies</td>
+                <td>Identity of signer, integrity of binary</td>
+                <td>No known malware, valid Developer ID</td>
+                <td>Guidelines compliance, functionality, content</td>
+            </tr>
+            <tr>
+                <td>Who performs it</td>
+                <td>Developer (locally)</td>
+                <td>Apple (automated scan)</td>
+                <td>Apple (automated + human)</td>
+            </tr>
+            <tr>
+                <td>When it happens</td>
+                <td>Build time</td>
+                <td>Post-build, pre-distribution</td>
+                <td>After upload to App Store Connect</td>
+            </tr>
+            <tr>
+                <td>Required for</td>
+                <td>All code execution on iOS/macOS</td>
+                <td>macOS apps outside Mac App Store</td>
+                <td>App Store / TestFlight distribution</td>
+            </tr>
+            <tr>
+                <td>Result</td>
+                <td>Signed binary</td>
+                <td>Notarization ticket (stapled to binary)</td>
+                <td>Approved for distribution</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>8.2 The Notarization Process</h3>
+
+    <ol>
+        <li><strong>Developer signs</strong> the app with a Developer ID certificate (not a distribution cert)</li>
+        <li><strong>Upload to Apple</strong> via <code>notarytool</code> (or legacy <code>altool</code>)</li>
+        <li><strong>Apple scans</strong> the binary for known malware signatures, suspicious behaviors, and private API usage</li>
+        <li><strong>Apple issues a ticket</strong> — a signed assertion that the binary passed the scan</li>
+        <li><strong>Developer staples</strong> the ticket to the app bundle (embeds it so Gatekeeper can check offline)</li>
+        <li><strong>Gatekeeper checks</strong> the stapled ticket (or queries Apple's servers) before allowing first launch</li>
+    </ol>
+
+    <pre><code><span class="comment"># Sign with Developer ID</span>
+$ codesign --deep --force --options runtime \
+    --sign <span class="string">"Developer ID Application: ACME Inc (TEAMID)"</span> \
+    MyApp.app
+
+<span class="comment"># Submit for notarization</span>
+$ xcrun notarytool submit MyApp.zip \
+    --apple-id <span class="string">"dev@acme.com"</span> \
+    --team-id <span class="string">"A1B2C3D4E5"</span> \
+    --password <span class="string">"@keychain:AC_PASSWORD"</span> \
+    --wait
+
+<span class="comment"># Staple the ticket</span>
+$ xcrun stapler staple MyApp.app
+
+<span class="comment"># Verify notarization</span>
+$ spctl --assess --type execute --verbose MyApp.app</code></pre>
+
+    <h3>8.3 Hardened Runtime</h3>
+
+    <p>Notarization requires the <strong>Hardened Runtime</strong> capability (<code>--options runtime</code> flag). This enables a set of security protections similar to iOS's restrictions:</p>
+
+    <ul>
+        <li><strong>Library Validation</strong> — only Apple-signed or same-team-signed libraries can be loaded</li>
+        <li><strong>No unsigned executable memory</strong> — <code>MAP_JIT</code> required for JIT compilation</li>
+        <li><strong>DYLD environment variable restrictions</strong> — <code>DYLD_INSERT_LIBRARIES</code> blocked</li>
+        <li><strong>Debugging restrictions</strong> — <code>task_for_pid()</code> blocked unless entitled</li>
+    </ul>
+
+    <p>Exceptions can be granted via entitlements (e.g., <code>com.apple.security.cs.allow-unsigned-executable-memory</code>), but each exception must be justified and may trigger additional scrutiny during notarization.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — iOS Relevance of Notarization</div>
+        <p>While notarization is macOS-specific today, Apple has signaled interest in "notarization-like" processes for alternative app marketplaces under the EU Digital Markets Act (DMA). The <strong>iOS 17.4 sideloading framework</strong> in the EU requires apps distributed outside the App Store to be notarized by Apple — a scan for malware and policy violations, similar to macOS notarization but with additional requirements around marketplace operator responsibilities.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 9: CODESIGN TOOL INTERNALS                                 -->
+    <!-- ================================================================== -->
+
+    <h2 id="codesign-internals">9. codesign Tool Internals</h2>
+
+    <p>The <code>codesign</code> command-line tool is the workhorse of Apple's code signing infrastructure. Understanding what it does internally is essential for debugging signing issues and building CI/CD pipelines.</p>
+
+    <h3>9.1 What codesign Does Under the Hood</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    codesign SIGNING PROCESS                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Input: unsigned Mach-O binary + signing identity + entitlements        │
+│                                                                         │
+│  Step 1: COMPUTE CODE DIRECTORY                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ • Divide __TEXT, __DATA segments into 4KB pages                  │   │
+│  │ • SHA-256 hash each page → store in CodeDirectory.codeSlots[]   │   │
+│  │ • Hash Info.plist → specialSlot[-1]                              │   │
+│  │ • Hash Requirements → specialSlot[-2]                            │   │
+│  │ • Hash ResourceDir (CodeResources) → specialSlot[-3]            │   │
+│  │ • Hash Entitlements → specialSlot[-5]                            │   │
+│  │ • Hash DER Entitlements → specialSlot[-7]                        │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                                 │                                       │
+│                                 ▼                                       │
+│  Step 2: CREATE CMS SIGNATURE                                           │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ • Hash the CodeDirectory → this is the "message" to sign        │   │
+│  │ • Sign with private key from Keychain (RSA-SHA256 or ECDSA)     │   │
+│  │ • Bundle signing cert + WWDR intermediate cert into CMS         │   │
+│  │ • Optionally include timestamp from Apple's TSA server          │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                                 │                                       │
+│                                 ▼                                       │
+│  Step 3: EMBED IN MACH-O                                                │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ • Append SuperBlob to __LINKEDIT segment:                        │   │
+│  │   ┌─────────────────────────────────────────────────────────┐    │   │
+│  │   │ SuperBlob (magic: 0xFADE0CC0)                           │    │   │
+│  │   │ ├── CodeDirectory    (magic: 0xFADE0C02)                │    │   │
+│  │   │ ├── Requirements     (magic: 0xFADE0C01)                │    │   │
+│  │   │ ├── Entitlements XML (magic: 0xFADE7171)                │    │   │
+│  │   │ ├── Entitlements DER (magic: 0xFADE7172)                │    │   │
+│  │   │ ├── CMS Signature    (magic: 0xFADE0B01)                │    │   │
+│  │   │ └── Alt CodeDirectory (SHA-1, for compat)               │    │   │
+│  │   └─────────────────────────────────────────────────────────┘    │   │
+│  │ • Add/update LC_CODE_SIGNATURE load command pointing to blob    │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  Output: signed Mach-O binary with embedded code signature              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>9.2 Code Directory Structure</h3>
+
+    <p>The Code Directory is the central data structure of code signing. It contains all the hashes that define the binary's identity:</p>
+
+    <pre><code><span class="comment">// Code Directory structure (from Apple's open-source Security framework)</span>
+<span class="keyword">struct</span> <span class="type">CodeDirectory</span> {
+    <span class="keyword">uint32_t</span> magic;          <span class="comment">// 0xFADE0C02</span>
+    <span class="keyword">uint32_t</span> length;
+    <span class="keyword">uint32_t</span> version;         <span class="comment">// 0x20400 for current</span>
+    <span class="keyword">uint32_t</span> flags;           <span class="comment">// CS_ADHOC, CS_LINKER_SIGNED, etc.</span>
+    <span class="keyword">uint32_t</span> hashOffset;      <span class="comment">// offset to code slot hashes</span>
+    <span class="keyword">uint32_t</span> identOffset;     <span class="comment">// offset to signing identifier string</span>
+    <span class="keyword">uint32_t</span> nSpecialSlots;   <span class="comment">// number of special slots (Info.plist, etc.)</span>
+    <span class="keyword">uint32_t</span> nCodeSlots;      <span class="comment">// number of code page hashes</span>
+    <span class="keyword">uint32_t</span> codeLimit;       <span class="comment">// size of code to hash</span>
+    <span class="keyword">uint8_t</span>  hashSize;        <span class="comment">// 32 for SHA-256</span>
+    <span class="keyword">uint8_t</span>  hashType;        <span class="comment">// 2 = SHA-256, 1 = SHA-1</span>
+    <span class="keyword">uint8_t</span>  platform;
+    <span class="keyword">uint8_t</span>  pageSize;        <span class="comment">// log2(page_size) = 12 → 4096 bytes</span>
+    <span class="keyword">uint32_t</span> spare2;
+    <span class="comment">// v0x20100+</span>
+    <span class="keyword">uint32_t</span> scatterOffset;
+    <span class="comment">// v0x20200+</span>
+    <span class="keyword">uint32_t</span> teamOffset;      <span class="comment">// offset to team identifier string</span>
+    <span class="comment">// v0x20300+</span>
+    <span class="keyword">uint32_t</span> spare3;
+    <span class="keyword">uint64_t</span> codeLimit64;
+    <span class="comment">// v0x20400+</span>
+    <span class="keyword">uint64_t</span> execSegBase;     <span class="comment">// offset of executable segment</span>
+    <span class="keyword">uint64_t</span> execSegLimit;
+    <span class="keyword">uint64_t</span> execSegFlags;    <span class="comment">// CS_EXECSEG_MAIN_BINARY, etc.</span>
+    <span class="comment">// Followed by: hash slots (special + code)</span>
+};</code></pre>
+
+    <h3>9.3 Essential codesign Commands</h3>
+
+    <pre><code><span class="comment"># Sign an app bundle</span>
+$ codesign --force --sign <span class="string">"iPhone Distribution: ACME Inc (TEAMID)"</span> \
+    --entitlements MyApp.entitlements \
+    MyApp.app
+
+<span class="comment"># Sign with timestamp (recommended for distribution)</span>
+$ codesign --force --sign <span class="string">"Developer ID Application: ACME Inc"</span> \
+    --timestamp \
+    --options runtime \
+    MyApp.app
+
+<span class="comment"># Verify signature</span>
+$ codesign --verify --deep --strict --verbose=4 MyApp.app
+
+<span class="comment"># Display signing information</span>
+$ codesign -d --verbose=4 MyApp.app
+
+<span class="comment"># Display entitlements</span>
+$ codesign -d --entitlements :- MyApp.app
+
+<span class="comment"># Display code directory hashes</span>
+$ codesign -d --verbose=4 MyApp.app 2>&amp;1 | grep CDHash
+
+<span class="comment"># Verify against a specific requirement</span>
+$ codesign --verify --requirement='anchor apple generic and
+    certificate leaf[subject.OU] = "A1B2C3D4E5"' MyApp.app
+
+<span class="comment"># Remove signature</span>
+$ codesign --remove-signature MyApp.app
+
+<span class="comment"># Re-sign with different identity (common in CI/CD)</span>
+$ codesign --force --sign <span class="string">"Apple Distribution: ACME Inc (TEAMID)"</span> \
+    --preserve-metadata=identifier,entitlements,flags \
+    --generate-entitlement-der \
+    MyApp.app</code></pre>
+
+    <h3>9.4 Special Slots Reference</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Slot Index</th>
+                <th>Content</th>
+                <th>Description</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>-1</td>
+                <td>Info.plist</td>
+                <td>Hash of the app's Info.plist</td>
+            </tr>
+            <tr>
+                <td>-2</td>
+                <td>Requirements</td>
+                <td>Hash of the designated requirement</td>
+            </tr>
+            <tr>
+                <td>-3</td>
+                <td>Resource Directory</td>
+                <td>Hash of _CodeSignature/CodeResources</td>
+            </tr>
+            <tr>
+                <td>-4</td>
+                <td>Application Specific</td>
+                <td>Reserved (unused on iOS)</td>
+            </tr>
+            <tr>
+                <td>-5</td>
+                <td>Entitlements (XML)</td>
+                <td>Hash of XML-encoded entitlements</td>
+            </tr>
+            <tr>
+                <td>-6</td>
+                <td>Reserved</td>
+                <td>DMG-specific slot</td>
+            </tr>
+            <tr>
+                <td>-7</td>
+                <td>Entitlements (DER)</td>
+                <td>Hash of DER-encoded entitlements (iOS 15+)</td>
+            </tr>
+            <tr>
+                <td>0..N</td>
+                <td>Code pages</td>
+                <td>Hash of each 4KB page of executable code</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — CDHash and Trust Caches</div>
+        <p>The <strong>CDHash</strong> (Code Directory Hash) is the SHA-256 hash of the entire Code Directory. It serves as the unique fingerprint of a specific build. Apple maintains <strong>trust caches</strong> — lists of CDHashes for system binaries baked into the kernel cache. These binaries don't need CMS signature verification at runtime because their CDHash is pre-trusted. This is how Apple's own system daemons bypass the normal certificate chain validation — they're identified by CDHash, not by certificate.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 10: ARCHITECT — LARGE TEAM CODE SIGNING                    -->
+    <!-- ================================================================== -->
+
+    <h2 id="architect">10. <span class="tag-architect">ARCHITECT</span> <span class="tag-l6">L6</span> Managing Code Signing for Large Teams</h2>
+
+    <p>Code signing at scale — across dozens of developers, multiple app targets, CI/CD pipelines, and framework dependencies — is one of the most operationally complex aspects of iOS development. A Staff engineer must design systems that are secure, reliable, and don't become a bottleneck.</p>
+
+    <h3>10.1 Automatic vs Manual Signing</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Automatic Signing</th>
+                <th>Manual Signing</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Certificate management</td>
+                <td>Xcode creates/manages automatically</td>
+                <td>Developer/CI explicitly selects certificate</td>
+            </tr>
+            <tr>
+                <td>Profile management</td>
+                <td>Xcode creates/renews/downloads automatically</td>
+                <td>Profiles downloaded from portal or managed by tool</td>
+            </tr>
+            <tr>
+                <td>Entitlements</td>
+                <td>Xcode syncs with portal capabilities</td>
+                <td>Developer maintains .entitlements file manually</td>
+            </tr>
+            <tr>
+                <td>CI/CD compatibility</td>
+                <td>Requires Apple ID login on CI machine</td>
+                <td>Works with pre-installed certs and profiles</td>
+            </tr>
+            <tr>
+                <td>Multi-target apps</td>
+                <td>Can struggle with extensions, frameworks</td>
+                <td>Full control over each target's signing</td>
+            </tr>
+            <tr>
+                <td>Team conflicts</td>
+                <td>Xcode may regenerate profiles, breaking other devs</td>
+                <td>Stable — profiles don't change unexpectedly</td>
+            </tr>
+            <tr>
+                <td>Recommendation</td>
+                <td>Small teams, simple apps</td>
+                <td>Large teams, CI/CD, multi-target apps</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must Know — Why Large Teams Use Manual Signing</div>
+        <p>Automatic signing's biggest problem at scale is <strong>non-determinism</strong>. When Developer A opens Xcode, it may regenerate the provisioning profile, invalidating the one Developer B is using. On CI, automatic signing requires storing Apple ID credentials on the build machine and dealing with 2FA. Manual signing with a tool like <code>fastlane match</code> ensures every developer and CI machine uses the <em>exact same</em> certificate and profile, stored in a shared encrypted repository.</p>
+    </div>
+
+    <h3>10.2 fastlane match — The Industry Standard</h3>
+
+    <p><code>fastlane match</code> implements the "codesigning-as-a-service" pattern: certificates and profiles are stored in a shared, encrypted Git repository (or Google Cloud Storage / S3), and every developer and CI machine syncs from this single source of truth.</p>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    FASTLANE MATCH ARCHITECTURE                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Encrypted Git Repo (or GCS/S3 bucket)                                  │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │  certs/                                                          │   │
+│  │  ├── development/                                                │   │
+│  │  │   ├── CERT_ID.cer          (DER-encoded certificate)         │   │
+│  │  │   └── CERT_ID.p12          (encrypted private key)           │   │
+│  │  └── distribution/                                               │   │
+│  │      ├── CERT_ID.cer                                             │   │
+│  │      └── CERT_ID.p12                                             │   │
+│  │  profiles/                                                       │   │
+│  │  ├── development/                                                │   │
+│  │  │   └── Development_com.acme.myapp.mobileprovision              │   │
+│  │  ├── adhoc/                                                      │   │
+│  │  │   └── AdHoc_com.acme.myapp.mobileprovision                   │   │
+│  │  └── appstore/                                                   │   │
+│  │      └── AppStore_com.acme.myapp.mobileprovision                 │   │
+│  └──────────────────────────────┬───────────────────────────────────┘   │
+│                                 │                                       │
+│              ┌──────────────────┼──────────────────┐                    │
+│              │                  │                   │                    │
+│              ▼                  ▼                   ▼                    │
+│  ┌───────────────┐  ┌───────────────┐  ┌────────────────────┐          │
+│  │  Developer A   │  │  Developer B   │  │  CI/CD Server      │          │
+│  │  `match dev`   │  │  `match dev`   │  │  `match appstore`  │          │
+│  │                │  │                │  │                    │          │
+│  │  Decrypts &    │  │  Decrypts &    │  │  Decrypts &        │          │
+│  │  installs to   │  │  installs to   │  │  installs to       │          │
+│  │  local Keychain│  │  local Keychain│  │  CI Keychain        │          │
+│  └───────────────┘  └───────────────┘  └────────────────────┘          │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <pre><code><span class="comment">// Matchfile configuration</span>
+git_url(<span class="string">"https://github.com/acme/ios-certificates.git"</span>)
+storage_mode(<span class="string">"git"</span>)
+type(<span class="string">"appstore"</span>)
+app_identifier([
+    <span class="string">"com.acme.myapp"</span>,
+    <span class="string">"com.acme.myapp.widget"</span>,
+    <span class="string">"com.acme.myapp.notification-service"</span>
+])
+team_id(<span class="string">"A1B2C3D4E5"</span>)
+readonly(<span class="keyword">true</span>)  <span class="comment">// CI should never modify certs</span></code></pre>
+
+    <h3>10.3 CI/CD Keychain Management</h3>
+
+    <p>On CI servers (GitHub Actions, Jenkins, Bitrise, etc.), code signing requires careful Keychain management because the build agent may not have a login Keychain or may be running as a different user:</p>
+
+    <pre><code><span class="comment">#!/bin/bash</span>
+<span class="comment"># CI/CD code signing setup script</span>
+
+<span class="comment"># Create a temporary keychain</span>
+KEYCHAIN_NAME=<span class="string">"build.keychain-db"</span>
+KEYCHAIN_PASSWORD=$(openssl rand -base64 <span class="number">32</span>)
+
+security create-keychain -p <span class="string">"$KEYCHAIN_PASSWORD"</span> <span class="string">"$KEYCHAIN_NAME"</span>
+
+<span class="comment"># Configure keychain: no auto-lock, add to search list</span>
+security set-keychain-settings -lut <span class="number">21600</span> <span class="string">"$KEYCHAIN_NAME"</span>
+security list-keychains -d user -s <span class="string">"$KEYCHAIN_NAME"</span> $(security list-keychains -d user | tr -d <span class="string">'"'</span>)
+security unlock-keychain -p <span class="string">"$KEYCHAIN_PASSWORD"</span> <span class="string">"$KEYCHAIN_NAME"</span>
+
+<span class="comment"># Import certificate and private key</span>
+security import certificate.p12 \
+    -k <span class="string">"$KEYCHAIN_NAME"</span> \
+    -P <span class="string">"$P12_PASSWORD"</span> \
+    -T /usr/bin/codesign \
+    -T /usr/bin/security
+
+<span class="comment"># Allow codesign to access the key without UI prompt</span>
+security set-key-partition-list -S apple-tool:,apple: \
+    -s -k <span class="string">"$KEYCHAIN_PASSWORD"</span> <span class="string">"$KEYCHAIN_NAME"</span>
+
+<span class="comment"># Install provisioning profiles</span>
+mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles/
+cp *.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+
+<span class="comment"># Build and sign</span>
+xcodebuild archive \
+    -workspace MyApp.xcworkspace \
+    -scheme MyApp \
+    -archivePath build/MyApp.xcarchive \
+    CODE_SIGN_IDENTITY=<span class="string">"Apple Distribution: ACME Inc (TEAMID)"</span> \
+    PROVISIONING_PROFILE_SPECIFIER=<span class="string">"match AppStore com.acme.myapp"</span>
+
+<span class="comment"># Cleanup: delete temporary keychain</span>
+security delete-keychain <span class="string">"$KEYCHAIN_NAME"</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — set-key-partition-list</div>
+        <p>The <code>security set-key-partition-list</code> command is the most commonly missed step in CI code signing setup. Without it, <code>codesign</code> will fail with <strong>"User interaction is not allowed"</strong> because macOS requires explicit permission for a process to access Keychain items. This command grants <code>codesign</code> access without a UI prompt. The <code>-S apple-tool:,apple:</code> flags specify the partition IDs that are allowed access.</p>
+    </div>
+
+    <h3>10.4 Certificate Rotation Strategy</h3>
+
+    <p>Distribution certificates last ~3 years, but proactive rotation avoids emergency situations:</p>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                 CERTIFICATE ROTATION TIMELINE                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Year 0          Year 1          Year 2          Year 3                 │
+│  ├────────────────┼────────────────┼────────────────┤                   │
+│  │                │                │                │                   │
+│  │  Cert A ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■│                   │
+│  │  (active)      │                │                │ expires           │
+│  │                │                │                │                   │
+│  │                │   Cert B ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■    │
+│  │                │   (created at  │                │                   │
+│  │                │    18 months)  │                │                   │
+│  │                │                │                │                   │
+│  │                │  Transition    │  Cert B is     │                   │
+│  │                │  window: both  │  primary,      │                   │
+│  │                │  certs valid   │  Cert A revoked│                   │
+│  │                │                │                │                   │
+│  └────────────────┴────────────────┴────────────────┘                   │
+│                                                                         │
+│  Rotation Steps:                                                        │
+│  1. Create new cert 12-18 months before old cert expires                │
+│  2. Generate new profiles with new cert                                 │
+│  3. Update match repo / CI with new cert                                │
+│  4. Transition all builds to new cert                                   │
+│  5. Revoke old cert after all apps re-signed                            │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>10.5 Framework and Extension Signing</h3>
+
+    <p>In a multi-target app (main app + extensions + embedded frameworks), every executable component must be independently signed. The signing must be consistent:</p>
+
+    <pre><code><span class="comment">// Xcode build settings for multi-target signing</span>
+
+<span class="comment">// Main App Target</span>
+CODE_SIGN_IDENTITY = <span class="string">"Apple Distribution: ACME Inc (TEAMID)"</span>
+PROVISIONING_PROFILE_SPECIFIER = <span class="string">"match AppStore com.acme.myapp"</span>
+CODE_SIGN_STYLE = Manual
+
+<span class="comment">// Widget Extension Target</span>
+CODE_SIGN_IDENTITY = <span class="string">"Apple Distribution: ACME Inc (TEAMID)"</span>
+PROVISIONING_PROFILE_SPECIFIER = <span class="string">"match AppStore com.acme.myapp.widget"</span>
+CODE_SIGN_STYLE = Manual
+
+<span class="comment">// Notification Service Extension</span>
+CODE_SIGN_IDENTITY = <span class="string">"Apple Distribution: ACME Inc (TEAMID)"</span>
+PROVISIONING_PROFILE_SPECIFIER = <span class="string">"match AppStore com.acme.myapp.notif"</span>
+CODE_SIGN_STYLE = Manual
+
+<span class="comment">// Embedded Framework (same team, no profile needed)</span>
+CODE_SIGN_IDENTITY = <span class="string">"Apple Distribution: ACME Inc (TEAMID)"</span>
+CODE_SIGN_STYLE = Manual</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Code Signing Architecture for Large Teams</div>
+        <ul>
+            <li><strong>Use manual signing for all targets</strong> — automatic signing creates non-deterministic behavior across team members and CI</li>
+            <li><strong>Centralize certificates with fastlane match</strong> — single encrypted repo, one source of truth, <code>readonly</code> mode on CI</li>
+            <li><strong>Create a dedicated CI/CD Apple ID</strong> — don't use a personal account; create a service account with App Manager role</li>
+            <li><strong>Separate keychains on CI</strong> — create a temporary keychain per build, delete after; never pollute the system keychain</li>
+            <li><strong>Automate profile regeneration</strong> — when adding new capabilities, run <code>match</code> with <code>force_for_new_devices</code> to regenerate profiles</li>
+            <li><strong>Pin WWDR intermediate certificate</strong> — ensure CI machines have the correct WWDR CA installed (G3/G4); expired intermediates cause mysterious failures</li>
+            <li><strong>Monitor certificate expiry</strong> — set up alerts 90, 60, and 30 days before expiry; automate rotation with match</li>
+            <li><strong>Use Xcode Cloud for simpler setups</strong> — Apple manages signing automatically in Xcode Cloud, eliminating most of these concerns</li>
+        </ul>
+    </div>
+
+    <h3>10.6 Complete CI/CD Signing Workflow</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│              COMPLETE CI/CD CODE SIGNING WORKFLOW                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────┐                                                        │
+│  │  Git Push    │                                                        │
+│  └──────┬──────┘                                                        │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  CI Pipeline Triggered                                          │    │
+│  └──────┬──────────────────────────────────────────────────────────┘    │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  1. Create Temporary Keychain                                   │    │
+│  │     security create-keychain -p $PASS build.keychain-db         │    │
+│  └──────┬──────────────────────────────────────────────────────────┘    │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  2. Decrypt & Install Certificates (from match repo / secrets)  │    │
+│  │     security import cert.p12 -k build.keychain-db               │    │
+│  │     security set-key-partition-list ...                          │    │
+│  └──────┬──────────────────────────────────────────────────────────┘    │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  3. Install Provisioning Profiles                               │    │
+│  │     cp *.mobileprovision ~/Library/MobileDevice/Profiles/       │    │
+│  └──────┬──────────────────────────────────────────────────────────┘    │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  4. Build & Archive                                             │    │
+│  │     xcodebuild archive -scheme MyApp ...                        │    │
+│  └──────┬──────────────────────────────────────────────────────────┘    │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  5. Export IPA                                                  │    │
+│  │     xcodebuild -exportArchive -exportOptionsPlist options.plist │    │
+│  └──────┬──────────────────────────────────────────────────────────┘    │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  6. Validate Signature                                          │    │
+│  │     codesign --verify --deep --strict MyApp.app                 │    │
+│  │     diff entitlements (binary vs profile)                       │    │
+│  └──────┬──────────────────────────────────────────────────────────┘    │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  7. Upload to App Store Connect / TestFlight                    │    │
+│  │     xcrun altool --upload-app ...                               │    │
+│  └──────┬──────────────────────────────────────────────────────────┘    │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  8. Cleanup                                                     │    │
+│  │     security delete-keychain build.keychain-db                  │    │
+│  │     rm -rf ~/Library/MobileDevice/Provisioning Profiles/*       │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>10.7 Interview Questions</h3>
+
+    <h4><span class="tag-senior">Senior</span> Q: What happens if you sign an app with a certificate that doesn't match the provisioning profile?</h4>
+
+    <p><strong>A:</strong> AMFI will reject the app at launch. The provisioning profile contains the DER-encoded certificates that are authorized to sign the app. If the signing certificate's public key doesn't match any certificate in the profile's <code>DeveloperCertificates</code> array, the signature validation fails. On a device, this manifests as the app icon appearing briefly then disappearing, or a "Unable to Verify App" dialog. In the Console, you'll see <code>amfid</code> logging a verification failure.</p>
+
+    <h4><span class="tag-architect">Architect</span> Q: How would you design a code signing system for a company with 50 iOS developers, 10 app targets, and 3 CI/CD environments?</h4>
+
+    <p><strong>A:</strong> The design should address five concerns:</p>
+    <ol>
+        <li><strong>Certificate management</strong> — Use <code>fastlane match</code> with an encrypted Git repository. Create one distribution certificate shared across all targets (they share the same Team ID). Development certificates can be per-developer (automatic) or shared (match).</li>
+        <li><strong>Profile management</strong> — One provisioning profile per target per distribution type. Use match to generate and store all profiles. CI runs <code>match</code> in <code>readonly</code> mode; only the release manager can run <code>match</code> in write mode to regenerate profiles.</li>
+        <li><strong>CI/CD isolation</strong> — Each CI job creates a temporary keychain, imports certs, builds, and deletes the keychain. No persistent signing material on CI machines. Secrets (match passphrase, p12 password) stored in CI secret management (GitHub Secrets, Vault, etc.).</li>
+        <li><strong>Access control</strong> — Separate Apple Developer Portal roles: Admin (cert management), App Manager (profile management), Developer (read-only). Match repo access controlled via Git permissions.</li>
+        <li><strong>Monitoring</strong> — Automated alerts for certificate expiry (90/60/30 days), profile expiry, WWDR intermediate certificate updates. A Slack bot or dashboard showing signing health across all targets.</li>
+    </ol>
+
+    <h4><span class="tag-l6">L6</span> Q: Explain the security implications of the get-task-allow entitlement and why it must never appear in production builds.</h4>
+
+    <p><strong>A:</strong> The <code>get-task-allow</code> entitlement grants the <code>task_for_pid()</code> Mach trap to other processes. This trap returns a <strong>task port</strong> — a Mach port that gives complete control over the target process: read/write memory (<code>mach_vm_read</code>/<code>mach_vm_write</code>), suspend/resume threads, modify registers, and inject code. This is how <code>lldb</code> implements breakpoints and memory inspection. In a production build, this would allow any process (including malware) to read encryption keys, authentication tokens, and user data from the app's memory. AMFI enforces that <code>get-task-allow</code> is only present in development profiles (which are device-restricted), never in App Store or enterprise profiles. If you somehow managed to embed it in a distribution build, the App Store automated checks would reject it.</p>
+
+    <h4><span class="tag-architect">Architect</span> Q: Your enterprise-distributed app suddenly stops launching on all employee devices. What happened and how do you recover?</h4>
+
+    <p><strong>A:</strong> The most likely cause is <strong>certificate revocation</strong> — either Apple revoked the enterprise certificate (policy violation) or someone on the team accidentally revoked it in the Developer Portal. iOS checks certificate status via OCSP at launch time. Recovery steps: (1) Check the Developer Portal for certificate status. (2) If revoked by Apple, contact Apple Developer Support immediately — if it was accidental or a misunderstanding, they may reinstate it. (3) If the cert is permanently revoked, create a new enterprise certificate, regenerate all provisioning profiles, re-sign all apps, and redistribute via MDM. (4) For faster recovery, maintain a <strong>secondary enterprise certificate</strong> (Apple allows multiple) with pre-built profiles, so you can re-sign and push within hours. (5) Long-term: implement MDM-based distribution so re-deployment is automated, and maintain a "break glass" procedure documented in the team's runbook.</p>
+
+    <div class="nav-footer">
+        <a href="04-privacy-framework.html">← Previous: Privacy Frameworks</a>
+        <a href="06-runtime-security.html">Next: Runtime Security →</a>
+    </div>
+</div>
+</body>
+</html>

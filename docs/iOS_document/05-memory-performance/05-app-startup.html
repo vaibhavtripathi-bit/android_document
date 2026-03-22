@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>App Startup &amp; Launch Time — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Memory &amp; Performance</a><span class="sep">›</span>
+        App Startup &amp; Launch Time
+    </nav>
+
+    <h1>App Startup &amp; Launch Time</h1>
+    <p class="subtitle">From dyld4 shared cache to first frame — every millisecond of app launch dissected, measured, and optimized.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#launch-phases">Launch Phases Overview</a></li>
+            <li><a href="#pre-main">Pre-main: dyld4 and Beyond</a></li>
+            <li><a href="#dyld4">dyld4 Closures and Shared Cache</a></li>
+            <li><a href="#load-initialize">+load vs +initialize</a></li>
+            <li><a href="#static-initializers">Static Initializers</a></li>
+            <li><a href="#objc-registration">ObjC Class Registration</a></li>
+            <li><a href="#post-main">Post-main: First Frame</a></li>
+            <li><a href="#scene-timing">UIScene Connection Timing</a></li>
+            <li><a href="#instruments">Instruments App Launch Template</a></li>
+            <li><a href="#signpost">os_signpost for Custom Intervals</a></li>
+            <li><a href="#metrickit-launch">MetricKit Launch Diagnostics</a></li>
+            <li><a href="#optimization">Reducing Launch Time: Real Strategies</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="launch-phases">Launch Phases Overview</h2>
+
+    <div class="diagram">
+App Launch Timeline:
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│  User taps icon                                                  │
+│       │                                                          │
+│       ▼                                                          │
+│  ┌─────────────────────────────────────────────────────────┐     │
+│  │                   PRE-MAIN                               │     │
+│  │                                                          │     │
+│  │  1. Kernel creates process                               │     │
+│  │  2. dyld4 loads executable + dylibs                      │     │
+│  │  3. dyld4 applies fixups (rebasing + binding)            │     │
+│  │  4. ObjC runtime: register classes, categories           │     │
+│  │  5. Run +load methods                                    │     │
+│  │  6. Run C++ static initializers                          │     │
+│  │  7. Run Swift type metadata accessors                    │     │
+│  │  8. Call main()                                          │     │
+│  └─────────────────────────────────────────────────────────┘     │
+│       │                                                          │
+│       ▼                                                          │
+│  ┌─────────────────────────────────────────────────────────┐     │
+│  │                   POST-MAIN                              │     │
+│  │                                                          │     │
+│  │  9. UIApplicationMain / @main                            │     │
+│  │ 10. UIApplication + AppDelegate init                     │     │
+│  │ 11. willFinishLaunchingWithOptions                       │     │
+│  │ 12. didFinishLaunchingWithOptions                        │     │
+│  │ 13. UIScene connection (scene-based apps)                │     │
+│  │ 14. First view controller loaded                         │     │
+│  │ 15. First layout pass                                    │     │
+│  │ 16. First Core Animation commit                          │     │
+│  │ 17. First frame rendered ← "launch complete"             │     │
+│  └─────────────────────────────────────────────────────────┘     │
+│                                                                  │
+│  Apple's target: &lt; 400ms total (cold launch)                    │
+│  Measured by: Time to first frame (TTI)                          │
+└──────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>Cold vs Warm vs Hot Launch</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Type</th>
+                <th>Definition</th>
+                <th>What's Cached</th>
+                <th>Typical Time</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Cold</strong></td>
+                <td>App not in memory, no cached data</td>
+                <td>Nothing — full dyld load</td>
+                <td>1-5 seconds</td>
+            </tr>
+            <tr>
+                <td><strong>Warm</strong></td>
+                <td>App not running but dylibs cached</td>
+                <td>Shared cache, some file caches</td>
+                <td>0.5-2 seconds</td>
+            </tr>
+            <tr>
+                <td><strong>Hot (Resume)</strong></td>
+                <td>App suspended in background</td>
+                <td>Everything — just unsuspend</td>
+                <td>&lt; 100ms</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="pre-main">Pre-main: dyld4 and Beyond</h2>
+
+    <p>Pre-main time is everything that happens before your <code>main()</code> function (or <code>@main</code> entry point) is called. On a complex app, this can be 50-80% of total launch time.</p>
+
+    <div class="diagram">
+Pre-main Breakdown:
+┌──────────────────────────────────────────────────────┐
+│ dyld4 Load (typically 50-200ms)                      │
+│ ├── Map executable into memory                       │
+│ ├── Load dependent dylibs (recursive)                │
+│ ├── Apply fixups:                                    │
+│ │   ├── Rebase: adjust pointers for ASLR             │
+│ │   └── Bind: resolve external symbol references     │
+│ ├── Run initializers:                                │
+│ │   ├── ObjC +load methods                           │
+│ │   ├── C++ static constructors                      │
+│ │   └── Swift type metadata registration             │
+│ └── Call main()                                      │
+└──────────────────────────────────────────────────────┘
+
+Time breakdown (typical large app):
+  dylib loading:     30-50ms
+  Rebasing/binding:  20-40ms
+  ObjC setup:        10-30ms
+  Initializers:      10-100ms (highly variable)
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="dyld4">dyld4 Closures and Shared Cache</h2>
+
+    <p><code>dyld4</code> (introduced in iOS 16 / macOS 13) is a major rewrite of the dynamic linker. It introduces <strong>pre-built closures</strong> that cache the results of linking, making subsequent launches faster.</p>
+
+    <h3>Shared Cache</h3>
+
+    <p>Apple pre-links all system frameworks into a single <strong>dyld shared cache</strong> file. This means loading UIKit, Foundation, CoreGraphics, etc. is essentially free — they're already mapped into every process's address space.</p>
+
+    <div class="diagram">
+dyld Shared Cache:
+┌──────────────────────────────────────────────────────┐
+│ /System/Library/Caches/com.apple.dyld/               │
+│                                                      │
+│ Single file containing ALL system frameworks:        │
+│ ┌──────────┬──────────┬──────────┬──────────┐       │
+│ │  UIKit   │Foundation│CoreGraphi│  Metal   │ ...   │
+│ │          │          │cs        │          │       │
+│ └──────────┴──────────┴──────────┴──────────┘       │
+│                                                      │
+│ Pre-linked: all inter-framework references resolved  │
+│ Pre-optimized: ObjC selectors uniqued                │
+│ Shared: mapped into every process (clean memory)     │
+└──────────────────────────────────────────────────────┘
+
+Your app's dylibs are NOT in the shared cache.
+Each custom framework adds load time.
+    </div>
+
+    <h3>dyld4 Closures</h3>
+
+    <pre><code><span class="comment">// dyld4 creates a "closure" on first launch that caches:</span>
+<span class="comment">// - Which dylibs to load and in what order</span>
+<span class="comment">// - All fixup locations (rebase + bind)</span>
+<span class="comment">// - Initializer order</span>
+<span class="comment">//</span>
+<span class="comment">// On subsequent launches, dyld4 replays the closure</span>
+<span class="comment">// instead of re-computing everything.</span>
+<span class="comment">//</span>
+<span class="comment">// The closure is invalidated when:</span>
+<span class="comment">// - App is updated</span>
+<span class="comment">// - OS is updated</span>
+<span class="comment">// - A dylib changes</span>
+<span class="comment">// - Device is rebooted (sometimes)</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: ASLR and Rebasing</div>
+        <p>Address Space Layout Randomization (ASLR) loads the executable at a random base address for security. But the Mach-O binary contains pointers that assume a fixed base address. <strong>Rebasing</strong> adjusts all these internal pointers by adding the ASLR slide. <strong>Binding</strong> resolves references to external symbols (functions in other dylibs). Both are O(n) in the number of pointers — more classes and methods means more fixups. dyld4 closures cache these fixup results.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="load-initialize">+load vs +initialize</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th><code>+load</code></th>
+                <th><code>+initialize</code></th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>When called</td>
+                <td>During pre-main (dyld initializers)</td>
+                <td>Lazily, before first message to class</td>
+            </tr>
+            <tr>
+                <td>Guaranteed to run?</td>
+                <td>Yes, always</td>
+                <td>Only if class is used</td>
+            </tr>
+            <tr>
+                <td>Thread</td>
+                <td>Main thread (blocks launch)</td>
+                <td>Whatever thread sends first message</td>
+            </tr>
+            <tr>
+                <td>Subclass behavior</td>
+                <td>Each class's +load runs independently</td>
+                <td>Subclass inherits if not overridden</td>
+            </tr>
+            <tr>
+                <td>Category behavior</td>
+                <td>Category +load runs separately</td>
+                <td>Category replaces class implementation</td>
+            </tr>
+            <tr>
+                <td>Impact on launch</td>
+                <td>Direct — adds to pre-main time</td>
+                <td>None at launch (lazy)</td>
+            </tr>
+            <tr>
+                <td>Use case</td>
+                <td>Method swizzling (legacy)</td>
+                <td>One-time class setup</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// ❌ +load runs during pre-main — slows launch</span>
+<span class="keyword">@objc class</span> <span class="type">AnalyticsTracker</span>: <span class="type">NSObject</span> {
+    <span class="keyword">override class func</span> <span class="func">load</span>() {
+        <span class="comment">// This runs before main()!</span>
+        <span class="comment">// Every +load adds to pre-main time</span>
+        <span class="func">swizzleViewDidAppear</span>()
+    }
+}
+
+<span class="comment">// ✅ +initialize runs lazily — no launch impact</span>
+<span class="keyword">@objc class</span> <span class="type">ThemeManager</span>: <span class="type">NSObject</span> {
+    <span class="keyword">override class func</span> <span class="func">initialize</span>() {
+        <span class="comment">// Runs on first use, not at launch</span>
+        <span class="func">setupDefaultTheme</span>()
+    }
+}
+
+<span class="comment">// ✅ Best: Use Swift static properties (lazy by default)</span>
+<span class="keyword">class</span> <span class="type">Configuration</span> {
+    <span class="keyword">static let</span> shared = <span class="type">Configuration</span>()  <span class="comment">// Lazy, thread-safe</span>
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Hidden +load Methods</div>
+        <p>Third-party SDKs often include <code>+load</code> methods for automatic initialization. Each one adds to your pre-main time. Audit your dependencies: run <code>otool -oV YourApp | grep -A 1 "load"</code> to find all +load implementations. Consider replacing SDKs that use +load with ones that support explicit initialization.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="static-initializers">Static Initializers</h2>
+
+    <p>C++ static initializers and Swift global variables with complex initializers run during pre-main. They're executed in the order dyld processes the initializer list.</p>
+
+    <pre><code><span class="comment">// C++ static initializer (runs at load time)</span>
+<span class="comment">// static MyClass instance; // Constructor runs pre-main</span>
+
+<span class="comment">// Swift: global variables with simple literals are fine</span>
+<span class="keyword">let</span> maxRetries = <span class="number">3</span>  <span class="comment">// No initializer cost</span>
+
+<span class="comment">// Swift: global variables with complex init run lazily (dispatch_once)</span>
+<span class="keyword">let</span> dateFormatter: <span class="type">DateFormatter</span> = {
+    <span class="keyword">let</span> f = <span class="type">DateFormatter</span>()
+    f.dateFormat = <span class="string">"yyyy-MM-dd"</span>
+    <span class="keyword">return</span> f
+}()
+<span class="comment">// ✅ This is lazy in Swift — runs on first access, not at launch</span>
+
+<span class="comment">// ⚠️ But __attribute__((constructor)) in C/ObjC runs at load time:</span>
+<span class="comment">// __attribute__((constructor))</span>
+<span class="comment">// void earlyInit(void) {</span>
+<span class="comment">//     // Runs pre-main — avoid!</span>
+<span class="comment">// }</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="objc-registration">ObjC Class Registration</h2>
+
+    <p>During pre-main, the ObjC runtime registers every class and category in the binary. More classes = more registration time.</p>
+
+    <pre><code><span class="comment">// Each ObjC class adds to registration time:</span>
+<span class="comment">// - Class metadata is read from the binary</span>
+<span class="comment">// - Class is inserted into the runtime's class table</span>
+<span class="comment">// - Categories are attached to their classes</span>
+<span class="comment">// - Selectors are uniqued</span>
+<span class="comment">//</span>
+<span class="comment">// A large app might have 20,000+ ObjC classes</span>
+<span class="comment">// Registration cost: ~1-2ms per 1000 classes</span>
+<span class="comment">//</span>
+<span class="comment">// Swift classes that don't inherit from NSObject</span>
+<span class="comment">// don't go through ObjC registration → faster</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="post-main">Post-main: First Frame</h2>
+
+    <p>Post-main time is everything from <code>main()</code> to the first rendered frame. This is where most optimization opportunities lie because it's your code.</p>
+
+    <pre><code><span class="comment">// Post-main timeline:</span>
+<span class="keyword">@main</span>
+<span class="keyword">class</span> <span class="type">AppDelegate</span>: <span class="type">UIResponder</span>, <span class="type">UIApplicationDelegate</span> {
+
+    <span class="keyword">func</span> <span class="func">application</span>(
+        _ application: <span class="type">UIApplication</span>,
+        <span class="func">willFinishLaunchingWithOptions</span> launchOptions: [<span class="type">UIApplication</span>.<span class="type">LaunchOptionsKey</span>: <span class="type">Any</span>]?
+    ) -> <span class="type">Bool</span> {
+        <span class="comment">// ⏱ Phase 1: Minimal setup only</span>
+        <span class="comment">// - Crash reporting (must be first)</span>
+        <span class="comment">// - Core Data stack (if needed for first screen)</span>
+        <span class="keyword">return true</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">application</span>(
+        _ application: <span class="type">UIApplication</span>,
+        <span class="func">didFinishLaunchingWithOptions</span> launchOptions: [<span class="type">UIApplication</span>.<span class="type">LaunchOptionsKey</span>: <span class="type">Any</span>]?
+    ) -> <span class="type">Bool</span> {
+        <span class="comment">// ⏱ Phase 2: Essential initialization</span>
+        <span class="comment">// - Analytics (but defer heavy init)</span>
+        <span class="comment">// - Push notification registration</span>
+        <span class="comment">// - Deep link handling</span>
+
+        <span class="comment">// ❌ DON'T: Initialize all SDKs here</span>
+        <span class="comment">// ❌ DON'T: Sync network calls</span>
+        <span class="comment">// ❌ DON'T: Heavy data processing</span>
+
+        <span class="keyword">return true</span>
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="scene-timing">UIScene Connection Timing</h2>
+
+    <pre><code><span class="keyword">class</span> <span class="type">SceneDelegate</span>: <span class="type">UIResponder</span>, <span class="type">UIWindowSceneDelegate</span> {
+    <span class="keyword">var</span> window: <span class="type">UIWindow</span>?
+
+    <span class="keyword">func</span> <span class="func">scene</span>(
+        _ scene: <span class="type">UIScene</span>,
+        <span class="func">willConnectTo</span> session: <span class="type">UISceneSession</span>,
+        options connectionOptions: <span class="type">UIScene</span>.<span class="type">ConnectionOptions</span>
+    ) {
+        <span class="comment">// ⏱ This is where the first window + root VC are created</span>
+        <span class="comment">// Everything here is on the critical path to first frame</span>
+
+        <span class="keyword">guard let</span> windowScene = scene <span class="keyword">as?</span> <span class="type">UIWindowScene</span> <span class="keyword">else</span> { <span class="keyword">return</span> }
+        window = <span class="type">UIWindow</span>(windowScene: windowScene)
+
+        <span class="comment">// ✅ Use a lightweight placeholder while loading</span>
+        window?.rootViewController = <span class="type">LaunchViewController</span>()
+        window?.<span class="func">makeKeyAndVisible</span>()
+
+        <span class="comment">// Defer heavy initialization</span>
+        <span class="type">DispatchQueue</span>.main.<span class="func">async</span> {
+            <span class="keyword">self</span>.<span class="func">setupRealRootViewController</span>()
+        }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="instruments">Instruments App Launch Template</h2>
+
+    <p>The App Launch template in Instruments measures the complete launch timeline with per-phase breakdowns.</p>
+
+    <div class="diagram">
+Instruments App Launch Template Output:
+┌──────────────────────────────────────────────────────────┐
+│ Phase              │ Duration │ Details                   │
+├────────────────────┼──────────┼───────────────────────────┤
+│ Process Creation   │   15ms   │ Kernel fork + exec        │
+│ dyld               │  120ms   │ Load 47 dylibs            │
+│ libSystem Init     │   8ms    │ C runtime setup           │
+│ ObjC Setup         │  25ms    │ Register 12,847 classes   │
+│ Initializers       │  45ms    │ 23 +load, 5 C++ static   │
+│ UIKit Init         │  30ms    │ UIApplication creation    │
+│ didFinishLaunching │  85ms    │ Your code                 │
+│ Scene Connection   │  40ms    │ Window + root VC          │
+│ First Layout       │  35ms    │ Auto Layout solve         │
+│ First Render       │  20ms    │ Core Animation commit     │
+├────────────────────┼──────────┼───────────────────────────┤
+│ TOTAL              │  423ms   │                           │
+└──────────────────────────────────────────────────────────┘
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="signpost">os_signpost for Custom Intervals</h2>
+
+    <pre><code><span class="keyword">import</span> <span class="type">os</span>
+
+<span class="keyword">let</span> launchLog = <span class="type">OSLog</span>(subsystem: <span class="string">"com.myapp"</span>, category: .pointsOfInterest)
+
+<span class="keyword">class</span> <span class="type">LaunchProfiler</span> {
+    <span class="keyword">static func</span> <span class="func">beginPhase</span>(_ name: <span class="type">StaticString</span>) {
+        <span class="func">os_signpost</span>(.begin, log: launchLog, name: name)
+    }
+
+    <span class="keyword">static func</span> <span class="func">endPhase</span>(_ name: <span class="type">StaticString</span>) {
+        <span class="func">os_signpost</span>(.end, log: launchLog, name: name)
+    }
+}
+
+<span class="comment">// Usage in AppDelegate:</span>
+<span class="keyword">func</span> <span class="func">application</span>(_ app: <span class="type">UIApplication</span>,
+    <span class="func">didFinishLaunchingWithOptions</span> opts: [<span class="type">UIApplication</span>.<span class="type">LaunchOptionsKey</span>: <span class="type">Any</span>]?) -> <span class="type">Bool</span> {
+
+    <span class="type">LaunchProfiler</span>.<span class="func">beginPhase</span>(<span class="string">"CrashReporting"</span>)
+    <span class="type">CrashReporter</span>.<span class="func">initialize</span>()
+    <span class="type">LaunchProfiler</span>.<span class="func">endPhase</span>(<span class="string">"CrashReporting"</span>)
+
+    <span class="type">LaunchProfiler</span>.<span class="func">beginPhase</span>(<span class="string">"CoreDataStack"</span>)
+    <span class="type">CoreDataStack</span>.shared.<span class="func">loadPersistentStores</span>()
+    <span class="type">LaunchProfiler</span>.<span class="func">endPhase</span>(<span class="string">"CoreDataStack"</span>)
+
+    <span class="type">LaunchProfiler</span>.<span class="func">beginPhase</span>(<span class="string">"Analytics"</span>)
+    <span class="type">Analytics</span>.<span class="func">configure</span>()
+    <span class="type">LaunchProfiler</span>.<span class="func">endPhase</span>(<span class="string">"Analytics"</span>)
+
+    <span class="keyword">return true</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="metrickit-launch">MetricKit Launch Diagnostics</h2>
+
+    <pre><code><span class="keyword">import</span> <span class="type">MetricKit</span>
+
+<span class="keyword">class</span> <span class="type">LaunchMetricsSubscriber</span>: <span class="type">NSObject</span>, <span class="type">MXMetricManagerSubscriber</span> {
+    <span class="keyword">func</span> <span class="func">didReceive</span>(_ payloads: [<span class="type">MXMetricPayload</span>]) {
+        <span class="keyword">for</span> payload <span class="keyword">in</span> payloads {
+            <span class="keyword">if let</span> launchMetrics = payload.applicationLaunchMetrics {
+                <span class="keyword">let</span> histogram = launchMetrics.histogrammedTimeToFirstDraw
+                <span class="func">print</span>(<span class="string">"Time to first draw histogram:"</span>)
+                <span class="func">print</span>(<span class="string">"  p50: \(histogram.bucketEnumerator)"</span>)
+
+                <span class="keyword">let</span> resumeHistogram = launchMetrics.histogrammedApplicationResumeTime
+                <span class="func">print</span>(<span class="string">"Resume time histogram: \(resumeHistogram)"</span>)
+            }
+        }
+    }
+}
+
+<span class="comment">// MetricKit provides:</span>
+<span class="comment">// - histogrammedTimeToFirstDraw: cold launch time distribution</span>
+<span class="comment">// - histogrammedApplicationResumeTime: warm resume time</span>
+<span class="comment">// - histogrammedOptimizedTimeToFirstDraw: optimized launch (iOS 16+)</span>
+<span class="comment">// Data is aggregated across all users — shows real-world distribution</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="optimization">Reducing Launch Time: Real Strategies</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: From 3s to Under 400ms</div>
+        <p>Here's a battle-tested playbook for reducing launch time in a large production app. Each strategy is ordered by typical impact.</p>
+    </div>
+
+    <h3>Pre-main Optimizations</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Strategy</th>
+                <th>Typical Savings</th>
+                <th>Effort</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Reduce dylib count (merge into fewer frameworks)</td>
+                <td>50-200ms</td>
+                <td>High</td>
+            </tr>
+            <tr>
+                <td>Use mergeable libraries (Xcode 15+)</td>
+                <td>30-100ms</td>
+                <td>Low</td>
+            </tr>
+            <tr>
+                <td>Remove +load methods</td>
+                <td>10-50ms per method</td>
+                <td>Medium</td>
+            </tr>
+            <tr>
+                <td>Reduce ObjC class count (use Swift structs)</td>
+                <td>10-30ms</td>
+                <td>High</td>
+            </tr>
+            <tr>
+                <td>Remove unused code (dead stripping)</td>
+                <td>5-20ms</td>
+                <td>Low</td>
+            </tr>
+            <tr>
+                <td>Avoid static initializers in C/C++ code</td>
+                <td>5-50ms</td>
+                <td>Medium</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Post-main Optimizations</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Strategy</th>
+                <th>Typical Savings</th>
+                <th>Details</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Defer SDK initialization</td>
+                <td>100-500ms</td>
+                <td>Init analytics, ads, etc. after first frame</td>
+            </tr>
+            <tr>
+                <td>Lazy-load non-critical features</td>
+                <td>50-200ms</td>
+                <td>Don't create what's not visible</td>
+            </tr>
+            <tr>
+                <td>Simplify initial view hierarchy</td>
+                <td>30-100ms</td>
+                <td>Fewer views = faster layout</td>
+            </tr>
+            <tr>
+                <td>Avoid synchronous network/disk on main thread</td>
+                <td>0-2000ms</td>
+                <td>Move to background, show placeholder</td>
+            </tr>
+            <tr>
+                <td>Pre-warm on background thread</td>
+                <td>50-150ms</td>
+                <td>Start data loading before UI needs it</td>
+            </tr>
+            <tr>
+                <td>Reduce Auto Layout complexity</td>
+                <td>20-80ms</td>
+                <td>Fewer constraints, avoid priorities</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Deferred Initialization Pattern</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">AppLauncher</span> {
+    <span class="keyword">enum</span> <span class="type">Priority</span> {
+        <span class="keyword">case</span> critical    <span class="comment">// Before first frame</span>
+        <span class="keyword">case</span> high        <span class="comment">// First idle moment after launch</span>
+        <span class="keyword">case</span> medium      <span class="comment">// Within 2 seconds of launch</span>
+        <span class="keyword">case</span> low         <span class="comment">// When user first interacts</span>
+    }
+
+    <span class="keyword">private var</span> tasks: [(priority: <span class="type">Priority</span>, work: () -> <span class="type">Void</span>)] = []
+
+    <span class="keyword">func</span> <span class="func">register</span>(priority: <span class="type">Priority</span>, _ work: <span class="keyword">@escaping</span> () -> <span class="type">Void</span>) {
+        tasks.<span class="func">append</span>((priority, work))
+    }
+
+    <span class="keyword">func</span> <span class="func">executeCritical</span>() {
+        tasks.<span class="func">filter</span> { $0.priority == .critical }
+             .<span class="func">forEach</span> { $0.<span class="func">work</span>() }
+    }
+
+    <span class="keyword">func</span> <span class="func">executeDeferred</span>() {
+        <span class="comment">// Run after first frame is rendered</span>
+        <span class="type">DispatchQueue</span>.main.<span class="func">async</span> { [<span class="keyword">weak self</span>] <span class="keyword">in</span>
+            self?.tasks.<span class="func">filter</span> { $0.priority == .high }
+                       .<span class="func">forEach</span> { $0.<span class="func">work</span>() }
+        }
+
+        <span class="type">DispatchQueue</span>.main.<span class="func">asyncAfter</span>(deadline: .now() + <span class="number">2.0</span>) { [<span class="keyword">weak self</span>] <span class="keyword">in</span>
+            self?.tasks.<span class="func">filter</span> { $0.priority == .medium }
+                       .<span class="func">forEach</span> { $0.<span class="func">work</span>() }
+        }
+    }
+}
+
+<span class="comment">// Usage:</span>
+<span class="keyword">let</span> launcher = <span class="type">AppLauncher</span>()
+launcher.<span class="func">register</span>(priority: .critical) { <span class="type">CrashReporter</span>.<span class="func">start</span>() }
+launcher.<span class="func">register</span>(priority: .high)     { <span class="type">Analytics</span>.<span class="func">configure</span>() }
+launcher.<span class="func">register</span>(priority: .medium)   { <span class="type">AdSDK</span>.<span class="func">initialize</span>() }
+launcher.<span class="func">register</span>(priority: .low)      { <span class="type">FeatureFlags</span>.<span class="func">refresh</span>() }</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Launch Time Regression Testing</div>
+        <p>Add launch time to your CI pipeline: (1) Use <code>XCTMetric</code> with <code>XCTApplicationLaunchMetric</code> in performance tests, (2) Set a budget (e.g., 400ms cold launch), (3) Fail the build if launch time regresses beyond the budget, (4) Track trends over time with MetricKit data from production.</p>
+    </div>
+
+    <pre><code><span class="keyword">import</span> <span class="type">XCTest</span>
+
+<span class="keyword">class</span> <span class="type">LaunchPerformanceTests</span>: <span class="type">XCTestCase</span> {
+    <span class="keyword">func</span> <span class="func">testLaunchPerformance</span>() {
+        <span class="func">measure</span>(metrics: [<span class="type">XCTApplicationLaunchMetric</span>()]) {
+            <span class="type">XCUIApplication</span>().<span class="func">launch</span>()
+        }
+    }
+}</code></pre>
+
+    <div class="nav-footer">
+        <a href="04-jetsam-memory-pressure.html">← Previous: Jetsam</a>
+        <a href="06-instruments-profiling.html">Next: Instruments &amp; Profiling →</a>
+    </div>
+</div>
+</body>
+</html>

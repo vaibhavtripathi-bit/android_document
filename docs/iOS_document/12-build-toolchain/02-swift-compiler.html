@@ -1,0 +1,927 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Swift Compiler Pipeline — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Build &amp; Toolchain</a><span class="sep">›</span>
+        Swift Compiler Pipeline
+    </nav>
+
+    <h1>Swift Compiler Pipeline</h1>
+    <p class="subtitle">From source text to machine code — the complete Swift compilation pipeline including parsing, AST construction, type checking, SIL generation and optimization, LLVM IR lowering, and machine code emission. Understanding this pipeline is essential for writing code that compiles fast and runs fast.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#overview">1. Compilation Pipeline Overview</a></li>
+            <li><a href="#parsing">2. Parsing &amp; AST</a></li>
+            <li><a href="#type-checking">3. Type Checking &amp; Semantic Analysis</a></li>
+            <li><a href="#sil">4. SIL (Swift Intermediate Language)</a></li>
+            <li><a href="#sil-optimizations">5. SIL Optimization Passes</a></li>
+            <li><a href="#llvm">6. LLVM IR &amp; Machine Code</a></li>
+            <li><a href="#wmo">7. Whole Module Optimization vs Incremental</a></li>
+            <li><a href="#inlinable">8. @inlinable and @usableFromInline</a></li>
+            <li><a href="#compile-time">9. Compile Time Analysis</a></li>
+            <li><a href="#architect">10. Architect: Writing Faster-Compiling Code</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="overview">1. Compilation Pipeline Overview</h2>
+
+    <p>The Swift compiler (<code>swiftc</code>) transforms source code through a series of well-defined stages. Each stage produces an intermediate representation that feeds into the next. Understanding these stages helps you reason about compiler behavior, optimization opportunities, and compile-time performance.</p>
+
+    <div class="diagram">
+┌──────────────────────────────────────────────────────────────────────┐
+│                    Swift Compilation Pipeline                         │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  Source Code (.swift)                                                 │
+│       │                                                               │
+│       ▼                                                               │
+│  ┌─────────────┐                                                      │
+│  │   Lexer     │  Tokenization: source text → tokens                  │
+│  └──────┬──────┘                                                      │
+│         ▼                                                             │
+│  ┌─────────────┐                                                      │
+│  │   Parser    │  Tokens → Abstract Syntax Tree (AST)                 │
+│  └──────┬──────┘                                                      │
+│         ▼                                                             │
+│  ┌─────────────┐                                                      │
+│  │   Sema      │  Type checking, name resolution, constraint solving  │
+│  │ (Semantic   │  This is where most compile time is spent            │
+│  │  Analysis)  │                                                      │
+│  └──────┬──────┘                                                      │
+│         ▼                                                             │
+│  ┌─────────────┐                                                      │
+│  │  SILGen     │  AST → Raw SIL (Swift Intermediate Language)         │
+│  └──────┬──────┘                                                      │
+│         ▼                                                             │
+│  ┌─────────────┐                                                      │
+│  │ SIL Passes  │  Mandatory passes: diagnostics, ownership checking   │
+│  │ (Mandatory) │  Runs at all optimization levels                     │
+│  └──────┬──────┘                                                      │
+│         ▼                                                             │
+│  ┌─────────────┐                                                      │
+│  │ SIL Passes  │  ARC optimization, devirtualization, inlining,       │
+│  │ (Optimize)  │  generic specialization (only with -O/-Osize)        │
+│  └──────┬──────┘                                                      │
+│         ▼                                                             │
+│  ┌─────────────┐                                                      │
+│  │  IRGen      │  SIL → LLVM IR                                       │
+│  └──────┬──────┘                                                      │
+│         ▼                                                             │
+│  ┌─────────────┐                                                      │
+│  │ LLVM Passes │  Standard LLVM optimizations (register allocation,   │
+│  │             │  instruction selection, loop optimization, etc.)      │
+│  └──────┬──────┘                                                      │
+│         ▼                                                             │
+│  ┌─────────────┐                                                      │
+│  │  Backend    │  LLVM IR → Machine Code (.o object file)             │
+│  └─────────────┘                                                      │
+│                                                                       │
+└──────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>1.1 Inspecting Each Stage</h3>
+
+    <pre><code><span class="comment"># Emit tokens (lexer output)</span>
+swiftc -dump-parse MyFile.swift
+
+<span class="comment"># Emit AST (after parsing)</span>
+swiftc -dump-ast MyFile.swift
+
+<span class="comment"># Emit raw SIL (before optimization)</span>
+swiftc -emit-silgen MyFile.swift -o MyFile.rawsil
+
+<span class="comment"># Emit canonical SIL (after mandatory passes)</span>
+swiftc -emit-sil MyFile.swift -o MyFile.sil
+
+<span class="comment"># Emit optimized SIL (after optimization passes)</span>
+swiftc -emit-sil -O MyFile.swift -o MyFile.optsil
+
+<span class="comment"># Emit LLVM IR</span>
+swiftc -emit-ir MyFile.swift -o MyFile.ll
+
+<span class="comment"># Emit assembly</span>
+swiftc -emit-assembly MyFile.swift -o MyFile.s
+
+<span class="comment"># Emit object file</span>
+swiftc -emit-object MyFile.swift -o MyFile.o</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="parsing">2. Parsing &amp; AST</h2>
+
+    <p>The parser transforms a stream of tokens into an Abstract Syntax Tree (AST). Swift's parser is a recursive-descent parser that can handle Swift's complex grammar including trailing closures, operator precedence, and result builders.</p>
+
+    <h3>2.1 Lexer → Tokens</h3>
+
+    <pre><code><span class="comment">// Source code</span>
+<span class="keyword">func</span> <span class="func">add</span>(_ a: <span class="type">Int</span>, _ b: <span class="type">Int</span>) -> <span class="type">Int</span> {
+    <span class="keyword">return</span> a + b
+}
+
+<span class="comment">// Tokenized as:</span>
+<span class="comment">// kw_func  identifier("add")  l_paren  kw__  identifier("a")  colon</span>
+<span class="comment">// identifier("Int")  comma  kw__  identifier("b")  colon</span>
+<span class="comment">// identifier("Int")  r_paren  arrow  identifier("Int")  l_brace</span>
+<span class="comment">// kw_return  identifier("a")  oper_binary_unspaced("+")  identifier("b")</span>
+<span class="comment">// r_brace</span></code></pre>
+
+    <h3>2.2 AST Structure</h3>
+
+    <p>The AST represents the syntactic structure of the program. Each node corresponds to a language construct. The AST is <strong>untyped</strong> at this stage — type information is added during semantic analysis.</p>
+
+    <div class="diagram">
+AST for: func add(_ a: Int, _ b: Int) -> Int { return a + b }
+
+FuncDecl "add"
+├── ParameterList
+│   ├── ParamDecl "a"
+│   │   └── TypeRepr "Int"
+│   └── ParamDecl "b"
+│       └── TypeRepr "Int"
+├── ReturnType
+│   └── TypeRepr "Int"
+└── BraceStmt (body)
+    └── ReturnStmt
+        └── BinaryExpr "+"
+            ├── DeclRefExpr "a"
+            └── DeclRefExpr "b"
+    </div>
+
+    <h3>2.3 Key Parser Features</h3>
+
+    <ul>
+        <li><strong>Error recovery</strong> — The parser continues after errors, producing partial ASTs for better diagnostics</li>
+        <li><strong>Incremental parsing</strong> — swift-syntax can re-parse only changed regions (used by SourceKit)</li>
+        <li><strong>Result builder transformation</strong> — @ViewBuilder and similar are desugared during parsing into nested closure calls</li>
+        <li><strong>Macro expansion</strong> — Swift 5.9 macros are expanded after parsing, producing new AST nodes</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2 id="type-checking">3. Type Checking &amp; Semantic Analysis</h2>
+
+    <p>The semantic analysis phase (called "Sema") is the most complex and time-consuming part of the compiler. It performs name resolution, type inference, constraint solving, and protocol conformance checking.</p>
+
+    <h3>3.1 Constraint-Based Type Inference</h3>
+
+    <p>Swift uses a <strong>constraint solver</strong> for type inference. For each expression, the compiler generates a system of type constraints and solves them simultaneously. This is powerful but can be exponentially expensive for complex expressions.</p>
+
+    <pre><code><span class="comment">// Simple — few constraints</span>
+<span class="keyword">let</span> x = <span class="number">42</span>  <span class="comment">// T0 = IntegerLiteralType, T0 conforms to ExpressibleByIntegerLiteral</span>
+              <span class="comment">// Solution: T0 = Int</span>
+
+<span class="comment">// Complex — many constraints interact</span>
+<span class="keyword">let</span> result = [<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>]
+    .<span class="func">map</span> { $0 * <span class="number">2</span> }
+    .<span class="func">filter</span> { $0 > <span class="number">3</span> }
+    .<span class="func">reduce</span>(<span class="number">0</span>, +)
+<span class="comment">// Constraints: array literal type, closure parameter types, return types,</span>
+<span class="comment">// operator overload resolution for *, >, + — all solved simultaneously</span>
+
+<span class="comment">// Pathological — exponential constraint solving</span>
+<span class="keyword">let</span> bad = <span class="number">1</span> + <span class="number">2</span> + <span class="number">3</span> + <span class="number">4</span> + <span class="number">5</span> + <span class="number">6</span> + <span class="number">7</span> + <span class="number">8</span> + <span class="number">9</span> + <span class="number">10</span>
+<span class="comment">// Each + has multiple overloads → combinatorial explosion</span>
+<span class="comment">// Fix: break into sub-expressions or add type annotations</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Type Checker Explosion</div>
+        <p>The constraint solver's worst-case complexity is exponential in the number of overloaded operators in a single expression. Long chains of <code>+</code> on numeric literals, complex dictionary literals, and deeply nested closures without type annotations are the most common culprits. The compiler has a 15-second timeout per expression (configurable with <code>-solver-expression-time-limit</code>).</p>
+    </div>
+
+    <h3>3.2 What Sema Checks</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Check</th>
+                <th>Description</th>
+                <th>Compile Time Impact</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Name resolution</td>
+                <td>Resolving identifiers to declarations</td>
+                <td>Low — mostly hash lookups</td>
+            </tr>
+            <tr>
+                <td>Type inference</td>
+                <td>Constraint solving for expressions</td>
+                <td>High — can be exponential</td>
+            </tr>
+            <tr>
+                <td>Overload resolution</td>
+                <td>Selecting the right function overload</td>
+                <td>Medium-High — combinatorial</td>
+            </tr>
+            <tr>
+                <td>Protocol conformance</td>
+                <td>Verifying types satisfy protocol requirements</td>
+                <td>Medium — witness table lookup</td>
+            </tr>
+            <tr>
+                <td>Generic constraint checking</td>
+                <td>Verifying generic where clauses</td>
+                <td>Medium — depends on constraint complexity</td>
+            </tr>
+            <tr>
+                <td>Access control</td>
+                <td>Verifying visibility rules</td>
+                <td>Low</td>
+            </tr>
+            <tr>
+                <td>Availability checking</td>
+                <td>Verifying API availability for deployment target</td>
+                <td>Low</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="sil">4. SIL (Swift Intermediate Language)</h2>
+
+    <p>SIL is Swift's unique intermediate representation that sits between the AST and LLVM IR. It's the key innovation that enables Swift-specific optimizations that LLVM alone cannot perform — particularly ARC optimization and protocol devirtualization.</p>
+
+    <h3>4.1 Why SIL Exists</h3>
+
+    <p>LLVM IR is too low-level to represent Swift semantics like reference counting, protocol dispatch, and value types with copy-on-write. SIL preserves these high-level semantics so the optimizer can reason about them before lowering to LLVM IR.</p>
+
+    <div class="diagram">
+Why not go directly from AST to LLVM IR?
+
+AST → LLVM IR (hypothetical):
+  • ARC operations become opaque function calls — LLVM can't optimize them
+  • Protocol dispatch becomes indirect calls — LLVM can't devirtualize
+  • Value semantics lost — LLVM can't optimize copy-on-write
+  • Generic code stays generic — LLVM can't specialize
+
+AST → SIL → LLVM IR (actual):
+  • ARC operations are first-class SIL instructions — optimizer can eliminate redundant ones
+  • Protocol dispatch is explicit — optimizer can devirtualize with type info
+  • Value semantics preserved — optimizer can eliminate unnecessary copies
+  • Generics explicit — optimizer can specialize for concrete types
+    </div>
+
+    <h3>4.2 SIL Syntax</h3>
+
+    <pre><code><span class="comment">// Swift source</span>
+<span class="keyword">func</span> <span class="func">increment</span>(_ x: <span class="type">Int</span>) -> <span class="type">Int</span> {
+    <span class="keyword">return</span> x + <span class="number">1</span>
+}
+
+<span class="comment">// Raw SIL (simplified)</span>
+sil @$s4main9incrementySiSiF : $@convention(thin) (Int) -> Int {
+bb0(%0 : $Int):
+  %1 = integer_literal $Builtin.IntLiteral, 1
+  %2 = struct_extract %0 : $Int, #Int._value
+  %3 = builtin "sadd_with_overflow_Int64"(%2, %1) : $(Builtin.Int64, Builtin.Int1)
+  %4 = tuple_extract %3, 0
+  %5 = struct $Int (%4 : $Builtin.Int64)
+  return %5 : $Int
+}</code></pre>
+
+    <h3>4.3 Key SIL Concepts</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Concept</th>
+                <th>Description</th>
+                <th>Example</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>strong_retain</code> / <code>strong_release</code></td>
+                <td>ARC operations as first-class instructions</td>
+                <td><code>strong_retain %0 : $MyClass</code></td>
+            </tr>
+            <tr>
+                <td><code>witness_method</code></td>
+                <td>Protocol method dispatch through witness table</td>
+                <td><code>witness_method $T, #Hashable.hash</code></td>
+            </tr>
+            <tr>
+                <td><code>class_method</code></td>
+                <td>Virtual method dispatch through vtable</td>
+                <td><code>class_method %0, #Base.foo</code></td>
+            </tr>
+            <tr>
+                <td><code>alloc_stack</code> / <code>alloc_ref</code></td>
+                <td>Stack vs heap allocation</td>
+                <td><code>alloc_stack $MyStruct</code></td>
+            </tr>
+            <tr>
+                <td><code>copy_value</code> / <code>destroy_value</code></td>
+                <td>Ownership operations</td>
+                <td><code>copy_value %0 : $MyClass</code></td>
+            </tr>
+            <tr>
+                <td><code>begin_access</code> / <code>end_access</code></td>
+                <td>Exclusivity enforcement</td>
+                <td><code>begin_access [modify] %0</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>4.4 SIL for ARC — A Detailed Example</h3>
+
+    <pre><code><span class="comment">// Swift source</span>
+<span class="keyword">func</span> <span class="func">processUser</span>(_ user: <span class="type">User</span>) {
+    <span class="keyword">let</span> name = user.name     <span class="comment">// retain user, load name, retain name</span>
+    <span class="func">print</span>(name)              <span class="comment">// use name</span>
+}                            <span class="comment">// release name, release user</span>
+
+<span class="comment">// Raw SIL (conceptual)</span>
+sil @processUser : $@convention(thin) (@guaranteed User) -> () {
+bb0(%0 : $User):
+  strong_retain %0 : $User                    <span class="comment">// +1 user</span>
+  %name = ref_element_addr %0, #User.name     <span class="comment">// get name field addr</span>
+  %name_val = load %name : $*String           <span class="comment">// load name</span>
+  strong_retain %name_val : $String            <span class="comment">// +1 name</span>
+  %print = function_ref @print                 <span class="comment">// get print function</span>
+  apply %print(%name_val)                      <span class="comment">// call print</span>
+  strong_release %name_val : $String           <span class="comment">// -1 name</span>
+  strong_release %0 : $User                    <span class="comment">// -1 user</span>
+  %void = tuple ()
+  return %void : $()
+}
+
+<span class="comment">// After ARC optimization — redundant retain/release eliminated</span>
+sil @processUser : $@convention(thin) (@guaranteed User) -> () {
+bb0(%0 : $User):
+  %name = ref_element_addr %0, #User.name
+  %name_val = load %name : $*String
+  %print = function_ref @print
+  apply %print(%name_val)
+  %void = tuple ()
+  return %void : $()
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">SIL Ownership Model</div>
+        <p>SIL has a formal ownership model with four conventions: <code>@owned</code> (caller transfers ownership), <code>@guaranteed</code> (caller retains ownership, callee borrows), <code>@unowned</code> (no ownership), and <code>@in</code>/<code>@inout</code> for indirect values. This model enables the compiler to prove ARC operations are redundant and eliminate them.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="sil-optimizations">5. SIL Optimization Passes</h2>
+
+    <p>SIL optimization passes are the heart of Swift's performance story. They operate on the SIL representation where Swift semantics are still visible, enabling optimizations that would be impossible at the LLVM IR level.</p>
+
+    <h3>5.1 Mandatory Passes (Always Run)</h3>
+
+    <p>These run even at <code>-Onone</code> and are required for correctness:</p>
+
+    <ul>
+        <li><strong>Definite Initialization</strong> — Verifies all variables are initialized before use</li>
+        <li><strong>Ownership Verification</strong> — Checks SIL ownership invariants</li>
+        <li><strong>Exclusivity Enforcement</strong> — Verifies memory access exclusivity (no simultaneous read/write)</li>
+        <li><strong>Diagnostic Passes</strong> — Emit warnings and errors based on SIL analysis</li>
+        <li><strong>Mandatory Inlining</strong> — Inlines <code>@_transparent</code> functions (like operator wrappers)</li>
+    </ul>
+
+    <h3>5.2 Optimization Passes (Run with -O/-Osize)</h3>
+
+    <h4>ARC Optimization</h4>
+
+    <pre><code><span class="comment">// Before ARC optimization</span>
+<span class="keyword">func</span> <span class="func">example</span>(_ obj: <span class="type">MyClass</span>) {
+    <span class="comment">// SIL: strong_retain obj</span>
+    <span class="keyword">let</span> x = obj
+    <span class="comment">// SIL: strong_retain obj (for x)</span>
+    <span class="func">use</span>(x)
+    <span class="comment">// SIL: strong_release x</span>
+    <span class="comment">// SIL: strong_release obj</span>
+}
+
+<span class="comment">// After ARC optimization — retains/releases eliminated</span>
+<span class="comment">// The optimizer proves obj stays alive for the entire function,</span>
+<span class="comment">// so x doesn't need its own retain/release pair.</span></code></pre>
+
+    <h4>Devirtualization</h4>
+
+    <pre><code><span class="comment">// Before devirtualization</span>
+<span class="keyword">protocol</span> <span class="type">Drawable</span> {
+    <span class="keyword">func</span> <span class="func">draw</span>()
+}
+
+<span class="keyword">struct</span> <span class="type">Circle</span>: <span class="type">Drawable</span> {
+    <span class="keyword">func</span> <span class="func">draw</span>() { <span class="comment">/* ... */</span> }
+}
+
+<span class="keyword">func</span> <span class="func">render</span>(_ shape: <span class="keyword">some</span> <span class="type">Drawable</span>) {
+    shape.<span class="func">draw</span>()  <span class="comment">// SIL: witness_method $T, #Drawable.draw (indirect call)</span>
+}
+
+<span class="func">render</span>(<span class="type">Circle</span>())
+
+<span class="comment">// After devirtualization + specialization</span>
+<span class="comment">// The optimizer sees render() is called with Circle,</span>
+<span class="comment">// specializes the function, and replaces the witness_method</span>
+<span class="comment">// call with a direct function call to Circle.draw()</span>
+<span class="comment">// SIL: function_ref @Circle.draw (direct call — no overhead)</span></code></pre>
+
+    <h4>Generic Specialization</h4>
+
+    <pre><code><span class="comment">// Generic function</span>
+<span class="keyword">func</span> <span class="func">swap</span>&lt;<span class="type">T</span>&gt;(_ a: <span class="keyword">inout</span> <span class="type">T</span>, _ b: <span class="keyword">inout</span> <span class="type">T</span>) {
+    <span class="keyword">let</span> temp = a
+    a = b
+    b = temp
+}
+
+<span class="comment">// Call sites</span>
+<span class="keyword">var</span> x = <span class="number">1</span>, y = <span class="number">2</span>
+<span class="func">swap</span>(&amp;x, &amp;y)  <span class="comment">// T = Int</span>
+
+<span class="keyword">var</span> s1 = <span class="string">"hello"</span>, s2 = <span class="string">"world"</span>
+<span class="func">swap</span>(&amp;s1, &amp;s2)  <span class="comment">// T = String</span>
+
+<span class="comment">// After generic specialization, the compiler generates:</span>
+<span class="comment">// swap_Int(inout Int, inout Int)     — specialized for Int</span>
+<span class="comment">// swap_String(inout String, inout String) — specialized for String</span>
+<span class="comment">// Direct value manipulation, no witness tables, no type metadata</span></code></pre>
+
+    <h4>Function Inlining</h4>
+
+    <pre><code><span class="comment">// Before inlining</span>
+<span class="keyword">@inline</span>(__always)
+<span class="keyword">func</span> <span class="func">isEven</span>(_ n: <span class="type">Int</span>) -> <span class="type">Bool</span> {
+    <span class="keyword">return</span> n % <span class="number">2</span> == <span class="number">0</span>
+}
+
+<span class="keyword">func</span> <span class="func">process</span>(_ values: [<span class="type">Int</span>]) -> [<span class="type">Int</span>] {
+    <span class="keyword">return</span> values.<span class="func">filter</span>(<span class="func">isEven</span>)
+}
+
+<span class="comment">// After inlining — isEven body is substituted at the call site</span>
+<span class="comment">// No function call overhead, enables further optimizations</span></code></pre>
+
+    <h3>5.3 Optimization Pass Pipeline</h3>
+
+    <div class="diagram">
+SIL Optimization Pipeline:
+
+Raw SIL
+  │
+  ├─ Mandatory Passes
+  │   ├─ Definite initialization
+  │   ├─ Ownership verification
+  │   ├─ Access marker elimination
+  │   └─ Mandatory inlining (@_transparent)
+  │
+  ▼
+Canonical SIL
+  │
+  ├─ Early Optimization Passes (if -O/-Osize)
+  │   ├─ Generic specialization
+  │   ├─ Devirtualization (class + protocol)
+  │   ├─ Function signature optimization
+  │   └─ Closure specialization
+  │
+  ├─ Mid-Level Passes
+  │   ├─ ARC optimization (retain/release elimination)
+  │   ├─ Copy-on-write optimization
+  │   ├─ Stack promotion (heap → stack for escaping closures)
+  │   ├─ Dead code elimination
+  │   └─ Constant propagation
+  │
+  ├─ Late Passes
+  │   ├─ Function inlining (cost-based heuristic)
+  │   ├─ Late devirtualization
+  │   ├─ Code motion
+  │   └─ Final ARC optimization
+  │
+  ▼
+Optimized SIL → IRGen → LLVM IR
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="llvm">6. LLVM IR &amp; Machine Code</h2>
+
+    <p>After SIL optimization, the IRGen phase lowers SIL to LLVM IR. LLVM then applies its own optimization passes and generates machine code for the target architecture.</p>
+
+    <h3>6.1 SIL → LLVM IR Lowering</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>SIL Concept</th>
+                <th>LLVM IR Representation</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Swift struct</td>
+                <td>LLVM struct (passed by value or pointer)</td>
+            </tr>
+            <tr>
+                <td>Swift class</td>
+                <td>Pointer to heap-allocated struct with metadata</td>
+            </tr>
+            <tr>
+                <td><code>strong_retain</code></td>
+                <td>Call to <code>swift_retain</code> runtime function</td>
+            </tr>
+            <tr>
+                <td><code>witness_method</code></td>
+                <td>Load from witness table + indirect call</td>
+            </tr>
+            <tr>
+                <td><code>class_method</code></td>
+                <td>Load from vtable + indirect call</td>
+            </tr>
+            <tr>
+                <td>Protocol existential</td>
+                <td>Inline buffer (3 words) + metadata + witness table pointer</td>
+            </tr>
+            <tr>
+                <td>Generic function</td>
+                <td>Function taking type metadata + witness tables as hidden params</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>6.2 LLVM Optimizations</h3>
+
+    <p>LLVM applies architecture-independent and architecture-specific optimizations:</p>
+
+    <ul>
+        <li><strong>Instruction combining</strong> — Simplify instruction sequences</li>
+        <li><strong>Loop optimizations</strong> — Unrolling, vectorization, loop-invariant code motion</li>
+        <li><strong>Register allocation</strong> — Map virtual registers to physical registers</li>
+        <li><strong>Instruction scheduling</strong> — Reorder for pipeline efficiency</li>
+        <li><strong>Auto-vectorization</strong> — Use SIMD instructions (NEON on ARM)</li>
+        <li><strong>Tail call optimization</strong> — Convert tail calls to jumps</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2 id="wmo">7. Whole Module Optimization vs Incremental</h2>
+
+    <p>The compilation mode determines the scope of information available to the optimizer. This is one of the most impactful build settings for both build time and runtime performance.</p>
+
+    <h3>7.1 Incremental Compilation</h3>
+
+    <div class="diagram">
+Incremental Mode: Each file compiled separately
+
+Module "MyApp" (4 files):
+
+  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+  │ A.swift  │    │ B.swift  │    │ C.swift  │    │ D.swift  │
+  │          │    │          │    │          │    │          │
+  │ class Foo│    │ class Bar│    │ func baz │    │ func qux │
+  │  func f()│    │  func g()│    │  uses Foo│    │  uses Bar│
+  └────┬─────┘    └────┬─────┘    └────┬─────┘    └────┬─────┘
+       │               │               │               │
+    swiftc           swiftc          swiftc          swiftc
+   (primary A)     (primary B)    (primary C)     (primary D)
+       │               │               │               │
+     A.o             B.o             C.o             D.o
+
+  Optimizer for C.swift:
+  • Sees Foo's interface but NOT its implementation
+  • Cannot inline Foo.f() into baz()
+  • Cannot devirtualize Foo.f() (might be overridden in another file)
+    </div>
+
+    <h3>7.2 Whole Module Optimization</h3>
+
+    <div class="diagram">
+Whole Module Mode: All files compiled together
+
+Module "MyApp" (4 files):
+
+  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+  │ A.swift  │  │ B.swift  │  │ C.swift  │  │ D.swift  │
+  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘
+       │             │              │              │
+       └─────────────┼──────────────┼──────────────┘
+                     │
+               Single swiftc
+            (sees ALL files)
+                     │
+       ┌─────────────┼──────────────┬──────────────┐
+       │             │              │              │
+     A.o           B.o            C.o            D.o
+
+  Optimizer for C.swift:
+  • Sees Foo's full implementation
+  • CAN inline Foo.f() into baz()
+  • CAN devirtualize if Foo has no subclasses in module
+  • CAN specialize generics for concrete types used in module
+    </div>
+
+    <h3>7.3 Performance Impact</h3>
+
+    <pre><code><span class="comment">// This code benefits dramatically from WMO</span>
+<span class="keyword">protocol</span> <span class="type">DataProcessor</span> {
+    <span class="keyword">func</span> <span class="func">process</span>(_ data: <span class="type">Data</span>) -> <span class="type">ProcessedData</span>
+}
+
+<span class="keyword">final class</span> <span class="type">JSONProcessor</span>: <span class="type">DataProcessor</span> {
+    <span class="keyword">func</span> <span class="func">process</span>(_ data: <span class="type">Data</span>) -> <span class="type">ProcessedData</span> {
+        <span class="comment">// ... implementation ...</span>
+    }
+}
+
+<span class="comment">// In another file:</span>
+<span class="keyword">func</span> <span class="func">handleData</span>&lt;<span class="type">P</span>: <span class="type">DataProcessor</span>&gt;(_ processor: <span class="type">P</span>, data: <span class="type">Data</span>) -> <span class="type">ProcessedData</span> {
+    <span class="keyword">return</span> processor.<span class="func">process</span>(data)
+}
+
+<span class="comment">// Call site</span>
+<span class="keyword">let</span> result = <span class="func">handleData</span>(<span class="type">JSONProcessor</span>(), data: myData)
+
+<span class="comment">// With WMO, the compiler:</span>
+<span class="comment">// 1. Specializes handleData for JSONProcessor</span>
+<span class="comment">// 2. Devirtualizes processor.process() to direct call</span>
+<span class="comment">// 3. Potentially inlines JSONProcessor.process()</span>
+<span class="comment">// Result: zero abstraction overhead</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="inlinable">8. @inlinable and @usableFromInline</h2>
+
+    <p>These attributes control cross-module optimization by exposing function bodies in the module's <code>.swiftinterface</code> file.</p>
+
+    <h3>8.1 @inlinable</h3>
+
+    <pre><code><span class="comment">// In a framework module</span>
+<span class="keyword">public struct</span> <span class="type">Vector2D</span> {
+    <span class="keyword">public var</span> x: <span class="type">Double</span>
+    <span class="keyword">public var</span> y: <span class="type">Double</span>
+
+    <span class="keyword">@inlinable</span>
+    <span class="keyword">public var</span> magnitude: <span class="type">Double</span> {
+        <span class="keyword">return</span> (x * x + y * y).<span class="func">squareRoot</span>()
+    }
+
+    <span class="keyword">@inlinable</span>
+    <span class="keyword">public func</span> <span class="func">distance</span>(to other: <span class="type">Vector2D</span>) -> <span class="type">Double</span> {
+        <span class="keyword">let</span> dx = x - other.x
+        <span class="keyword">let</span> dy = y - other.y
+        <span class="keyword">return</span> (dx * dx + dy * dy).<span class="func">squareRoot</span>()
+    }
+}
+
+<span class="comment">// In the app module — compiler can inline these across module boundary</span>
+<span class="keyword">let</span> v = <span class="type">Vector2D</span>(x: <span class="number">3</span>, y: <span class="number">4</span>)
+<span class="keyword">let</span> m = v.magnitude  <span class="comment">// Can be inlined → (3*3 + 4*4).squareRoot()</span></code></pre>
+
+    <h3>8.2 @usableFromInline</h3>
+
+    <pre><code><span class="keyword">public struct</span> <span class="type">Cache</span>&lt;<span class="type">Key</span>: <span class="type">Hashable</span>, <span class="type">Value</span>&gt; {
+    <span class="comment">// Internal storage, but accessible from @inlinable functions</span>
+    <span class="keyword">@usableFromInline</span>
+    <span class="keyword">internal var</span> storage: [<span class="type">Key</span>: <span class="type">Value</span>]
+
+    <span class="keyword">@inlinable</span>
+    <span class="keyword">public subscript</span>(key: <span class="type">Key</span>) -> <span class="type">Value</span>? {
+        <span class="keyword">get</span> { <span class="keyword">return</span> storage[key] }
+        <span class="keyword">set</span> { storage[key] = newValue }
+    }
+}</code></pre>
+
+    <h3>8.3 Tradeoffs</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>@inlinable</th>
+                <th>Non-inlinable (default)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Cross-module optimization</td>
+                <td>Yes — body available to clients</td>
+                <td>No — opaque function call</td>
+            </tr>
+            <tr>
+                <td>ABI stability</td>
+                <td>Body becomes part of ABI contract</td>
+                <td>Only signature is ABI</td>
+            </tr>
+            <tr>
+                <td>Binary size</td>
+                <td>Larger (body duplicated in clients)</td>
+                <td>Smaller (single copy)</td>
+            </tr>
+            <tr>
+                <td>Framework updates</td>
+                <td>Clients must recompile to get changes</td>
+                <td>Clients get changes automatically</td>
+            </tr>
+            <tr>
+                <td>Best for</td>
+                <td>Small, hot-path functions (stdlib, math)</td>
+                <td>Complex functions, evolving APIs</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">@inlinable ABI Contract</div>
+        <p>Once you mark a function <code>@inlinable</code>, its body becomes part of your module's ABI. Clients may have inlined the old body, so changing the implementation without recompiling clients can lead to inconsistent behavior. Only use <code>@inlinable</code> for stable, performance-critical functions.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="compile-time">9. Compile Time Analysis</h2>
+
+    <p>Understanding what makes Swift code slow to compile is essential for maintaining developer productivity on large projects.</p>
+
+    <h3>9.1 Measuring Compile Times</h3>
+
+    <pre><code><span class="comment"># Per-function compile time (functions taking > 100ms)</span>
+<span class="comment"># Add to OTHER_SWIFT_FLAGS:</span>
+-Xfrontend -warn-long-function-bodies=100
+
+<span class="comment"># Per-expression compile time (expressions taking > 100ms)</span>
+-Xfrontend -warn-long-expression-type-checking=100
+
+<span class="comment"># Detailed timing for each compilation phase</span>
+-Xfrontend -debug-time-compilation
+
+<span class="comment"># Type checker statistics</span>
+-Xfrontend -debug-time-expression-type-checking</code></pre>
+
+    <h3>9.2 Common Compile-Time Bottlenecks</h3>
+
+    <pre><code><span class="comment">// SLOW: Long operator chains without type context</span>
+<span class="keyword">let</span> sum = a + b + c + d + e + f + g + h + i + j
+<span class="comment">// Fix: Break into sub-expressions</span>
+<span class="keyword">let</span> sum1 = a + b + c + d + e
+<span class="keyword">let</span> sum2 = f + g + h + i + j
+<span class="keyword">let</span> sum = sum1 + sum2
+
+<span class="comment">// SLOW: Complex dictionary literals</span>
+<span class="keyword">let</span> config: [<span class="type">String</span>: <span class="type">Any</span>] = [
+    <span class="string">"key1"</span>: value1, <span class="string">"key2"</span>: value2, <span class="comment">/* ... 20 more ... */</span>
+]
+<span class="comment">// Fix: Add explicit type or build incrementally</span>
+<span class="keyword">var</span> config = [<span class="type">String</span>: <span class="type">Any</span>]()
+config[<span class="string">"key1"</span>] = value1
+config[<span class="string">"key2"</span>] = value2
+
+<span class="comment">// SLOW: Closures without parameter types</span>
+<span class="keyword">let</span> result = items.<span class="func">reduce</span>(<span class="number">0</span>) { $0 + $1.value * $1.weight }
+<span class="comment">// Fix: Add closure parameter types</span>
+<span class="keyword">let</span> result = items.<span class="func">reduce</span>(<span class="number">0</span>) { (sum: <span class="type">Double</span>, item: <span class="type">Item</span>) -> <span class="type">Double</span> <span class="keyword">in</span>
+    sum + item.value * item.weight
+}
+
+<span class="comment">// SLOW: Ternary with different literal types</span>
+<span class="keyword">let</span> x = condition ? <span class="number">1.0</span> : <span class="number">0</span>  <span class="comment">// Double vs IntegerLiteral ambiguity</span>
+<span class="comment">// Fix: Make types explicit</span>
+<span class="keyword">let</span> x: <span class="type">Double</span> = condition ? <span class="number">1.0</span> : <span class="number">0.0</span></code></pre>
+
+    <h3>9.3 Generics vs Protocols vs Existentials — Compile Time</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Approach</th>
+                <th>Compile Time</th>
+                <th>Runtime Cost</th>
+                <th>Binary Size</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Concrete types</td>
+                <td>Fastest</td>
+                <td>Zero overhead</td>
+                <td>Smallest</td>
+            </tr>
+            <tr>
+                <td><code>some Protocol</code> (opaque)</td>
+                <td>Fast</td>
+                <td>Zero (specialized)</td>
+                <td>Moderate (specializations)</td>
+            </tr>
+            <tr>
+                <td><code>&lt;T: Protocol&gt;</code> (generic)</td>
+                <td>Moderate</td>
+                <td>Zero with WMO (specialized)</td>
+                <td>Larger (specializations)</td>
+            </tr>
+            <tr>
+                <td><code>any Protocol</code> (existential)</td>
+                <td>Fast</td>
+                <td>Indirect dispatch + boxing</td>
+                <td>Smallest (no specialization)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">10. Architect: Writing Faster-Compiling Code</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>At Staff level, you're responsible for build time across the entire team. A 5-minute build costs 100 engineers 500 minutes per build. Understanding compiler behavior lets you establish coding guidelines that keep builds fast as the codebase grows.</p>
+    </div>
+
+    <h3>10.1 Coding Guidelines for Fast Compilation</h3>
+
+    <ol>
+        <li><strong>Add explicit return types to public functions</strong> — The type checker doesn't need to infer them</li>
+        <li><strong>Add type annotations to complex closures</strong> — Especially in chains of map/filter/reduce</li>
+        <li><strong>Break long expressions into named sub-expressions</strong> — Reduces constraint solver scope</li>
+        <li><strong>Prefer <code>some Protocol</code> over <code>any Protocol</code></strong> — Enables specialization, reduces type-erasure overhead</li>
+        <li><strong>Use <code>final</code> on classes that won't be subclassed</strong> — Enables devirtualization without WMO</li>
+        <li><strong>Avoid <code>[String: Any]</code> dictionaries</strong> — Use typed structs instead</li>
+        <li><strong>Limit protocol conformance chains</strong> — Deep protocol hierarchies slow conformance checking</li>
+    </ol>
+
+    <h3>10.2 Module Architecture for Build Speed</h3>
+
+    <div class="diagram">
+Optimal Module Graph (wide and shallow):
+
+  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+  │ Feature A│  │ Feature B│  │ Feature C│  │ Feature D│  ← Independent
+  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘    (parallel build)
+       │             │              │              │
+       └─────────────┼──────────────┼──────────────┘
+                     │
+              ┌──────┴──────┐
+              │    Core     │  ← Shared foundation
+              └─────────────┘
+
+Suboptimal Module Graph (deep chain):
+
+  ┌──────────┐
+  │ Feature A│  ← Must wait for everything below
+  └────┬─────┘
+       │
+  ┌────┴─────┐
+  │ Feature B│  ← Must wait for C
+  └────┬─────┘
+       │
+  ┌────┴─────┐
+  │ Feature C│  ← Must wait for Core
+  └────┬─────┘
+       │
+  ┌────┴─────┐
+  │   Core   │  ← Builds first (serial bottleneck)
+  └──────────┘
+    </div>
+
+    <h3>10.3 Build Time Monitoring</h3>
+
+    <pre><code><span class="comment">// CI script to track build times over time</span>
+<span class="comment">#!/bin/bash</span>
+
+<span class="comment"># Build with timing</span>
+xcodebuild build \
+    -workspace MyApp.xcworkspace \
+    -scheme MyApp \
+    -configuration Debug \
+    -showBuildTimingSummary 2>&amp;1 | tee build_log.txt
+
+<span class="comment"># Extract total build time</span>
+TOTAL_TIME=$(grep <span class="string">"Build Timing Summary"</span> -A 100 build_log.txt | \
+    grep <span class="string">"Total"</span> | awk <span class="string">'{print $2}'</span>)
+
+<span class="comment"># Report to metrics system</span>
+curl -X POST <span class="string">"https://metrics.company.com/api/build-time"</span> \
+    -d <span class="string">"{\"time\": \"$TOTAL_TIME\", \"commit\": \"$(git rev-parse HEAD)\"}"</span></code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Compiler Flags Cheat Sheet</div>
+        <table>
+            <thead>
+                <tr><th>Flag</th><th>Purpose</th></tr>
+            </thead>
+            <tbody>
+                <tr><td><code>-Onone</code></td><td>No optimization (fastest compile, slowest runtime)</td></tr>
+                <tr><td><code>-O</code></td><td>Full optimization (slower compile, fastest runtime)</td></tr>
+                <tr><td><code>-Osize</code></td><td>Size optimization (smaller binary, slightly slower)</td></tr>
+                <tr><td><code>-emit-sil</code></td><td>Output SIL for inspection</td></tr>
+                <tr><td><code>-emit-ir</code></td><td>Output LLVM IR</td></tr>
+                <tr><td><code>-warn-long-function-bodies=N</code></td><td>Warn on functions taking &gt; N ms to type-check</td></tr>
+                <tr><td><code>-warn-long-expression-type-checking=N</code></td><td>Warn on expressions taking &gt; N ms</td></tr>
+                <tr><td><code>-debug-time-compilation</code></td><td>Print per-phase timing</td></tr>
+                <tr><td><code>-stats-output-dir DIR</code></td><td>Output detailed compiler statistics</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="nav-footer">
+        <a href="01-xcode-build-system.html">← Xcode Build System</a>
+        <a href="03-linker-dyld.html">Next: Linker &amp; dyld →</a>
+    </div>
+</div>
+</body>
+</html>

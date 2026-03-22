@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Memory Regions &amp; Allocation — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Memory &amp; Performance</a><span class="sep">›</span>
+        Memory Regions &amp; Allocation
+    </nav>
+
+    <h1>Memory Regions &amp; Allocation</h1>
+    <p class="subtitle">Stack vs heap, when value types escape to the heap, unsafe pointers, autorelease pools, and ObjC bridging costs — the allocation landscape for iOS.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#stack-vs-heap">Stack vs Heap Allocation</a></li>
+            <li><a href="#value-vs-ref">Value Types vs Reference Types</a></li>
+            <li><a href="#heap-promotion">When Value Types Go to the Heap</a></li>
+            <li><a href="#contiguous-array">ContiguousArray vs Array</a></li>
+            <li><a href="#managed-buffer">ManagedBuffer</a></li>
+            <li><a href="#unsafe-pointers">UnsafeBufferPointer Family</a></li>
+            <li><a href="#autorelease">Autorelease Pools</a></li>
+            <li><a href="#bridging-costs">ObjC Bridging Costs</a></li>
+            <li><a href="#tagged-pointers">Tagged Pointers for Small Objects</a></li>
+            <li><a href="#layout-optimization">Memory Layout Optimization</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="stack-vs-heap">Stack vs Heap Allocation</h2>
+
+    <div class="diagram">
+Process Memory Layout (simplified):
+┌──────────────────────────────┐ High addresses
+│         Stack                │ ← grows downward
+│  (function frames, locals)   │
+│         ↓                    │
+├──────────────────────────────┤
+│                              │
+│      (unmapped gap)          │
+│                              │
+├──────────────────────────────┤
+│         ↑                    │
+│         Heap                 │ ← grows upward
+│  (malloc'd objects, classes) │
+├──────────────────────────────┤
+│    Uninitialized Data (BSS)  │
+├──────────────────────────────┤
+│    Initialized Data          │
+│    (global vars, statics)    │
+├──────────────────────────────┤
+│    Text (Code)               │
+│    (read-only, executable)   │
+└──────────────────────────────┘ Low addresses
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Stack</th>
+                <th>Heap</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Allocation speed</td>
+                <td>~1 instruction (move stack pointer)</td>
+                <td>~100+ instructions (malloc search)</td>
+            </tr>
+            <tr>
+                <td>Deallocation</td>
+                <td>Automatic (function return)</td>
+                <td>Manual (free/ARC release)</td>
+            </tr>
+            <tr>
+                <td>Thread safety</td>
+                <td>Per-thread (no contention)</td>
+                <td>Shared (lock contention in malloc)</td>
+            </tr>
+            <tr>
+                <td>Size limit</td>
+                <td>~1MB main thread, ~512KB secondary</td>
+                <td>Limited by available memory</td>
+            </tr>
+            <tr>
+                <td>Fragmentation</td>
+                <td>None (LIFO)</td>
+                <td>Yes (requires compaction/coalescing)</td>
+            </tr>
+            <tr>
+                <td>Cache locality</td>
+                <td>Excellent (contiguous)</td>
+                <td>Poor (scattered)</td>
+            </tr>
+            <tr>
+                <td>What lives here</td>
+                <td>Local value types, function params, return addresses</td>
+                <td>Class instances, closures, escaped values</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="keyword">func</span> <span class="func">stackVsHeap</span>() {
+    <span class="comment">// Stack allocated (value type, doesn't escape)</span>
+    <span class="keyword">var</span> point = <span class="type">CGPoint</span>(x: <span class="number">10</span>, y: <span class="number">20</span>)  <span class="comment">// 16 bytes on stack</span>
+    <span class="keyword">var</span> numbers = (<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>)               <span class="comment">// Tuple on stack</span>
+
+    <span class="comment">// Heap allocated (reference type)</span>
+    <span class="keyword">let</span> view = <span class="type">UIView</span>()                    <span class="comment">// Object on heap</span>
+    <span class="keyword">let</span> array = [<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>]                  <span class="comment">// Buffer on heap</span>
+
+    <span class="comment">// Stack frame layout for this function:</span>
+    <span class="comment">// [return address] [saved registers] [point] [numbers] [view ptr] [array ptr]</span>
+    <span class="comment">//                                     ↑ stack  ↑ stack    ↑ heap     ↑ heap</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="value-vs-ref">Value Types vs Reference Types</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Characteristic</th>
+                <th>Value Types (struct, enum, tuple)</th>
+                <th>Reference Types (class, closure)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Default storage</td>
+                <td>Stack (inline)</td>
+                <td>Heap</td>
+            </tr>
+            <tr>
+                <td>Assignment</td>
+                <td>Copy (bitwise for simple types)</td>
+                <td>Reference copy (pointer)</td>
+            </tr>
+            <tr>
+                <td>Identity</td>
+                <td>No identity (value equality)</td>
+                <td>Has identity (<code>===</code>)</td>
+            </tr>
+            <tr>
+                <td>Reference counting</td>
+                <td>None (unless contains refs)</td>
+                <td>Yes (ARC)</td>
+            </tr>
+            <tr>
+                <td>Thread safety</td>
+                <td>Inherently safe (copies)</td>
+                <td>Requires synchronization</td>
+            </tr>
+            <tr>
+                <td>Polymorphism</td>
+                <td>Protocol-based (witness tables)</td>
+                <td>Inheritance-based (vtable)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>The Hidden Cost of Value Types with References</h3>
+
+    <pre><code><span class="comment">// This struct is NOT free to copy — it contains reference types</span>
+<span class="keyword">struct</span> <span class="type">Message</span> {
+    <span class="keyword">let</span> id: <span class="type">UUID</span>              <span class="comment">// 16 bytes, value type ✅</span>
+    <span class="keyword">let</span> text: <span class="type">String</span>           <span class="comment">// 16 bytes, but may heap-allocate buffer</span>
+    <span class="keyword">let</span> sender: <span class="type">User</span>          <span class="comment">// Class → retain on copy ⚠️</span>
+    <span class="keyword">let</span> attachments: [<span class="type">Data</span>]   <span class="comment">// Array buffer → retain on copy ⚠️</span>
+    <span class="keyword">let</span> metadata: [<span class="type">String</span>: <span class="type">Any</span>] <span class="comment">// Dictionary → retain on copy ⚠️</span>
+}
+
+<span class="comment">// Copying this struct triggers 3 retain operations</span>
+<span class="comment">// (sender, attachments buffer, metadata buffer)</span>
+<span class="keyword">let</span> copy = message  <span class="comment">// Not just a memcpy!</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Structs with Many References</div>
+        <p>A struct containing N reference-type properties requires N retain operations on copy and N release operations on destruction. For structs with many reference fields (e.g., a model with 10+ String properties), the copy cost can exceed that of a class. Profile before assuming "structs are always faster."</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="heap-promotion">When Value Types Go to the Heap</h2>
+
+    <p>Value types are not always stack-allocated. The compiler promotes them to the heap in several situations:</p>
+
+    <h3>1. Existential Containers (Protocol Types)</h3>
+
+    <pre><code><span class="keyword">protocol</span> <span class="type">Shape</span> {
+    <span class="keyword">func</span> <span class="func">area</span>() -> <span class="type">Double</span>
+}
+
+<span class="keyword">struct</span> <span class="type">Circle</span>: <span class="type">Shape</span> {
+    <span class="keyword">var</span> radius: <span class="type">Double</span>
+    <span class="keyword">func</span> <span class="func">area</span>() -> <span class="type">Double</span> { .pi * radius * radius }
+}
+
+<span class="keyword">struct</span> <span class="type">LargeShape</span>: <span class="type">Shape</span> {
+    <span class="keyword">var</span> a: <span class="type">Double</span>, b: <span class="type">Double</span>, c: <span class="type">Double</span>, d: <span class="type">Double</span>, e: <span class="type">Double</span>
+    <span class="keyword">func</span> <span class="func">area</span>() -> <span class="type">Double</span> { a * b }
+}
+
+<span class="comment">// Existential container layout (5 words = 40 bytes):</span>
+<span class="comment">// [value buffer: 3 words (24 bytes)] [value witness table ptr] [protocol witness table ptr]</span>
+
+<span class="keyword">let</span> shape1: <span class="type">Shape</span> = <span class="type">Circle</span>(radius: <span class="number">5</span>)
+<span class="comment">// Circle fits in 24-byte inline buffer (1 Double = 8 bytes) → stack</span>
+
+<span class="keyword">let</span> shape2: <span class="type">Shape</span> = <span class="type">LargeShape</span>(a: <span class="number">1</span>, b: <span class="number">2</span>, c: <span class="number">3</span>, d: <span class="number">4</span>, e: <span class="number">5</span>)
+<span class="comment">// LargeShape is 40 bytes → doesn't fit in 24-byte buffer → HEAP ALLOCATED</span></code></pre>
+
+    <div class="diagram">
+Existential Container (40 bytes):
+┌────────────────────────────────────────────────────────┐
+│ Value Buffer (24 bytes)                                │
+│ ┌──────────────────────────────────────────────────┐   │
+│ │ Small value: stored inline                       │   │
+│ │ Large value: pointer to heap allocation ──────▶ HEAP│
+│ └──────────────────────────────────────────────────┘   │
+├────────────────────────────────────────────────────────┤
+│ Value Witness Table pointer (8 bytes)                  │
+│ → size, alignment, copy, destroy functions             │
+├────────────────────────────────────────────────────────┤
+│ Protocol Witness Table pointer (8 bytes)               │
+│ → protocol method implementations                      │
+└────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>2. Closures Capturing Value Types</h3>
+
+    <pre><code><span class="keyword">func</span> <span class="func">makeCounter</span>() -> () -> <span class="type">Int</span> {
+    <span class="keyword">var</span> count = <span class="number">0</span>  <span class="comment">// Promoted to heap — captured by escaping closure</span>
+    <span class="keyword">return</span> {
+        count += <span class="number">1</span>
+        <span class="keyword">return</span> count
+    }
+}
+
+<span class="keyword">let</span> counter = <span class="func">makeCounter</span>()
+<span class="func">counter</span>()  <span class="comment">// 1</span>
+<span class="func">counter</span>()  <span class="comment">// 2 — count lives on the heap</span></code></pre>
+
+    <h3>3. Inout Parameters That Escape</h3>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">Config</span> {
+    <span class="keyword">var</span> timeout: <span class="type">Int</span> = <span class="number">30</span>
+
+    <span class="keyword">mutating func</span> <span class="func">adjustTimeout</span>() {
+        <span class="comment">// If the compiler can't prove this doesn't escape,</span>
+        <span class="comment">// the struct may be heap-allocated</span>
+        <span class="type">DispatchQueue</span>.global().<span class="func">async</span> {
+            <span class="comment">// Can't capture inout — compiler error</span>
+            <span class="comment">// But similar patterns with closures cause heap promotion</span>
+        }
+    }
+}</code></pre>
+
+    <h3>4. Generic Contexts Without Specialization</h3>
+
+    <pre><code><span class="comment">// Without specialization, the compiler uses value witness tables</span>
+<span class="comment">// and may heap-allocate to handle arbitrary-sized T</span>
+<span class="keyword">func</span> <span class="func">process</span>&lt;<span class="type">T</span>&gt;(_ value: <span class="type">T</span>) {
+    <span class="comment">// If T is large or the function isn't specialized,</span>
+    <span class="comment">// value may be passed via heap-allocated buffer</span>
+}
+
+<span class="comment">// With @inlinable, the compiler can specialize and stack-allocate:</span>
+<span class="keyword">@inlinable func</span> <span class="func">processInlinable</span>&lt;<span class="type">T</span>&gt;(_ value: <span class="type">T</span>) {
+    <span class="comment">// Compiler generates specialized version for each T</span>
+    <span class="comment">// → stack allocation possible</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="contiguous-array">ContiguousArray vs Array</h2>
+
+    <p><code>Array</code> in Swift can be backed by either a Swift native array buffer or an <code>NSArray</code> (when bridged from ObjC). <code>ContiguousArray</code> is always backed by a contiguous Swift buffer.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Array</th>
+                <th>ContiguousArray</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>ObjC bridging</td>
+                <td>Can wrap NSArray</td>
+                <td>Always native Swift buffer</td>
+            </tr>
+            <tr>
+                <td>Element access</td>
+                <td>May indirect through NSArray</td>
+                <td>Always direct pointer arithmetic</td>
+            </tr>
+            <tr>
+                <td>Performance (class elements)</td>
+                <td>Slightly slower (bridge check)</td>
+                <td>Faster (no bridge check)</td>
+            </tr>
+            <tr>
+                <td>Performance (struct elements)</td>
+                <td>Same (can't bridge structs)</td>
+                <td>Same</td>
+            </tr>
+            <tr>
+                <td>Use when</td>
+                <td>General purpose, ObjC interop</td>
+                <td>Performance-critical, class elements</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// For arrays of class types in performance-critical code:</span>
+<span class="keyword">var</span> views: <span class="type">ContiguousArray</span>&lt;<span class="type">UIView</span>&gt; = []
+views.<span class="func">reserveCapacity</span>(<span class="number">1000</span>)
+<span class="keyword">for</span> _ <span class="keyword">in</span> <span class="number">0</span>..&lt;<span class="number">1000</span> {
+    views.<span class="func">append</span>(<span class="type">UIView</span>())
+}
+
+<span class="comment">// For arrays of value types, Array and ContiguousArray are identical:</span>
+<span class="keyword">var</span> points: [<span class="type">CGPoint</span>] = []  <span class="comment">// Same performance as ContiguousArray&lt;CGPoint&gt;</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="managed-buffer">ManagedBuffer</h2>
+
+    <p><code>ManagedBuffer</code> provides a way to allocate a single heap block containing both a header and a contiguous array of elements. This is useful for custom data structures that need to minimize allocations.</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">RingBuffer</span>&lt;<span class="type">Element</span>&gt; {
+    <span class="keyword">private var</span> storage: <span class="type">ManagedBuffer</span>&lt;<span class="type">RingHeader</span>, <span class="type">Element</span>&gt;
+
+    <span class="keyword">struct</span> <span class="type">RingHeader</span> {
+        <span class="keyword">var</span> head: <span class="type">Int</span>
+        <span class="keyword">var</span> tail: <span class="type">Int</span>
+        <span class="keyword">var</span> count: <span class="type">Int</span>
+        <span class="keyword">let</span> capacity: <span class="type">Int</span>
+    }
+
+    <span class="keyword">init</span>(capacity: <span class="type">Int</span>) {
+        storage = <span class="type">ManagedBuffer</span>&lt;<span class="type">RingHeader</span>, <span class="type">Element</span>&gt;.<span class="func">create</span>(
+            minimumCapacity: capacity
+        ) { buffer <span class="keyword">in</span>
+            <span class="type">RingHeader</span>(head: <span class="number">0</span>, tail: <span class="number">0</span>, count: <span class="number">0</span>, capacity: capacity)
+        }
+    }
+}</code></pre>
+
+    <div class="diagram">
+ManagedBuffer Memory Layout:
+┌──────────────────────────────────────────┐
+│ Swift Object Header (16 bytes)           │
+│ (metadata pointer + refcount)            │
+├──────────────────────────────────────────┤
+│ Header (RingHeader)                      │
+│ head: Int, tail: Int, count: Int,        │
+│ capacity: Int                            │
+├──────────────────────────────────────────┤
+│ Element[0]                               │
+│ Element[1]                               │
+│ Element[2]                               │
+│ ...                                      │
+│ Element[capacity-1]                      │
+└──────────────────────────────────────────┘
+
+Single allocation for header + elements → better cache locality
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="unsafe-pointers">UnsafeBufferPointer Family</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Type</th>
+                <th>Mutability</th>
+                <th>Typed?</th>
+                <th>Use Case</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>UnsafePointer&lt;T&gt;</code></td>
+                <td>Read-only</td>
+                <td>Yes</td>
+                <td>C API interop (const T*)</td>
+            </tr>
+            <tr>
+                <td><code>UnsafeMutablePointer&lt;T&gt;</code></td>
+                <td>Read-write</td>
+                <td>Yes</td>
+                <td>C API interop (T*)</td>
+            </tr>
+            <tr>
+                <td><code>UnsafeBufferPointer&lt;T&gt;</code></td>
+                <td>Read-only</td>
+                <td>Yes</td>
+                <td>Contiguous typed buffer</td>
+            </tr>
+            <tr>
+                <td><code>UnsafeMutableBufferPointer&lt;T&gt;</code></td>
+                <td>Read-write</td>
+                <td>Yes</td>
+                <td>Mutable contiguous buffer</td>
+            </tr>
+            <tr>
+                <td><code>UnsafeRawPointer</code></td>
+                <td>Read-only</td>
+                <td>No</td>
+                <td>Untyped memory (void*)</td>
+            </tr>
+            <tr>
+                <td><code>UnsafeRawBufferPointer</code></td>
+                <td>Read-only</td>
+                <td>No</td>
+                <td>Byte-level access</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Safe access to array's contiguous storage</span>
+<span class="keyword">let</span> numbers = [<span class="number">1.0</span>, <span class="number">2.0</span>, <span class="number">3.0</span>, <span class="number">4.0</span>]
+numbers.<span class="func">withUnsafeBufferPointer</span> { buffer <span class="keyword">in</span>
+    <span class="comment">// buffer.baseAddress is UnsafePointer&lt;Double&gt;</span>
+    <span class="comment">// buffer.count is 4</span>
+    <span class="comment">// Can pass to C APIs like vDSP</span>
+    <span class="keyword">var</span> sum: <span class="type">Double</span> = <span class="number">0</span>
+    <span class="func">vDSP_sveD</span>(buffer.baseAddress!, <span class="number">1</span>, &amp;sum, <span class="func">vDSP_Length</span>(buffer.count))
+}
+
+<span class="comment">// Manual memory allocation</span>
+<span class="keyword">let</span> buffer = <span class="type">UnsafeMutableBufferPointer</span>&lt;<span class="type">Int</span>&gt;.<span class="func">allocate</span>(capacity: <span class="number">100</span>)
+<span class="keyword">defer</span> { buffer.<span class="func">deallocate</span>() }
+buffer.<span class="func">initialize</span>(repeating: <span class="number">0</span>)
+buffer[<span class="number">0</span>] = <span class="number">42</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Pointer Lifetime</div>
+        <p>Pointers obtained from <code>withUnsafeBufferPointer</code> are only valid within the closure. Storing them for later use is undefined behavior — the array may reallocate its buffer, leaving the pointer dangling. Similarly, <code>UnsafeMutablePointer.allocate</code> memory must be manually deallocated to avoid leaks.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="autorelease">Autorelease Pools</h2>
+
+    <p>Autorelease pools are an Objective-C concept that still matters in Swift when bridging to ObjC APIs. An autoreleased object is not released immediately — it's added to the current autorelease pool and released when the pool drains.</p>
+
+    <h3>When Autorelease Pools Matter in Swift</h3>
+
+    <pre><code><span class="comment">// ❌ Without autoreleasepool: memory spikes</span>
+<span class="keyword">func</span> <span class="func">processImages</span>() {
+    <span class="keyword">for</span> i <span class="keyword">in</span> <span class="number">0</span>..&lt;<span class="number">10_000</span> {
+        <span class="comment">// UIImage.init may return autoreleased ObjC objects</span>
+        <span class="keyword">let</span> image = <span class="type">UIImage</span>(named: <span class="string">"photo_\(i)"</span>)
+        <span class="func">processImage</span>(image)
+        <span class="comment">// Autoreleased objects accumulate until RunLoop drains pool</span>
+    }
+}
+
+<span class="comment">// ✅ With autoreleasepool: bounded memory</span>
+<span class="keyword">func</span> <span class="func">processImagesFixed</span>() {
+    <span class="keyword">for</span> i <span class="keyword">in</span> <span class="number">0</span>..&lt;<span class="number">10_000</span> {
+        <span class="func">autoreleasepool</span> {
+            <span class="keyword">let</span> image = <span class="type">UIImage</span>(named: <span class="string">"photo_\(i)"</span>)
+            <span class="func">processImage</span>(image)
+        } <span class="comment">// Pool drains here — autoreleased objects freed</span>
+    }
+}</code></pre>
+
+    <h3>When You Need @autoreleasepool in Swift</h3>
+
+    <ul>
+        <li><strong>Tight loops calling ObjC APIs</strong> — especially image/data processing</li>
+        <li><strong>Background threads</strong> — no RunLoop to drain the default pool</li>
+        <li><strong>Command-line tools</strong> — no RunLoop at all</li>
+        <li><strong>Unit tests</strong> — to ensure deterministic deallocation</li>
+    </ul>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: How Autorelease Pools Work</div>
+        <p>Each thread has a stack of autorelease pool pages. When <code>autoreleasepool { }</code> is entered, a sentinel is pushed. When the block exits, every object pushed after the sentinel is sent a <code>release</code> message. The main thread's RunLoop drains the autorelease pool at the end of each event loop iteration. On background threads without a RunLoop, objects accumulate until the thread exits — which is why explicit <code>autoreleasepool</code> blocks are critical in background processing loops.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="bridging-costs">ObjC Bridging Costs</h2>
+
+    <p>Bridging between Swift and Objective-C types has real performance costs that are often invisible in source code.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Swift Type</th>
+                <th>ObjC Type</th>
+                <th>Bridging Cost</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>String</code></td>
+                <td><code>NSString</code></td>
+                <td>O(1) if ASCII/small, O(n) if UTF-8 → UTF-16 conversion needed</td>
+            </tr>
+            <tr>
+                <td><code>Array</code></td>
+                <td><code>NSArray</code></td>
+                <td>O(1) lazy bridge (elements bridged on access)</td>
+            </tr>
+            <tr>
+                <td><code>Dictionary</code></td>
+                <td><code>NSDictionary</code></td>
+                <td>O(1) lazy bridge</td>
+            </tr>
+            <tr>
+                <td><code>Set</code></td>
+                <td><code>NSSet</code></td>
+                <td>O(1) lazy bridge</td>
+            </tr>
+            <tr>
+                <td><code>Data</code></td>
+                <td><code>NSData</code></td>
+                <td>O(1) (shares buffer)</td>
+            </tr>
+            <tr>
+                <td><code>Int</code>, <code>Double</code></td>
+                <td><code>NSNumber</code></td>
+                <td>Heap allocation (unless tagged pointer)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Hidden bridging cost: String → NSString</span>
+<span class="keyword">let</span> swiftString = <span class="string">"Hello, World!"</span>
+<span class="keyword">let</span> nsString = swiftString <span class="keyword">as</span> <span class="type">NSString</span>  <span class="comment">// May allocate NSString</span>
+<span class="keyword">let</span> length = nsString.length              <span class="comment">// UTF-16 length</span>
+
+<span class="comment">// Avoid repeated bridging in loops:</span>
+<span class="keyword">func</span> <span class="func">processStrings</span>(_ strings: [<span class="type">String</span>]) {
+    <span class="comment">// ❌ Each iteration bridges String → NSString</span>
+    <span class="keyword">for</span> s <span class="keyword">in</span> strings {
+        <span class="keyword">let</span> ns = s <span class="keyword">as</span> <span class="type">NSString</span>
+        <span class="comment">// ... use NSString API ...</span>
+    }
+
+    <span class="comment">// ✅ Bridge once, iterate the NSArray</span>
+    <span class="keyword">let</span> nsArray = strings <span class="keyword">as</span> <span class="type">NSArray</span>
+    <span class="keyword">for</span> ns <span class="keyword">in</span> nsArray {
+        <span class="comment">// ... use NSString API ...</span>
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Minimize Bridging in Hot Paths</div>
+        <p>Profile bridging costs with Instruments (Allocations instrument, filter by <code>NSString</code> or <code>__NSArrayI</code>). In performance-critical code: (1) avoid <code>as NSString</code> in loops, (2) use Swift-native APIs instead of Foundation when possible, (3) cache bridged values if reused, (4) use <code>ContiguousArray</code> for class-element arrays to avoid NSArray bridge checks.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="tagged-pointers">Tagged Pointers for Small Objects</h2>
+
+    <p>Tagged pointers store small ObjC objects directly in the pointer value, avoiding heap allocation entirely. This is transparent to code but has significant performance implications.</p>
+
+    <pre><code><span class="comment">// These are likely tagged pointers (no heap allocation):</span>
+<span class="keyword">let</span> n1: <span class="type">NSNumber</span> = <span class="number">42</span>           <span class="comment">// Integer fits in 60 bits</span>
+<span class="keyword">let</span> n2: <span class="type">NSNumber</span> = <span class="number">3.14</span>         <span class="comment">// Float fits in 60 bits</span>
+<span class="keyword">let</span> s1: <span class="type">NSString</span> = <span class="string">"Hi"</span>          <span class="comment">// 2 ASCII chars fit</span>
+<span class="keyword">let</span> d1: <span class="type">NSDate</span> = <span class="type">NSDate</span>()        <span class="comment">// Timestamp fits</span>
+
+<span class="comment">// These are NOT tagged pointers (heap allocated):</span>
+<span class="keyword">let</span> s2: <span class="type">NSString</span> = <span class="string">"This is a longer string that won't fit"</span>
+<span class="keyword">let</span> big: <span class="type">NSNumber</span> = <span class="type">NSNumber</span>(value: <span class="type">UInt64</span>.max)</code></pre>
+
+    <p>Tagged pointers have zero retain/release cost — the runtime recognizes them and skips reference counting entirely. This makes them extremely efficient for small, frequently-created objects.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="layout-optimization">Memory Layout Optimization</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: Memory Layout Optimization for Data-Heavy Apps</div>
+        <p>For apps processing large datasets (maps, media, ML), memory layout directly impacts performance through cache utilization. Key strategies:</p>
+        <ol>
+            <li><strong>Struct-of-Arrays (SoA) vs Array-of-Structs (AoS)</strong> — if you process one field at a time, SoA gives better cache locality</li>
+            <li><strong>Minimize padding</strong> — use <code>MemoryLayout&lt;T&gt;.size</code> vs <code>.stride</code> to understand padding. Order fields by decreasing alignment to minimize gaps.</li>
+            <li><strong>Avoid existential containers</strong> — use generics with concrete types instead of protocol types for data collections</li>
+            <li><strong>Use ContiguousArray</strong> for class-element collections in hot paths</li>
+            <li><strong>Pool allocations</strong> — reuse buffers instead of allocating/deallocating per frame</li>
+        </ol>
+    </div>
+
+    <pre><code><span class="comment">// Understanding memory layout</span>
+<span class="func">print</span>(<span class="type">MemoryLayout</span>&lt;<span class="type">Int</span>&gt;.size)       <span class="comment">// 8 bytes</span>
+<span class="func">print</span>(<span class="type">MemoryLayout</span>&lt;<span class="type">Int</span>&gt;.stride)     <span class="comment">// 8 bytes</span>
+<span class="func">print</span>(<span class="type">MemoryLayout</span>&lt;<span class="type">Int</span>&gt;.alignment)  <span class="comment">// 8 bytes</span>
+
+<span class="keyword">struct</span> <span class="type">Padded</span> {
+    <span class="keyword">var</span> a: <span class="type">Bool</span>    <span class="comment">// 1 byte + 7 padding</span>
+    <span class="keyword">var</span> b: <span class="type">Double</span>  <span class="comment">// 8 bytes</span>
+    <span class="keyword">var</span> c: <span class="type">Bool</span>    <span class="comment">// 1 byte + 7 padding</span>
+}
+<span class="comment">// MemoryLayout&lt;Padded&gt;.size = 24 (with padding)</span>
+
+<span class="keyword">struct</span> <span class="type">Packed</span> {
+    <span class="keyword">var</span> b: <span class="type">Double</span>  <span class="comment">// 8 bytes</span>
+    <span class="keyword">var</span> a: <span class="type">Bool</span>    <span class="comment">// 1 byte</span>
+    <span class="keyword">var</span> c: <span class="type">Bool</span>    <span class="comment">// 1 byte + 6 padding</span>
+}
+<span class="comment">// MemoryLayout&lt;Packed&gt;.size = 16 (less padding)</span>
+
+<span class="comment">// Note: Swift compiler may reorder fields for optimal layout</span>
+<span class="comment">// (unlike C, field order in source ≠ field order in memory)</span></code></pre>
+
+    <div class="nav-footer">
+        <a href="02-retain-cycles.html">← Previous: Retain Cycles</a>
+        <a href="04-jetsam-memory-pressure.html">Next: Jetsam &amp; Memory Pressure →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Actors &amp; Isolation — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Concurrency &amp; Threading</a><span class="sep">›</span>
+        Actors &amp; Isolation
+    </nav>
+
+    <h1>Actors &amp; Isolation</h1>
+    <p class="subtitle">How Swift actors provide compile-time data race safety — the reentrancy problem that catches everyone, @MainActor semantics, global actors, nonisolated escape hatches, and the Swift 6 strict concurrency revolution.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#actor-model">1. The Actor Model: How Actors Provide Data Race Safety</a></li>
+            <li><a href="#reentrancy">2. Actor Reentrancy: The #1 Gotcha</a></li>
+            <li><a href="#main-actor">3. @MainActor: What It Means, How It Works</a></li>
+            <li><a href="#global-actors">4. Global Actors: Creating Custom Ones</a></li>
+            <li><a href="#nonisolated">5. nonisolated Keyword</a></li>
+            <li><a href="#isolation-checking">6. Actor Isolation Checking at Compile Time</a></li>
+            <li><a href="#swift6">7. Swift 6 Strict Concurrency Mode</a></li>
+            <li><a href="#architect">8. Architect: Actor Architecture for Complex Apps</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="actor-model">1. The Actor Model: How Actors Provide Data Race Safety</h2>
+
+    <p>An <code>actor</code> is a reference type (like a class) that <strong>isolates its mutable state</strong>. All access to an actor's properties and methods from outside the actor must go through a serialized "mailbox" — ensuring only one task accesses the actor's state at a time.</p>
+
+    <h3>1.1 Actor Internals</h3>
+
+    <div class="diagram">
+Actor Internal Architecture:
+
+┌──────────────────────────────────────────────┐
+│                 actor BankAccount             │
+│                                               │
+│  ┌─────────────────────────────────────────┐ │
+│  │         Serial Executor                  │ │
+│  │  (backed by DispatchSerialQueue or       │ │
+│  │   custom SerialExecutor)                 │ │
+│  │                                          │ │
+│  │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐   │ │
+│  │  │Job 1 │→│Job 2 │→│Job 3 │→│Job 4 │   │ │
+│  │  └──────┘ └──────┘ └──────┘ └──────┘   │ │
+│  │  ▲ executing        queued ──────────▶  │ │
+│  └─────────────────────────────────────────┘ │
+│                                               │
+│  ┌─────────────────────────────────────────┐ │
+│  │         Isolated State                   │ │
+│  │  var balance: Double                     │ │
+│  │  var transactions: [Transaction]         │ │
+│  └─────────────────────────────────────────┘ │
+└──────────────────────────────────────────────┘
+
+External access: must await (goes through executor queue)
+Internal access: synchronous (already on the executor)
+    </div>
+
+    <pre><code><span class="keyword">actor</span> <span class="type">BankAccount</span> {
+    <span class="keyword">let</span> id: <span class="type">String</span>           <span class="comment">// let properties: accessible without await</span>
+    <span class="keyword">private(set) var</span> balance: <span class="type">Double</span>  <span class="comment">// var properties: isolated</span>
+    <span class="keyword">private var</span> transactions: [<span class="type">Transaction</span>] = []
+
+    <span class="keyword">init</span>(id: <span class="type">String</span>, initialBalance: <span class="type">Double</span>) {
+        <span class="keyword">self</span>.id = id
+        <span class="keyword">self</span>.balance = initialBalance
+    }
+
+    <span class="comment">// Methods are isolated: only one caller at a time</span>
+    <span class="keyword">func</span> <span class="func">deposit</span>(_ amount: <span class="type">Double</span>) {
+        balance += amount
+        transactions.<span class="func">append</span>(<span class="type">Transaction</span>(type: .deposit, amount: amount))
+    }
+
+    <span class="keyword">func</span> <span class="func">withdraw</span>(_ amount: <span class="type">Double</span>) <span class="keyword">throws</span> {
+        <span class="keyword">guard</span> balance >= amount <span class="keyword">else</span> {
+            <span class="keyword">throw</span> <span class="type">BankError</span>.insufficientFunds
+        }
+        balance -= amount
+        transactions.<span class="func">append</span>(<span class="type">Transaction</span>(type: .withdrawal, amount: amount))
+    }
+}
+
+<span class="comment">// External access requires await</span>
+<span class="keyword">let</span> account = <span class="type">BankAccount</span>(id: <span class="string">"123"</span>, initialBalance: <span class="number">1000</span>)
+<span class="keyword">let</span> balance = <span class="keyword">await</span> account.balance       <span class="comment">// await required for var</span>
+<span class="keyword">let</span> id = account.id                       <span class="comment">// No await needed for let</span>
+<span class="keyword">try await</span> account.<span class="func">withdraw</span>(<span class="number">500</span>)           <span class="comment">// await required for methods</span></code></pre>
+
+    <h3>1.2 Actor vs Class vs Struct</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Feature</th>
+                <th>struct</th>
+                <th>class</th>
+                <th>actor</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Value/Reference</td>
+                <td>Value type</td>
+                <td>Reference type</td>
+                <td>Reference type</td>
+            </tr>
+            <tr>
+                <td>Inheritance</td>
+                <td>No</td>
+                <td>Yes</td>
+                <td>No</td>
+            </tr>
+            <tr>
+                <td>Data race safe</td>
+                <td>Yes (copies)</td>
+                <td>No (manual sync)</td>
+                <td>Yes (isolation)</td>
+            </tr>
+            <tr>
+                <td>Sendable</td>
+                <td>If all props are</td>
+                <td>Must be @unchecked</td>
+                <td>Always Sendable</td>
+            </tr>
+            <tr>
+                <td>External access</td>
+                <td>Synchronous</td>
+                <td>Synchronous</td>
+                <td>Requires await</td>
+            </tr>
+            <tr>
+                <td>Identity</td>
+                <td>No (value)</td>
+                <td>===</td>
+                <td>===</td>
+            </tr>
+            <tr>
+                <td>deinit</td>
+                <td>No</td>
+                <td>Yes</td>
+                <td>Yes</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="reentrancy">2. Actor Reentrancy: The #1 Gotcha</h2>
+
+    <p>This is the most important concept in this entire document. <strong>Actor reentrancy</strong> means that when an actor method suspends at an <code>await</code> point, other messages can be processed by the actor before the original method resumes. This can break invariants that you assumed held across the await.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Critical: Actor Reentrancy Breaks Assumptions</div>
+        <p>Actors are NOT like locks. A lock holds exclusive access for the entire critical section. An actor releases its "lock" at every <code>await</code> point. If you check a condition, await something, then act on the condition — the condition may have changed.</p>
+    </div>
+
+    <pre><code><span class="keyword">actor</span> <span class="type">ImageCache</span> {
+    <span class="keyword">private var</span> cache: [<span class="type">URL</span>: <span class="type">UIImage</span>] = [:]
+
+    <span class="comment">// ❌ BUG: Reentrancy problem</span>
+    <span class="keyword">func</span> <span class="func">fetchImage</span>(url: <span class="type">URL</span>) <span class="keyword">async throws</span> -> <span class="type">UIImage</span> {
+        <span class="keyword">if let</span> cached = cache[url] {
+            <span class="keyword">return</span> cached
+        }
+
+        <span class="comment">// ⚠️ SUSPENSION POINT: actor is "unlocked" here</span>
+        <span class="comment">// Another call to fetchImage(url:) for the SAME URL</span>
+        <span class="comment">// can start executing while we're awaiting</span>
+        <span class="keyword">let</span> (data, _) = <span class="keyword">try await</span> <span class="type">URLSession</span>.shared.<span class="func">data</span>(from: url)
+
+        <span class="comment">// We resume, but another call may have already cached this URL</span>
+        <span class="comment">// We're doing a DUPLICATE download!</span>
+        <span class="keyword">let</span> image = <span class="type">UIImage</span>(data: data)!
+        cache[url] = image
+        <span class="keyword">return</span> image
+    }
+}</code></pre>
+
+    <div class="diagram">
+Actor Reentrancy Timeline:
+
+Task A calls fetchImage(url: X)
+│
+├─ Check cache: miss
+├─ Start URLSession download ──── await (actor "unlocked") ────┐
+│                                                               │
+│  Task B calls fetchImage(url: X)                              │
+│  ├─ Check cache: still miss (A hasn't finished)               │
+│  ├─ Start ANOTHER download ── await ──┐                       │
+│  │                                    │                       │
+│  │  Task C calls fetchImage(url: Y)   │                       │
+│  │  ├─ Check cache: miss              │                       │
+│  │  ├─ Start download ── await ──┐    │                       │
+│  │  │                            │    │                       │
+│  │  │  ◀── A's download completes ────┘                       │
+│  │  │  A resumes: cache[X] = image                            │
+│  │  │                                                         │
+│  │  ◀── B's download completes (DUPLICATE!)                   │
+│  │  B resumes: cache[X] = image (overwrites, wasted work)     │
+│  │                                                            │
+│  ◀── C's download completes                                   │
+│  C resumes: cache[Y] = image                                  │
+    </div>
+
+    <h3>2.1 Fixing Reentrancy: In-Flight Tracking</h3>
+
+    <pre><code><span class="keyword">actor</span> <span class="type">ImageCache</span> {
+    <span class="keyword">private var</span> cache: [<span class="type">URL</span>: <span class="type">UIImage</span>] = [:]
+    <span class="keyword">private var</span> inFlight: [<span class="type">URL</span>: <span class="type">Task</span>&lt;<span class="type">UIImage</span>, <span class="type">Error</span>&gt;] = [:]
+
+    <span class="comment">// ✅ CORRECT: Handles reentrancy</span>
+    <span class="keyword">func</span> <span class="func">fetchImage</span>(url: <span class="type">URL</span>) <span class="keyword">async throws</span> -> <span class="type">UIImage</span> {
+        <span class="comment">// Check cache</span>
+        <span class="keyword">if let</span> cached = cache[url] {
+            <span class="keyword">return</span> cached
+        }
+
+        <span class="comment">// Check if already downloading</span>
+        <span class="keyword">if let</span> existing = inFlight[url] {
+            <span class="keyword">return try await</span> existing.value  <span class="comment">// Piggyback on existing download</span>
+        }
+
+        <span class="comment">// Start new download and track it</span>
+        <span class="keyword">let</span> task = <span class="type">Task</span> {
+            <span class="keyword">let</span> (data, _) = <span class="keyword">try await</span> <span class="type">URLSession</span>.shared.<span class="func">data</span>(from: url)
+            <span class="keyword">guard let</span> image = <span class="type">UIImage</span>(data: data) <span class="keyword">else</span> {
+                <span class="keyword">throw</span> <span class="type">ImageError</span>.decodingFailed
+            }
+            <span class="keyword">return</span> image
+        }
+
+        inFlight[url] = task
+
+        <span class="keyword">do</span> {
+            <span class="keyword">let</span> image = <span class="keyword">try await</span> task.value
+            cache[url] = image
+            inFlight[url] = <span class="keyword">nil</span>
+            <span class="keyword">return</span> image
+        } <span class="keyword">catch</span> {
+            inFlight[url] = <span class="keyword">nil</span>
+            <span class="keyword">throw</span> error
+        }
+    }
+}</code></pre>
+
+    <h3>2.2 General Reentrancy Rules</h3>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Reentrancy Safety</div>
+        <ul>
+            <li><strong>Never assume state is unchanged after an await</strong> — always re-check conditions after suspension</li>
+            <li><strong>Use in-flight tracking</strong> for deduplication of async work</li>
+            <li><strong>Perform state mutations synchronously</strong> — do all state changes before or after await, never split across one</li>
+            <li><strong>Use the "check-await-check" pattern</strong>: validate preconditions, await, re-validate before mutating</li>
+            <li><strong>Consider whether you need an actor at all</strong> — if all operations are synchronous, a struct or class with a lock may be simpler</li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="main-actor">3. @MainActor: What It Means, How It Works</h2>
+
+    <p><code>@MainActor</code> is a global actor that ensures code runs on the main thread. It's the compile-time replacement for <code>DispatchQueue.main.async</code>.</p>
+
+    <h3>3.1 How @MainActor Works</h3>
+
+    <pre><code><span class="comment">// @MainActor on a class: ALL properties and methods are main-thread-isolated</span>
+<span class="keyword">@MainActor</span>
+<span class="keyword">class</span> <span class="type">ViewModel</span>: <span class="type">ObservableObject</span> {
+    <span class="keyword">@Published var</span> items: [<span class="type">Item</span>] = []  <span class="comment">// Guaranteed main thread</span>
+    <span class="keyword">@Published var</span> isLoading = <span class="keyword">false</span>
+
+    <span class="keyword">func</span> <span class="func">loadItems</span>() <span class="keyword">async</span> {
+        isLoading = <span class="keyword">true</span>   <span class="comment">// ✅ On main thread</span>
+        <span class="keyword">let</span> items = <span class="keyword">try</span>? <span class="keyword">await</span> api.<span class="func">fetchItems</span>()  <span class="comment">// Suspends, may run elsewhere</span>
+        <span class="keyword">self</span>.items = items ?? []  <span class="comment">// ✅ Back on main thread after await</span>
+        isLoading = <span class="keyword">false</span>  <span class="comment">// ✅ On main thread</span>
+    }
+}
+
+<span class="comment">// @MainActor on individual methods</span>
+<span class="keyword">class</span> <span class="type">DataProcessor</span> {
+    <span class="keyword">func</span> <span class="func">process</span>() <span class="keyword">async</span> -> [<span class="type">Item</span>] {
+        <span class="comment">// Runs on any thread</span>
+        <span class="keyword">return await</span> <span class="func">heavyWork</span>()
+    }
+
+    <span class="keyword">@MainActor</span>
+    <span class="keyword">func</span> <span class="func">updateUI</span>(items: [<span class="type">Item</span>]) {
+        <span class="comment">// Guaranteed main thread</span>
+        tableView.<span class="func">reloadData</span>()
+    }
+}
+
+<span class="comment">// @MainActor on closures</span>
+<span class="keyword">func</span> <span class="func">fetchAndDisplay</span>() {
+    <span class="type">Task</span> { <span class="keyword">@MainActor in</span>
+        <span class="keyword">let</span> data = <span class="keyword">try await</span> <span class="func">fetchData</span>()
+        label.text = <span class="type">String</span>(data: data, encoding: .utf8)
+    }
+}</code></pre>
+
+    <h3>3.2 @MainActor vs DispatchQueue.main</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th><code>@MainActor</code></th>
+                <th><code>DispatchQueue.main</code></th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Enforcement</td>
+                <td>Compile-time</td>
+                <td>Runtime only (crashes if wrong)</td>
+            </tr>
+            <tr>
+                <td>Granularity</td>
+                <td>Type, method, property, closure</td>
+                <td>Block-level only</td>
+            </tr>
+            <tr>
+                <td>Async integration</td>
+                <td>Native (await resumes on main)</td>
+                <td>Manual (dispatch back to main)</td>
+            </tr>
+            <tr>
+                <td>Sendable checking</td>
+                <td>Compiler verifies data crossing boundaries</td>
+                <td>No checking</td>
+            </tr>
+            <tr>
+                <td>Performance</td>
+                <td>Optimized (may skip hop if already on main)</td>
+                <td>Always dispatches (even if on main)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: MainActor.run vs Task { @MainActor in }</div>
+        <p><code>MainActor.run { }</code> is a synchronous hop to the main actor — it suspends the current task and resumes on the main actor. <code>Task { @MainActor in }</code> creates a new unstructured task that runs on the main actor. The key difference: <code>MainActor.run</code> is inline (the calling task waits), while <code>Task { @MainActor in }</code> is fire-and-forget (the calling code continues immediately). Use <code>MainActor.run</code> when you need the result; use <code>Task { @MainActor in }</code> for fire-and-forget UI updates.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="global-actors">4. Global Actors: Creating Custom Ones</h2>
+
+    <p>A <strong>global actor</strong> is a singleton actor that can be used as an attribute to isolate types, methods, and properties to a specific serial execution context. <code>@MainActor</code> is the most common global actor, but you can create your own.</p>
+
+    <pre><code><span class="comment">// Defining a custom global actor</span>
+<span class="keyword">@globalActor</span>
+<span class="keyword">actor</span> <span class="type">DatabaseActor</span> {
+    <span class="keyword">static let</span> shared = <span class="type">DatabaseActor</span>()
+}
+
+<span class="comment">// Using the global actor</span>
+<span class="keyword">@DatabaseActor</span>
+<span class="keyword">class</span> <span class="type">DatabaseManager</span> {
+    <span class="keyword">private var</span> connection: <span class="type">SQLiteConnection</span>?
+
+    <span class="keyword">func</span> <span class="func">query</span>(_ sql: <span class="type">String</span>) -> [<span class="type">Row</span>] {
+        <span class="comment">// Guaranteed to run on DatabaseActor's serial executor</span>
+        connection?.<span class="func">execute</span>(sql) ?? []
+    }
+
+    <span class="keyword">func</span> <span class="func">transaction</span>(_ block: () <span class="keyword">throws</span> -> <span class="type">Void</span>) <span class="keyword">rethrows</span> {
+        connection?.<span class="func">beginTransaction</span>()
+        <span class="keyword">try</span> <span class="func">block</span>()
+        connection?.<span class="func">commitTransaction</span>()
+    }
+}
+
+<span class="comment">// Isolated methods on non-actor types</span>
+<span class="keyword">class</span> <span class="type">Repository</span> {
+    <span class="keyword">@DatabaseActor</span>
+    <span class="keyword">func</span> <span class="func">saveUser</span>(_ user: <span class="type">User</span>) {
+        <span class="comment">// Runs on DatabaseActor</span>
+    }
+
+    <span class="keyword">@MainActor</span>
+    <span class="keyword">func</span> <span class="func">displayUser</span>(_ user: <span class="type">User</span>) {
+        <span class="comment">// Runs on MainActor</span>
+    }
+}
+
+<span class="comment">// Calling across actor boundaries</span>
+<span class="keyword">func</span> <span class="func">loadAndDisplay</span>() <span class="keyword">async</span> {
+    <span class="keyword">let</span> repo = <span class="type">Repository</span>()
+    <span class="keyword">let</span> user = <span class="keyword">await</span> repo.<span class="func">fetchUser</span>()  <span class="comment">// Hops to DatabaseActor</span>
+    <span class="keyword">await</span> repo.<span class="func">displayUser</span>(user)       <span class="comment">// Hops to MainActor</span>
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: Global Actor Overhead</div>
+        <p>Every call to a global-actor-isolated method requires a context switch (hop) if the caller is on a different executor. In hot paths, this can add significant latency. Don't use global actors for fine-grained operations called thousands of times — batch the work into fewer, larger calls to the actor.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="nonisolated">5. nonisolated Keyword</h2>
+
+    <p><code>nonisolated</code> opts a method or property out of actor isolation. It can be called synchronously from any context, but cannot access the actor's isolated state.</p>
+
+    <pre><code><span class="keyword">actor</span> <span class="type">UserSession</span> {
+    <span class="keyword">let</span> userID: <span class="type">String</span>
+    <span class="keyword">var</span> token: <span class="type">String</span>?
+    <span class="keyword">var</span> lastActivity: <span class="type">Date</span> = <span class="type">Date</span>()
+
+    <span class="keyword">init</span>(userID: <span class="type">String</span>) {
+        <span class="keyword">self</span>.userID = userID
+    }
+
+    <span class="comment">// nonisolated: can access let properties only</span>
+    <span class="keyword">nonisolated var</span> description: <span class="type">String</span> {
+        <span class="string">"Session for user \(userID)"</span>  <span class="comment">// ✅ userID is let</span>
+        <span class="comment">// token  // ❌ Error: cannot access var from nonisolated</span>
+    }
+
+    <span class="comment">// nonisolated for protocol conformance</span>
+    <span class="keyword">nonisolated func</span> <span class="func">hash</span>(into hasher: <span class="keyword">inout</span> <span class="type">Hasher</span>) {
+        hasher.<span class="func">combine</span>(userID)  <span class="comment">// ✅ let property</span>
+    }
+}
+
+<span class="comment">// Common use: Hashable, Equatable, CustomStringConvertible</span>
+<span class="keyword">extension</span> <span class="type">UserSession</span>: <span class="type">Hashable</span> {
+    <span class="keyword">nonisolated static func</span> == (lhs: <span class="type">UserSession</span>, rhs: <span class="type">UserSession</span>) -> <span class="type">Bool</span> {
+        lhs.userID == rhs.userID
+    }
+}
+
+<span class="comment">// nonisolated(unsafe) — escape hatch for bridging</span>
+<span class="keyword">actor</span> <span class="type">LegacyBridge</span> {
+    <span class="keyword">nonisolated(unsafe) var</span> cachedValue: <span class="type">String</span>?
+    <span class="comment">// Compiler won't check isolation — YOU must ensure safety</span>
+    <span class="comment">// Use only when bridging to legacy code that handles its own sync</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="isolation-checking">6. Actor Isolation Checking at Compile Time</h2>
+
+    <p>The Swift compiler performs <strong>static analysis</strong> to verify that actor-isolated state is never accessed from the wrong context. This is the core of Swift's data race safety guarantee.</p>
+
+    <h3>6.1 Isolation Rules</h3>
+
+    <pre><code><span class="keyword">actor</span> <span class="type">Counter</span> {
+    <span class="keyword">var</span> count = <span class="number">0</span>
+
+    <span class="keyword">func</span> <span class="func">increment</span>() {
+        count += <span class="number">1</span>  <span class="comment">// ✅ Inside actor: synchronous access</span>
+    }
+}
+
+<span class="keyword">func</span> <span class="func">useCounter</span>() <span class="keyword">async</span> {
+    <span class="keyword">let</span> counter = <span class="type">Counter</span>()
+
+    <span class="keyword">await</span> counter.<span class="func">increment</span>()    <span class="comment">// ✅ Cross-actor: await required</span>
+    <span class="keyword">let</span> c = <span class="keyword">await</span> counter.count  <span class="comment">// ✅ Cross-actor property access</span>
+
+    <span class="comment">// counter.count  // ❌ Error: actor-isolated property 'count'</span>
+    <span class="comment">//                //    can only be referenced on 'Counter'</span>
+
+    <span class="comment">// counter.count += 1  // ❌ Error: cannot mutate from outside</span>
+}
+
+<span class="comment">// Closures and isolation</span>
+<span class="keyword">actor</span> <span class="type">DataStore</span> {
+    <span class="keyword">var</span> items: [<span class="type">String</span>] = []
+
+    <span class="keyword">func</span> <span class="func">process</span>() {
+        <span class="comment">// Synchronous closure: inherits actor isolation</span>
+        items.<span class="func">forEach</span> { item <span class="keyword">in</span>
+            <span class="func">print</span>(item)  <span class="comment">// ✅ Still on actor</span>
+        }
+
+        <span class="comment">// Escaping async closure: loses actor isolation</span>
+        <span class="type">Task</span>.<span class="func">detached</span> {
+            <span class="comment">// await self.items  // Must await from detached task</span>
+            <span class="keyword">let</span> items = <span class="keyword">await</span> <span class="keyword">self</span>.items
+            <span class="func">print</span>(items)
+        }
+    }
+}</code></pre>
+
+    <h3>6.2 Isolation Domains</h3>
+
+    <div class="diagram">
+Isolation Domains in a Typical App:
+
+┌─────────────────────────────────────────────────────────────┐
+│                    MainActor Domain                          │
+│  ViewControllers, Views, @Published properties, UI updates   │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ await (actor hop)
+┌──────────────────────────▼──────────────────────────────────┐
+│                  ViewModel Actor Domain                       │
+│  Business logic, state management                            │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ await (actor hop)
+┌──────────────────────────▼──────────────────────────────────┐
+│               Service Actor Domains                          │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────────────┐ │
+│  │ NetworkActor │ │ CacheActor   │ │ DatabaseActor        │ │
+│  │ (API calls)  │ │ (in-memory)  │ │ (Core Data/SQLite)   │ │
+│  └──────────────┘ └──────────────┘ └──────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+                           │ await (actor hop)
+┌──────────────────────────▼──────────────────────────────────┐
+│                 Nonisolated Domain                            │
+│  Pure functions, value types, Sendable structs               │
+└─────────────────────────────────────────────────────────────┘
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="swift6">7. Swift 6 Strict Concurrency Mode</h2>
+
+    <p>Swift 6 makes data race safety a <strong>compile-time guarantee</strong>. All Sendable violations that were warnings become errors. This is the biggest breaking change in Swift's history.</p>
+
+    <h3>7.1 What Changes in Swift 6</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Scenario</th>
+                <th>Swift 5.x</th>
+                <th>Swift 6</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Non-Sendable type crossing actor boundary</td>
+                <td>Warning (with strict flag)</td>
+                <td>Error</td>
+            </tr>
+            <tr>
+                <td>Mutable capture in @Sendable closure</td>
+                <td>Warning</td>
+                <td>Error</td>
+            </tr>
+            <tr>
+                <td>Global mutable variable</td>
+                <td>Allowed</td>
+                <td>Error (must be actor-isolated or Sendable)</td>
+            </tr>
+            <tr>
+                <td>Protocol conformance isolation mismatch</td>
+                <td>Warning</td>
+                <td>Error</td>
+            </tr>
+            <tr>
+                <td>Implicit @MainActor inference</td>
+                <td>Limited</td>
+                <td>Expanded (UIView subclasses, etc.)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Swift 6 errors you'll encounter:</span>
+
+<span class="comment">// 1. Global mutable state</span>
+<span class="keyword">var</span> globalCache: [<span class="type">String</span>: <span class="type">Any</span>] = [:]  <span class="comment">// ❌ Error in Swift 6</span>
+<span class="comment">// Fix: Make it actor-isolated or use a lock</span>
+
+<span class="comment">// 2. Non-Sendable type crossing boundary</span>
+<span class="keyword">class</span> <span class="type">MutableConfig</span> {
+    <span class="keyword">var</span> timeout = <span class="number">30</span>
+}
+
+<span class="keyword">func</span> <span class="func">configure</span>() <span class="keyword">async</span> {
+    <span class="keyword">let</span> config = <span class="type">MutableConfig</span>()
+    <span class="keyword">await</span> server.<span class="func">apply</span>(config)  <span class="comment">// ❌ MutableConfig is not Sendable</span>
+}
+
+<span class="comment">// 3. Closure capturing mutable state</span>
+<span class="keyword">var</span> results: [<span class="type">Int</span>] = []
+<span class="type">Task</span> {
+    results.<span class="func">append</span>(<span class="number">1</span>)  <span class="comment">// ❌ Mutation of captured var in @Sendable closure</span>
+}
+
+<span class="comment">// Fixes for common Swift 6 issues:</span>
+
+<span class="comment">// Fix 1: Actor for global state</span>
+<span class="keyword">actor</span> <span class="type">GlobalCache</span> {
+    <span class="keyword">static let</span> shared = <span class="type">GlobalCache</span>()
+    <span class="keyword">private var</span> storage: [<span class="type">String</span>: <span class="type">Any</span>] = [:]
+    <span class="keyword">func</span> <span class="func">get</span>(_ key: <span class="type">String</span>) -> <span class="type">Any</span>? { storage[key] }
+}
+
+<span class="comment">// Fix 2: Make types Sendable</span>
+<span class="keyword">struct</span> <span class="type">ImmutableConfig</span>: <span class="type">Sendable</span> {
+    <span class="keyword">let</span> timeout: <span class="type">Int</span>
+}
+
+<span class="comment">// Fix 3: Use actor for collected results</span>
+<span class="keyword">await</span> <span class="func">withTaskGroup</span>(of: <span class="type">Int</span>.<span class="keyword">self</span>) { group <span class="keyword">in</span>
+    group.<span class="func">addTask</span> { <span class="number">1</span> }
+    <span class="keyword">var</span> results: [<span class="type">Int</span>] = []
+    <span class="keyword">for await</span> result <span class="keyword">in</span> group {
+        results.<span class="func">append</span>(result)  <span class="comment">// ✅ Mutation inside structured scope</span>
+    }
+}</code></pre>
+
+    <h3>7.2 Migration Strategy for Swift 6</h3>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Swift 6 Migration</div>
+        <ul>
+            <li><strong>Step 1</strong>: Enable <code>-strict-concurrency=complete</code> in Swift 5.10 to see all warnings</li>
+            <li><strong>Step 2</strong>: Fix warnings module-by-module, starting with leaf modules</li>
+            <li><strong>Step 3</strong>: Use <code>@unchecked Sendable</code> as a temporary escape hatch for types you can't modify yet</li>
+            <li><strong>Step 4</strong>: Use <code>nonisolated(unsafe)</code> for global variables that are genuinely safe</li>
+            <li><strong>Step 5</strong>: Enable Swift 6 language mode per-target as each is ready</li>
+            <li><strong>Step 6</strong>: Remove <code>@unchecked</code> annotations as you properly fix each type</li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">8. Architect: Actor Architecture for Complex Apps</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>Actors are powerful but not free. Over-using actors creates "actor hop storms" where every method call requires a context switch. Under-using them leaves data races. The art is finding the right granularity.</p>
+    </div>
+
+    <h3>8.1 When Actors Hurt Performance</h3>
+
+    <pre><code><span class="comment">// ❌ Anti-pattern: Too many fine-grained actors</span>
+<span class="keyword">actor</span> <span class="type">PixelProcessor</span> {
+    <span class="keyword">var</span> value: <span class="type">UInt8</span> = <span class="number">0</span>
+    <span class="keyword">func</span> <span class="func">adjust</span>(by delta: <span class="type">Int8</span>) { <span class="comment">/* ... */</span> }
+}
+
+<span class="comment">// Processing 1 million pixels with individual actors:</span>
+<span class="keyword">let</span> pixels = (<span class="number">0</span>..&lt;<span class="number">1_000_000</span>).<span class="func">map</span> { _ <span class="keyword">in</span> <span class="type">PixelProcessor</span>() }
+<span class="keyword">for</span> pixel <span class="keyword">in</span> pixels {
+    <span class="keyword">await</span> pixel.<span class="func">adjust</span>(by: <span class="number">10</span>)  <span class="comment">// 1M actor hops! Terrible performance.</span>
+}
+
+<span class="comment">// ✅ Better: One actor managing a collection</span>
+<span class="keyword">actor</span> <span class="type">ImageProcessor</span> {
+    <span class="keyword">var</span> pixels: [<span class="type">UInt8</span>]
+
+    <span class="keyword">func</span> <span class="func">adjustAll</span>(by delta: <span class="type">Int8</span>) {
+        <span class="keyword">for</span> i <span class="keyword">in</span> pixels.indices {
+            pixels[i] = <span class="type">UInt8</span>(<span class="func">clamping</span>: <span class="type">Int</span>(pixels[i]) + <span class="type">Int</span>(delta))
+        }
+    }
+}</code></pre>
+
+    <h3>8.2 Actor Granularity Guidelines</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Granularity</th>
+                <th>Example</th>
+                <th>When to Use</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Per-subsystem</td>
+                <td><code>actor NetworkManager</code></td>
+                <td>Shared services with moderate contention</td>
+            </tr>
+            <tr>
+                <td>Per-entity</td>
+                <td><code>actor ChatRoom</code></td>
+                <td>Independent entities with their own state</td>
+            </tr>
+            <tr>
+                <td>Per-resource</td>
+                <td><code>actor DatabasePool</code></td>
+                <td>Protecting a specific shared resource</td>
+            </tr>
+            <tr>
+                <td>Global actor</td>
+                <td><code>@MainActor</code></td>
+                <td>Cross-cutting concerns (UI, database)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>8.3 Recommended Architecture</h3>
+
+    <pre><code><span class="comment">// Layer 1: UI (MainActor)</span>
+<span class="keyword">@MainActor</span>
+<span class="keyword">final class</span> <span class="type">FeedViewController</span>: <span class="type">UIViewController</span> {
+    <span class="keyword">private let</span> viewModel: <span class="type">FeedViewModel</span>
+}
+
+<span class="comment">// Layer 2: ViewModel (MainActor for UI binding)</span>
+<span class="keyword">@MainActor</span>
+<span class="keyword">final class</span> <span class="type">FeedViewModel</span>: <span class="type">ObservableObject</span> {
+    <span class="keyword">@Published var</span> posts: [<span class="type">Post</span>] = []
+    <span class="keyword">private let</span> feedService: <span class="type">FeedService</span>
+
+    <span class="keyword">func</span> <span class="func">refresh</span>() <span class="keyword">async</span> {
+        posts = <span class="keyword">try</span>? <span class="keyword">await</span> feedService.<span class="func">fetchPosts</span>()
+    }
+}
+
+<span class="comment">// Layer 3: Service (actor for thread safety)</span>
+<span class="keyword">actor</span> <span class="type">FeedService</span> {
+    <span class="keyword">private let</span> api: <span class="type">APIClient</span>
+    <span class="keyword">private let</span> cache: <span class="type">FeedCache</span>
+
+    <span class="keyword">func</span> <span class="func">fetchPosts</span>() <span class="keyword">async throws</span> -> [<span class="type">Post</span>] {
+        <span class="keyword">if let</span> cached = <span class="keyword">await</span> cache.<span class="func">getPosts</span>() {
+            <span class="keyword">return</span> cached
+        }
+        <span class="keyword">let</span> posts = <span class="keyword">try await</span> api.<span class="func">fetchPosts</span>()
+        <span class="keyword">await</span> cache.<span class="func">store</span>(posts)
+        <span class="keyword">return</span> posts
+    }
+}
+
+<span class="comment">// Layer 4: Cache (actor for state protection)</span>
+<span class="keyword">actor</span> <span class="type">FeedCache</span> {
+    <span class="keyword">private var</span> posts: [<span class="type">Post</span>]?
+    <span class="keyword">private var</span> lastFetch: <span class="type">Date</span>?
+
+    <span class="keyword">func</span> <span class="func">getPosts</span>() -> [<span class="type">Post</span>]? {
+        <span class="keyword">guard let</span> lastFetch, <span class="type">Date</span>().<span class="func">timeIntervalSince</span>(lastFetch) &lt; <span class="number">300</span> <span class="keyword">else</span> {
+            <span class="keyword">return nil</span>
+        }
+        <span class="keyword">return</span> posts
+    }
+}
+
+<span class="comment">// Layer 5: API Client (nonisolated — stateless)</span>
+<span class="keyword">struct</span> <span class="type">APIClient</span>: <span class="type">Sendable</span> {
+    <span class="keyword">func</span> <span class="func">fetchPosts</span>() <span class="keyword">async throws</span> -> [<span class="type">Post</span>] {
+        <span class="keyword">let</span> (data, _) = <span class="keyword">try await</span> <span class="type">URLSession</span>.shared.<span class="func">data</span>(from: postsURL)
+        <span class="keyword">return try</span> <span class="type">JSONDecoder</span>().<span class="func">decode</span>([<span class="type">Post</span>].<span class="keyword">self</span>, from: data)
+    }
+}</code></pre>
+
+    <div class="nav-footer">
+        <a href="03-swift-concurrency.html">← Swift Concurrency</a>
+        <a href="05-async-sequences.html">Next: Async Sequences →</a>
+    </div>
+</div>
+</body>
+</html>

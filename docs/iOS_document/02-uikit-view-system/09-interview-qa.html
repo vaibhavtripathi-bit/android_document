@@ -1,0 +1,1394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UIKit View System — Interview Q&amp;A — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">UIKit View System</a><span class="sep">›</span>
+        Interview Q&amp;A
+    </nav>
+
+    <h1>UIKit View System — Interview Q&amp;A</h1>
+    <p class="subtitle">75 Staff-level interview questions covering view hierarchy internals, touch event flow, Auto Layout, the rendering pipeline, Core Graphics, custom views, animations, and table/collection views. Each answer targets the depth expected at a Google L6 / Apple ICT5 interview.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">How to Use</div>
+        <p>Click any question to reveal its answer. Questions are tagged: <span class="tag tag-senior">Senior</span> for L5-level, <span class="tag tag-l6">L6</span> for Staff-level, and <span class="tag tag-architect">Architect</span> for system-design depth. Try answering before revealing.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>View Hierarchy Internals (Questions 1–10)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>1. Explain the UIView / CALayer duality. Why does every UIView have a backing CALayer, and what responsibilities does each own?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>UIView</code> is the <strong>responder-chain participant</strong> — it handles touch events, accessibility, Auto Layout constraints, and coordinate-space conversions. <code>CALayer</code> is the <strong>visual node</strong> — it owns the bitmap backing store, geometry (bounds, position, anchorPoint, transform), and compositing properties (opacity, cornerRadius, shadow).</p>
+                <p>Every UIView creates a <code>CALayer</code> in <code>init</code> and sets itself as the layer's <code>delegate</code>. The view forwards visual property setters (frame, backgroundColor, alpha) to the layer. This separation exists because:</p>
+                <ol>
+                    <li><strong>macOS heritage</strong>: On macOS, <code>NSView</code> can be layer-backed or non-layer-backed. The layer is a separate rendering concept. iOS always uses layers.</li>
+                    <li><strong>Render-server isolation</strong>: CALayer's property tree is serialized and sent to the out-of-process render server (<code>backboardd</code>). UIView state (responder chain, constraints) stays in-process. This separation keeps the render server lean.</li>
+                    <li><strong>Reuse</strong>: You can use CALayer, CAShapeLayer, CAGradientLayer, etc. without UIView overhead when you need pure visual elements with no event handling.</li>
+                </ol>
+                <div class="callout callout-architect">
+                    <div class="callout-title">Architect Insight</div>
+                    <p>You can replace a view's default layer class by overriding <code>class var layerClass: AnyClass</code>. This is how <code>AVPlayerLayer</code>, <code>CAMetalLayer</code>, and <code>CAEAGLLayer</code> integrate — the view returns the specialized layer class, avoiding an extra layer in the hierarchy.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>2. Walk through the hitTest(_:with:) algorithm. Why does it use reverse pre-order traversal?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>hitTest(_:with:)</code> finds the deepest (front-most) view that contains the touch point. The algorithm:</p>
+                <ol>
+                    <li>Check <code>self.point(inside:with:)</code>. If <code>false</code>, return <code>nil</code> — prune the entire subtree.</li>
+                    <li>Check guards: <code>isHidden</code>, <code>!isUserInteractionEnabled</code>, <code>alpha &lt; 0.01</code> → return <code>nil</code>.</li>
+                    <li>Iterate subviews in <strong>reverse order</strong> (last subview first = front-most visually). For each subview, convert the point to the subview's coordinate space and recursively call <code>hitTest</code>.</li>
+                    <li>Return the first non-nil result. If no subview claims the hit, return <code>self</code>.</li>
+                </ol>
+                <p><strong>Reverse pre-order</strong> is used because subviews added later are drawn on top (higher z-order). The user taps what they see, so the front-most view must win. Iterating in reverse ensures the visually topmost subview is tested first, and the algorithm short-circuits on the first match.</p>
+                <pre><code>override func hitTest(_ point: CGPoint, with event: UIEvent?) -&gt; UIView? {
+    guard isUserInteractionEnabled, !isHidden, alpha &gt;= 0.01 else { return nil }
+    guard self.point(inside: point, with: event) else { return nil }
+    for subview in subviews.reversed() {
+        let converted = subview.convert(point, from: self)
+        if let hit = subview.hitTest(converted, with: event) {
+            return hit
+        }
+    }
+    return self
+}</code></pre>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>3. How do you make a UIView respond to touches outside its bounds?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Override <code>point(inside:with:)</code> in the <strong>parent</strong> view (not the child) to return <code>true</code> for the expanded region. Alternatively, override <code>hitTest(_:with:)</code> in the parent to forward the point to the child even when it falls outside the parent's bounds.</p>
+                <p>A common pattern for expanding tap targets:</p>
+                <pre><code>override func point(inside point: CGPoint, with event: UIEvent?) -&gt; Bool {
+    let expandedBounds = bounds.insetBy(dx: -20, dy: -20)
+    return expandedBounds.contains(point)
+}</code></pre>
+                <p>The key insight: <code>hitTest</code> on the parent calls <code>point(inside:)</code> on itself first. If the parent's bounds don't include the child's overflow area, the parent returns <code>nil</code> before ever reaching the child. So the fix must be at the parent level.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>4. What is the difference between frame, bounds, and center? How does the layer's anchorPoint affect them?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>bounds</strong>: The view's rectangle in its <em>own</em> coordinate space. Origin is typically (0,0) but changes when you scroll a UIScrollView (scrolling = changing bounds.origin).</p>
+                <p><strong>center</strong>: The view's center point in its <em>superview's</em> coordinate space. Maps to the layer's <code>position</code>.</p>
+                <p><strong>frame</strong>: The smallest axis-aligned rectangle enclosing the view in its <em>superview's</em> coordinate space. It is <strong>derived</strong> from bounds, center, and transform. When a transform is applied (e.g., rotation), the frame grows to enclose the rotated rectangle — it becomes unreliable for layout.</p>
+                <p><strong>anchorPoint</strong>: Defines which point of the layer corresponds to <code>position</code>/<code>center</code>. Default is (0.5, 0.5) — the geometric center. Changing anchorPoint to (0, 0) makes the top-left corner the anchor. This shifts the layer visually without changing <code>position</code>, so the frame changes. Transforms rotate/scale around the anchorPoint.</p>
+                <div class="callout callout-warning">
+                    <div class="callout-title">Common Pitfall</div>
+                    <p>Changing <code>anchorPoint</code> without adjusting <code>position</code> causes the view to jump. To change anchorPoint without visual movement: save the old frame, set the new anchorPoint, then restore the frame.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>5. What is the difference between clipsToBounds (UIView) and masksToBounds (CALayer)?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>They are the <strong>same property</strong>. <code>UIView.clipsToBounds</code> is a wrapper that reads/writes <code>layer.masksToBounds</code>. Setting one updates the other. The naming difference reflects the UIKit vs Core Animation naming conventions.</p>
+                <p>When <code>true</code>, sublayers/subviews that extend beyond the parent's bounds are clipped. This has a performance implication: combined with <code>cornerRadius</code>, it triggers <strong>off-screen rendering</strong> because the GPU must render the subtree to an off-screen buffer, apply the mask, then composite the result. For scrolling lists, this can cause frame drops.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>6. How does UIView manage its layer's delegate? What happens if you set a layer's delegate to a different object?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>UIView sets itself as its layer's delegate during initialization. The view implements <code>CALayerDelegate</code> methods including <code>display(_:)</code>, <code>draw(_:in:)</code>, <code>layoutSublayers(of:)</code>, and <code>action(for:forKey:)</code>. This is how UIView intercepts layout and drawing requests from the layer.</p>
+                <p>Apple explicitly states: <strong>never reassign a UIView-owned layer's delegate</strong>. Doing so breaks the view's ability to respond to layout changes, drawing requests, and implicit animation queries. The view would stop updating its visual appearance and layout.</p>
+                <p>For standalone layers (not backing a UIView), you can freely set delegates. But a UIView's backing layer's delegate must always be the view itself.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>7. Explain the layer tree, presentation tree, and render tree. When would you access each?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Model layer tree</strong>: The "source of truth" — the property values you set in code. Accessed via <code>layer.position</code>, <code>layer.opacity</code>, etc. Reflects the final state immediately, even during animation.</p>
+                <p><strong>Presentation tree</strong>: Reflects the <em>in-flight animated</em> values. Accessed via <code>layer.presentation()</code>. During a 0.3s opacity animation from 1.0 to 0.0, the model layer reads 0.0 immediately, but <code>presentation()?.opacity</code> returns the interpolated value at the current moment (e.g., 0.6).</p>
+                <p><strong>Render tree</strong>: A private copy held by the <strong>render server</strong> (out-of-process). You cannot access it directly. It's the data the GPU actually uses to composite each frame.</p>
+                <p><strong>When to use presentation()</strong>: Hit-testing during animation (to test against the visual position, not the model position), reading current animated values for physics-based interruptions, or synchronizing non-animated properties with animated ones.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>8. What is the purpose of UIView.layerClass? Give three real-world examples.</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Overriding <code>class var layerClass: AnyClass</code> tells UIKit to create a specific CALayer subclass as the view's backing layer instead of the default <code>CALayer</code>. This avoids adding an extra sublayer and gives the view direct access to the specialized layer's properties.</p>
+                <p><strong>Examples</strong>:</p>
+                <ol>
+                    <li><strong>Video playback</strong>: Return <code>AVPlayerLayer.self</code> so the view directly displays video content. <code>AVPlayerView</code> can then expose <code>player</code> as a property that forwards to the layer.</li>
+                    <li><strong>Metal rendering</strong>: Return <code>CAMetalLayer.self</code> for GPU-rendered content. The view's layer is the drawable surface — no extra sublayer needed.</li>
+                    <li><strong>Shape drawing</strong>: Return <code>CAShapeLayer.self</code> for a view that draws vector paths. Avoids the overhead of <code>draw(_:)</code> and bitmap backing stores — the shape is rendered by the GPU directly.</li>
+                    <li><strong>Gradient backgrounds</strong>: Return <code>CAGradientLayer.self</code> so the view automatically renders a gradient without custom drawing code.</li>
+                </ol>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>9. How does the view hierarchy map to the layer hierarchy? Can they diverge?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Every <code>addSubview(_:)</code> call also adds the child view's layer as a sublayer of the parent view's layer. The view hierarchy and layer hierarchy are kept in sync by UIKit. However, they <strong>can diverge</strong>:</p>
+                <ul>
+                    <li>You can add standalone <code>CALayer</code> sublayers to a view's layer directly (<code>view.layer.addSublayer(shapeLayer)</code>). These layers have no corresponding UIView — they don't participate in the responder chain, Auto Layout, or accessibility.</li>
+                    <li><code>CATransformLayer</code> can create 3D layer hierarchies that have no UIView equivalent.</li>
+                    <li>UIKit internally adds private sublayers (e.g., for scroll indicators, selection highlights).</li>
+                </ul>
+                <p>The divergence means: <strong>layer sublayers ⊇ subview layers</strong>. The view hierarchy is always a subset of the layer hierarchy.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>10. What is the cost of a deep view hierarchy? How would you flatten it for performance?</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Costs of deep hierarchies</strong>:</p>
+                <ul>
+                    <li><strong>Hit testing</strong>: O(n) traversal of all views for every touch. Deep trees with many siblings are expensive.</li>
+                    <li><strong>Layout</strong>: Auto Layout constraint solving scales super-linearly. More views = more constraints = longer layout passes.</li>
+                    <li><strong>Rendering</strong>: Each layer is a texture in VRAM. More layers = more GPU compositing passes and more memory.</li>
+                    <li><strong>Memory</strong>: Each UIView is ~700 bytes, each CALayer ~300 bytes. 1000 views ≈ 1MB just for the objects, plus backing stores.</li>
+                </ul>
+                <p><strong>Flattening strategies</strong>:</p>
+                <ul>
+                    <li>Override <code>draw(_:)</code> to render multiple elements into a single backing store (trading flexibility for performance).</li>
+                    <li>Use <code>CAShapeLayer</code> / <code>CATextLayer</code> instead of UIView subclasses for non-interactive elements.</li>
+                    <li>Use <code>shouldRasterize = true</code> on complex subtrees that don't change frequently.</li>
+                    <li>In table/collection views, use flat cell layouts — avoid nesting stack views inside stack views.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Touch Event Flow (Questions 11–20)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>11. Trace the full path of a touch from the user's finger to your UIButton action. Include every system component.</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <ol>
+                    <li><strong>Hardware</strong>: The digitizer detects capacitance changes and generates raw touch data at 60–120 Hz.</li>
+                    <li><strong>IOKit driver</strong>: The kernel's <code>IOHIDEvent</code> system packages the raw data into a Mach message.</li>
+                    <li><strong>SpringBoard</strong>: Receives the IOHIDEvent via a Mach port. Determines which app owns the touched screen region and forwards the event to that app's process via another Mach port.</li>
+                    <li><strong>App's main RunLoop</strong>: The event arrives as a Source1 (port-based) callback. UIKit's internal event queue receives it.</li>
+                    <li><strong>UIApplication.sendEvent(_:)</strong>: The application object packages the touch into a <code>UIEvent</code> containing <code>UITouch</code> objects.</li>
+                    <li><strong>UIWindow.sendEvent(_:)</strong>: The key window receives the event.</li>
+                    <li><strong>Hit testing</strong>: <code>hitTest(_:with:)</code> traverses the view hierarchy (reverse pre-order) to find the deepest view under the touch point.</li>
+                    <li><strong>Gesture recognizer pipeline</strong>: The window sends touches to all gesture recognizers in the hit-test view's chain <em>before</em> the view itself. Recognizers get first priority.</li>
+                    <li><strong>Responder chain</strong>: If no gesture recognizer claims the touch, <code>touchesBegan/Moved/Ended</code> is called on the hit-test view, then up the responder chain.</li>
+                    <li><strong>UIControl target-action</strong>: For UIButton, the control's internal gesture recognizer fires the target-action pair on <code>.touchUpInside</code>.</li>
+                </ol>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>12. What is the responder chain? How is it constructed, and how does it differ from the view hierarchy?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>The responder chain is a linked list of <code>UIResponder</code> objects that can handle events. It follows this path:</p>
+                <p><strong>Hit-test view → superview → … → root view → UIViewController → parent VC → … → UIWindow → UIApplication → UIApplicationDelegate</strong></p>
+                <p>It differs from the view hierarchy in two ways:</p>
+                <ul>
+                    <li><strong>View controllers are inserted</strong>: Between a VC's root view and its superview, the VC itself is in the chain. This is how VCs can handle events that their views don't.</li>
+                    <li><strong>UIWindow, UIApplication, and the app delegate</strong> are at the end — they're not views but can handle events (e.g., keyboard shortcuts, menu commands).</li>
+                </ul>
+                <p>The chain is used for more than touches: it routes <code>canPerformAction</code> queries, menu commands, keyboard input, undo/redo, and <code>becomeFirstResponder</code>/<code>resignFirstResponder</code>.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>13. How do UIGestureRecognizers interact with the responder chain? What does delaysTouchesBegan do?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Gesture recognizers (GRs) operate in a <strong>parallel pipeline</strong> alongside the responder chain. When a touch begins:</p>
+                <ol>
+                    <li>All GRs attached to the hit-test view and its ancestors receive the touch simultaneously.</li>
+                    <li>GRs are in <code>.possible</code> state. They analyze incoming touches to decide whether to recognize.</li>
+                    <li>If a GR transitions to <code>.recognized</code> (discrete) or <code>.began</code> (continuous), it "claims" the touch. By default, the responder chain receives <code>touchesCancelled</code> — the view's touch handling is cancelled.</li>
+                </ol>
+                <p><strong>delaysTouchesBegan</strong>: When <code>true</code>, the system <em>withholds</em> <code>touchesBegan</code> from the view until the GR fails. This prevents the view from starting visual feedback (e.g., highlight) that would need to be reversed. The downside: perceived latency — the view doesn't respond until the GR decides.</p>
+                <p><strong>cancelsTouchesInView</strong>: When <code>false</code>, both the GR and the view receive touches simultaneously. Useful for analytics GRs that observe without interfering.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>14. How does UIScrollView's gesture recognition interact with its subviews' tap gestures?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>UIScrollView has a <code>UIPanGestureRecognizer</code> with <code>delaysTouchesBegan = false</code> and a private <code>UIScrollViewDelayedTouchesBeganGestureRecognizer</code> that introduces a ~150ms delay. This creates the "scroll vs tap" disambiguation:</p>
+                <ol>
+                    <li>Touch begins → scroll view's delayed-touch GR starts a timer (~150ms).</li>
+                    <li>If the finger moves beyond a threshold before the timer fires → pan gesture recognizes → scroll begins, subview never gets <code>touchesBegan</code>.</li>
+                    <li>If the finger stays still → timer fires → <code>touchesBegan</code> is delivered to the subview → tap can be recognized.</li>
+                </ol>
+                <p><code>delaysContentTouches = false</code> disables this delay — subviews get touches immediately, but scrolling feels less responsive because the scroll view must wait for the subview's GR to fail.</p>
+                <p><code>canCancelContentTouches = true</code> (default) allows the scroll view to cancel the subview's touches mid-stream if a pan is detected after the initial delay.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>15. Explain require(toFail:) and how it creates gesture dependency chains.</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>gestureA.require(toFail: gestureB)</code> means gesture A cannot transition to <code>.recognized</code> until gesture B has transitioned to <code>.failed</code>. This creates a dependency: A waits for B to fail before it can succeed.</p>
+                <p><strong>Classic use case</strong>: Single-tap vs double-tap. The single-tap GR requires the double-tap GR to fail. If the user double-taps, the double-tap recognizes and the single-tap never fires. If the user single-taps, the double-tap fails (timeout), then the single-tap fires — with a delay equal to the double-tap's timeout.</p>
+                <p><strong>Performance implication</strong>: Every <code>require(toFail:)</code> adds latency equal to the dependent GR's failure timeout. Chaining multiple dependencies compounds this delay. Use sparingly.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>16. What is the first responder? How does the keyboard relate to the responder chain?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>The <strong>first responder</strong> is the responder object that currently receives keyboard input and action messages. A UITextField becomes first responder when tapped (calling <code>becomeFirstResponder()</code>), which triggers the keyboard to appear.</p>
+                <p>Keyboard events are sent to the first responder. If the first responder doesn't handle a key command, the event travels up the responder chain. This is how a parent view controller can handle keyboard shortcuts even when a text field is focused.</p>
+                <p><code>resignFirstResponder()</code> dismisses the keyboard. <code>UIView.endEditing(true)</code> forces the entire subtree to resign, which is the common "tap outside to dismiss keyboard" pattern.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>17. How does hit testing work with transforms (rotation, scale)? What about 3D transforms?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>When <code>hitTest</code> converts the touch point to a subview's coordinate space via <code>convert(_:from:)</code>, it applies the <strong>inverse</strong> of the subview's transform. For 2D affine transforms (rotation, scale, translation), this works correctly — the touch point is mapped into the untransformed coordinate space, and <code>point(inside:with:)</code> tests against the original bounds.</p>
+                <p>For <strong>3D transforms</strong> (<code>CATransform3D</code>), hit testing uses the <strong>flattened 2D projection</strong>. The 3D transform is projected onto the screen plane, and the inverse of that 2D projection is used. This means hit testing works for perspective-rotated views, but the hit area corresponds to the visual projection, not the original rectangle.</p>
+                <p><strong>Edge case</strong>: If a 3D transform makes the layer edge-on (perpendicular to the screen), the projection degenerates and hit testing fails — the view becomes untappable.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>18. How would you implement a passthrough view that ignores touches on itself but lets subviews receive them?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Override <code>hitTest(_:with:)</code> to return <code>nil</code> when the hit lands on <code>self</code> (not on a subview):</p>
+                <pre><code>override func hitTest(_ point: CGPoint, with event: UIEvent?) -&gt; UIView? {
+    let hit = super.hitTest(point, with: event)
+    return hit === self ? nil : hit
+}</code></pre>
+                <p>This lets subviews receive touches normally, but touches on the empty areas of the view fall through to views behind it. This is useful for overlay containers, floating toolbars, or HUD views where the background should be transparent to touches.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>19. What is UIEvent.EventType? What types of events flow through sendEvent(_:)?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>UIEvent</code> carries several event types through the same <code>sendEvent(_:)</code> pipeline:</p>
+                <ul>
+                    <li><strong>.touches</strong>: Direct and indirect touch events (finger, Apple Pencil).</li>
+                    <li><strong>.motion</strong>: Shake gesture events (<code>motionBegan/Ended</code>).</li>
+                    <li><strong>.remoteControl</strong>: Media remote events (play, pause, next track).</li>
+                    <li><strong>.presses</strong>: Physical button presses (keyboard keys, game controller buttons).</li>
+                    <li><strong>.hover</strong> (iPadOS/Catalyst): Pointer hover events.</li>
+                    <li><strong>.scroll</strong> (Catalyst): Trackpad/mouse scroll events.</li>
+                </ul>
+                <p>All flow through <code>UIApplication.sendEvent(_:)</code> → <code>UIWindow.sendEvent(_:)</code>, but the routing after that differs: touches go through hit testing, motion events go to the first responder, remote control events go up the responder chain.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>20. How does Apple Pencil's touch handling differ from finger touches? What about predictive touches?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Apple Pencil touches have additional properties: <code>force</code> (pressure), <code>altitudeAngle</code>, <code>azimuthAngle(in:)</code>, and <code>azimuthUnitVector(in:)</code>. The <code>type</code> property is <code>.pencil</code> (vs <code>.direct</code> for fingers).</p>
+                <p><strong>Higher sample rate</strong>: Pencil reports at 240 Hz (vs 60-120 Hz for fingers). Use <code>event.coalescedTouches(for:)</code> to get all intermediate samples between deliveries — critical for smooth drawing.</p>
+                <p><strong>Predictive touches</strong>: <code>event.predictedTouches(for:)</code> returns estimated future touch positions (typically 2-4 frames ahead). Drawing apps render these predicted points to reduce perceived latency, then replace them with actual data as it arrives. This is how apps like Procreate achieve near-zero latency.</p>
+                <p>Pencil touches also support <strong>hover</strong> (Pencil 2nd gen on iPad Pro): the pencil reports position before touching the screen, enabling preview effects.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Layout System (Questions 21–30)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>21. How does Auto Layout's Cassowary constraint solver work? What is its time complexity?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Auto Layout uses the <strong>Cassowary incremental linear constraint solver</strong>. Each constraint is a linear equation or inequality: <code>view.left = superview.left + 16</code> becomes <code>x₁ = x₂ + 16</code>. The solver maintains a <strong>simplex tableau</strong> that represents all constraints simultaneously.</p>
+                <p><strong>Incremental</strong> means when you add or remove a single constraint, the solver doesn't re-solve from scratch — it performs a pivot operation on the existing tableau. This is O(n) for a single change, where n is the number of constraints.</p>
+                <p><strong>Priorities</strong> are handled by the simplex method's objective function. Required constraints (priority 1000) are hard constraints — the system is infeasible if they conflict. Optional constraints (priority &lt; 1000) are soft constraints — the solver minimizes their violation, weighted by priority.</p>
+                <p><strong>Practical complexity</strong>: For typical layouts, solving is roughly O(n) to O(n·log n). But pathological cases (deeply nested views with cross-hierarchy constraints) can approach O(n²) or worse. Apple's WWDC 2018 session showed that constraint count should stay under ~1000 for smooth 60fps layout.</p>
+                <div class="callout callout-architect">
+                    <div class="callout-title">Architect Insight</div>
+                    <p>The solver's performance depends on constraint <em>locality</em>. Constraints between siblings are cheap (local). Constraints between distant views in the hierarchy are expensive because they create dependencies across the tableau. This is why flat hierarchies with local constraints perform best.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>22. Describe the three layout passes: constraint update, layout, and display. When does each run?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>UIKit's layout engine runs three passes per RunLoop iteration, in order:</p>
+                <ol>
+                    <li><strong>Constraints update pass</strong> (outside → in, leaf → root): Calls <code>updateConstraints()</code> on views that have been marked via <code>setNeedsUpdateConstraints()</code>. Views add/remove/modify constraints. The Cassowary solver is updated incrementally. Direction: from leaves toward the root.</li>
+                    <li><strong>Layout pass</strong> (outside → in, root → leaf): Calls <code>layoutSubviews()</code> on views marked via <code>setNeedsLayout()</code>. The solver's solution is read and applied to each view's frame. Direction: from root toward leaves (parent positions children).</li>
+                    <li><strong>Display pass</strong> (outside → in): Calls <code>draw(_:)</code> on views marked via <code>setNeedsDisplay()</code>. Views that override <code>draw(_:)</code> render into their backing store.</li>
+                </ol>
+                <p>All three passes are deferred — calling <code>setNeedsLayout()</code> doesn't trigger layout immediately. It marks the view as "dirty" and the pass runs at the end of the current RunLoop iteration. Use <code>layoutIfNeeded()</code> to force immediate layout (useful for animations).</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>23. What are constraint priorities? Explain the difference between required, defaultHigh, defaultLow, and fittingSize.</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Constraint priority is a Float from 1 to 1000:</p>
+                <ul>
+                    <li><strong>.required (1000)</strong>: Must be satisfied. Conflicts between required constraints crash in debug (unsatisfiable constraint log) and silently break a constraint in release.</li>
+                    <li><strong>.defaultHigh (750)</strong>: Used by content hugging. "I prefer not to grow beyond my intrinsic size."</li>
+                    <li><strong>.defaultLow (250)</strong>: Used by compression resistance. "I prefer not to shrink below my intrinsic size."</li>
+                    <li><strong>.fittingSizeLevel (50)</strong>: Used by <code>systemLayoutSizeFitting</code> — the weakest priority, used for size calculation queries.</li>
+                </ul>
+                <p><strong>Key rule</strong>: Never set a priority to 1000 and then try to change it at runtime — required constraints cannot be demoted. Set it to 999 if you might need to change it later. The solver treats 999 and 1000 very differently: 999 is optional (can be violated), 1000 is required (violation = error).</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>24. Explain content hugging and compression resistance. Give a concrete example where getting them wrong causes bugs.</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Content hugging</strong>: "Don't stretch me." A high hugging priority means the view resists growing beyond its <code>intrinsicContentSize</code>. The solver adds: <code>width ≤ intrinsicWidth</code> at the hugging priority.</p>
+                <p><strong>Compression resistance</strong>: "Don't squish me." A high resistance priority means the view resists shrinking below its intrinsic size. The solver adds: <code>width ≥ intrinsicWidth</code> at the resistance priority.</p>
+                <p><strong>Bug example</strong>: Two labels side by side in a horizontal stack, total text wider than the screen. Both have compression resistance = 750 (default). Auto Layout must shrink one — but which? It's ambiguous. The solver picks arbitrarily, causing inconsistent truncation. Fix: set the less important label's compression resistance to 749.</p>
+                <p>Similarly: a label next to a text field. Both have hugging = 250 (default). Extra space must go somewhere — ambiguous. Fix: set the text field's hugging to 249 so it stretches, keeping the label tight.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>25. What is translatesAutoresizingMaskIntoConstraints? Why does forgetting it cause so many bugs?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>When <code>true</code> (the default for programmatically created views), UIKit automatically generates constraints from the view's <code>autoresizingMask</code> to replicate springs-and-struts behavior. These auto-generated constraints almost always <strong>conflict</strong> with your manually added constraints, producing unsatisfiable constraint errors.</p>
+                <p>You must set <code>translatesAutoresizingMaskIntoConstraints = false</code> before adding your own constraints. Views created in Interface Builder have this set to <code>false</code> automatically. Views created in code default to <code>true</code>.</p>
+                <p>The auto-generated constraints are required (priority 1000) and pin the view to its current frame. They conflict with almost any other constraint you add, which is why the "Unable to simultaneously satisfy constraints" log is the #1 Auto Layout debugging issue.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>26. How does UIStackView work internally? Does it use constraints?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Yes, UIStackView generates and manages Auto Layout constraints internally. It creates constraints between arranged subviews for spacing, alignment, and distribution. When you add/remove views or change properties (axis, spacing, distribution), it tears down and recreates the relevant constraints.</p>
+                <p><strong>Key behaviors</strong>:</p>
+                <ul>
+                    <li><strong>Non-rendering</strong>: UIStackView does not have a backing store — it overrides <code>class var layerClass</code> to return <code>CATransformLayer</code>, which cannot render content. It's purely a layout container.</li>
+                    <li><strong>isHidden optimization</strong>: Setting <code>arrangedSubview.isHidden = true</code> collapses the space — the stack view removes the spacing constraint for that view. This is animatable.</li>
+                    <li><strong>Distribution modes</strong>: <code>.fill</code> stretches one view (based on hugging priorities), <code>.fillEqually</code> makes all views equal size, <code>.fillProportionally</code> distributes based on intrinsic sizes, <code>.equalSpacing</code> and <code>.equalCentering</code> adjust spacing.</li>
+                </ul>
+                <div class="callout callout-warning">
+                    <div class="callout-title">Performance Warning</div>
+                    <p>Deeply nested stack views generate exponentially more constraints. A 3-level nesting of stacks with 5 items each can produce 100+ constraints. For scrolling cells, prefer flat constraint-based layouts over nested stacks.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>27. What is intrinsicContentSize? Which views have it, and what happens when it changes?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>intrinsicContentSize</code> is the natural size a view wants to be based on its content. UILabel returns the size needed to display its text. UIImageView returns the image's point size. UIButton returns the size for its title + image + padding. Plain UIView returns <code>(.noIntrinsicMetric, .noIntrinsicMetric)</code> — no natural size.</p>
+                <p>When content changes (e.g., label text changes), the view calls <code>invalidateIntrinsicContentSize()</code>. This tells Auto Layout to re-query <code>intrinsicContentSize</code> and re-solve constraints. The solver treats intrinsic size as two optional constraints (hugging and compression resistance) per axis.</p>
+                <p>For custom views, override <code>intrinsicContentSize</code> and call <code>invalidateIntrinsicContentSize()</code> whenever the content changes. Return <code>.noIntrinsicMetric</code> for axes where the view has no natural size.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>28. What is the layout feedback loop, and how do you avoid it?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>A layout feedback loop occurs when <code>layoutSubviews()</code> modifies something that triggers another layout pass, which triggers another, ad infinitum. Common causes:</p>
+                <ul>
+                    <li>Adding/removing constraints inside <code>layoutSubviews()</code></li>
+                    <li>Calling <code>setNeedsLayout()</code> inside <code>layoutSubviews()</code></li>
+                    <li>Changing a property that invalidates intrinsic content size during layout</li>
+                    <li>Modifying a view's frame in a way that triggers its superview's layout</li>
+                </ul>
+                <p>UIKit detects this and breaks the loop after a few iterations, logging a warning. But the damage is done — the layout is incorrect and CPU time is wasted.</p>
+                <p><strong>Prevention</strong>: In <code>layoutSubviews()</code>, only read the solver's output (frames) and apply it. Never modify constraints, add/remove views, or change properties that trigger layout. Move constraint changes to <code>updateConstraints()</code>.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>29. How do Safe Area insets propagate through the view hierarchy? What about keyboard avoidance?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>safeAreaInsets</code> propagate from the window down through the view hierarchy. The window's safe area accounts for the status bar, home indicator, and notch. Each view's safe area is the intersection of its parent's safe area with its own bounds.</p>
+                <p>View controllers can add to the safe area via <code>additionalSafeAreaInsets</code>. Container VCs (navigation, tab bar) add their bar heights. This is how content automatically avoids bars without hardcoded offsets.</p>
+                <p><strong>Keyboard avoidance</strong>: Starting in iOS 15, <code>UIView</code> has <code>keyboardLayoutGuide</code> — a layout guide that tracks the keyboard's frame. Constrain views to this guide for automatic keyboard avoidance. Before iOS 15, you observe <code>UIResponder.keyboardWillShowNotification</code> and manually adjust constraints or content insets.</p>
+                <p><code>safeAreaInsetsDidChange()</code> is called when insets change (e.g., rotation, keyboard appearance via the keyboard layout guide). Override it to respond to changes.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>30. How would you debug an "Unable to simultaneously satisfy constraints" error?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>The console log lists all conflicting constraints. Debugging steps:</p>
+                <ol>
+                    <li><strong>Identify the views</strong>: Each constraint references views by memory address. Use <code>po [view address]</code> in the debugger, or add <code>accessibilityIdentifier</code> to views — it appears in the constraint log.</li>
+                    <li><strong>Check for autoresizing mask constraints</strong>: Look for constraints with <code>NSAutoresizingMaskLayoutConstraint</code> — you forgot <code>translatesAutoresizingMaskIntoConstraints = false</code>.</li>
+                    <li><strong>Find the odd one out</strong>: The system breaks one constraint to resolve the conflict. The log says "Will attempt to recover by breaking constraint [X]." That's often the one you need to lower in priority or remove.</li>
+                    <li><strong>Use symbolic breakpoint</strong>: Set a breakpoint on <code>UIViewAlertForUnsatisfiableConstraints</code> to catch the exact moment of conflict.</li>
+                    <li><strong>Xcode's view debugger</strong>: The runtime view hierarchy shows constraint conflicts visually with warning icons.</li>
+                </ol>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Rendering Pipeline (Questions 31–40)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>31. Describe the full Core Animation rendering pipeline from CATransaction commit to pixels on screen.</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>The pipeline spans two processes:</p>
+                <ol>
+                    <li><strong>App process — Commit phase</strong>:
+                        <ul>
+                            <li>At the end of the RunLoop iteration, <code>CATransaction.commit()</code> is called implicitly.</li>
+                            <li>The transaction collects all layer tree changes (property mutations, added/removed layers).</li>
+                            <li>Layout is resolved (<code>layoutSubviews</code>), display is resolved (<code>draw(_:)</code> for dirty layers).</li>
+                            <li>The layer tree is <strong>encoded</strong> (serialized) and sent to the render server via IPC (Mach messages).</li>
+                        </ul>
+                    </li>
+                    <li><strong>Render server (backboardd) — Render phase</strong>:
+                        <ul>
+                            <li>Decodes the layer tree.</li>
+                            <li>Builds a <strong>render tree</strong> optimized for GPU execution.</li>
+                            <li>Submits GPU commands: texture uploads, compositing operations, shader programs.</li>
+                            <li>The GPU composites all layers into the final framebuffer.</li>
+                            <li>The display controller scans out the framebuffer to the physical display at the next vsync.</li>
+                        </ul>
+                    </li>
+                </ol>
+                <p>The render server runs at a higher priority than your app, ensuring smooth animation even when the app is busy. This is why Core Animation animations (which run in the render server) are smoother than manual frame-by-frame animation in the app process.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>32. What is a CATransaction? What is the difference between implicit and explicit transactions?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>A <code>CATransaction</code> batches layer tree changes into a single atomic commit to the render server.</p>
+                <p><strong>Implicit transaction</strong>: Created automatically by Core Animation at the beginning of each RunLoop iteration. All layer property changes during that iteration are batched. Committed at the end of the iteration. You never see it — it's automatic.</p>
+                <p><strong>Explicit transaction</strong>: Created with <code>CATransaction.begin()</code> / <code>CATransaction.commit()</code>. Useful for:</p>
+                <ul>
+                    <li>Disabling implicit animations: <code>CATransaction.setDisableActions(true)</code></li>
+                    <li>Changing animation duration: <code>CATransaction.setAnimationDuration(0.5)</code></li>
+                    <li>Adding a completion block: <code>CATransaction.setCompletionBlock { ... }</code></li>
+                    <li>Grouping changes that should commit together</li>
+                </ul>
+                <p>Transactions nest. An explicit transaction inside an implicit one creates a nested scope. The outermost commit triggers the actual IPC to the render server.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>33. What is off-screen rendering? What triggers it, and why is it expensive?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Off-screen rendering occurs when the GPU cannot composite a layer in a single pass and must render it to a temporary off-screen buffer first, then composite that buffer into the final framebuffer.</p>
+                <p><strong>Triggers</strong>:</p>
+                <ul>
+                    <li><code>cornerRadius</code> + <code>masksToBounds</code> (clipping rounded corners)</li>
+                    <li><code>shadow</code> without <code>shadowPath</code> (GPU must compute the shadow shape from the layer's alpha channel)</li>
+                    <li><code>mask</code> property (layer masking)</li>
+                    <li><code>allowsGroupOpacity</code> with non-1.0 opacity on a layer with sublayers</li>
+                    <li>Custom <code>shouldRasterize = true</code> (intentional off-screen render + cache)</li>
+                </ul>
+                <p><strong>Why expensive</strong>: The GPU must (1) allocate an off-screen buffer in VRAM, (2) switch rendering context to the off-screen buffer, (3) render the layer subtree, (4) switch back to the framebuffer, (5) composite the off-screen buffer. The context switches are the main cost — they flush the GPU pipeline.</p>
+                <p><strong>Mitigation</strong>: Set <code>shadowPath</code> for shadows. Use <code>layer.cornerRadius</code> without <code>masksToBounds</code> (iOS 13+ rounds corners without off-screen rendering for simple cases). Use pre-rendered images with rounded corners.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>34. Explain shouldRasterize. When does it help, and when does it hurt?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>shouldRasterize = true</code> tells Core Animation to render the layer subtree into a bitmap cache (off-screen buffer) and reuse that cache for subsequent frames. The cache is stored in GPU memory.</p>
+                <p><strong>Helps when</strong>: The layer subtree is complex (many sublayers, shadows, masks) but doesn't change frequently. The off-screen render happens once, and subsequent frames use the cached bitmap — much cheaper than re-compositing the subtree every frame.</p>
+                <p><strong>Hurts when</strong>:</p>
+                <ul>
+                    <li>The layer changes every frame (animation, scrolling content) — the cache is invalidated and re-rendered every frame, making it <em>more</em> expensive than no caching.</li>
+                    <li>The layer is larger than the screen — the cache consumes significant VRAM.</li>
+                    <li>The <code>rasterizationScale</code> doesn't match the screen scale — the cached bitmap is scaled, causing blurriness. Always set <code>rasterizationScale = UIScreen.main.scale</code>.</li>
+                </ul>
+                <p>Core Animation evicts rasterized caches after ~100ms of non-use. Use Instruments' Core Animation template — "Color Hits Green and Misses Red" — to verify caching effectiveness.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>35. What is the render server? Why does it run out-of-process?</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p>The render server is <code>backboardd</code> (previously <code>SpringBoard</code> handled this on older iOS). It's a system daemon that composites all app windows and system UI into the final display framebuffer.</p>
+                <p><strong>Why out-of-process</strong>:</p>
+                <ul>
+                    <li><strong>Isolation</strong>: If your app hangs or crashes, animations already committed to the render server continue smoothly. The user sees a frozen UI but animations don't stutter.</li>
+                    <li><strong>Priority</strong>: The render server runs at real-time priority, higher than any app. It never misses a vsync deadline due to app-level work.</li>
+                    <li><strong>Security</strong>: Apps can't directly access GPU resources or other apps' layer trees. The render server mediates all GPU access.</li>
+                    <li><strong>Efficiency</strong>: The render server composites all apps' layers in a single GPU pass, sharing the GPU efficiently.</li>
+                </ul>
+                <p>The tradeoff: IPC overhead. Every frame, the layer tree diff must be serialized and sent via Mach messages. This is why the "commit" phase in Instruments shows IPC time.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>36. What is the difference between a layer's backing store and its contents property?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>The <strong>backing store</strong> is the bitmap buffer (IOSurface) that holds the layer's rendered pixels. It's allocated when the layer needs to display custom-drawn content (via <code>draw(_:)</code> or <code>display()</code>). Its size = bounds.size × contentsScale × screen scale. A 100×100pt view at 3x scale = 300×300px = 360KB (at 4 bytes/pixel).</p>
+                <p>The <strong>contents</strong> property (<code>layer.contents</code>) is a <code>CGImage</code> (or <code>IOSurface</code>) that the layer displays. You can set it directly: <code>layer.contents = image.cgImage</code>. When you do this, no backing store is allocated — the layer displays the provided image directly.</p>
+                <p><code>UIImageView</code> works this way: it sets <code>layer.contents</code> to the image's CGImage, avoiding the cost of a backing store and <code>draw(_:)</code>. This is why UIImageView is more efficient than a custom view that draws an image in <code>draw(_:)</code>.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>37. What is contentsScale? What happens if you set it incorrectly?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>contentsScale</code> defines the mapping between the layer's logical coordinate space (points) and its backing store's pixel resolution. On a 3x Retina display, <code>contentsScale</code> should be 3.0.</p>
+                <p>If set too low (e.g., 1.0 on a 3x display): the backing store is 1/3 the needed resolution. Core Animation scales it up, resulting in <strong>blurry rendering</strong>.</p>
+                <p>If set too high: the backing store is unnecessarily large, wasting memory and GPU bandwidth.</p>
+                <p>UIView automatically sets its layer's <code>contentsScale</code> to <code>UIScreen.main.scale</code>. But standalone CALayers (not backing a UIView) default to 1.0 — you must set <code>contentsScale</code> manually. This is a common source of blurry <code>CATextLayer</code> and <code>CAShapeLayer</code> content.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>38. How do implicit animations work in Core Animation? Why don't they fire on UIView-backed layers?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>When you change an <strong>animatable property</strong> on a standalone CALayer (e.g., <code>layer.opacity = 0</code>), Core Animation automatically creates a <code>CABasicAnimation</code> with a default 0.25s duration. This is an implicit animation.</p>
+                <p>The mechanism: Core Animation calls <code>action(forKey:)</code> on the layer's delegate (and the layer itself). If an action object (conforming to <code>CAAction</code>) is returned, it's executed as an animation. Standalone layers return a <code>CABasicAnimation</code> by default.</p>
+                <p><strong>UIView-backed layers</strong>: UIView implements <code>action(for:forKey:)</code> (the delegate method) and returns <code>NSNull()</code> when <em>outside</em> a <code>UIView.animate</code> block — this suppresses implicit animations. Inside an animation block, UIView returns a <code>CABasicAnimation</code> configured with the block's parameters. This is how <code>UIView.animate</code> works under the hood — it temporarily changes the action returned by the layer delegate.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>39. What is CADisplayLink? How does it relate to ProMotion's variable refresh rate?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>CADisplayLink</code> is a timer synchronized to the display's refresh rate. Its callback fires once per frame, giving you the <code>timestamp</code> (when the frame will be displayed) and <code>targetTimestamp</code> (the next frame's display time). The delta between them is the frame duration.</p>
+                <p><strong>ProMotion</strong> (120Hz, variable): The display dynamically adjusts its refresh rate (24, 30, 48, 60, 80, 120 Hz) based on content. CADisplayLink's <code>preferredFrameRateRange</code> (iOS 15+) lets you specify minimum, maximum, and preferred frame rates. The system picks the best rate.</p>
+                <pre><code>let link = CADisplayLink(target: self, selector: #selector(step))
+link.preferredFrameRateRange = CAFrameRateRange(
+    minimum: 30, maximum: 120, preferred: 120
+)
+link.add(to: .main, forMode: .common)</code></pre>
+                <p>For animations that don't need 120fps (e.g., a clock hand), set a lower preferred rate to save battery. The system may also lower the rate if the GPU is under pressure.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>40. How would you diagnose and fix a scrolling performance problem caused by rendering?</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Diagnosis workflow</strong>:</p>
+                <ol>
+                    <li><strong>Instruments → Core Animation</strong>: Check FPS counter. Look for drops below 60 (or 120 on ProMotion).</li>
+                    <li><strong>Color Blended Layers</strong>: Red = alpha blending (expensive compositing). Minimize transparent views over other content.</li>
+                    <li><strong>Color Off-screen Rendered</strong>: Yellow = off-screen rendering. Identify which layers trigger it.</li>
+                    <li><strong>Color Hits Green / Misses Red</strong>: For rasterized layers — green = cache hit (good), red = cache miss (re-rendering every frame).</li>
+                    <li><strong>Time Profiler</strong>: Check if the bottleneck is CPU (layout, drawing) or GPU (compositing).</li>
+                </ol>
+                <p><strong>Common fixes</strong>:</p>
+                <ul>
+                    <li>Set <code>shadowPath</code> for all shadows</li>
+                    <li>Set <code>layer.opaque = true</code> and <code>backgroundColor</code> on cells to avoid blending</li>
+                    <li>Pre-decode images on a background queue (<code>CGImage</code> decoding is lazy and expensive)</li>
+                    <li>Use <code>shouldRasterize</code> for complex static cell content</li>
+                    <li>Flatten view hierarchies — fewer layers = fewer compositing passes</li>
+                    <li>Avoid <code>cornerRadius + masksToBounds</code> — use pre-rounded images or <code>CAShapeLayer</code> masks</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Drawing &amp; Core Graphics (Questions 41–48)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>41. When should you override draw(_:) vs using CAShapeLayer or UIImageView?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Override draw(_:) when</strong>: You need complex, dynamic, pixel-level rendering that changes based on state — custom charts, waveforms, handwriting. The content is too complex for layer composition.</p>
+                <p><strong>Use CAShapeLayer when</strong>: You need vector paths (lines, curves, shapes). CAShapeLayer is GPU-accelerated, animatable (path morphing), and doesn't require a backing store bitmap. Better for simple to moderate vector graphics.</p>
+                <p><strong>Use UIImageView when</strong>: Displaying static or pre-rendered images. UIImageView sets <code>layer.contents</code> directly — no backing store allocation, no <code>draw(_:)</code> overhead. Most memory-efficient option.</p>
+                <p><strong>Key tradeoff</strong>: <code>draw(_:)</code> allocates a backing store (width × height × 4 bytes × scale²). A full-screen view on iPhone 15 Pro Max at 3x = 1290×2796×4 = ~14MB. This is why you should avoid <code>draw(_:)</code> for large views unless absolutely necessary.</p>
+                <div class="callout callout-warning">
+                    <div class="callout-title">Memory Impact</div>
+                    <p>Every view that overrides <code>draw(_:)</code> gets a backing store bitmap. Ten 200×200pt views at 3x = 10 × 600×600×4 = 14.4MB. Prefer layer-based approaches (CAShapeLayer, CAGradientLayer) that don't need backing stores.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>42. Explain the Core Graphics coordinate system. How does it differ from UIKit's?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Core Graphics (Quartz)</strong>: Origin at bottom-left, Y increases upward (mathematical convention). This is the native coordinate system of CGContext.</p>
+                <p><strong>UIKit</strong>: Origin at top-left, Y increases downward (screen convention). UIKit applies a transform (flip + translate) to the CGContext before calling <code>draw(_:)</code>, so you can draw in UIKit coordinates.</p>
+                <p><strong>When it matters</strong>: If you create a <code>CGContext</code> manually (e.g., <code>UIGraphicsBeginImageContext</code>), UIKit applies the flip. But if you use <code>CGContext</code> directly (e.g., in a <code>CALayerDelegate.draw(_:in:)</code> method), the context is <em>not</em> flipped — you're in CG coordinates. Images drawn with <code>CGContext.draw(image:in:)</code> will appear upside down unless you flip the context manually.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>43. What is the difference between UIGraphicsImageRenderer and UIGraphicsBeginImageContext?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>UIGraphicsImageRenderer</code> (iOS 10+) is the modern replacement:</p>
+                <ul>
+                    <li><strong>Automatic format selection</strong>: Chooses the optimal pixel format. For content without alpha, it uses an opaque format (no alpha channel = 25% less memory). <code>UIGraphicsBeginImageContext</code> always uses RGBA.</li>
+                    <li><strong>Wide color support</strong>: Automatically uses extended sRGB or Display P3 when appropriate. The legacy API is limited to sRGB.</li>
+                    <li><strong>Closure-based API</strong>: No risk of forgetting <code>UIGraphicsEndImageContext()</code>. The context is automatically cleaned up.</li>
+                    <li><strong>PDF and image data</strong>: Can generate PDF data, PNG data, and JPEG data directly.</li>
+                </ul>
+                <pre><code>let renderer = UIGraphicsImageRenderer(size: CGSize(width: 100, height: 100))
+let image = renderer.image { ctx in
+    UIColor.red.setFill()
+    ctx.fill(CGRect(x: 0, y: 0, width: 100, height: 100))
+}</code></pre>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>44. How does image decoding work in iOS? Why is it a performance concern?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>When you create a <code>UIImage</code> from data or a file, the image is <strong>not decoded immediately</strong>. The compressed data (JPEG/PNG) is stored in memory. Decoding (decompression to raw pixels) happens <strong>lazily</strong> — the first time the image is rendered (displayed in a UIImageView or drawn in a context).</p>
+                <p><strong>Why it's a problem</strong>: Decoding happens on the main thread during rendering. A 12MP photo (4032×3024) decodes to ~48MB of raw pixels. This takes 20-50ms — enough to drop multiple frames during scrolling.</p>
+                <p><strong>Solutions</strong>:</p>
+                <ul>
+                    <li><strong>Background pre-decoding</strong>: Draw the image into a CGContext on a background queue. The resulting image is already decoded.</li>
+                    <li><strong>Downsampling</strong>: Use <code>CGImageSourceCreateThumbnailAtIndex</code> with <code>kCGImageSourceThumbnailMaxPixelSize</code> to decode at the display size, not the full resolution. A 100×100pt cell doesn't need a 4032×3024 image.</li>
+                    <li><strong>ImageIO framework</strong>: <code>CGImageSource</code> supports incremental decoding and efficient thumbnailing without loading the full image into memory.</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>45. What is drawsAsynchronously? How does it work?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>CALayer.drawsAsynchronously = true</code> tells Core Animation to record the drawing commands (from <code>draw(_:)</code>) into a command buffer and execute them on a background thread, rather than executing them synchronously on the main thread.</p>
+                <p>The drawing commands are captured into a <code>CGContext</code> command buffer during the display pass. The actual rasterization (executing those commands to produce pixels) happens asynchronously. The layer displays a placeholder until the rasterization completes.</p>
+                <p><strong>When it helps</strong>: Views with expensive <code>draw(_:)</code> implementations (complex paths, text rendering, gradients). It moves the CPU-intensive rasterization off the main thread.</p>
+                <p><strong>Caveats</strong>: The drawing must be thread-safe — no accessing shared mutable state. There may be a 1-frame delay before the content appears. Not effective if the drawing is already fast.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>46. How do you draw text efficiently in Core Graphics? Compare CTFramesetter, NSAttributedString drawing, and CATextLayer.</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>CTFramesetter (Core Text)</strong>: Lowest-level, most control. Create a framesetter from an attributed string, create a frame for a path, draw the frame into a CGContext. Gives you line-by-line control, custom truncation, and inline attachments. Used by UILabel internally.</p>
+                <p><strong>NSAttributedString.draw(in:)</strong>: Convenience wrapper around Core Text. Draws attributed text into the current UIKit graphics context. Simpler API but less control. Suitable for most custom drawing needs.</p>
+                <p><strong>CATextLayer</strong>: A layer that renders text without a backing store (GPU-rendered). Set <code>string</code> to an NSAttributedString. No <code>draw(_:)</code> needed. But: limited layout control, no line-break customization, and you must set <code>contentsScale</code> manually.</p>
+                <p><strong>Performance ranking</strong>: CATextLayer (no backing store) > NSAttributedString.draw (one backing store) > CTFramesetter (most flexible but same backing store cost). For scrolling cells with text, UILabel (which uses Core Text internally with optimizations) is usually the best choice.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>47. What is the difference between setNeedsDisplay() and setNeedsLayout()? Can you call them from a background thread?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>setNeedsDisplay()</code> marks the view's content as dirty — its <code>draw(_:)</code> will be called during the next display pass. Used when the view's visual content needs to change (e.g., data changed, colors changed).</p>
+                <p><code>setNeedsLayout()</code> marks the view's layout as dirty — its <code>layoutSubviews()</code> will be called during the next layout pass. Used when subview positions/sizes need to change.</p>
+                <p><strong>Threading</strong>: Both must be called on the <strong>main thread only</strong>. They modify UIView state, which is not thread-safe. Calling from a background thread is undefined behavior — it may work sometimes and crash other times. In Swift 6 with strict concurrency, the compiler enforces this via @MainActor.</p>
+                <p>Both are <strong>coalesced</strong>: calling <code>setNeedsDisplay()</code> 100 times in one RunLoop iteration results in a single <code>draw(_:)</code> call.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>48. How would you implement a high-performance custom drawing view that updates at 120fps?</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p>Don't use <code>draw(_:)</code> — it allocates a backing store and rasterizes on the CPU every frame. Instead:</p>
+                <ol>
+                    <li><strong>Use CAMetalLayer</strong>: Override <code>layerClass</code> to return <code>CAMetalLayer.self</code>. Render directly to the GPU via Metal. This is how game engines and drawing apps achieve 120fps.</li>
+                    <li><strong>Use CADisplayLink</strong> with <code>preferredFrameRateRange</code> set to 120fps to drive the render loop.</li>
+                    <li><strong>Double/triple buffer</strong>: Metal's drawable pool provides this automatically. While the GPU renders frame N, the display shows frame N-1, and you're preparing frame N+1.</li>
+                    <li><strong>Minimize CPU work per frame</strong>: Pre-compute geometry, use GPU compute shaders for data processing, batch draw calls.</li>
+                </ol>
+                <p>For simpler cases (animated vector graphics), use <code>CAShapeLayer</code> with <code>CADisplayLink</code>-driven path updates. The shape is GPU-rendered without a backing store.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Custom Views &amp; Accessibility (Questions 49–55)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>49. What methods should a well-architected custom UIView subclass override? Walk through the lifecycle.</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>A complete custom view lifecycle:</p>
+                <ol>
+                    <li><strong>init(frame:)</strong> and <strong>init?(coder:)</strong>: Call a shared setup method. Create subviews, add constraints, set default properties. Do NOT reference <code>bounds</code> or <code>superview</code> here — they're not set yet.</li>
+                    <li><strong>intrinsicContentSize</strong>: Return the natural size based on content. Call <code>invalidateIntrinsicContentSize()</code> when content changes.</li>
+                    <li><strong>updateConstraints()</strong>: Modify constraints based on current state. Call <code>super.updateConstraints()</code> last. Only called when <code>setNeedsUpdateConstraints()</code> was called.</li>
+                    <li><strong>layoutSubviews()</strong>: Adjust frames for subviews that can't be expressed with constraints (e.g., circular layout). Call <code>super.layoutSubviews()</code> first to let Auto Layout run.</li>
+                    <li><strong>draw(_:)</strong>: Custom Core Graphics drawing. Only override if you need pixel-level rendering. The rect parameter is the dirty region.</li>
+                    <li><strong>didMoveToWindow()</strong>: Start/stop animations or observation. <code>window != nil</code> means the view is on screen.</li>
+                    <li><strong>traitCollectionDidChange(_:)</strong>: Respond to dark mode, size class, or accessibility changes.</li>
+                </ol>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>50. How do you make a custom view work correctly with Auto Layout? What is the role of intrinsicContentSize?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>For Auto Layout compatibility:</p>
+                <ul>
+                    <li>Override <code>intrinsicContentSize</code> to return the natural size. This lets the view participate in stack views and constraint-based layouts without explicit width/height constraints.</li>
+                    <li>Call <code>invalidateIntrinsicContentSize()</code> whenever the content changes (text, image, data).</li>
+                    <li>Set appropriate content hugging and compression resistance priorities.</li>
+                    <li>If the view has a fixed aspect ratio, add an internal aspect ratio constraint.</li>
+                </ul>
+                <p><code>intrinsicContentSize</code> generates two constraints per axis: <code>width ≤ intrinsicWidth</code> (hugging) and <code>width ≥ intrinsicWidth</code> (compression resistance), both at their respective priorities. This is how Auto Layout knows the view's preferred size without explicit size constraints.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>51. What accessibility properties must a custom view implement to be VoiceOver-compatible?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>At minimum:</p>
+                <ul>
+                    <li><strong>isAccessibilityElement = true</strong>: Marks the view as an accessible element. Container views should be <code>false</code>; leaf elements should be <code>true</code>.</li>
+                    <li><strong>accessibilityLabel</strong>: A concise description ("Play button", "Profile photo"). Read by VoiceOver.</li>
+                    <li><strong>accessibilityTraits</strong>: Describes the element type (<code>.button</code>, <code>.header</code>, <code>.image</code>, <code>.adjustable</code>). Affects how VoiceOver interacts with it.</li>
+                    <li><strong>accessibilityValue</strong>: Current value for dynamic elements ("50%", "3 of 10").</li>
+                    <li><strong>accessibilityHint</strong>: Describes the result of the action ("Double-tap to play the song").</li>
+                </ul>
+                <p>For custom controls: implement <code>accessibilityActivate()</code> for tap actions, <code>accessibilityIncrement()</code>/<code>accessibilityDecrement()</code> for adjustable elements (sliders).</p>
+                <p>For container views with custom-drawn children: override <code>accessibilityElements</code> to provide an ordered array of <code>UIAccessibilityElement</code> objects with correct frames.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>52. How does Dynamic Type work? What must a custom view do to support it?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Dynamic Type lets users choose their preferred text size in Settings. The system provides scaled fonts via <code>UIFont.preferredFont(forTextStyle:)</code>.</p>
+                <p><strong>Custom view requirements</strong>:</p>
+                <ul>
+                    <li>Use <code>UIFont.preferredFont(forTextStyle:)</code> or <code>UIFontMetrics</code> for custom fonts.</li>
+                    <li>Set <code>adjustsFontForContentSizeCategory = true</code> on labels and text views for automatic updates.</li>
+                    <li>Override <code>traitCollectionDidChange(_:)</code> and check <code>traitCollection.preferredContentSizeCategory</code> for layout changes needed at different sizes.</li>
+                    <li>Call <code>invalidateIntrinsicContentSize()</code> when the font size changes.</li>
+                    <li>Ensure layouts accommodate larger text — use scroll views, flexible heights, and avoid fixed-height containers.</li>
+                </ul>
+                <p><code>UIFontMetrics</code> scales custom fonts proportionally: <code>UIFontMetrics(forTextStyle: .body).scaledFont(for: customFont)</code>.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>53. How do you implement a custom UIControl subclass? What is the target-action mechanism?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Subclass <code>UIControl</code> (not UIView) to get the target-action mechanism. Override touch tracking methods:</p>
+                <pre><code>override func beginTracking(_ touch: UITouch, with event: UIEvent?) -&gt; Bool {
+    sendActions(for: .touchDown)
+    return true
+}
+override func endTracking(_ touch: UITouch?, with event: UIEvent?) {
+    if let touch = touch, bounds.contains(touch.location(in: self)) {
+        sendActions(for: .touchUpInside)
+    } else {
+        sendActions(for: .touchUpOutside)
+    }
+}
+override func cancelTracking(with event: UIEvent?) {
+    sendActions(for: .touchCancel)
+}</code></pre>
+                <p>The <strong>target-action mechanism</strong>: <code>addTarget(_:action:for:)</code> stores a (target, action, events) tuple. When <code>sendActions(for:)</code> is called, UIControl iterates stored tuples matching the event and calls <code>UIApplication.sendAction(_:to:from:for:)</code>, which dispatches the action through the responder chain if the target is nil.</p>
+                <p>Update <code>isHighlighted</code>, <code>isSelected</code>, and <code>isEnabled</code> states and adjust visual appearance in their <code>didSet</code> observers.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>54. What is sizeThatFits(_:) vs systemLayoutSizeFitting(_:)? When do you use each?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>sizeThatFits(_:)</strong>: A manual sizing method from the pre-Auto Layout era. The parameter is a "suggested" size (typically the available width). The view calculates and returns its ideal size. Does NOT change the view's frame. Used by <code>sizeToFit()</code> internally.</p>
+                <p><strong>systemLayoutSizeFitting(_:)</strong>: An Auto Layout method. Asks the constraint solver for the view's size given a target size. Uses <code>.fittingSizeLevel</code> priority (50) for the target, so constraints take precedence. Returns the size that satisfies all constraints while being as close to the target as possible.</p>
+                <p><strong>When to use</strong>:</p>
+                <ul>
+                    <li><code>sizeThatFits</code>: Legacy views, manual layout, or views that don't use Auto Layout.</li>
+                    <li><code>systemLayoutSizeFitting</code>: Auto Layout views. Common for self-sizing table view cells: call it on the cell's <code>contentView</code> with <code>UIView.layoutFittingCompressedSize</code> to get the minimum height.</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>55. How do you handle trait collection changes for dark mode, size classes, and accessibility?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Override <code>traitCollectionDidChange(_:)</code> and check which traits changed:</p>
+                <pre><code>override func traitCollectionDidChange(_ previous: UITraitCollection?) {
+    super.traitCollectionDidChange(previous)
+    if traitCollection.hasDifferentColorAppearance(comparedTo: previous) {
+        updateColors()
+    }
+    if traitCollection.preferredContentSizeCategory
+        != previous?.preferredContentSizeCategory {
+        invalidateIntrinsicContentSize()
+    }
+}</code></pre>
+                <p><strong>iOS 17+ (trait registration)</strong>: Use <code>registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (self: MyView, _) in ... }</code> for targeted trait observation, replacing the broad <code>traitCollectionDidChange</code>.</p>
+                <p><strong>Best practices</strong>: Use semantic colors (<code>UIColor.label</code>, <code>UIColor.systemBackground</code>) and asset catalog colors with dark mode variants. Use <code>UIImage</code> symbol configurations for SF Symbols. Avoid caching resolved colors — they change when traits change.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Animations (Questions 56–65)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>56. Compare UIView.animate, UIViewPropertyAnimator, and Core Animation (CABasicAnimation). When would you choose each?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>UIView.animate</strong>: Simple, fire-and-forget animations. Set properties in the closure, specify duration and curve. No ability to pause, reverse, or scrub. Best for simple transitions.</p>
+                <p><strong>UIViewPropertyAnimator</strong>: Interactive, interruptible animations. Supports pausing (<code>pauseAnimation()</code>), reversing (<code>isReversed = true</code>), scrubbing (<code>fractionComplete</code>), and custom timing curves (including spring). Can be started, paused, and resumed. Best for gesture-driven animations (swipe-to-dismiss, interactive transitions).</p>
+                <p><strong>CABasicAnimation / CAKeyframeAnimation</strong>: Low-level Core Animation. Runs entirely in the render server — survives app suspension. Supports keypath animations on any animatable layer property, including properties UIView doesn't expose (e.g., <code>borderWidth</code>, <code>shadowOffset</code>, individual transform components). Best for complex layer animations.</p>
+                <div class="callout callout-info">
+                    <div class="callout-title">Decision Guide</div>
+                    <p>Simple transition → <code>UIView.animate</code>. Gesture-driven or interruptible → <code>UIViewPropertyAnimator</code>. Layer-specific properties or render-server animations → <code>CABasicAnimation</code>.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>57. Explain the model layer vs presentation layer during animation. Why does hit testing break during animation?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>When you animate a view from position A to position B:</p>
+                <ul>
+                    <li><strong>Model layer</strong>: Immediately set to position B (the final value). <code>view.frame</code> returns position B even during the animation.</li>
+                    <li><strong>Presentation layer</strong>: Interpolates from A to B over the animation duration. <code>view.layer.presentation()?.position</code> returns the current visual position.</li>
+                </ul>
+                <p><strong>Hit testing breaks</strong> because <code>hitTest</code> uses the <strong>model layer's</strong> frame, not the presentation layer's. The view is visually at position A (presentation layer) but hit-testable at position B (model layer). The user taps the visible view and misses.</p>
+                <p><strong>Fix</strong>: Override <code>hitTest</code> to use the presentation layer's frame, or use <code>UIViewPropertyAnimator</code> which updates the model layer continuously during interactive animations.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>58. How does UIViewPropertyAnimator handle animation interruption? What happens when you reverse a running animation?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>When you pause a running <code>UIViewPropertyAnimator</code>:</p>
+                <ol>
+                    <li>The animation is paused at its current <code>fractionComplete</code>.</li>
+                    <li>The model layer is updated to match the presentation layer's current values (the "in-flight" values are captured).</li>
+                    <li>The Core Animation animation is removed from the render server.</li>
+                </ol>
+                <p>When you set <code>isReversed = true</code> and call <code>continueAnimation</code>:</p>
+                <ul>
+                    <li>A new animation is created from the current position back to the original values.</li>
+                    <li>The timing curve is applied in reverse — the animation decelerates into the original position naturally.</li>
+                </ul>
+                <p>This is how iOS's interactive dismiss gesture works: the pan gesture drives <code>fractionComplete</code>. On release, the system decides whether to complete or reverse based on velocity and position, then calls <code>continueAnimation</code> with the appropriate <code>isReversed</code> value.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>59. What is a CAAnimationGroup? How do you synchronize multiple animations?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>CAAnimationGroup</code> groups multiple <code>CAAnimation</code> objects to run simultaneously with a shared duration and timing. All animations in the group start at the same time and share the group's <code>beginTime</code>, <code>duration</code>, and <code>timingFunction</code>.</p>
+                <pre><code>let group = CAAnimationGroup()
+group.duration = 0.5
+group.animations = [scaleAnim, opacityAnim, rotationAnim]
+layer.add(group, forKey: "combinedAnimation")</code></pre>
+                <p>Individual animations within the group can have their own <code>beginTime</code> (relative to the group's start) for staggered effects. Their durations are clamped to the group's duration.</p>
+                <p>For <code>UIView.animate</code>, you achieve synchronization by setting all properties in the same animation block — UIKit creates a single implicit <code>CATransaction</code> that groups them.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>60. How do spring animations work? What are damping ratio, initial velocity, and stiffness?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Spring animations simulate a damped harmonic oscillator. The physics equation: <code>F = -kx - cv</code> where k = stiffness, c = damping, x = displacement, v = velocity.</p>
+                <p><strong>UIView.animate(withDuration:delay:usingSpringWithDamping:initialSpringVelocity:)</strong>:</p>
+                <ul>
+                    <li><strong>dampingRatio</strong> (0-1): 1.0 = critically damped (no bounce). 0.5 = bouncy. 0.0 = oscillates forever.</li>
+                    <li><strong>initialSpringVelocity</strong>: Starting velocity in "total animation distance per second." A value of 1.0 means the animation starts at a speed that would cover the full distance in 1 second.</li>
+                </ul>
+                <p><strong>UISpringTimingParameters</strong> (iOS 10+): Takes <code>mass</code>, <code>stiffness</code>, <code>damping</code>, and <code>initialVelocity</code> (as CGVector for 2D). More physically accurate. Used with <code>UIViewPropertyAnimator</code>.</p>
+                <p><strong>iOS 17+ spring(duration:bounce:)</strong>: Simplified API. <code>bounce</code> = 0 is critically damped, positive values add bounce. Duration is approximate — the spring settles when energy drops below a threshold.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>61. What is CATransaction.setDisableActions(true)? When and why would you use it?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>It disables implicit animations for all layer property changes within the transaction scope. Without it, changing a standalone layer's properties (position, opacity, backgroundColor) triggers a default 0.25s animation.</p>
+                <pre><code>CATransaction.begin()
+CATransaction.setDisableActions(true)
+shapeLayer.strokeEnd = 1.0
+shapeLayer.fillColor = UIColor.red.cgColor
+CATransaction.commit()</code></pre>
+                <p><strong>When to use</strong>:</p>
+                <ul>
+                    <li>Updating layer properties in response to scroll position (you want instant updates, not animated).</li>
+                    <li>Setting initial layer state before the view appears.</li>
+                    <li>Updating CAShapeLayer paths during gesture tracking.</li>
+                    <li>Any time you change layer properties and don't want the default animation.</li>
+                </ul>
+                <p>For UIView-backed layers, implicit animations are already suppressed outside <code>UIView.animate</code> blocks, so this is mainly needed for standalone CALayers.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>62. How do you create a custom view controller transition animation?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Implement the <code>UIViewControllerAnimatedTransitioning</code> protocol:</p>
+                <ol>
+                    <li><code>transitionDuration(using:)</code>: Return the animation duration.</li>
+                    <li><code>animateTransition(using:)</code>: Receive a <code>UIViewControllerContextTransitioning</code> context. Get the from/to views and the container view. Set up initial frames, animate, and call <code>context.completeTransition(!context.transitionWasCancelled)</code>.</li>
+                </ol>
+                <p>For <strong>interactive transitions</strong>, also implement <code>UIViewControllerInteractiveTransitioning</code> (or use <code>UIPercentDrivenInteractiveTransition</code>). A gesture recognizer drives <code>update(_:)</code>, <code>cancel()</code>, or <code>finish()</code>.</p>
+                <p>Wire it up via <code>UIViewControllerTransitioningDelegate</code>: set the presenting VC's <code>transitioningDelegate</code> and return your animator from <code>animationController(forPresented:presenting:source:)</code>.</p>
+                <p><strong>Key pitfall</strong>: Always call <code>completeTransition(_:)</code>. Forgetting it leaves the view hierarchy in an inconsistent state — the from-view stays in the container and the app appears frozen.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>63. What is CAKeyframeAnimation? How does it differ from CABasicAnimation?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>CABasicAnimation</code> interpolates between two values (fromValue → toValue) with a single timing function. <code>CAKeyframeAnimation</code> interpolates through an array of values (keyframes) with per-segment timing.</p>
+                <p><strong>CAKeyframeAnimation properties</strong>:</p>
+                <ul>
+                    <li><code>values</code>: Array of keyframe values. The animation interpolates through them in order.</li>
+                    <li><code>keyTimes</code>: Array of Floats (0.0-1.0) specifying when each keyframe is reached. Must match <code>values</code> count.</li>
+                    <li><code>timingFunctions</code>: Array of timing functions for each segment between keyframes. Count = values.count - 1.</li>
+                    <li><code>path</code>: A CGPath for position animations — the layer follows the path. Overrides <code>values</code>.</li>
+                    <li><code>calculationMode</code>: <code>.linear</code>, <code>.discrete</code>, <code>.paced</code>, <code>.cubic</code>, <code>.cubicPaced</code> — controls interpolation between keyframes.</li>
+                </ul>
+                <p>Use keyframe animations for multi-step sequences, path-following, and complex easing that can't be expressed with a single timing function.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>64. How do you animate Auto Layout constraint changes?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Modify the constraint's <code>constant</code> (or activate/deactivate constraints) <em>outside</em> the animation block, then call <code>layoutIfNeeded()</code> <em>inside</em> the animation block:</p>
+                <pre><code>heightConstraint.constant = 200
+UIView.animate(withDuration: 0.3) {
+    self.view.layoutIfNeeded()
+}</code></pre>
+                <p><strong>Why this works</strong>: Changing the constant marks the view as needing layout. <code>layoutIfNeeded()</code> forces an immediate layout pass. Inside the animation block, UIKit intercepts the resulting frame changes and creates Core Animation animations for them.</p>
+                <p><strong>Common mistake</strong>: Changing the constant inside the animation block. This works but is conceptually wrong — the constraint change is immediate; it's the layout pass that should be animated.</p>
+                <p>For <code>UIViewPropertyAnimator</code>: call <code>addAnimations { self.view.layoutIfNeeded() }</code> after modifying constraints.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>65. What is CAReplicatorLayer? Give a practical use case.</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>CAReplicatorLayer</code> automatically creates copies of its sublayers with incremental transforms, colors, and timing offsets. It's GPU-accelerated — the copies are rendered by the GPU without additional backing stores.</p>
+                <p><strong>Properties</strong>: <code>instanceCount</code> (number of copies), <code>instanceTransform</code> (incremental transform per copy), <code>instanceDelay</code> (animation delay per copy), <code>instanceColor</code> / <code>instanceRedOffset</code> / etc. (color modification per copy).</p>
+                <p><strong>Use cases</strong>:</p>
+                <ul>
+                    <li><strong>Loading indicator</strong>: A single dot sublayer replicated 8 times with rotational transform and animation delay creates a spinning activity indicator.</li>
+                    <li><strong>Reflection effect</strong>: One copy with a vertical flip transform and reduced opacity creates a mirror reflection.</li>
+                    <li><strong>Audio visualizer</strong>: Bars replicated horizontally with scale animations and staggered delays.</li>
+                </ul>
+                <p>It's far more efficient than creating N separate layers because the GPU handles replication.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Table &amp; Collection Views (Questions 66–75)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>66. How does UITableView's cell reuse mechanism work internally? What happens during dequeueReusableCell?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>UITableView maintains a <strong>reuse pool</strong> — a dictionary keyed by reuse identifier, with each value being an array of off-screen cell instances.</p>
+                <ol>
+                    <li><strong>Cell scrolls off-screen</strong>: The table view removes it from the view hierarchy and places it in the reuse pool. <code>prepareForReuse()</code> is called on the cell.</li>
+                    <li><strong>dequeueReusableCell(withIdentifier:for:)</strong>: Checks the reuse pool for an available cell with that identifier. If found, removes it from the pool and returns it. If not found, creates a new instance (from the registered class/nib/storyboard prototype).</li>
+                    <li><strong>Configuration</strong>: Your code configures the dequeued cell with new data in <code>cellForRowAt</code>.</li>
+                    <li><strong>Display</strong>: The table view adds the cell to its view hierarchy at the correct position.</li>
+                </ol>
+                <p><strong>prepareForReuse()</strong> should reset visual state (clear images, reset labels, cancel pending async work) but NOT reset structural properties (constraints, subview hierarchy). The cell's structure should be identical for all reuses — only content changes.</p>
+                <div class="callout callout-warning">
+                    <div class="callout-title">Common Bug</div>
+                    <p>Forgetting to cancel async image loads in <code>prepareForReuse()</code>. A slow image load completes after the cell is reused for a different row, showing the wrong image. Always cancel pending work and verify the cell's index path in the completion handler.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>67. What is the difference between UITableViewDiffableDataSource and the traditional UITableViewDataSource?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Traditional UITableViewDataSource</strong>: You implement <code>numberOfSections</code>, <code>numberOfRowsInSection</code>, and <code>cellForRowAt</code>. When data changes, you must manually calculate which rows to insert/delete/move and call <code>performBatchUpdates</code>. Getting this wrong causes "inconsistent number of rows" crashes.</p>
+                <p><strong>DiffableDataSource</strong> (iOS 13+): You create snapshots (<code>NSDiffableDataSourceSnapshot</code>) representing the complete data state. Apply the snapshot, and the framework automatically computes the diff and generates animated insertions, deletions, moves, and reloads.</p>
+                <pre><code>var snapshot = NSDiffableDataSourceSnapshot&lt;Section, Item&gt;()
+snapshot.appendSections([.main])
+snapshot.appendItems(items, toSection: .main)
+dataSource.apply(snapshot, animatingDifferences: true)</code></pre>
+                <p><strong>Key requirements</strong>: Section and Item types must be <code>Hashable</code>. The diff algorithm uses hash values to identify items. Items with the same hash are considered the same item (possibly moved). Use stable, unique identifiers — not array indices.</p>
+                <p><strong>Performance</strong>: The diff algorithm is O(n) using a Myers-like algorithm. For very large datasets (10K+ items), use <code>apply(snapshot, animatingDifferences: false)</code> to skip animation computation.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>68. How does self-sizing work for table view cells? What are the performance implications?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Set <code>tableView.rowHeight = UITableView.automaticDimension</code> and <code>estimatedRowHeight = 44</code>. The table view uses Auto Layout to compute each cell's height:</p>
+                <ol>
+                    <li>The cell is configured with data.</li>
+                    <li><code>systemLayoutSizeFitting(UIView.layoutFittingCompressedSize)</code> is called on the cell's <code>contentView</code>.</li>
+                    <li>The constraint solver computes the minimum height that satisfies all constraints.</li>
+                    <li>This height is used for that row.</li>
+                </ol>
+                <p><strong>Performance implications</strong>:</p>
+                <ul>
+                    <li>Auto Layout solving happens for every cell as it's about to appear. Complex constraints = slow sizing.</li>
+                    <li><code>estimatedRowHeight</code> is critical: the table view uses it for scroll indicator size and content offset calculations without measuring every cell. A bad estimate causes scroll bar jumping.</li>
+                    <li>For large datasets, consider caching computed heights keyed by content hash.</li>
+                </ul>
+                <p><strong>Requirement</strong>: The cell must have an unbroken chain of constraints from top to bottom of the <code>contentView</code>. Missing a constraint = zero height or unsatisfiable constraints.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>69. What is UICollectionViewCompositionalLayout? How does it compare to UICollectionViewFlowLayout?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>FlowLayout</strong>: A single-section, line-based layout. Items flow left-to-right, top-to-bottom (or along the scroll axis). All items in a section share the same layout behavior. Limited customization — complex layouts require subclassing and overriding <code>layoutAttributesForElements(in:)</code>.</p>
+                <p><strong>CompositionalLayout</strong> (iOS 13+): A declarative, composable layout system with three levels:</p>
+                <ul>
+                    <li><strong>Item</strong>: Size relative to group (<code>.fractionalWidth</code>, <code>.fractionalHeight</code>, <code>.absolute</code>, <code>.estimated</code>).</li>
+                    <li><strong>Group</strong>: Horizontal, vertical, or custom arrangement of items. Groups define the repeating unit.</li>
+                    <li><strong>Section</strong>: Contains groups. Each section can have a different layout. Supports orthogonal scrolling (horizontal scroll within a vertical layout).</li>
+                </ul>
+                <p><strong>Key advantages</strong>: Per-section layouts (grid in section 0, carousel in section 1), orthogonal scrolling sections, section headers/footers as supplementary views, decoration views, and <code>NSCollectionLayoutBoundarySupplementaryItem</code> for sticky headers.</p>
+                <p>CompositionalLayout replaces nearly all use cases that previously required custom UICollectionViewLayout subclasses.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>70. How does prefetching work in UITableView and UICollectionView?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Implement <code>UITableViewDataSourcePrefetching</code> (or <code>UICollectionViewDataSourcePrefetching</code>):</p>
+                <ul>
+                    <li><code>prefetchRowsAt indexPaths:</code>: Called for rows that are approaching the visible area. Start async data loading (image downloads, database queries) here.</li>
+                    <li><code>cancelPrefetchingForRowsAt indexPaths:</code>: Called when rows are no longer likely to be displayed (user changed scroll direction). Cancel pending work here.</li>
+                </ul>
+                <p>The system predicts which cells will be needed based on scroll velocity and direction. It calls prefetch ~2-3 screens ahead of the visible area.</p>
+                <p><strong>Implementation pattern</strong>: Start an async operation in <code>prefetchRowsAt</code>, store the operation/task keyed by index path, cancel it in <code>cancelPrefetchingForRowsAt</code>, and check for a cached result in <code>cellForRowAt</code> before starting a new load.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>71. What is UICollectionView.CellRegistration? How does it improve over register/dequeue?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>CellRegistration</code> (iOS 14+) combines registration and configuration into a single, type-safe object:</p>
+                <pre><code>let registration = UICollectionView.CellRegistration&lt;MyCell, Item&gt; {
+    cell, indexPath, item in
+    cell.configure(with: item)
+}
+
+// In diffable data source:
+dataSource = UICollectionViewDiffableDataSource(collectionView: cv) {
+    cv, indexPath, item in
+    cv.dequeueConfiguredReusableCell(using: registration,
+                                      for: indexPath, item: item)
+}</code></pre>
+                <p><strong>Advantages over register/dequeue</strong>:</p>
+                <ul>
+                    <li><strong>Type safety</strong>: No string-based reuse identifiers. No force-casting from <code>dequeueReusableCell</code>.</li>
+                    <li><strong>Unified configuration</strong>: The configuration closure is called for both new and reused cells — no separate <code>cellForRowAt</code> logic.</li>
+                    <li><strong>No separate registration step</strong>: Registration happens implicitly on first use.</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>72. How do you implement a sticky header in UICollectionView? Compare FlowLayout and CompositionalLayout approaches.</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>FlowLayout</strong>: Set <code>sectionHeadersPinToVisibleBounds = true</code>. The flow layout automatically adjusts the header's layout attributes to keep it at the top of the visible area as the section scrolls.</p>
+                <p><strong>CompositionalLayout</strong>: Create a <code>NSCollectionLayoutBoundarySupplementaryItem</code> with <code>pinToVisibleBounds = true</code>:</p>
+                <pre><code>let headerSize = NSCollectionLayoutSize(
+    widthDimension: .fractionalWidth(1.0),
+    heightDimension: .estimated(44)
+)
+let header = NSCollectionLayoutBoundarySupplementaryItem(
+    layoutSize: headerSize,
+    elementKind: UICollectionView.elementKindSectionHeader,
+    alignment: .top
+)
+header.pinToVisibleBounds = true
+section.boundarySupplementaryItems = [header]</code></pre>
+                <p><strong>Custom FlowLayout subclass</strong> (for advanced behavior): Override <code>layoutAttributesForElements(in:)</code> and <code>shouldInvalidateLayout(forBoundsChange:)</code>. Manually adjust the header's frame to clamp it within the visible bounds while staying within its section's range.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>73. What is the reconfigureItems API in DiffableDataSource? How does it differ from reloadItems?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>reconfigureItems</code> (iOS 15+) updates existing cells <em>in place</em> without dequeuing new cells. The existing cell's configuration closure is called again with the updated data. The cell is not removed from the collection view — its identity is preserved.</p>
+                <p><code>reloadItems</code> dequeues a <strong>new cell</strong>, configures it, and replaces the old cell with a cross-fade animation. This is more expensive and causes a visual flash.</p>
+                <p><strong>When to use reconfigure</strong>: The item's identity hasn't changed, but its content has (e.g., a "like" count updated, an image finished loading). The cell stays in place and smoothly updates.</p>
+                <p><strong>When to use reload</strong>: The cell type or structure might change based on the new data (e.g., switching from a text cell to an image cell).</p>
+                <pre><code>var snapshot = dataSource.snapshot()
+snapshot.reconfigureItems([updatedItem])
+dataSource.apply(snapshot)</code></pre>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>74. How would you build an infinite-scrolling feed with UICollectionView? What are the performance considerations?</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Architecture</strong>:</p>
+                <ol>
+                    <li><strong>Pagination trigger</strong>: In <code>willDisplay cell</code> or prefetching delegate, detect when the user is within N items of the end. Trigger a page fetch.</li>
+                    <li><strong>Data source update</strong>: Append new items to the diffable data source snapshot. Use <code>apply(snapshot, animatingDifferences: true)</code> — the diff algorithm efficiently handles appends.</li>
+                    <li><strong>Loading indicator</strong>: Add a footer supplementary view that shows a spinner while loading.</li>
+                </ol>
+                <p><strong>Performance considerations</strong>:</p>
+                <ul>
+                    <li><strong>Memory</strong>: DiffableDataSource holds all item identifiers in memory. For 100K+ items, use <code>SectionSnapshot</code> with lazy loading or implement a custom data source that only holds visible + buffer items.</li>
+                    <li><strong>Diff performance</strong>: Appending to a snapshot is O(n) where n = new items. But applying a snapshot with 50K existing items still requires hashing all items. Consider <code>animatingDifferences: false</code> for large datasets.</li>
+                    <li><strong>Image management</strong>: Use prefetching to start image loads 2-3 screens ahead. Cancel loads for cells that scroll past. Use thumbnail sizes appropriate for cell dimensions.</li>
+                    <li><strong>Cell reuse</strong>: Ensure <code>prepareForReuse()</code> cancels all async work. Verify the cell's identity in async completion handlers.</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>75. Compare UIContentConfiguration (iOS 14+) with the traditional cell subclassing approach. What problem does it solve?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Traditional approach</strong>: Subclass UITableViewCell/UICollectionViewCell. Add custom subviews. Configure in <code>cellForRowAt</code>. The cell class owns both the view hierarchy and the configuration logic — tightly coupled.</p>
+                <p><strong>UIContentConfiguration</strong>: Separates configuration (data) from presentation (views). A configuration is a lightweight value type describing <em>what</em> to display. A content view renders it.</p>
+                <pre><code>var config = UIListContentConfiguration.subtitleCell()
+config.text = "Title"
+config.secondaryText = "Subtitle"
+config.image = UIImage(systemName: "star")
+cell.contentConfiguration = config</code></pre>
+                <p><strong>Problems solved</strong>:</p>
+                <ul>
+                    <li><strong>Reusability</strong>: The same configuration can be applied to any cell, header, or custom view. No subclass needed.</li>
+                    <li><strong>State management</strong>: <code>UIConfigurationState</code> tracks highlighted, selected, disabled states. The configuration automatically updates appearance for each state via <code>configurationUpdateHandler</code>.</li>
+                    <li><strong>Composability</strong>: Background configurations (<code>UIBackgroundConfiguration</code>) and content configurations are independent — mix and match.</li>
+                    <li><strong>System integration</strong>: <code>UIListContentConfiguration</code> provides system-standard cell layouts that automatically adapt to Dynamic Type, accessibility, and platform conventions.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <div class="nav-footer">
+        <a href="08-table-collection-views.html">&larr; Table &amp; Collection Views</a>
+        <a href="../03-swiftui-internals/index.html">SwiftUI Internals &rarr;</a>
+    </div>
+</div>
+
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+    q.addEventListener('click', () => {
+        q.nextElementSibling.classList.toggle('open');
+    });
+});
+</script>
+</body>
+</html>

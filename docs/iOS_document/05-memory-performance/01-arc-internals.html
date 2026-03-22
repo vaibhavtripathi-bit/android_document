@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ARC Internals — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Memory &amp; Performance</a><span class="sep">›</span>
+        ARC Internals
+    </nav>
+
+    <h1>ARC Internals</h1>
+    <p class="subtitle">Automatic Reference Counting from compiler insertion to runtime execution — the complete mental model for Staff-level iOS engineers.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#arc-vs-gc">ARC vs Garbage Collection</a></li>
+            <li><a href="#retain-release">Retain/Release Under the Hood</a></li>
+            <li><a href="#object-layout">Swift Object Layout</a></li>
+            <li><a href="#refcount">Reference Count Storage</a></li>
+            <li><a href="#side-tables">Side Tables for Weak References</a></li>
+            <li><a href="#weak-zeroing">Weak Reference Zeroing Mechanism</a></li>
+            <li><a href="#unowned-vs-weak">unowned vs weak</a></li>
+            <li><a href="#extended-lifetime">withExtendedLifetime</a></li>
+            <li><a href="#cow">Copy-on-Write for Value Types</a></li>
+            <li><a href="#tagged-pointers">Tagged Pointers</a></li>
+            <li><a href="#isa-optimization">ISA Pointer Optimization</a></li>
+            <li><a href="#compiler-arc">ARC at the Compiler Level</a></li>
+            <li><a href="#optimizer">Retain/Release Optimization</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="arc-vs-gc">ARC vs Garbage Collection</h2>
+
+    <p>ARC and GC solve the same problem — automatic memory management — but with fundamentally different tradeoffs. Understanding these tradeoffs is critical for explaining why iOS chose ARC and what constraints it imposes.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Dimension</th>
+                <th>ARC (Swift/ObjC)</th>
+                <th>Tracing GC (Java/Go/C#)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>When it runs</td>
+                <td>Deterministic — at compile-inserted points</td>
+                <td>Non-deterministic — GC decides when</td>
+            </tr>
+            <tr>
+                <td>Deallocation timing</td>
+                <td>Immediate when refcount hits 0</td>
+                <td>Deferred until GC cycle</td>
+            </tr>
+            <tr>
+                <td>Pause times</td>
+                <td>None (no stop-the-world)</td>
+                <td>GC pauses (mitigated in modern GCs)</td>
+            </tr>
+            <tr>
+                <td>Cycles</td>
+                <td>Cannot detect — programmer must break</td>
+                <td>Automatically collected</td>
+            </tr>
+            <tr>
+                <td>Overhead</td>
+                <td>Per retain/release call (atomic increment)</td>
+                <td>Per GC cycle (mark/sweep/compact)</td>
+            </tr>
+            <tr>
+                <td>Memory high-water mark</td>
+                <td>Lower — objects freed immediately</td>
+                <td>Higher — objects linger until GC</td>
+            </tr>
+            <tr>
+                <td>Predictability</td>
+                <td>High — deinit runs at known points</td>
+                <td>Low — finalizers run at GC's discretion</td>
+            </tr>
+            <tr>
+                <td>Thread safety cost</td>
+                <td>Atomic refcount operations</td>
+                <td>Write barriers, card tables</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Why Apple Chose ARC Over GC</div>
+        <p>Apple actually shipped a tracing GC for Objective-C on macOS (10.5 Leopard, 2007) called <strong>libauto</strong>. It was deprecated in 10.8 and removed in 10.11. The reasons: GC pauses were unacceptable for UI responsiveness, memory overhead was too high for mobile devices, and the non-deterministic deallocation made resource management (file handles, GPU buffers) unreliable. ARC, introduced in 2011, gave the benefits of automatic memory management with deterministic deallocation and zero pause times — perfect for the resource-constrained, latency-sensitive iOS environment.</p>
+    </div>
+
+    <h3>The Fundamental ARC Contract</h3>
+
+    <p>ARC's contract is simple: the compiler inserts <code>retain</code> (increment refcount) and <code>release</code> (decrement refcount) calls at compile time. When the strong reference count reaches zero, the object is deallocated immediately. This happens:</p>
+
+    <ul>
+        <li>When a variable goes out of scope</li>
+        <li>When a property is reassigned</li>
+        <li>When a collection element is removed</li>
+        <li>When an optional is set to <code>nil</code></li>
+    </ul>
+
+    <pre><code><span class="keyword">class</span> <span class="type">Document</span> {
+    <span class="keyword">let</span> name: <span class="type">String</span>
+    <span class="keyword">init</span>(name: <span class="type">String</span>) {
+        <span class="keyword">self</span>.name = name
+        <span class="func">print</span>(<span class="string">"Document '\(name)' created"</span>)
+    }
+    <span class="keyword">deinit</span> {
+        <span class="func">print</span>(<span class="string">"Document '\(name)' deallocated"</span>)
+    }
+}
+
+<span class="keyword">func</span> <span class="func">example</span>() {
+    <span class="keyword">let</span> doc = <span class="type">Document</span>(name: <span class="string">"Report"</span>)  <span class="comment">// refcount = 1</span>
+    <span class="keyword">let</span> copy = doc                            <span class="comment">// refcount = 2 (retain)</span>
+    <span class="func">print</span>(copy.name)
+    <span class="comment">// end of scope: copy released (refcount = 1)</span>
+    <span class="comment">//               doc released  (refcount = 0 → deinit)</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="retain-release">Retain/Release Under the Hood</h2>
+
+    <p>At the runtime level, Swift uses <code>swift_retain</code> and <code>swift_release</code> functions (not ObjC's <code>objc_retain</code>/<code>objc_release</code>, though those are used for <code>@objc</code> classes). These are implemented in the Swift runtime library.</p>
+
+    <h3>The Atomic Increment</h3>
+
+    <p>The strong reference count is modified using atomic operations to ensure thread safety. On ARM64 (all modern iOS devices), this uses the <code>LDXR</code>/<code>STXR</code> (load-exclusive/store-exclusive) instruction pair:</p>
+
+    <div class="diagram">
+swift_retain(object):
+┌─────────────────────────────────────────┐
+│ 1. Load object's refcount (atomic)      │
+│ 2. Increment strong count by 1          │
+│ 3. Store back (atomic, may retry on     │
+│    contention via LL/SC loop)           │
+│ 4. Return object pointer                │
+└─────────────────────────────────────────┘
+
+swift_release(object):
+┌─────────────────────────────────────────┐
+│ 1. Load object's refcount (atomic)      │
+│ 2. Decrement strong count by 1          │
+│ 3. If strong count == 0:                │
+│    a. Call object's deinit              │
+│    b. If no weak/unowned refs:          │
+│       → Free memory immediately         │
+│    c. If weak/unowned refs exist:       │
+│       → Mark as deallocating            │
+│       → Memory freed when last          │
+│         unowned ref is accessed or      │
+│         last weak ref is zeroed         │
+│ 4. Store back (atomic)                  │
+└─────────────────────────────────────────┘
+    </div>
+
+    <h3>Three Reference Count Types</h3>
+
+    <p>Swift objects maintain <strong>three</strong> separate reference counts, not just one:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Count</th>
+                <th>Incremented By</th>
+                <th>When Zero</th>
+                <th>Effect</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Strong</strong></td>
+                <td>Strong references (<code>let x = obj</code>)</td>
+                <td>Object is deinitialized</td>
+                <td><code>deinit</code> runs, stored properties released</td>
+            </tr>
+            <tr>
+                <td><strong>Unowned</strong></td>
+                <td><code>unowned</code> references</td>
+                <td>Object memory is freed</td>
+                <td>Heap allocation returned to allocator</td>
+            </tr>
+            <tr>
+                <td><strong>Weak</strong></td>
+                <td><code>weak</code> references (via side table)</td>
+                <td>Side table entry freed</td>
+                <td>Side table deallocated</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Unowned Keeps Memory Alive</div>
+        <p>A common misconception: <code>unowned</code> references don't prevent deinitialization, but they <strong>do</strong> prevent the memory from being freed. The object's memory stays allocated (in a "zombie" state) until all unowned references are gone. This means <code>unowned</code> can cause memory to linger longer than expected in pathological cases. With <code>weak</code>, the side table mechanism avoids this — the object memory is freed as soon as strong count hits zero.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="object-layout">Swift Object Layout</h2>
+
+    <p>Every Swift class instance on the heap has a specific memory layout. Understanding this layout is essential for reasoning about memory overhead and performance.</p>
+
+    <div class="diagram">
+Swift Heap Object Layout (64-bit):
+┌────────────────────────────────────────────────┐
+│ Metadata Pointer (8 bytes)                     │  ← ISA / type metadata
+├────────────────────────────────────────────────┤
+│ Reference Count (8 bytes)                      │  ← Inline refcount word
+├────────────────────────────────────────────────┤
+│ Stored Property 1                              │
+├────────────────────────────────────────────────┤
+│ Stored Property 2                              │
+├────────────────────────────────────────────────┤
+│ ...                                            │
+├────────────────────────────────────────────────┤
+│ Stored Property N                              │
+└────────────────────────────────────────────────┘
+
+Minimum object size: 16 bytes (metadata + refcount)
+Alignment: 16 bytes on ARM64
+    </div>
+
+    <h3>Metadata Pointer</h3>
+
+    <p>The first 8 bytes point to the <strong>type metadata</strong> structure, which contains:</p>
+
+    <ul>
+        <li><strong>Value witness table</strong> — size, alignment, stride, copy/destroy functions</li>
+        <li><strong>Virtual method table (vtable)</strong> — for class method dispatch</li>
+        <li><strong>Superclass pointer</strong> — for inheritance chain</li>
+        <li><strong>Type descriptor</strong> — name, generic parameters, field descriptors</li>
+    </ul>
+
+    <p>For <code>@objc</code> classes, this pointer serves as the <strong>ISA pointer</strong> that the Objective-C runtime uses for message dispatch.</p>
+
+    <h3>Reference Count Word</h3>
+
+    <p>The second 8 bytes store the reference counts in a packed format:</p>
+
+    <div class="diagram">
+Inline Reference Count Word (64 bits):
+┌───────────────────────────────────────────────────────────┐
+│ Bit 63    │ Bits 62-33  │ Bit 32  │ Bits 31-1 │ Bit 0    │
+│ UseSlowRC │ Strong RC   │ isDeinit│ Unowned RC│ Immortal │
+│ (1 bit)   │ (30 bits)   │ (1 bit) │ (31 bits) │ (1 bit)  │
+└───────────────────────────────────────────────────────────┘
+
+UseSlowRC = 1 → refcounts are in a side table (for weak refs)
+Immortal  = 1 → object is never deallocated (e.g., static strings)
+isDeinit  = 1 → object is currently being deinitialized
+    </div>
+
+    <p>The inline format packs strong and unowned counts into a single 64-bit word, enabling atomic operations on both simultaneously. When weak references exist, the <code>UseSlowRC</code> bit is set and counts move to a side table.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="refcount">Reference Count Storage</h2>
+
+    <h3>Inline (Fast Path)</h3>
+
+    <p>When an object has only strong and unowned references (no weak), the reference counts are stored inline in the object header. This is the fast path — a single atomic read-modify-write on the 8-byte refcount word.</p>
+
+    <pre><code><span class="comment">// Conceptual: what the runtime does for retain</span>
+<span class="keyword">func</span> <span class="func">swift_retain</span>(_ object: <span class="type">HeapObject</span>) {
+    <span class="comment">// Single atomic increment of the strong count field</span>
+    <span class="keyword">let</span> oldBits = object.refCounts.<span class="func">atomicLoad</span>()
+    <span class="keyword">let</span> newBits = oldBits.<span class="func">incrementStrongCount</span>()
+    object.refCounts.<span class="func">atomicStore</span>(newBits)
+}
+
+<span class="comment">// Fast path: ~2-3 nanoseconds on A-series chips</span>
+<span class="comment">// Compare to ObjC objc_retain: ~5-10ns (hash table lookup)</span></code></pre>
+
+    <h3>Out-of-Line (Slow Path — Side Table)</h3>
+
+    <p>When the first <code>weak</code> reference to an object is created, the runtime:</p>
+
+    <ol>
+        <li>Allocates a <strong>side table entry</strong> on the heap</li>
+        <li>Copies the current strong/unowned counts to the side table</li>
+        <li>Replaces the inline refcount word with a pointer to the side table</li>
+        <li>Sets the <code>UseSlowRC</code> bit</li>
+    </ol>
+
+    <p>All subsequent retain/release operations go through the side table (the "slow path").</p>
+
+    <!-- ============================================================ -->
+    <h2 id="side-tables">Side Tables for Weak References</h2>
+
+    <p>The side table is a critical piece of Swift's memory management that enables weak reference zeroing without keeping the object's memory alive.</p>
+
+    <div class="diagram">
+Without weak references (inline):
+┌──────────────────┐
+│ HeapObject       │
+│ ┌──────────────┐ │
+│ │ metadata ptr │ │
+│ ├──────────────┤ │
+│ │ refcount     │ │──── strong + unowned counts inline
+│ ├──────────────┤ │
+│ │ properties   │ │
+│ └──────────────┘ │
+└──────────────────┘
+
+With weak references (side table):
+┌──────────────────┐         ┌────────────────────┐
+│ HeapObject       │         │ Side Table Entry    │
+│ ┌──────────────┐ │         │ ┌────────────────┐  │
+│ │ metadata ptr │ │         │ │ strong count   │  │
+│ ├──────────────┤ │         │ ├────────────────┤  │
+│ │ side table ──│─│────────▶│ │ unowned count  │  │
+│ │ pointer      │ │         │ ├────────────────┤  │
+│ ├──────────────┤ │         │ │ weak count     │  │
+│ │ properties   │ │         │ ├────────────────┤  │
+│ └──────────────┘ │         │ │ object pointer │──│──▶ back to HeapObject
+└──────────────────┘         │ └────────────────┘  │
+                             └────────────────────┘
+    </div>
+
+    <h3>Why Side Tables?</h3>
+
+    <p>The side table design solves a critical problem: when an object is deallocated, weak references must be set to <code>nil</code>. Without side tables, you'd need to either:</p>
+
+    <ul>
+        <li><strong>Keep the object memory alive</strong> until all weak references are gone (wastes memory)</li>
+        <li><strong>Maintain a list of all weak reference locations</strong> in the object (expensive to update)</li>
+    </ul>
+
+    <p>With side tables, the object memory can be freed immediately when the strong count hits zero. Weak references point to the side table, not the object. When a weak reference is loaded, the runtime checks the side table — if the object is gone, it returns <code>nil</code> and decrements the weak count.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="weak-zeroing">Weak Reference Zeroing Mechanism</h2>
+
+    <p>When you read a <code>weak</code> reference, the runtime performs a multi-step process:</p>
+
+    <div class="diagram">
+Loading a weak reference:
+┌─────────────────────────────────────────────────┐
+│ 1. Load side table pointer from weak variable   │
+│ 2. Lock the side table entry (spin lock)        │
+│ 3. Check if object is still alive:              │
+│    ├── YES: Increment strong count (retain)     │
+│    │        Return strong reference              │
+│    └── NO:  Set weak variable to nil             │
+│             Decrement weak count                 │
+│             Return nil                           │
+│ 4. Unlock side table entry                      │
+└─────────────────────────────────────────────────┘
+    </div>
+
+    <p>This is why accessing a <code>weak</code> reference always produces an <code>Optional</code> — the runtime must check if the object is still alive, and it might not be.</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">Cache</span> {
+    <span class="keyword">weak var</span> delegate: <span class="type">CacheDelegate</span>?
+
+    <span class="keyword">func</span> <span class="func">notifyDelegate</span>() {
+        <span class="comment">// Runtime: load side table → check alive → retain or nil</span>
+        <span class="keyword">guard let</span> delegate = delegate <span class="keyword">else</span> {
+            <span class="keyword">return</span> <span class="comment">// Object was deallocated</span>
+        }
+        <span class="comment">// delegate is now a strong reference (retained)</span>
+        delegate.<span class="func">cacheDidUpdate</span>(<span class="keyword">self</span>)
+        <span class="comment">// Strong reference released at end of scope</span>
+    }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Weak Reference Performance Cost</div>
+        <p>Loading a weak reference is significantly more expensive than loading a strong reference: it involves a side table lookup, a spin lock, and a conditional retain. In hot loops, this matters. Profile before using <code>weak</code> in performance-critical paths — sometimes restructuring to avoid the weak reference entirely is better. The cost is approximately 10-20x a simple strong reference load.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="unowned-vs-weak">unowned vs weak</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th><code>weak</code></th>
+                <th><code>unowned</code></th>
+                <th><code>unowned(unsafe)</code></th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Type</td>
+                <td><code>Optional</code></td>
+                <td>Non-optional</td>
+                <td>Non-optional</td>
+            </tr>
+            <tr>
+                <td>On access after dealloc</td>
+                <td>Returns <code>nil</code></td>
+                <td>Traps (fatal error)</td>
+                <td>Undefined behavior</td>
+            </tr>
+            <tr>
+                <td>Storage</td>
+                <td>Side table pointer</td>
+                <td>Direct object pointer</td>
+                <td>Direct object pointer</td>
+            </tr>
+            <tr>
+                <td>Keeps memory alive?</td>
+                <td>No (side table only)</td>
+                <td>Yes (object memory)</td>
+                <td>No</td>
+            </tr>
+            <tr>
+                <td>Thread-safe zeroing?</td>
+                <td>Yes</td>
+                <td>N/A (traps)</td>
+                <td>No</td>
+            </tr>
+            <tr>
+                <td>Performance</td>
+                <td>Slowest (side table)</td>
+                <td>Medium (extra check)</td>
+                <td>Fastest (no check)</td>
+            </tr>
+            <tr>
+                <td>Use when</td>
+                <td>Lifetime uncertain</td>
+                <td>Lifetime guaranteed ≥ self</td>
+                <td>Performance-critical + guaranteed</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="keyword">class</span> <span class="type">Parent</span> {
+    <span class="keyword">var</span> child: <span class="type">Child</span>?
+}
+
+<span class="keyword">class</span> <span class="type">Child</span> {
+    <span class="comment">// Safe: parent always outlives child</span>
+    <span class="keyword">unowned let</span> parent: <span class="type">Parent</span>
+
+    <span class="keyword">init</span>(parent: <span class="type">Parent</span>) {
+        <span class="keyword">self</span>.parent = parent
+    }
+}
+
+<span class="keyword">class</span> <span class="type">NetworkManager</span> {
+    <span class="comment">// Weak: delegate may be deallocated at any time</span>
+    <span class="keyword">weak var</span> delegate: <span class="type">NetworkDelegate</span>?
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: unowned in Async Contexts</div>
+        <p>Never use <code>unowned</code> in closures that execute asynchronously (network callbacks, timers, GCD dispatches) unless you have an ironclad guarantee the referenced object outlives the closure. In practice, this is almost never true for async work. Use <code>weak</code> instead — the optional unwrapping cost is negligible compared to a crash in production.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="extended-lifetime">withExtendedLifetime</h2>
+
+    <p><code>withExtendedLifetime</code> prevents the compiler from releasing an object before a certain point. This is necessary when you're working with unsafe pointers or bridging to C APIs that hold raw pointers to Swift objects.</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">AudioBuffer</span> {
+    <span class="keyword">var</span> samples: [<span class="type">Float</span>] = []
+
+    <span class="keyword">func</span> <span class="func">processWithCAPI</span>() {
+        <span class="comment">// Without withExtendedLifetime, the compiler might release</span>
+        <span class="comment">// self before c_process_audio returns, because 'self' has</span>
+        <span class="comment">// no more strong references after the pointer is taken.</span>
+        <span class="func">withExtendedLifetime</span>(<span class="keyword">self</span>) {
+            samples.<span class="func">withUnsafeMutableBufferPointer</span> { buffer <span class="keyword">in</span>
+                <span class="func">c_process_audio</span>(buffer.baseAddress, buffer.count)
+            }
+        }
+    }
+}
+
+<span class="comment">// Also useful for keeping objects alive during observation:</span>
+<span class="keyword">let</span> observer = <span class="type">NotificationCenter</span>.default.<span class="func">addObserver</span>(...)
+<span class="func">withExtendedLifetime</span>(observer) {
+    <span class="comment">// observer guaranteed alive for this block</span>
+    <span class="func">performWork</span>()
+}</code></pre>
+
+    <h3>When the Compiler Can Release Early</h3>
+
+    <p>The Swift compiler's optimizer can release objects as soon as they're no longer used, even before the end of their lexical scope. This is called <strong>lifetime shortening</strong> and is usually beneficial, but can cause issues with unsafe code:</p>
+
+    <pre><code><span class="keyword">func</span> <span class="func">dangerous</span>() {
+    <span class="keyword">let</span> data = <span class="type">Data</span>(repeating: <span class="number">0</span>, count: <span class="number">1024</span>)
+    <span class="keyword">let</span> ptr = (data <span class="keyword">as</span> <span class="type">NSData</span>).bytes
+    <span class="comment">// ⚠️ Compiler may release 'data' here — it's not used again</span>
+    <span class="comment">// ptr is now a dangling pointer!</span>
+    <span class="func">memcpy</span>(destination, ptr, <span class="number">1024</span>) <span class="comment">// 💥 Use-after-free</span>
+}
+
+<span class="keyword">func</span> <span class="func">safe</span>() {
+    <span class="keyword">let</span> data = <span class="type">Data</span>(repeating: <span class="number">0</span>, count: <span class="number">1024</span>)
+    <span class="func">withExtendedLifetime</span>(data) {
+        <span class="keyword">let</span> ptr = (data <span class="keyword">as</span> <span class="type">NSData</span>).bytes
+        <span class="func">memcpy</span>(destination, ptr, <span class="number">1024</span>) <span class="comment">// ✅ data alive</span>
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="cow">Copy-on-Write for Value Types</h2>
+
+    <p>Swift's standard library collections (<code>Array</code>, <code>Dictionary</code>, <code>Set</code>, <code>String</code>) use copy-on-write (CoW) to avoid unnecessary copying. The value type holds a reference to a heap-allocated buffer; copies share the buffer until one of them mutates.</p>
+
+    <div class="diagram">
+Copy-on-Write Lifecycle:
+
+1. Initial:
+   var a = [1, 2, 3]
+   ┌───┐     ┌──────────────┐
+   │ a │────▶│ Buffer (RC=1)│
+   └───┘     │ [1, 2, 3]    │
+             └──────────────┘
+
+2. After copy (no mutation):
+   var b = a
+   ┌───┐     ┌──────────────┐     ┌───┐
+   │ a │────▶│ Buffer (RC=2)│◀────│ b │
+   └───┘     │ [1, 2, 3]    │     └───┘
+             └──────────────┘
+
+3. After mutation (copy triggered):
+   b.append(4)
+   ┌───┐     ┌──────────────┐     ┌───┐     ┌──────────────┐
+   │ a │────▶│ Buffer (RC=1)│     │ b │────▶│ Buffer (RC=1)│
+   └───┘     │ [1, 2, 3]    │     └───┘     │ [1, 2, 3, 4] │
+             └──────────────┘               └──────────────┘
+    </div>
+
+    <h3>Implementing Custom CoW</h3>
+
+    <pre><code><span class="keyword">final class</span> <span class="type">StorageBuffer</span>&lt;<span class="type">T</span>&gt; {
+    <span class="keyword">var</span> elements: [<span class="type">T</span>]
+    <span class="keyword">init</span>(_ elements: [<span class="type">T</span>]) { <span class="keyword">self</span>.elements = elements }
+}
+
+<span class="keyword">struct</span> <span class="type">CoWCollection</span>&lt;<span class="type">T</span>&gt; {
+    <span class="keyword">private var</span> storage: <span class="type">StorageBuffer</span>&lt;<span class="type">T</span>&gt;
+
+    <span class="keyword">init</span>(_ elements: [<span class="type">T</span>]) {
+        storage = <span class="type">StorageBuffer</span>(elements)
+    }
+
+    <span class="keyword">var</span> elements: [<span class="type">T</span>] {
+        storage.elements
+    }
+
+    <span class="keyword">mutating func</span> <span class="func">append</span>(_ element: <span class="type">T</span>) {
+        <span class="comment">// isKnownUniquelyReferenced checks if RC == 1</span>
+        <span class="keyword">if</span> !<span class="func">isKnownUniquelyReferenced</span>(&amp;storage) {
+            storage = <span class="type">StorageBuffer</span>(storage.elements)
+        }
+        storage.elements.<span class="func">append</span>(element)
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: isKnownUniquelyReferenced</div>
+        <p>Always use <code>isKnownUniquelyReferenced</code> for custom CoW types. It checks if the reference count is exactly 1 without any overhead beyond a single atomic load. The storage class <strong>must</strong> be a Swift native class (not an <code>@objc</code> class) — <code>isKnownUniquelyReferenced</code> always returns <code>false</code> for Objective-C objects.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="tagged-pointers">Tagged Pointers</h2>
+
+    <p>Tagged pointers are an Objective-C runtime optimization where small objects are stored directly in the pointer value instead of on the heap. On ARM64, the top bit indicates a tagged pointer, and the next 3 bits encode the class.</p>
+
+    <div class="diagram">
+Regular pointer (heap object):
+┌─────────────────────────────────────────────────────────────────┐
+│ 0  [63 bits of heap address]                                    │
+└─────────────────────────────────────────────────────────────────┘
+
+Tagged pointer (inline value):
+┌─────────────────────────────────────────────────────────────────┐
+│ 1  [3-bit class tag] [60 bits of payload data]                  │
+└─────────────────────────────────────────────────────────────────┘
+
+Tagged classes (ARM64):
+  Tag 0: NSAtom (unused)
+  Tag 1: NSNumber (int/float that fits in 60 bits)
+  Tag 2: NSString (up to ~7 ASCII characters)
+  Tag 3: NSDate
+  Tag 4: NSData (small)
+  Tag 5: NSManagedObjectID
+  Tag 6: NSIndexPath
+  Tag 7: Extended tag (8 more bits → 256 more classes)
+    </div>
+
+    <p>Tagged pointers are significant for performance because they avoid heap allocation entirely — no <code>malloc</code>, no reference counting, no deallocation. They're particularly impactful for <code>NSNumber</code> (extremely common in ObjC bridging) and short strings.</p>
+
+    <pre><code><span class="comment">// These NSNumber values are likely tagged pointers:</span>
+<span class="keyword">let</span> n1 = <span class="type">NSNumber</span>(value: <span class="number">42</span>)       <span class="comment">// Fits in 60 bits → tagged</span>
+<span class="keyword">let</span> n2 = <span class="type">NSNumber</span>(value: <span class="number">3.14</span>)     <span class="comment">// Float fits → tagged</span>
+
+<span class="comment">// This NSString is likely a tagged pointer:</span>
+<span class="keyword">let</span> s1 = <span class="string">"Hello"</span> <span class="keyword">as</span> <span class="type">NSString</span>       <span class="comment">// 5 ASCII chars → tagged</span>
+
+<span class="comment">// This is NOT a tagged pointer (too long):</span>
+<span class="keyword">let</span> s2 = <span class="string">"This is a longer string"</span> <span class="keyword">as</span> <span class="type">NSString</span>  <span class="comment">// Heap allocated</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Swift Strings and Tagged Pointers</div>
+        <p>Swift's <code>String</code> has its own small string optimization separate from NSString tagged pointers. A Swift <code>String</code> uses 16 bytes inline (two words). If the string content fits in 15 bytes (small ASCII or UTF-8), it's stored directly in those 16 bytes with no heap allocation. This is independent of the ObjC tagged pointer mechanism and works for pure Swift strings that never bridge to NSString.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="isa-optimization">ISA Pointer Optimization</h2>
+
+    <p>On ARM64, Apple optimizes the ISA pointer (first word of every ObjC object) to pack additional information into unused bits. This is called the <strong>non-pointer ISA</strong> or <strong>optimized ISA</strong>.</p>
+
+    <div class="diagram">
+Non-Pointer ISA (ARM64):
+┌─────────────────────────────────────────────────────────────────┐
+│ Bit 63   │ Bit 62   │ Bits 61-46 │ Bits 45-3  │ Bits 2-1│Bit 0│
+│ nonptr   │ has_assoc│ has_cxx_dtr│ shiftcls   │ magic   │ idx │
+│ ISA flag │ objects? │ destructor?│ class ptr  │         │     │
+└─────────────────────────────────────────────────────────────────┘
+
+Key fields packed into the ISA:
+  - nonpointer    (1 bit):  1 = optimized ISA
+  - has_assoc     (1 bit):  Has associated objects?
+  - has_cxx_dtor  (1 bit):  Has C++ destructor?
+  - shiftcls      (33 bits): Class pointer (shifted)
+  - magic         (6 bits):  Identifies initialized objects
+  - weakly_referenced (1 bit): Has weak references?
+  - deallocating  (1 bit):  Currently in dealloc?
+  - has_sidetable_rc (1 bit): Refcount overflowed to side table?
+  - extra_rc      (19 bits): Inline reference count (0-524287)
+    </div>
+
+    <p>The key optimization: the <strong>reference count is stored inline in the ISA</strong> for ObjC objects (up to 524,287 in the 19-bit <code>extra_rc</code> field). This avoids a separate side table lookup for the vast majority of objects. Only when the count overflows does it spill to the ObjC side table (different from Swift's side table).</p>
+
+    <!-- ============================================================ -->
+    <h2 id="compiler-arc">ARC at the Compiler Level</h2>
+
+    <p>Understanding where the compiler inserts retain/release calls is essential for reasoning about performance. The Swift compiler operates on <strong>SIL (Swift Intermediate Language)</strong>, and ARC operations are visible in the SIL output.</p>
+
+    <h3>SIL ARC Instructions</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>SIL Instruction</th>
+                <th>Meaning</th>
+                <th>Runtime Call</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>strong_retain</code></td>
+                <td>Increment strong refcount</td>
+                <td><code>swift_retain</code></td>
+            </tr>
+            <tr>
+                <td><code>strong_release</code></td>
+                <td>Decrement strong refcount</td>
+                <td><code>swift_release</code></td>
+            </tr>
+            <tr>
+                <td><code>copy_value</code></td>
+                <td>Retain (ownership transfer)</td>
+                <td><code>swift_retain</code></td>
+            </tr>
+            <tr>
+                <td><code>destroy_value</code></td>
+                <td>Release (end of ownership)</td>
+                <td><code>swift_release</code></td>
+            </tr>
+            <tr>
+                <td><code>load_weak</code></td>
+                <td>Load weak ref (may be nil)</td>
+                <td><code>swift_weakLoadStrong</code></td>
+            </tr>
+            <tr>
+                <td><code>store_weak</code></td>
+                <td>Store to weak variable</td>
+                <td><code>swift_weakAssign</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Viewing SIL Output</h3>
+
+    <pre><code><span class="comment"># Generate raw SIL (before optimization)</span>
+swiftc -emit-sil MyFile.swift
+
+<span class="comment"># Generate optimized SIL (after ARC optimization)</span>
+swiftc -emit-sil -O MyFile.swift
+
+<span class="comment"># Example: see ARC operations for a simple function</span>
+swiftc -emit-sil -O -parse-as-library example.swift | grep -E <span class="string">"retain|release|copy_value|destroy_value"</span></code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: ARC at the Compiler Level</div>
+        <p>At the Staff level, you should be able to explain the ARC optimization pipeline:</p>
+        <ol>
+            <li><strong>SILGen</strong> — inserts conservative retain/release at every ownership transfer</li>
+            <li><strong>Mandatory passes</strong> — semantic checks, definite initialization</li>
+            <li><strong>ARC optimization passes</strong> — the key optimizations:
+                <ul>
+                    <li><strong>Retain/release pairing</strong> — removes retain immediately followed by release of the same value</li>
+                    <li><strong>Copy forwarding</strong> — eliminates copies when the source is not used after the copy</li>
+                    <li><strong>Owned-to-guaranteed conversion</strong> — passes parameters as borrowed instead of owned, eliminating retain/release at call sites</li>
+                    <li><strong>Dead object elimination</strong> — removes allocations whose results are never used</li>
+                    <li><strong>Semantic ARC optimization</strong> — uses ownership SSA to prove larger regions where retain/release can be eliminated</li>
+                </ul>
+            </li>
+            <li><strong>LLVM lowering</strong> — SIL ARC instructions become calls to <code>swift_retain</code>/<code>swift_release</code></li>
+        </ol>
+        <p>The optimizer can typically eliminate 50-80% of the retain/release calls that SILGen initially inserts. You can verify this by comparing <code>-emit-sil</code> (unoptimized) vs <code>-emit-sil -O</code> (optimized) output.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="optimizer">Retain/Release Optimization</h2>
+
+    <h3>Example: Redundant Retain/Release Elimination</h3>
+
+    <pre><code><span class="comment">// Source code:</span>
+<span class="keyword">func</span> <span class="func">getName</span>(_ person: <span class="type">Person</span>) -> <span class="type">String</span> {
+    <span class="keyword">let</span> name = person.name
+    <span class="keyword">return</span> name
+}
+
+<span class="comment">// Unoptimized SIL (conceptual):</span>
+<span class="comment">// strong_retain %person          ← retain parameter</span>
+<span class="comment">// %name = load %person.name</span>
+<span class="comment">// strong_retain %name            ← retain loaded value</span>
+<span class="comment">// strong_release %person         ← release parameter</span>
+<span class="comment">// return %name</span>
+
+<span class="comment">// Optimized SIL (conceptual):</span>
+<span class="comment">// %name = load %person.name      ← parameter is borrowed, no retain</span>
+<span class="comment">// strong_retain %name            ← only retain the return value</span>
+<span class="comment">// return %name</span></code></pre>
+
+    <h3>Guaranteed (Borrowed) Parameters</h3>
+
+    <p>One of the most impactful optimizations: the Swift calling convention uses <strong>guaranteed</strong> (borrowed) parameters by default. The caller retains the argument for the duration of the call, so the callee doesn't need to retain/release it:</p>
+
+    <pre><code><span class="comment">// The caller guarantees 'person' is alive for the call duration</span>
+<span class="comment">// So getName doesn't need to retain/release the parameter</span>
+<span class="keyword">func</span> <span class="func">getName</span>(_ person: <span class="type">Person</span>) -> <span class="type">String</span> {
+    <span class="keyword">return</span> person.name  <span class="comment">// No retain of 'person' needed</span>
+}
+
+<span class="comment">// Compare with @owned convention (explicit):</span>
+<span class="comment">// func getName(_ person: __owned Person) → caller transfers ownership</span>
+<span class="comment">// callee must release when done</span></code></pre>
+
+    <h3>Escape Analysis and Stack Promotion</h3>
+
+    <p>The optimizer can determine if a class instance never escapes the current function. If so, it can allocate it on the stack instead of the heap, eliminating all reference counting:</p>
+
+    <pre><code><span class="keyword">func</span> <span class="func">computeArea</span>(width: <span class="type">Double</span>, height: <span class="type">Double</span>) -> <span class="type">Double</span> {
+    <span class="comment">// If Rect is a class, the optimizer may stack-promote this</span>
+    <span class="comment">// allocation because 'r' never escapes the function</span>
+    <span class="keyword">let</span> r = <span class="type">Rect</span>(width: width, height: height)
+    <span class="keyword">return</span> r.area
+    <span class="comment">// No heap allocation, no refcounting</span>
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Help the Optimizer</div>
+        <p>To maximize ARC optimization:</p>
+        <ul>
+            <li>Use <code>final</code> on classes that won't be subclassed — enables devirtualization and better escape analysis</li>
+            <li>Prefer <code>struct</code> over <code>class</code> when you don't need reference semantics</li>
+            <li>Use <code>private</code>/<code>internal</code> access control — the optimizer can see all uses within the module</li>
+            <li>Enable Whole Module Optimization (<code>-whole-module-optimization</code>) for release builds</li>
+            <li>Avoid unnecessary closures that capture <code>self</code> — each capture is a retain</li>
+        </ul>
+    </div>
+
+    <h2>Summary: The Complete ARC Picture</h2>
+
+    <div class="diagram">
+┌──────────────────────────────────────────────────────────────┐
+│                    ARC LIFECYCLE                              │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Source Code                                                 │
+│      │                                                       │
+│      ▼                                                       │
+│  SILGen (conservative retain/release)                        │
+│      │                                                       │
+│      ▼                                                       │
+│  ARC Optimizer (eliminate 50-80% of retain/release)          │
+│      │                                                       │
+│      ▼                                                       │
+│  LLVM IR (swift_retain / swift_release calls)                │
+│      │                                                       │
+│      ▼                                                       │
+│  Runtime: Inline refcount (fast) or Side table (weak)        │
+│      │                                                       │
+│      ▼                                                       │
+│  Deallocation: deinit → free (or zombie if unowned refs)     │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+    </div>
+
+    <div class="nav-footer">
+        <a href="index.html">← Series Overview</a>
+        <a href="02-retain-cycles.html">Next: Retain Cycles →</a>
+    </div>
+</div>
+</body>
+</html>

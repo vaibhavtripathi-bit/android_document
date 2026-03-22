@@ -1,0 +1,994 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GCD Internals — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Concurrency &amp; Threading</a><span class="sep">›</span>
+        GCD Internals
+    </nav>
+
+    <h1>GCD Internals</h1>
+    <p class="subtitle">How libdispatch works under the hood — from kernel thread pools and queue data structures to QoS propagation, priority inversion resolution, and the target queue hierarchy that governs all dispatch behavior.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#libdispatch">1. libdispatch Architecture</a></li>
+            <li><a href="#queues">2. Dispatch Queues: Serial vs Concurrent</a></li>
+            <li><a href="#thread-pool">3. Thread Pool &amp; the 64-Thread Limit</a></li>
+            <li><a href="#qos">4. Quality of Service (QoS) Classes</a></li>
+            <li><a href="#priority-inversion">5. Priority Inversion &amp; Resolution</a></li>
+            <li><a href="#workitem">6. DispatchWorkItem</a></li>
+            <li><a href="#group">7. DispatchGroup</a></li>
+            <li><a href="#semaphore">8. DispatchSemaphore</a></li>
+            <li><a href="#source">9. DispatchSource</a></li>
+            <li><a href="#target-queue">10. Target Queue Hierarchy</a></li>
+            <li><a href="#architect">11. Architect: Thread-Safe Work Scheduling</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="libdispatch">1. libdispatch Architecture</h2>
+
+    <p>Grand Central Dispatch (GCD) is Apple's C-based concurrency library, open-sourced as <strong>libdispatch</strong>. It was introduced in Mac OS X 10.6 (2009) and iOS 4 (2010). Unlike thread-based concurrency where you manage threads directly, GCD uses a <strong>work-submission model</strong>: you submit blocks of work to queues, and libdispatch manages a pool of kernel threads to execute them.</p>
+
+    <h3>1.1 Core Components</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│                     Your Application                             │
+│                                                                  │
+│   dispatch_async(queue, block)    dispatch_sync(queue, block)    │
+└──────────────────────┬───────────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      libdispatch                                 │
+│                                                                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
+│  │ Queue Manager│  │  Work Items  │  │  Thread Pool Manager │   │
+│  │              │  │  (blocks)    │  │  (workqueue kext)    │   │
+│  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘   │
+│         │                 │                      │               │
+│         └─────────────────┼──────────────────────┘               │
+│                           │                                      │
+└───────────────────────────┼──────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    XNU Kernel                                    │
+│                                                                  │
+│  ┌──────────────────┐  ┌────────────────────────────────────┐   │
+│  │  pthread_workqueue│  │  Mach Scheduler                    │   │
+│  │  (kernel ext)     │  │  (priority bands, time quanta)     │   │
+│  └──────────────────┘  └────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <p>The key insight is that libdispatch doesn't create threads itself. It communicates with a <strong>kernel extension</strong> (<code>pthread_workqueue</code>) that manages a pool of worker threads. This is why GCD is more efficient than manual thread creation — the kernel can make globally optimal scheduling decisions.</p>
+
+    <h3>1.2 The Dispatch Object Hierarchy</h3>
+
+    <p>All GCD objects inherit from <code>dispatch_object_t</code> and are reference-counted (even in Swift's ARC world, GCD objects have their own retain/release):</p>
+
+    <div class="diagram">
+dispatch_object_t
+    ├── dispatch_queue_t
+    │       ├── dispatch_queue_serial_t
+    │       ├── dispatch_queue_concurrent_t
+    │       └── dispatch_queue_main_t (singleton)
+    ├── dispatch_source_t
+    ├── dispatch_group_t
+    ├── dispatch_semaphore_t
+    ├── dispatch_data_t
+    ├── dispatch_io_t
+    └── dispatch_workloop_t (iOS 12+)
+    </div>
+
+    <h3>1.3 How dispatch_async Works Internally</h3>
+
+    <p>When you call <code>dispatch_async(queue, block)</code>, here's what happens at the libdispatch level:</p>
+
+    <ol>
+        <li><strong>Block copy</strong>: The block is copied from stack to heap (if not already there). Captured variables are retained.</li>
+        <li><strong>Enqueue</strong>: The block is wrapped in a <code>dispatch_continuation_t</code> struct and appended to the queue's FIFO list (lock-free MPSC queue for serial, lock-free MPMC for concurrent).</li>
+        <li><strong>Drain signal</strong>: libdispatch signals the kernel workqueue that work is available.</li>
+        <li><strong>Thread wakeup</strong>: The kernel either wakes an idle thread or creates a new one (up to limits).</li>
+        <li><strong>Dequeue &amp; execute</strong>: The worker thread dequeues the continuation and invokes the block.</li>
+        <li><strong>Cleanup</strong>: The block is released (and captured objects with it).</li>
+    </ol>
+
+    <pre><code><span class="comment">// What you write:</span>
+<span class="type">DispatchQueue</span>.<span class="func">global</span>(qos: .<span class="attr">userInitiated</span>).<span class="func">async</span> {
+    <span class="keyword">let</span> data = <span class="func">processData</span>()
+    <span class="type">DispatchQueue</span>.main.<span class="func">async</span> {
+        <span class="keyword">self</span>.updateUI(with: data)
+    }
+}
+
+<span class="comment">// What libdispatch does internally (pseudocode):</span>
+<span class="comment">// 1. _dispatch_continuation_init(block) → heap-allocate continuation</span>
+<span class="comment">// 2. _dispatch_queue_push(queue, continuation) → MPSC enqueue</span>
+<span class="comment">// 3. _dispatch_queue_wakeup(queue) → signal kernel workqueue</span>
+<span class="comment">// 4. Worker thread: _dispatch_queue_drain(queue) → dequeue + invoke</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Lock-Free Queues</div>
+        <p>libdispatch uses <strong>lock-free data structures</strong> internally. Serial queues use an MPSC (Multiple Producer, Single Consumer) atomic linked list. The enqueue operation uses <code>os_atomic_xchg</code> (compare-and-swap) to atomically append to the tail. This means <code>dispatch_async</code> itself never blocks — it's O(1) and wait-free for the caller. The drain operation on the consumer side uses atomic load-acquire to process items in FIFO order.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="queues">2. Dispatch Queues: Serial vs Concurrent</h2>
+
+    <h3>2.1 Serial Queues</h3>
+
+    <p>A serial queue executes one block at a time, in FIFO order. It acts as a <strong>mutual exclusion mechanism</strong> — a lightweight alternative to locks for protecting shared state.</p>
+
+    <pre><code><span class="comment">// Creating a serial queue</span>
+<span class="keyword">let</span> serialQueue = <span class="type">DispatchQueue</span>(label: <span class="string">"com.app.cache"</span>)
+
+<span class="comment">// This is equivalent to:</span>
+<span class="keyword">let</span> serialQueue = <span class="type">DispatchQueue</span>(
+    label: <span class="string">"com.app.cache"</span>,
+    attributes: []  <span class="comment">// no .concurrent → serial by default</span>
+)
+
+<span class="comment">// Using as a synchronization mechanism</span>
+<span class="keyword">class</span> <span class="type">ThreadSafeCache</span>&lt;<span class="type">Key</span>: <span class="type">Hashable</span>, <span class="type">Value</span>&gt; {
+    <span class="keyword">private var</span> storage: [<span class="type">Key</span>: <span class="type">Value</span>] = [:]
+    <span class="keyword">private let</span> queue = <span class="type">DispatchQueue</span>(label: <span class="string">"com.app.cache"</span>)
+
+    <span class="keyword">func</span> <span class="func">get</span>(_ key: <span class="type">Key</span>) -> <span class="type">Value</span>? {
+        queue.<span class="func">sync</span> { storage[key] }
+    }
+
+    <span class="keyword">func</span> <span class="func">set</span>(_ key: <span class="type">Key</span>, value: <span class="type">Value</span>) {
+        queue.<span class="func">async</span> { [<span class="keyword">weak self</span>] <span class="keyword">in</span>
+            <span class="keyword">self</span>?.storage[key] = value
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: dispatch_sync Deadlock</div>
+        <p>Calling <code>sync</code> on the <strong>current</strong> serial queue causes a deadlock. The current block holds the queue's "execution token," and <code>sync</code> waits for that token — classic deadlock. This also applies transitively through target queues.</p>
+        <pre><code><span class="comment">// DEADLOCK! Never do this:</span>
+<span class="keyword">let</span> q = <span class="type">DispatchQueue</span>(label: <span class="string">"com.app.serial"</span>)
+q.<span class="func">async</span> {
+    q.<span class="func">sync</span> {  <span class="comment">// 💀 Deadlock: waiting for self</span>
+        <span class="func">print</span>(<span class="string">"never reached"</span>)
+    }
+}
+
+<span class="comment">// Also deadlocks on main queue:</span>
+<span class="type">DispatchQueue</span>.main.<span class="func">sync</span> {  <span class="comment">// 💀 if called from main thread</span>
+    <span class="func">print</span>(<span class="string">"never reached"</span>)
+}</code></pre>
+    </div>
+
+    <h3>2.2 Concurrent Queues</h3>
+
+    <p>A concurrent queue can execute multiple blocks simultaneously. The queue still dequeues in FIFO order, but it doesn't wait for one block to finish before starting the next.</p>
+
+    <pre><code><span class="keyword">let</span> concurrentQueue = <span class="type">DispatchQueue</span>(
+    label: <span class="string">"com.app.processing"</span>,
+    attributes: .concurrent
+)
+
+<span class="comment">// Reader-writer pattern using barrier</span>
+<span class="keyword">class</span> <span class="type">ThreadSafeDictionary</span>&lt;<span class="type">Key</span>: <span class="type">Hashable</span>, <span class="type">Value</span>&gt; {
+    <span class="keyword">private var</span> storage: [<span class="type">Key</span>: <span class="type">Value</span>] = [:]
+    <span class="keyword">private let</span> queue = <span class="type">DispatchQueue</span>(
+        label: <span class="string">"com.app.dict"</span>,
+        attributes: .concurrent
+    )
+
+    <span class="comment">// Multiple readers execute concurrently</span>
+    <span class="keyword">func</span> <span class="func">get</span>(_ key: <span class="type">Key</span>) -> <span class="type">Value</span>? {
+        queue.<span class="func">sync</span> { storage[key] }
+    }
+
+    <span class="comment">// Writer uses barrier: waits for all readers, then exclusive access</span>
+    <span class="keyword">func</span> <span class="func">set</span>(_ key: <span class="type">Key</span>, value: <span class="type">Value</span>) {
+        queue.<span class="func">async</span>(flags: .barrier) { [<span class="keyword">weak self</span>] <span class="keyword">in</span>
+            <span class="keyword">self</span>?.storage[key] = value
+        }
+    }
+}</code></pre>
+
+    <div class="diagram">
+Concurrent Queue with Barrier:
+
+Time ──────────────────────────────────────────────────────────▶
+
+Thread 1: ┃ Read A ┃         ┃ Read D ┃
+Thread 2: ┃ Read B ┃         ┃ Read E ┃
+Thread 3: ┃ Read C ┃         ┃ Read F ┃
+                    ┃ BARRIER ┃
+                    ┃ Write X ┃
+                    ┃(exclusive)┃
+
+All reads before barrier complete → barrier executes alone → reads after barrier start
+    </div>
+
+    <h3>2.3 Global Queues</h3>
+
+    <p>Apple provides pre-created global concurrent queues at each QoS level. These are shared across the entire process:</p>
+
+    <pre><code><span class="comment">// The four global concurrent queues</span>
+<span class="type">DispatchQueue</span>.<span class="func">global</span>(qos: .<span class="attr">userInteractive</span>)  <span class="comment">// Highest priority</span>
+<span class="type">DispatchQueue</span>.<span class="func">global</span>(qos: .<span class="attr">userInitiated</span>)    <span class="comment">// High priority</span>
+<span class="type">DispatchQueue</span>.<span class="func">global</span>(qos: .<span class="attr">utility</span>)           <span class="comment">// Medium priority</span>
+<span class="type">DispatchQueue</span>.<span class="func">global</span>(qos: .<span class="attr">background</span>)        <span class="comment">// Lowest priority</span>
+
+<span class="comment">// Plus two special ones:</span>
+<span class="type">DispatchQueue</span>.<span class="func">global</span>(qos: .<span class="attr">default</span>)            <span class="comment">// Between userInitiated and utility</span>
+<span class="type">DispatchQueue</span>.<span class="func">global</span>(qos: .<span class="attr">unspecified</span>)       <span class="comment">// Inherits from context</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: Barrier on Global Queues</div>
+        <p>Using <code>.barrier</code> on a global queue has <strong>no barrier effect</strong>. Barriers only work on custom concurrent queues you create. Since global queues are shared by the entire process, allowing barriers would let any code block the entire system. The barrier flag is silently ignored on global queues.</p>
+    </div>
+
+    <h3>2.4 Custom vs Global: When to Use Each</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Custom Queue</th>
+                <th>Global Queue</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Barrier support</td>
+                <td>Yes — reader/writer pattern</td>
+                <td>No — barrier silently ignored</td>
+            </tr>
+            <tr>
+                <td>Debugging</td>
+                <td>Custom label in crash logs</td>
+                <td>Generic label, hard to trace</td>
+            </tr>
+            <tr>
+                <td>Target queue</td>
+                <td>Configurable</td>
+                <td>Fixed to root queue</td>
+            </tr>
+            <tr>
+                <td>Thread explosion risk</td>
+                <td>Lower (controllable via target)</td>
+                <td>Higher (shared, no control)</td>
+            </tr>
+            <tr>
+                <td>Use case</td>
+                <td>Module-specific synchronization</td>
+                <td>Quick one-off background work</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="thread-pool">3. Thread Pool &amp; the 64-Thread Limit</h2>
+
+    <h3>3.1 How the Thread Pool Works</h3>
+
+    <p>GCD manages a <strong>per-process thread pool</strong> through the kernel's <code>pthread_workqueue</code> facility. The pool has these characteristics:</p>
+
+    <ul>
+        <li><strong>Lazy creation</strong>: Threads are created on demand, not upfront</li>
+        <li><strong>Reuse</strong>: Idle threads are kept alive briefly for reuse</li>
+        <li><strong>Per-workqueue limit</strong>: Each workqueue (mapped to a QoS class) can have up to <strong>64 threads</strong></li>
+        <li><strong>Overcommit queues</strong>: Some queues (like serial queues) use "overcommit" workqueues that can exceed the 64-thread limit — this is how thread explosion happens</li>
+    </ul>
+
+    <h3>3.2 Thread Explosion: The #1 GCD Problem</h3>
+
+    <p>Thread explosion occurs when GCD creates too many threads, exhausting system resources. Each thread costs ~512KB of stack space (1MB on macOS), plus kernel resources.</p>
+
+    <pre><code><span class="comment">// 🚨 Thread explosion pattern — DO NOT DO THIS</span>
+<span class="keyword">for</span> i <span class="keyword">in</span> <span class="number">0</span>..&lt;<span class="number">1000</span> {
+    <span class="type">DispatchQueue</span>.<span class="func">global</span>().<span class="func">async</span> {
+        <span class="comment">// Each block calls a synchronous API that blocks the thread</span>
+        <span class="keyword">let</span> data = <span class="keyword">try</span>? <span class="type">Data</span>(contentsOf: urls[i])  <span class="comment">// Blocks!</span>
+        <span class="func">process</span>(data)
+    }
+}
+<span class="comment">// GCD sees 1000 blocks, each blocking → creates up to 64+ threads</span>
+<span class="comment">// Each thread: 512KB stack → 32MB+ just for stacks</span>
+<span class="comment">// Plus context switching overhead → app becomes unresponsive</span></code></pre>
+
+    <div class="diagram">
+Thread Explosion Timeline:
+
+Time 0ms:   Block 0 submitted → Thread 1 created, starts executing
+Time 1ms:   Block 1 submitted → Thread 1 busy (blocked on I/O) → Thread 2 created
+Time 2ms:   Block 2 submitted → Threads 1,2 busy → Thread 3 created
+...
+Time 63ms:  Block 63 submitted → Thread 64 created (LIMIT HIT)
+Time 64ms:  Block 64 submitted → ⚠️ Overcommit: Thread 65 created anyway
+...
+Time 200ms: 200+ threads, each blocked on I/O
+            Stack memory: 200 × 512KB = 100MB
+            Context switches: thousands per second
+            App: unresponsive, possible Jetsam kill
+    </div>
+
+    <h3>3.3 Preventing Thread Explosion</h3>
+
+    <pre><code><span class="comment">// ✅ Solution 1: Use a serial queue for serialized access</span>
+<span class="keyword">let</span> processingQueue = <span class="type">DispatchQueue</span>(label: <span class="string">"com.app.processing"</span>)
+<span class="keyword">for</span> url <span class="keyword">in</span> urls {
+    processingQueue.<span class="func">async</span> {
+        <span class="keyword">let</span> data = <span class="keyword">try</span>? <span class="type">Data</span>(contentsOf: url)
+        <span class="func">process</span>(data)
+    }
+}
+
+<span class="comment">// ✅ Solution 2: Use a semaphore to limit concurrency</span>
+<span class="keyword">let</span> semaphore = <span class="type">DispatchSemaphore</span>(value: <span class="number">4</span>)  <span class="comment">// Max 4 concurrent</span>
+<span class="keyword">for</span> url <span class="keyword">in</span> urls {
+    <span class="type">DispatchQueue</span>.<span class="func">global</span>().<span class="func">async</span> {
+        semaphore.<span class="func">wait</span>()
+        <span class="keyword">defer</span> { semaphore.<span class="func">signal</span>() }
+        <span class="keyword">let</span> data = <span class="keyword">try</span>? <span class="type">Data</span>(contentsOf: url)
+        <span class="func">process</span>(data)
+    }
+}
+
+<span class="comment">// ✅ Solution 3: Use OperationQueue with maxConcurrentOperationCount</span>
+<span class="keyword">let</span> opQueue = <span class="type">OperationQueue</span>()
+opQueue.maxConcurrentOperationCount = <span class="number">4</span>
+
+<span class="comment">// ✅ Solution 4 (Modern): Use TaskGroup with limited concurrency</span>
+<span class="keyword">await</span> <span class="func">withTaskGroup</span>(of: <span class="type">Data</span>?.<span class="keyword">self</span>) { group <span class="keyword">in</span>
+    <span class="keyword">for</span> url <span class="keyword">in</span> urls {
+        group.<span class="func">addTask</span> {
+            <span class="keyword">try</span>? <span class="keyword">await</span> <span class="type">URLSession</span>.shared.<span class="func">data</span>(from: url).<span class="number">0</span>
+        }
+    }
+    <span class="comment">// Swift concurrency uses cooperative threading — no explosion</span>
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice</div>
+        <p>The modern solution to thread explosion is <strong>Swift concurrency</strong>. The cooperative thread pool used by async/await is limited to the number of CPU cores (typically 6-8 on modern iPhones). Tasks suspend at await points instead of blocking threads, so you can have thousands of in-flight tasks without creating thousands of threads.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="qos">4. Quality of Service (QoS) Classes</h2>
+
+    <p>QoS classes tell the system the <strong>intent</strong> of your work, allowing it to make intelligent scheduling decisions about CPU priority, I/O priority, timer coalescing, and CPU throughput vs efficiency core usage.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>QoS Class</th>
+                <th>Priority</th>
+                <th>Use Case</th>
+                <th>Scheduling Behavior</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>.userInteractive</code></td>
+                <td>Highest (33)</td>
+                <td>Main thread work, animations, event handling</td>
+                <td>Performance cores, highest CPU priority, immediate scheduling</td>
+            </tr>
+            <tr>
+                <td><code>.userInitiated</code></td>
+                <td>High (25)</td>
+                <td>User tapped something, waiting for result</td>
+                <td>Performance cores, high priority, minimal latency</td>
+            </tr>
+            <tr>
+                <td><code>.default</code></td>
+                <td>Medium (21)</td>
+                <td>Default when no QoS specified</td>
+                <td>Balanced between performance and efficiency</td>
+            </tr>
+            <tr>
+                <td><code>.utility</code></td>
+                <td>Low (17)</td>
+                <td>Long-running tasks: downloads, imports, indexing</td>
+                <td>Efficiency cores preferred, timer coalescing, I/O throttled</td>
+            </tr>
+            <tr>
+                <td><code>.background</code></td>
+                <td>Lowest (9)</td>
+                <td>Prefetching, maintenance, backups</td>
+                <td>Efficiency cores only, heavily throttled, may be deferred</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>4.1 QoS Propagation Rules</h3>
+
+    <p>QoS propagates through the system in specific ways:</p>
+
+    <pre><code><span class="comment">// Rule 1: Blocks inherit the QoS of the submitting thread</span>
+<span class="type">DispatchQueue</span>.<span class="func">global</span>(qos: .<span class="attr">userInitiated</span>).<span class="func">async</span> {
+    <span class="comment">// This block runs at .userInitiated</span>
+
+    <span class="type">DispatchQueue</span>.<span class="func">global</span>().<span class="func">async</span> {
+        <span class="comment">// This inherits .userInitiated from the submitting context</span>
+        <span class="comment">// NOT .default (the queue's own QoS)</span>
+    }
+}
+
+<span class="comment">// Rule 2: Queue QoS acts as a floor</span>
+<span class="keyword">let</span> utilityQueue = <span class="type">DispatchQueue</span>(
+    label: <span class="string">"com.app.utility"</span>,
+    qos: .utility
+)
+<span class="comment">// Submitting .background work to a .utility queue → runs at .utility</span>
+<span class="comment">// Submitting .userInitiated work to a .utility queue → runs at .userInitiated</span>
+
+<span class="comment">// Rule 3: dispatch_sync propagates QoS to the target queue</span>
+<span class="comment">// If main thread (userInteractive) calls sync on a background queue,</span>
+<span class="comment">// the block executes at userInteractive priority</span></code></pre>
+
+    <h3>4.2 QoS and Energy Impact</h3>
+
+    <div class="diagram">
+QoS Energy Impact:
+
+.userInteractive  ████████████████████  High energy, performance cores
+.userInitiated    ███████████████       High energy, performance cores
+.default          ██████████            Moderate energy
+.utility          ██████                Low energy, efficiency cores, throttled I/O
+.background       ███                   Minimal energy, heavily deferred
+
+On Apple Silicon (M1/A-series):
+┌─────────────────────────────────────────────────┐
+│  Performance Cores (P)  │  Efficiency Cores (E)  │
+│  .userInteractive       │  .utility              │
+│  .userInitiated         │  .background           │
+│  .default               │                        │
+└─────────────────────────────────────────────────┘
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="priority-inversion">5. Priority Inversion &amp; Resolution</h2>
+
+    <p>Priority inversion occurs when a high-priority task is blocked waiting for a low-priority task that can't run because medium-priority tasks are consuming CPU time.</p>
+
+    <h3>5.1 Classic Priority Inversion Scenario</h3>
+
+    <div class="diagram">
+Priority Inversion:
+
+High Priority (H):    ──────┃ BLOCKED waiting for lock ┃──────────▶
+                             held by L
+Medium Priority (M):  ──────┃ RUNNING (preempted L) ┃──────────────▶
+Low Priority (L):     ──┃RUN┃ preempted by M... can't release lock ┃
+
+Problem: H waits for L, but L can't run because M keeps preempting it.
+H is effectively running at L's priority — INVERTED.
+    </div>
+
+    <h3>5.2 How GCD Resolves Priority Inversion</h3>
+
+    <p>GCD uses <strong>priority boosting</strong> (also called priority inheritance) to resolve inversions:</p>
+
+    <ul>
+        <li><strong>dispatch_sync</strong>: When a high-QoS thread calls <code>sync</code> on a queue, GCD temporarily boosts the priority of the currently executing block on that queue to match the waiter's QoS.</li>
+        <li><strong>DispatchSemaphore</strong>: When <code>wait()</code> is called, the system can boost the priority of the thread that will eventually call <code>signal()</code>.</li>
+        <li><strong>Serial queues</strong>: The queue's effective QoS is raised to the highest QoS of any pending block.</li>
+    </ul>
+
+    <pre><code><span class="comment">// Priority inversion scenario and GCD's resolution</span>
+<span class="keyword">let</span> serialQueue = <span class="type">DispatchQueue</span>(label: <span class="string">"com.app.shared"</span>)
+
+<span class="comment">// Low-priority work is running on the serial queue</span>
+serialQueue.<span class="func">async</span>(qos: .<span class="attr">background</span>) {
+    <span class="func">heavyComputation</span>()  <span class="comment">// Takes 5 seconds</span>
+}
+
+<span class="comment">// High-priority work needs the same queue</span>
+<span class="type">DispatchQueue</span>.<span class="func">global</span>(qos: .<span class="attr">userInteractive</span>).<span class="func">async</span> {
+    serialQueue.<span class="func">sync</span> {
+        <span class="comment">// GCD detects: userInteractive is waiting for background work</span>
+        <span class="comment">// Resolution: boost background block to userInteractive priority</span>
+        <span class="func">quickUIUpdate</span>()
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: os_unfair_lock vs DispatchSemaphore for Priority Inversion</div>
+        <p><code>os_unfair_lock</code> (the recommended low-level lock on Apple platforms) supports priority inheritance natively through the kernel. <code>DispatchSemaphore</code> does <strong>not</strong> fully support priority inheritance in all cases — Apple's own documentation warns about this. For critical sections protecting shared state, prefer <code>os_unfair_lock</code> or serial dispatch queues over semaphores.</p>
+    </div>
+
+    <h3>5.3 Priority Inversion with dispatch_semaphore</h3>
+
+    <pre><code><span class="comment">// ⚠️ Semaphore-based priority inversion (hard to detect)</span>
+<span class="keyword">let</span> semaphore = <span class="type">DispatchSemaphore</span>(value: <span class="number">1</span>)
+
+<span class="comment">// Background thread acquires semaphore</span>
+<span class="type">DispatchQueue</span>.<span class="func">global</span>(qos: .<span class="attr">background</span>).<span class="func">async</span> {
+    semaphore.<span class="func">wait</span>()
+    <span class="func">slowDatabaseWrite</span>()  <span class="comment">// Holds semaphore for a long time</span>
+    semaphore.<span class="func">signal</span>()
+}
+
+<span class="comment">// Main thread waits on semaphore — PRIORITY INVERSION</span>
+<span class="comment">// The background thread holding the semaphore won't get boosted</span>
+<span class="comment">// because semaphore doesn't track which thread holds it</span>
+semaphore.<span class="func">wait</span>()  <span class="comment">// 💀 Main thread blocked, UI frozen</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="workitem">6. DispatchWorkItem</h2>
+
+    <p><code>DispatchWorkItem</code> wraps a block with additional capabilities: cancellation, notification on completion, and QoS assignment.</p>
+
+    <pre><code><span class="comment">// Creating and using a DispatchWorkItem</span>
+<span class="keyword">let</span> workItem = <span class="type">DispatchWorkItem</span>(qos: .<span class="attr">userInitiated</span>) {
+    <span class="keyword">let</span> result = <span class="func">performExpensiveSearch</span>(query)
+    <span class="type">DispatchQueue</span>.main.<span class="func">async</span> {
+        <span class="func">updateSearchResults</span>(result)
+    }
+}
+
+<span class="comment">// Submit to a queue</span>
+<span class="type">DispatchQueue</span>.<span class="func">global</span>().<span class="func">async</span>(execute: workItem)
+
+<span class="comment">// Cancel if user types a new query</span>
+workItem.<span class="func">cancel</span>()  <span class="comment">// Sets isCancelled = true</span>
+
+<span class="comment">// Notification when complete</span>
+workItem.<span class="func">notify</span>(queue: .main) {
+    <span class="func">print</span>(<span class="string">"Search complete (or cancelled)"</span>)
+}
+
+<span class="comment">// Wait synchronously (with timeout)</span>
+<span class="keyword">let</span> result = workItem.<span class="func">wait</span>(timeout: .<span class="func">now</span>() + <span class="number">5.0</span>)
+<span class="keyword">switch</span> result {
+<span class="keyword">case</span> .success: <span class="func">print</span>(<span class="string">"Completed"</span>)
+<span class="keyword">case</span> .timedOut: <span class="func">print</span>(<span class="string">"Timed out"</span>)
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: DispatchWorkItem Cancellation is Cooperative</div>
+        <p>Calling <code>cancel()</code> on a work item does <strong>not</strong> stop it from executing if it has already started. It only sets the <code>isCancelled</code> flag. If the block hasn't started yet, it will still be dequeued and "executed" — but the block body won't run. You must check <code>isCancelled</code> inside long-running work items for cancellation to be effective.</p>
+    </div>
+
+    <pre><code><span class="comment">// Proper cancellation checking</span>
+<span class="keyword">let</span> workItem = <span class="type">DispatchWorkItem</span> {
+    <span class="keyword">for</span> i <span class="keyword">in</span> <span class="number">0</span>..&lt;<span class="number">10000</span> {
+        <span class="keyword">guard</span> !<span class="type">Thread</span>.current.<span class="func">isCancelled</span> <span class="keyword">else</span> { <span class="keyword">return</span> }
+        <span class="comment">// Note: DispatchWorkItem.isCancelled is not directly accessible</span>
+        <span class="comment">// inside the block. You need to capture the item:</span>
+        <span class="func">processItem</span>(i)
+    }
+}
+
+<span class="comment">// Better pattern: capture the work item for cancellation checking</span>
+<span class="keyword">var</span> item: <span class="type">DispatchWorkItem</span>?
+item = <span class="type">DispatchWorkItem</span> {
+    <span class="keyword">for</span> i <span class="keyword">in</span> <span class="number">0</span>..&lt;<span class="number">10000</span> {
+        <span class="keyword">guard</span> item?.isCancelled == <span class="keyword">false</span> <span class="keyword">else</span> { <span class="keyword">return</span> }
+        <span class="func">processItem</span>(i)
+    }
+}
+<span class="type">DispatchQueue</span>.<span class="func">global</span>().<span class="func">async</span>(execute: item!)</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="group">7. DispatchGroup</h2>
+
+    <p><code>DispatchGroup</code> allows you to aggregate multiple asynchronous tasks and get notified when all of them complete. Internally, it uses an atomic counter.</p>
+
+    <pre><code><span class="keyword">let</span> group = <span class="type">DispatchGroup</span>()
+
+<span class="comment">// Pattern 1: Using enter/leave for async APIs</span>
+<span class="keyword">for</span> url <span class="keyword">in</span> imageURLs {
+    group.<span class="func">enter</span>()
+    <span class="func">downloadImage</span>(url) { image <span class="keyword">in</span>
+        <span class="func">processImage</span>(image)
+        group.<span class="func">leave</span>()  <span class="comment">// Must balance every enter()</span>
+    }
+}
+
+<span class="comment">// Async notification when all complete</span>
+group.<span class="func">notify</span>(queue: .main) {
+    <span class="func">print</span>(<span class="string">"All images processed"</span>)
+    <span class="func">updateUI</span>()
+}
+
+<span class="comment">// Pattern 2: Using dispatch_group_async (simpler for sync work)</span>
+<span class="keyword">let</span> group2 = <span class="type">DispatchGroup</span>()
+<span class="keyword">let</span> queue = <span class="type">DispatchQueue</span>.<span class="func">global</span>(qos: .<span class="attr">userInitiated</span>)
+
+queue.<span class="func">async</span>(group: group2) { <span class="func">task1</span>() }
+queue.<span class="func">async</span>(group: group2) { <span class="func">task2</span>() }
+queue.<span class="func">async</span>(group: group2) { <span class="func">task3</span>() }
+
+<span class="comment">// Synchronous wait with timeout</span>
+<span class="keyword">let</span> result = group2.<span class="func">wait</span>(timeout: .<span class="func">now</span>() + <span class="number">10.0</span>)
+<span class="keyword">if</span> result == .timedOut {
+    <span class="func">print</span>(<span class="string">"Some tasks didn't complete in time"</span>)
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: Unbalanced enter/leave</div>
+        <p>Every <code>enter()</code> must have a matching <code>leave()</code>. If you call <code>leave()</code> more times than <code>enter()</code>, your app <strong>crashes</strong> (EXC_BAD_INSTRUCTION). If you call <code>enter()</code> without a matching <code>leave()</code> (e.g., in an error path), the group never completes. Always use <code>defer { group.leave() }</code> to ensure balance.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="semaphore">8. DispatchSemaphore</h2>
+
+    <p>A counting semaphore that controls access to a resource by multiple threads. Initialized with a count; <code>wait()</code> decrements, <code>signal()</code> increments. When count reaches 0, <code>wait()</code> blocks.</p>
+
+    <pre><code><span class="comment">// Limiting concurrent network requests</span>
+<span class="keyword">let</span> maxConcurrent = <span class="type">DispatchSemaphore</span>(value: <span class="number">4</span>)
+
+<span class="keyword">for</span> url <span class="keyword">in</span> urls {
+    <span class="type">DispatchQueue</span>.<span class="func">global</span>().<span class="func">async</span> {
+        maxConcurrent.<span class="func">wait</span>()    <span class="comment">// Blocks if 4 already running</span>
+        <span class="keyword">defer</span> { maxConcurrent.<span class="func">signal</span>() }
+
+        <span class="keyword">let</span> data = <span class="func">synchronousDownload</span>(url)
+        <span class="func">process</span>(data)
+    }
+}
+
+<span class="comment">// Binary semaphore (mutex equivalent)</span>
+<span class="keyword">let</span> mutex = <span class="type">DispatchSemaphore</span>(value: <span class="number">1</span>)
+
+mutex.<span class="func">wait</span>()
+<span class="comment">// Critical section — only one thread at a time</span>
+sharedResource.<span class="func">modify</span>()
+mutex.<span class="func">signal</span>()
+
+<span class="comment">// Making async API synchronous (use sparingly!)</span>
+<span class="keyword">func</span> <span class="func">synchronousWrapper</span>() -> <span class="type">Data</span>? {
+    <span class="keyword">let</span> semaphore = <span class="type">DispatchSemaphore</span>(value: <span class="number">0</span>)
+    <span class="keyword">var</span> result: <span class="type">Data</span>?
+
+    <span class="func">asyncFetch</span> { data <span class="keyword">in</span>
+        result = data
+        semaphore.<span class="func">signal</span>()
+    }
+
+    semaphore.<span class="func">wait</span>()
+    <span class="keyword">return</span> result
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: Semaphore on Main Thread</div>
+        <p>Never call <code>semaphore.wait()</code> on the main thread. It blocks the thread, freezing the UI. If the work that will call <code>signal()</code> also needs the main thread (e.g., a UIKit callback), you get a deadlock. This is a common source of app freezes in production.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="source">9. DispatchSource</h2>
+
+    <p><code>DispatchSource</code> monitors low-level system events and delivers them as blocks on a dispatch queue. It's the bridge between kernel events and GCD.</p>
+
+    <h3>9.1 Source Types</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Source Type</th>
+                <th>Monitors</th>
+                <th>Use Case</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>.timer</code></td>
+                <td>Time intervals</td>
+                <td>Repeating tasks, debouncing</td>
+            </tr>
+            <tr>
+                <td><code>.read</code></td>
+                <td>File descriptor readability</td>
+                <td>Socket/pipe data available</td>
+            </tr>
+            <tr>
+                <td><code>.write</code></td>
+                <td>File descriptor writability</td>
+                <td>Socket/pipe ready for write</td>
+            </tr>
+            <tr>
+                <td><code>.vnode</code></td>
+                <td>File system changes</td>
+                <td>File modified/deleted/renamed</td>
+            </tr>
+            <tr>
+                <td><code>.process</code></td>
+                <td>Process events</td>
+                <td>Process exit, fork, signal</td>
+            </tr>
+            <tr>
+                <td><code>.signal</code></td>
+                <td>UNIX signals</td>
+                <td>SIGTERM, SIGHUP handling</td>
+            </tr>
+            <tr>
+                <td><code>.memoryPressure</code></td>
+                <td>System memory warnings</td>
+                <td>Cache eviction</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// DispatchSource timer — more precise than Timer</span>
+<span class="keyword">let</span> timer = <span class="type">DispatchSource</span>.<span class="func">makeTimerSource</span>(queue: .<span class="func">global</span>())
+timer.<span class="func">schedule</span>(
+    deadline: .<span class="func">now</span>(),
+    repeating: .<span class="func">seconds</span>(<span class="number">1</span>),
+    leeway: .<span class="func">milliseconds</span>(<span class="number">100</span>)  <span class="comment">// Allows coalescing for energy</span>
+)
+timer.<span class="func">setEventHandler</span> {
+    <span class="func">print</span>(<span class="string">"Tick at \(Date())"</span>)
+}
+timer.<span class="func">setCancelHandler</span> {
+    <span class="func">print</span>(<span class="string">"Timer cancelled"</span>)
+}
+timer.<span class="func">resume</span>()  <span class="comment">// Sources start suspended!</span>
+
+<span class="comment">// File system monitoring</span>
+<span class="keyword">let</span> fd = <span class="func">open</span>(<span class="string">"/path/to/file"</span>, <span class="type">O_EVTONLY</span>)
+<span class="keyword">let</span> source = <span class="type">DispatchSource</span>.<span class="func">makeFileSystemObjectSource</span>(
+    fileDescriptor: fd,
+    eventMask: [.write, .delete, .rename],
+    queue: .<span class="func">global</span>()
+)
+source.<span class="func">setEventHandler</span> {
+    <span class="keyword">let</span> flags = source.data
+    <span class="keyword">if</span> flags.<span class="func">contains</span>(.write) { <span class="func">print</span>(<span class="string">"File modified"</span>) }
+    <span class="keyword">if</span> flags.<span class="func">contains</span>(.delete) { <span class="func">print</span>(<span class="string">"File deleted"</span>) }
+}
+source.<span class="func">resume</span>()</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: DispatchSource vs Timer vs asyncAfter</div>
+        <p><code>DispatchSource.makeTimerSource</code> is the most precise and configurable timer in GCD. Unlike <code>Timer</code> (which requires a RunLoop), dispatch timers work on any queue. Unlike <code>asyncAfter</code> (which is one-shot), dispatch timers support repeating with configurable leeway for energy optimization. The leeway parameter lets the system coalesce timer firings across the process, reducing CPU wakeups.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="target-queue">10. Target Queue Hierarchy</h2>
+
+    <p>Every dispatch queue has a <strong>target queue</strong> — the queue where its blocks are ultimately executed. This forms a hierarchy that controls execution context, QoS, and mutual exclusion.</p>
+
+    <h3>10.1 Default Target Queues</h3>
+
+    <div class="diagram">
+Target Queue Hierarchy (Default):
+
+                    ┌──────────────────────┐
+                    │   Root Queue         │
+                    │   (per QoS level)    │
+                    │   Managed by kernel  │
+                    └──────────┬───────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                │
+    ┌─────────▼──────┐ ┌──────▼───────┐ ┌──────▼───────┐
+    │ Global Queue   │ │ Global Queue │ │ Global Queue │
+    │ .userInitiated │ │ .utility     │ │ .background  │
+    └─────────┬──────┘ └──────┬───────┘ └──────┬───────┘
+              │               │                │
+    ┌─────────▼──────┐ ┌──────▼───────┐ ┌──────▼───────┐
+    │ Your Custom    │ │ Your Custom  │ │ Your Custom  │
+    │ Serial Queue   │ │ Concurrent Q │ │ Serial Queue │
+    └────────────────┘ └──────────────┘ └──────────────┘
+
+By default, custom queues target the default-priority global concurrent queue.
+    </div>
+
+    <h3>10.2 Custom Target Queues</h3>
+
+    <pre><code><span class="comment">// Creating a queue hierarchy for mutual exclusion</span>
+<span class="keyword">let</span> targetQueue = <span class="type">DispatchQueue</span>(label: <span class="string">"com.app.subsystem"</span>)
+
+<span class="keyword">let</span> queue1 = <span class="type">DispatchQueue</span>(
+    label: <span class="string">"com.app.subsystem.cache"</span>,
+    target: targetQueue
+)
+<span class="keyword">let</span> queue2 = <span class="type">DispatchQueue</span>(
+    label: <span class="string">"com.app.subsystem.network"</span>,
+    target: targetQueue
+)
+
+<span class="comment">// queue1 and queue2 are MUTUALLY EXCLUSIVE because they share</span>
+<span class="comment">// a serial target queue. Blocks from either queue will never</span>
+<span class="comment">// execute concurrently with each other.</span>
+
+<span class="comment">// This is powerful for subsystem-level synchronization:</span>
+<span class="comment">// Each module gets its own queue for debugging/labeling,</span>
+<span class="comment">// but they all serialize through the shared target.</span></code></pre>
+
+    <h3>10.3 Target Queue and QoS Interaction</h3>
+
+    <pre><code><span class="comment">// The target queue's QoS acts as a ceiling</span>
+<span class="keyword">let</span> bgTarget = <span class="type">DispatchQueue</span>(
+    label: <span class="string">"com.app.bg"</span>,
+    qos: .background
+)
+
+<span class="keyword">let</span> childQueue = <span class="type">DispatchQueue</span>(
+    label: <span class="string">"com.app.child"</span>,
+    qos: .userInitiated,  <span class="comment">// Requested QoS</span>
+    target: bgTarget       <span class="comment">// But target is background!</span>
+)
+
+<span class="comment">// The child's effective QoS will be resolved considering both</span>
+<span class="comment">// its own QoS and the target's. The system takes the HIGHER</span>
+<span class="comment">// of the two to prevent priority inversion within the hierarchy.</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: DispatchWorkloop (iOS 12+)</div>
+        <p><code>DispatchWorkloop</code> is a specialized serial queue that provides <strong>priority-ordered</strong> execution instead of FIFO. Work items are dequeued in priority order, and the workloop supports full priority inversion avoidance. This is what Swift concurrency's actor executor uses under the hood. It's not commonly used directly, but understanding it helps explain actor scheduling behavior.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">11. Architect: Designing a Thread-Safe Work Scheduling System</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>At the Staff level, you'll be asked to design concurrency architectures for entire subsystems. Here's a real-world design for a thread-safe work scheduler that handles prioritization, cancellation, and bounded concurrency.</p>
+    </div>
+
+    <h3>11.1 Design Requirements</h3>
+
+    <ul>
+        <li>Process work items with configurable max concurrency</li>
+        <li>Support priority-based scheduling (higher priority items execute first)</li>
+        <li>Support cancellation of pending and in-flight work</li>
+        <li>Prevent thread explosion</li>
+        <li>Provide completion callbacks</li>
+        <li>Be testable (injectable queue for deterministic tests)</li>
+    </ul>
+
+    <pre><code><span class="keyword">final class</span> <span class="type">WorkScheduler</span>&lt;<span class="type">Result</span>: <span class="type">Sendable</span>&gt; {
+
+    <span class="keyword">enum</span> <span class="type">Priority</span>: <span class="type">Int</span>, <span class="type">Comparable</span> {
+        <span class="keyword">case</span> low = <span class="number">0</span>, normal = <span class="number">1</span>, high = <span class="number">2</span>, critical = <span class="number">3</span>
+        <span class="keyword">static func</span> &lt; (lhs: <span class="type">Priority</span>, rhs: <span class="type">Priority</span>) -> <span class="type">Bool</span> {
+            lhs.rawValue &lt; rhs.rawValue
+        }
+    }
+
+    <span class="keyword">private struct</span> <span class="type">WorkItem</span> {
+        <span class="keyword">let</span> id: <span class="type">UUID</span>
+        <span class="keyword">let</span> priority: <span class="type">Priority</span>
+        <span class="keyword">let</span> work: () -> <span class="type">Result</span>
+        <span class="keyword">let</span> completion: (<span class="type">Result</span>?) -> <span class="type">Void</span>
+        <span class="keyword">var</span> isCancelled = <span class="keyword">false</span>
+    }
+
+    <span class="keyword">private var</span> pendingItems: [<span class="type">WorkItem</span>] = []
+    <span class="keyword">private var</span> activeCount = <span class="number">0</span>
+    <span class="keyword">private let</span> maxConcurrency: <span class="type">Int</span>
+
+    <span class="keyword">private let</span> stateQueue = <span class="type">DispatchQueue</span>(
+        label: <span class="string">"com.app.scheduler.state"</span>
+    )
+    <span class="keyword">private let</span> executionQueue: <span class="type">DispatchQueue</span>
+
+    <span class="keyword">init</span>(
+        maxConcurrency: <span class="type">Int</span> = <span class="number">4</span>,
+        executionQueue: <span class="type">DispatchQueue</span> = .<span class="func">global</span>(qos: .<span class="attr">userInitiated</span>)
+    ) {
+        <span class="keyword">self</span>.maxConcurrency = maxConcurrency
+        <span class="keyword">self</span>.executionQueue = executionQueue
+    }
+
+    <span class="keyword">func</span> <span class="func">schedule</span>(
+        priority: <span class="type">Priority</span> = .normal,
+        work: <span class="keyword">@escaping</span> () -> <span class="type">Result</span>,
+        completion: <span class="keyword">@escaping</span> (<span class="type">Result</span>?) -> <span class="type">Void</span>
+    ) -> <span class="type">UUID</span> {
+        <span class="keyword">let</span> id = <span class="type">UUID</span>()
+        <span class="keyword">let</span> item = <span class="type">WorkItem</span>(
+            id: id, priority: priority,
+            work: work, completion: completion
+        )
+
+        stateQueue.<span class="func">async</span> { [<span class="keyword">weak self</span>] <span class="keyword">in</span>
+            <span class="keyword">self</span>?.pendingItems.<span class="func">append</span>(item)
+            <span class="keyword">self</span>?.pendingItems.<span class="func">sort</span> { $0.priority > $1.priority }
+            <span class="keyword">self</span>?.<span class="func">drainQueue</span>()
+        }
+        <span class="keyword">return</span> id
+    }
+
+    <span class="keyword">func</span> <span class="func">cancel</span>(id: <span class="type">UUID</span>) {
+        stateQueue.<span class="func">async</span> { [<span class="keyword">weak self</span>] <span class="keyword">in</span>
+            <span class="keyword">if let</span> index = <span class="keyword">self</span>?.pendingItems.<span class="func">firstIndex</span>(where: { $0.id == id }) {
+                <span class="keyword">self</span>?.pendingItems[index].isCancelled = <span class="keyword">true</span>
+                <span class="keyword">self</span>?.pendingItems.<span class="func">remove</span>(at: index)
+            }
+        }
+    }
+
+    <span class="keyword">private func</span> <span class="func">drainQueue</span>() {
+        <span class="comment">// Called on stateQueue — safe to access state</span>
+        <span class="keyword">while</span> activeCount &lt; maxConcurrency, !pendingItems.isEmpty {
+            <span class="keyword">let</span> item = pendingItems.<span class="func">removeFirst</span>()
+            <span class="keyword">guard</span> !item.isCancelled <span class="keyword">else</span> {
+                item.<span class="func">completion</span>(<span class="keyword">nil</span>)
+                <span class="keyword">continue</span>
+            }
+
+            activeCount += <span class="number">1</span>
+            executionQueue.<span class="func">async</span> { [<span class="keyword">weak self</span>] <span class="keyword">in</span>
+                <span class="keyword">let</span> result = item.<span class="func">work</span>()
+                item.<span class="func">completion</span>(result)
+
+                <span class="keyword">self</span>?.stateQueue.<span class="func">async</span> {
+                    <span class="keyword">self</span>?.activeCount -= <span class="number">1</span>
+                    <span class="keyword">self</span>?.<span class="func">drainQueue</span>()
+                }
+            }
+        }
+    }
+}</code></pre>
+
+    <h3>11.2 Design Analysis</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Design Decision</th>
+                <th>Rationale</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Serial <code>stateQueue</code></td>
+                <td>All state mutations are serialized — no locks needed, no data races</td>
+            </tr>
+            <tr>
+                <td>Separate <code>executionQueue</code></td>
+                <td>Work runs on a different queue so state access doesn't block execution</td>
+            </tr>
+            <tr>
+                <td>Injectable <code>executionQueue</code></td>
+                <td>Tests can inject a serial queue for deterministic behavior</td>
+            </tr>
+            <tr>
+                <td>Priority sorting</td>
+                <td>Higher-priority items are dequeued first (not strict FIFO)</td>
+            </tr>
+            <tr>
+                <td>Bounded concurrency</td>
+                <td><code>maxConcurrency</code> prevents thread explosion</td>
+            </tr>
+            <tr>
+                <td>Cooperative cancellation</td>
+                <td>Cancelled items are skipped during drain, completion called with nil</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: GCD Architecture Guidelines</div>
+        <ul>
+            <li><strong>One serial queue per subsystem</strong> for state protection — simpler than locks, no deadlock risk</li>
+            <li><strong>Never block the main queue</strong> — use async dispatch for all non-trivial work</li>
+            <li><strong>Use target queues</strong> to create subsystem-level mutual exclusion without a single bottleneck queue</li>
+            <li><strong>Always specify QoS</strong> — let the system make intelligent scheduling decisions</li>
+            <li><strong>Prefer custom queues over global queues</strong> — better debugging, barrier support, target queue control</li>
+            <li><strong>Limit concurrency explicitly</strong> — use semaphores, OperationQueue, or TaskGroup instead of unbounded dispatch_async</li>
+            <li><strong>Consider migrating to async/await</strong> — cooperative threading eliminates thread explosion by design</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="index.html">← Series Overview</a>
+        <a href="02-operation-queues.html">Next: Operation Queues →</a>
+    </div>
+</div>
+</body>
+</html>

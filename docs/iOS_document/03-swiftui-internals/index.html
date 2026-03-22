@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SwiftUI Internals — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        SwiftUI Internals
+    </nav>
+
+    <div class="series-header">
+        <h1>Series 3: SwiftUI Internals</h1>
+        <p class="subtitle">AttributeGraph, view identity, state propagation, layout, rendering, navigation, performance, and UIKit interop — the mental model Staff iOS engineers use to design large SwiftUI systems and debug “impossible” UI bugs.</p>
+    </div>
+
+    <p>SwiftUI is not “just declarative UI.” At Staff level, interviewers expect you to reason about <em>how</em> the framework reconciles trees, <em>where</em> state lives, <em>why</em> updates fan out the way they do, and <em>what</em> breaks when identity or layout assumptions fail. This series treats SwiftUI as a runtime with observable rules — not as syntax sugar — so you can explain tradeoffs, guide architecture reviews, and recover from production issues without guesswork.</p>
+
+    <p>Whether your org ships pure SwiftUI, hybrid UIKit bridges, or a design system layered on both, the same internals show up in interviews: diffing semantics, dependency tracking, layout negotiation, animation transaction boundaries, and the cost model of body re-evaluation. The documents here align those topics with the depth typical of Google L6 / Staff iOS loops: system design adjacent, failure-mode aware, and grounded in how Apple’s stack actually behaves on device.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">How to use this series</div>
+        <p>Skim the table of contents, read <strong>Why This Matters</strong> once, then follow the <strong>Learning Path</strong>. Each topic page is written to stand alone for interview cramming, but the order below reflects dependency: runtime and identity before state; layout before rendering; performance and interop after you understand the pipeline.</p>
+    </div>
+
+    <nav class="toc" aria-label="Table of contents">
+        <h3>On this page</h3>
+        <ul>
+            <li><a href="#why-this-matters">Why SwiftUI internals matter at Staff level</a></li>
+            <li><a href="#pipeline">Rendering pipeline overview (diagram)</a></li>
+            <li><a href="#staff-vs-senior">Staff vs Senior: what you must know</a></li>
+            <li><a href="#topics">Topic pages (card grid)</a></li>
+            <li><a href="#learning-path">Suggested learning path</a></li>
+            <li><a href="#interview-signals">What interviewers are really testing</a></li>
+            <li><a href="#failure-modes">Failure modes that separate levels</a></li>
+            <li><a href="#study-tactics">Study tactics for L6 loops</a></li>
+            <li><a href="#prerequisites">Prerequisites &amp; outcomes</a></li>
+            <li><a href="#time-budget">Suggested time budget</a></li>
+            <li><a href="#checkpoints">Checkpoint questions</a></li>
+            <li><a href="#rubric-alignment">L6 rubric alignment</a></li>
+        </ul>
+    </nav>
+
+    <h2 id="why-this-matters">Why SwiftUI Internals Matter for Staff-Level Interviews</h2>
+
+    <p>At Senior level, fluency with SwiftUI APIs is table stakes: you know property wrappers, modifiers, lists, and navigation stacks. At Staff level, the bar shifts to <em>mechanism</em> — you are evaluated on whether you can predict behavior under load, under partial refactors, and under ambiguous product requirements. Internals are the difference between memorized recipes and defensible architecture.</p>
+
+    <h3>AttributeGraph and the runtime substrate</h3>
+
+    <p>SwiftUI’s declarative surface compiles into a graph of attributes and dependencies. Understanding AttributeGraph (at the conceptual level interviewers expect) lets you answer questions that are otherwise hand-wavy: why a view body re-ran, why a child lost its animation, why a list row reset scroll position, or why a sheet dismissed unexpectedly. Staff candidates connect user-visible symptoms to <em>invalidation</em>, <em>dependency edges</em>, and <em>transaction semantics</em> rather than blaming “SwiftUI bugs” first.</p>
+
+    <p>You do not need private Apple source code in the room. You <em>do</em> need a coherent story: SwiftUI builds and updates a persistent representation of the UI, tracks inputs that feed into view bodies and layout, and applies changes in phases bounded by transactions. That story is how you discuss performance budgets, testing strategy, and migration risk when leadership asks for “SwiftUI everywhere.”</p>
+
+    <h3>View identity and diffing</h3>
+
+    <p>Identity is the hidden variable behind almost every subtle SwiftUI defect. Duplicate <code>id</code>s in lists, unstable <code>Equatable</code> view values, conditional branches that reshape the tree, and type erasure that hides structural changes — all of these alter how SwiftUI matches old and new outputs. Staff engineers explain identity with precision: they know when SwiftUI can reuse stateful children, when focus and keyboard state will reset, and how to design stable keys for dynamic collections.</p>
+
+    <p>Interviewers often probe diffing with scenarios: “We added a feature flag that wraps content in an extra container; why did animations break?” or “Why does this <code>ForEach</code> jank when the server returns duplicate IDs?” The internals-first answer names the reconciliation contract instead of guessing at modifier order.</p>
+
+    <h3>State architecture and ownership</h3>
+
+    <p>Property wrappers are not interchangeable sugar. <code>@State</code>, <code>@Binding</code>, <code>@Observable</code>, <code>@StateObject</code>, <code>@ObservedObject</code>, <code>@Environment</code>, and container objects each imply different lifetimes, update scopes, and thread assumptions. Staff-level answers separate <em>source of truth</em> from <em>projection</em>, describe unidirectional data flow at scale, and call out footguns like object identity churn, accidental “global” stores, and testability boundaries.</p>
+
+    <p>At L6, you are also judged on how state choices compose across modules: feature flags, analytics, deep links, and background refresh all compete for the same graph. Knowing where updates originate and how they propagate prevents architectures that are correct in a demo and catastrophic in production.</p>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect lens</div>
+        <p>Treat SwiftUI as a concurrent, incremental UI runtime with explicit phases (body evaluation, layout, rendering, animation application). Your job in staff interviews is not to recite APIs — it is to show you can place a bug or a design decision on the correct phase boundary, propose an invariant (identity, equatability, layout constraints), and defend a migration or performance plan with that model.</p>
+    </div>
+
+    <h2 id="pipeline">SwiftUI Rendering Pipeline — Conceptual Overview</h2>
+
+    <p>The diagram below is intentionally high level. It is the scaffold you can redraw on a whiteboard when an interviewer says “walk me through what happens when this <code>@Published</code> property changes.” The exact names of internal subsystems vary by OS version, but the <em>phases</em> are stable enough to reason about in staff loops.</p>
+
+    <div class="diagram" role="img" aria-label="ASCII diagram of SwiftUI rendering pipeline">
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         USER / SYSTEM INPUT                                  │
+│   taps, gestures, timers, URL sessions, notifications, Combine publishers    │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│              STATE & DEPENDENCY INVALIDATION                                 │
+│  Observable graph / property wrapper reads establish dependency edges        │
+│  Writes mark affected attributes dirty → scheduled update (run loop aligned) │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    VIEW BODY (RE)EVALUATION                                  │
+│  Produce lightweight value-typed description (View tree / type erasure)      │
+│  Identity + Equatable skip work where structural match allows                │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                 LAYOUT & MEASUREMENT (constraints in, sizes out)            │
+│  Propose → measure children → report sizes → place frames                    │
+│  Layout priorities, safe areas, GeometryReader, preferences propagate          │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│              RENDERING BACKEND (Core Animation / Metal-backed layers)         │
+│  Layer tree / draw commands — batched where possible                         │
+│  Integrates with UIKit hosting when using UIHostingController / cells        │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│            ANIMATION & TRANSACTION COMMIT                                    │
+│  Animation curves applied within transaction boundaries                      │
+│  Implicit vs explicit animations; additive vs replacing animations             │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │
+                                    ▼
+                              FRAME ON SCREEN
+    </div>
+
+    <p>Staff-level follow-ups often drill into two edges of this pipeline: <strong>where invalidation starts</strong> (which store changed, on which queue) and <strong>where cost accumulates</strong> (body hot paths, layout thrash, layer explosion). When you can point to a phase, you can propose targeted instrumentation instead of blanket “optimize SwiftUI.”</p>
+
+    <h2 id="staff-vs-senior">What Staff Engineers Must Know vs What Senior Engineers Know</h2>
+
+    <p>Use this table as a self-audit before mock interviews. Senior knowledge is deep <em>practitioner</em> knowledge; Staff knowledge adds <em>invariants, failure modes, and cross-cutting system reasoning</em> across modules, releases, and hybrid stacks.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Area</th>
+                <th>Senior (strong IC)</th>
+                <th>Staff (L6 / system owner)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Declarative syntax</td>
+                <td>Fluent with views, modifiers, composition, and common patterns.</td>
+                <td>Explains how syntax maps to persistent runtime structures and update scheduling.</td>
+            </tr>
+            <tr>
+                <td>Property wrappers</td>
+                <td>Uses <code>@State</code>, <code>@Binding</code>, <code>@ObservedObject</code>, <code>@StateObject</code> correctly in typical apps.</td>
+                <td>Specifies ownership, lifetime, invalidation scope, and test seams for each wrapper choice.</td>
+            </tr>
+            <tr>
+                <td>Observable models</td>
+                <td>Adopts <code>@Observable</code> / <code>ObservableObject</code> with Combine pipelines.</td>
+                <td>Designs module boundaries so observation is granular, avoids accidental fan-out, documents threading.</td>
+            </tr>
+            <tr>
+                <td>Lists &amp; collections</td>
+                <td>Builds performant <code>List</code> / <code>Lazy*</code> stacks with identifiers.</td>
+                <td>Reasons about diffing cost, identity stability, prefetch, and state preservation across updates.</td>
+            </tr>
+            <tr>
+                <td>Identity</td>
+                <td>Fixes bugs by tweaking <code>id:</code> or view structure when something resets.</td>
+                <td>States invariants for keys, predicts focus/scroll preservation, explains animation breakage from tree reshaping.</td>
+            </tr>
+            <tr>
+                <td>Layout</td>
+                <td>Combines stacks, grids, spacers, and priorities to achieve designs.</td>
+                <td>Explains measurement passes, ambiguity resolution, preference propagation, and layout performance traps.</td>
+            </tr>
+            <tr>
+                <td>Rendering</td>
+                <td>Uses drawing APIs, effects, and materials where needed.</td>
+                <td>Connects SwiftUI to Core Animation semantics, layer costs, and backing-store tradeoffs at scale.</td>
+            </tr>
+            <tr>
+                <td>Navigation</td>
+                <td>Ships NavigationStack / sheets / popovers with reasonable UX.</td>
+                <td>Compares navigation state machines, deep link integration, state restoration, and multi-platform nuances.</td>
+            </tr>
+            <tr>
+                <td>Performance</td>
+                <td>Profiles with Instruments, removes obvious hotspots.</td>
+                <td>Builds a theory of what SwiftUI measures per frame; targets structural fixes vs micro-optimizations.</td>
+            </tr>
+            <tr>
+                <td>UIKit interop</td>
+                <td>Embeds UIKit via representables and hosting controllers.</td>
+                <td>Specifies ownership of UIKit lifecycles, coordinator patterns, sizing contracts, and first-responder bridges.</td>
+            </tr>
+            <tr>
+                <td>Testing</td>
+                <td>Uses snapshot tests and some ViewInspector-style probing.</td>
+                <td>Designs testable state cores, dependency injection for SwiftUI entry points, and hermetic UI tests for regressions.</td>
+            </tr>
+            <tr>
+                <td>Migrations</td>
+                <td>Converts screens incrementally with pragmatic wrappers.</td>
+                <td>Plans phased rollouts, measures perf deltas, defines rollback triggers and observability for hybrid stacks.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h2 id="topics">Topic Pages</h2>
+
+    <p>Each page below links to a focused deep dive. Tags indicate the <em>minimum</em> level where the topic is commonly tested — L6 loops still expect Senior breadth everywhere, with Staff depth on starred internals topics.</p>
+
+    <div class="grid-cards">
+        <div class="card">
+            <a href="01-swiftui-runtime.html">
+                <h4>01 — SwiftUI Runtime &amp; AttributeGraph</h4>
+                <p><span class="tag tag-l6">L6 core</span></p>
+                <p>Dependency tracking, invalidation, transactions, and the persistent graph behind declarative updates. Build the vocabulary to explain “why this re-rendered” without folklore.</p>
+            </a>
+        </div>
+        <div class="card">
+            <a href="02-view-identity-diffing.html">
+                <h4>02 — View Identity &amp; Diffing</h4>
+                <p><span class="tag tag-architect">Architect</span></p>
+                <p>Structural identity, <code>EquatableView</code> behavior, type erasure, conditional branches, and list keys. The chapter that unlocks animation and state preservation mysteries.</p>
+            </a>
+        </div>
+        <div class="card">
+            <a href="03-state-management.html">
+                <h4>03 — State Management Deep Dive</h4>
+                <p><span class="tag tag-architect">Architect</span></p>
+                <p>Ownership graphs for wrappers and observable models, unidirectional flows, environment injection, and concurrency edges. Design stores that stay testable at feature-team scale.</p>
+            </a>
+        </div>
+        <div class="card">
+            <a href="04-layout-system.html">
+                <h4>04 — Layout System</h4>
+                <p><span class="tag tag-senior">Senior+</span></p>
+                <p>Proposal, measurement, placement, safe areas, layout priorities, and preference keys. Debug overlapping views and “ambiguous layout” without random spacer tweaks.</p>
+            </a>
+        </div>
+        <div class="card">
+            <a href="05-rendering-integration.html">
+                <h4>05 — Rendering &amp; Core Animation Integration</h4>
+                <p><span class="tag tag-l6">L6 core</span></p>
+                <p>How SwiftUI bridges to Core Animation, implicit animations, transaction boundaries, and layer-backed effects. Connect UI jank to the right subsystem.</p>
+            </a>
+        </div>
+        <div class="card">
+            <a href="06-navigation-evolution.html">
+                <h4>06 — Navigation Evolution</h4>
+                <p><span class="tag tag-senior">Senior+</span></p>
+                <p>From NavigationView to NavigationStack, path-driven routing, sheets vs stacks, deep links, and state restoration patterns for multi-screen flows.</p>
+            </a>
+        </div>
+        <div class="card">
+            <a href="07-performance.html">
+                <h4>07 — Performance Optimization</h4>
+                <p><span class="tag tag-architect">Architect</span></p>
+                <p>Body evaluation budgets, lazy containers, image decoding, attribute graph pressure, Instruments workflows, and architectural fixes vs local hacks.</p>
+            </a>
+        </div>
+        <div class="card">
+            <a href="08-interop.html">
+                <h4>08 — UIKit ↔ SwiftUI Interop</h4>
+                <p><span class="tag tag-l6">L6 core</span></p>
+                <p>UIViewRepresentable, UIViewControllerRepresentable, UIHostingController, sizing, first responder, and coordinator lifecycles in production hybrids.</p>
+            </a>
+        </div>
+        <div class="card">
+            <a href="09-interview-qa.html">
+                <h4>09 — Interview Questions &amp; Answers (60+)</h4>
+                <p><span class="tag tag-l6">L6 core</span></p>
+                <p>Consolidated Q&amp;A spanning runtime, identity, state, layout, rendering, navigation, performance, and interop — with Staff-caliber talking points and common follow-ups.</p>
+            </a>
+        </div>
+    </div>
+
+    <h2 id="learning-path">Suggested Learning Path</h2>
+
+    <p>Follow this order on first pass; deviate when you are cramming for a specific gap (for example, interop-only interviews).</p>
+
+    <ol>
+        <li>
+            <strong><a href="01-swiftui-runtime.html">SwiftUI Runtime &amp; AttributeGraph</a></strong>
+            <p>Establish the substrate: invalidation, transactions, and the mental model of a persistent UI graph. Everything else references these primitives.</p>
+        </li>
+        <li>
+            <strong><a href="02-view-identity-diffing.html">View Identity &amp; Diffing</a></strong>
+            <p>Learn to predict reuse vs rebuild. Without this, state and animation chapters feel like superstition.</p>
+        </li>
+        <li>
+            <strong><a href="03-state-management.html">State Management Deep Dive</a></strong>
+            <p>Map wrappers and observable objects to ownership and invalidation scopes. Practice drawing source-of-truth diagrams for multi-screen features.</p>
+        </li>
+        <li>
+            <strong><a href="04-layout-system.html">Layout System</a></strong>
+            <p>Understand measurement/placement before blaming rendering for jank. Pay special attention to preferences and safe-area propagation.</p>
+        </li>
+        <li>
+            <strong><a href="05-rendering-integration.html">Rendering &amp; Core Animation Integration</a></strong>
+            <p>Connect body/layout outputs to what Core Animation actually animates. Clarify implicit vs explicit animation boundaries.</p>
+        </li>
+        <li>
+            <strong><a href="06-navigation-evolution.html">Navigation Evolution</a></strong>
+            <p>Consolidate stack-based navigation with URL-driven flows. Prepare deep-link and restoration narratives for system-design-style questions.</p>
+        </li>
+        <li>
+            <strong><a href="07-performance.html">Performance Optimization</a></strong>
+            <p>Build a checklist: identity stability → body hot paths → layout thrash → layer costs → asset pipeline. Tie each to instrumentation evidence.</p>
+        </li>
+        <li>
+            <strong><a href="08-interop.html">UIKit ↔ SwiftUI Interop</a></strong>
+            <p>Finish with bridges because they combine everything: lifecycles, layout, focus, and animation handoff across boundaries.</p>
+        </li>
+        <li>
+            <strong><a href="09-interview-qa.html">Interview Q&amp;A (60+)</a></strong>
+            <p>Use spaced repetition: answer aloud, then compare to the canonical Staff-level script. Add your own follow-ups from recent production incidents.</p>
+        </li>
+    </ol>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Second pass — interview mode</div>
+        <p>Re-run the series with a timer. For each topic, prepare one <em>whiteboard story</em> (pipeline or ownership), one <em>war story</em> (real bug class), and one <em>design tradeoff</em> (SwiftUI-first vs hybrid). That triad matches most L6 rubrics better than trivia alone.</p>
+    </div>
+
+    <h2 id="interview-signals">What Interviewers Are Really Testing</h2>
+
+    <p>SwiftUI questions at Staff level rarely ask you to implement a fancy animation from scratch. They probe whether you can own ambiguity: large lists, nested observable models, hybrid screens, and cross-feature navigation. Interviewers listen for:</p>
+
+    <ul>
+        <li><strong>Phase awareness.</strong> You separate model updates, body evaluation, layout, and rendering commits — and you know which tools observe which phase (Instruments, os_signpost, breakpoints on layout).</li>
+        <li><strong>Invariants.</strong> You state what must remain stable (identity, equatability, layout constraints) for a feature to behave correctly.</li>
+        <li><strong>Scalability.</strong> You discuss how a pattern composes across dozens of teams — not just a single screen.</li>
+        <li><strong>Interop realism.</strong> You acknowledge UIKit’s first-responder model, keyboard management, and collection view recycling as first-class constraints.</li>
+        <li><strong>Risk literacy.</strong> You name OS-version dependencies, behavior changes across major releases, and how you’d roll out a migration with observability.</li>
+    </ul>
+
+    <h2 id="failure-modes">Failure Modes That Separate Levels</h2>
+
+    <p>Below are recurring incident classes. Senior engineers often resolve them experimentally; Staff engineers classify them quickly because they map to internals.</p>
+
+    <h3>State and invalidation</h3>
+    <ul>
+        <li>Whole subtree refreshes because a shared observable model broadcasts overly coarse changes.</li>
+        <li><code>@ObservedObject</code> recreated each body evaluation causes infinite or noisy update loops.</li>
+        <li>Environment values used as implicit globals hide dependencies and break previews/tests.</li>
+    </ul>
+
+    <h3>Identity and diffing</h3>
+    <ul>
+        <li>Feature flags insert wrappers that change structural identity, resetting child state and breaking animations.</li>
+        <li>Duplicate or missing <code>ForEach</code> identifiers produce unstable ordering and flaky focus.</li>
+        <li>Type erasure (<code>AnyView</code>) masks changes, defeating optimizations and obscuring diffs.</li>
+    </ul>
+
+    <h3>Layout and rendering</h3>
+    <ul>
+        <li>Feedback loops between <code>GeometryReader</code> and parent layout cause thrash or clipped content.</li>
+        <li>Expensive body work (image decoding, attributed string building) runs on critical paths.</li>
+        <li>Excessive transparency and shadows multiply layer costs, showing up as GPU-bound scrolling.</li>
+    </ul>
+
+    <h3>Navigation and hybrid stacks</h3>
+    <ul>
+        <li>Deep links push duplicate routes because path state is not canonicalized.</li>
+        <li>UIKit-hosted SwiftUI fails to forward sizing changes, producing zero-height or clipped hosting.</li>
+        <li>Sheet dismissal races with async navigation when transactions are not modeled explicitly.</li>
+    </ul>
+
+    <h2 id="study-tactics">Study Tactics for L6 Loops</h2>
+
+    <h3>Build a personal cheat sheet</h3>
+    <p>One page, your own words: pipeline phases, wrapper ownership table, identity rules for <code>ForEach</code>, and three interop recipes (embed UIKit in SwiftUI, embed SwiftUI in UIKit, shared coordinator). Reproduce it weekly from memory.</p>
+
+    <h3>Explain aloud with diagrams</h3>
+    <p>Use the ASCII pipeline above as a template. Narrate where a <code>@Published</code> change enters, what invalidates, and what commits to the render server. Interviewers reward smooth narration under time pressure.</p>
+
+    <h3>Pair each topic with a production anecdote</h3>
+    <p>Even anonymized stories beat abstract theory. Prepare:</p>
+    <ul>
+        <li>A time identity or diffing caused state loss — what invariant you added afterward.</li>
+        <li>A performance win that came from structural change, not micro-tuning.</li>
+        <li>A hybrid bridge bug — how you split responsibilities between coordinator and representable.</li>
+    </ul>
+
+    <h3>Drill the Q&amp;A bank under stress</h3>
+    <p>Use <a href="09-interview-qa.html">09 — Interview Q&amp;A</a> with a partner or voice memo. Force yourself to give a 60-second answer, then a 5-minute deep dive on the same question. Staff loops often escalate depth mid-answer.</p>
+
+    <h3>Cross-link related series</h3>
+    <p>SwiftUI does not exist in a vacuum. When interviewers pivot to process memory, scene lifecycle, or concurrency, connect outward:</p>
+    <ul>
+        <li><a href="../01-app-lifecycle/index.html">App &amp; Scene Lifecycle</a> for foreground/background interaction with UI updates.</li>
+        <li><a href="../02-uikit-view-system/index.html">UIKit View System</a> for hybrid hosting and responder-chain reasoning.</li>
+        <li><a href="../04-concurrency-threading/index.html">Concurrency &amp; Threading</a> for actor isolation and main-thread guarantees feeding SwiftUI.</li>
+    </ul>
+
+    <h2>Quick reference — vocabulary</h2>
+
+    <p>Fluent use of precise terms signals Staff depth. You should be comfortable using these in sentences without sounding rehearsed:</p>
+
+    <ul>
+        <li><strong>Invalidation</strong> — marking dependent work stale after a state change.</li>
+        <li><strong>Transaction</strong> — a scoped batch of related UI updates and animation semantics.</li>
+        <li><strong>Structural identity</strong> — how SwiftUI matches nodes across updates based on type and position.</li>
+        <li><strong>Preference / layout value</strong> — child-to-parent communication during layout passes.</li>
+        <li><strong>Hosting boundary</strong> — where UIKit ownership meets SwiftUI’s graph (representable / hosting controller).</li>
+        <li><strong>Source of truth</strong> — the canonical store for a piece of state; projections derive from it.</li>
+        <li><strong>Projection</strong> — a read/write view of state owned elsewhere (e.g., bindings, derived selectors).</li>
+        <li><strong>Dependency edge</strong> — a recorded read during body evaluation that ties a view to a model field.</li>
+        <li><strong>Body hot path</strong> — code executed frequently during reconciliation; keep it cheap and deterministic.</li>
+        <li><strong>Layout pass</strong> — the propose → measure → place sequence that resolves frames.</li>
+        <li><strong>Representable</strong> — the UIView/UIViewController bridge protocol surface for UIKit embedding.</li>
+        <li><strong>Coordinator</strong> — the delegate-shaped object that holds UIKit callbacks and forwards intent to SwiftUI state.</li>
+    </ul>
+
+    <h2 id="prerequisites">Prerequisites &amp; honest scope</h2>
+
+    <p>This series assumes you have shipped SwiftUI in production or at least built non-trivial prototypes. You should already know Swift value semantics at a practical level, understand <code>struct</code> vs <code>class</code> tradeoffs, and be comfortable reading Apple’s Human Interface Guidelines for navigation patterns. If Combine or async/await is new, pair <a href="../04-concurrency-threading/index.html">Concurrency &amp; Threading</a> with the state chapters — observation and main-actor isolation show up constantly in Staff answers.</p>
+
+    <p>We intentionally avoid binding you to private SPI or unstable toolchain symbols. When we say “AttributeGraph,” we mean the public mental model engineers use in WWDC talks, lab notes, and Instruments — sufficient to explain behavior and design tests. If your interviewer presses for file names inside SwiftUI binaries, steer back to observable behaviors and measurement strategies; that pivot is itself a Staff signal.</p>
+
+    <h3>Outcomes — what “done” looks like</h3>
+
+    <p>By the end of the nine documents, you should be able to:</p>
+
+    <ul>
+        <li>Narrate the end-to-end path from a model write to pixels on screen, naming phases and likely breakpoints.</li>
+        <li>Diagnose state-loss and animation bugs by inspecting identity and tree shape, not by randomly reordering modifiers.</li>
+        <li>Choose among property wrappers and observable containers with explicit ownership and test hooks.</li>
+        <li>Reason about layout feedback loops, safe-area propagation, and ambiguous layout without “vibe-based” spacer tuning.</li>
+        <li>Explain how navigation state should be represented for deep links, restoration, and multi-platform variants.</li>
+        <li>Profile SwiftUI-backed screens and distinguish CPU-bound body work from GPU-bound layer effects.</li>
+        <li>Specify UIKit bridge contracts (sizing, lifecycle, focus) that survive rotation, dynamic type, and multitasking.</li>
+    </ul>
+
+    <h2 id="time-budget">Suggested time budget (first pass)</h2>
+
+    <p>These ranges assume focused reading plus light note-taking. Add 25–40% if you are implementing side experiments in a sample app.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Document</th>
+                <th>First read</th>
+                <th>Deep pass + drills</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><a href="01-swiftui-runtime.html">01 — Runtime &amp; AttributeGraph</a></td>
+                <td>60–90 min</td>
+                <td>+45 min whiteboard narration</td>
+            </tr>
+            <tr>
+                <td><a href="02-view-identity-diffing.html">02 — Identity &amp; Diffing</a></td>
+                <td>60–90 min</td>
+                <td>+60 min bug reproduction exercises</td>
+            </tr>
+            <tr>
+                <td><a href="03-state-management.html">03 — State Management</a></td>
+                <td>75–110 min</td>
+                <td>+60 min ownership diagramming</td>
+            </tr>
+            <tr>
+                <td><a href="04-layout-system.html">04 — Layout System</a></td>
+                <td>55–85 min</td>
+                <td>+45 min layout edge cases</td>
+            </tr>
+            <tr>
+                <td><a href="05-rendering-integration.html">05 — Rendering &amp; CA</a></td>
+                <td>55–85 min</td>
+                <td>+45 min animation boundary drills</td>
+            </tr>
+            <tr>
+                <td><a href="06-navigation-evolution.html">06 — Navigation</a></td>
+                <td>50–80 min</td>
+                <td>+45 min routing design sketch</td>
+            </tr>
+            <tr>
+                <td><a href="07-performance.html">07 — Performance</a></td>
+                <td>65–95 min</td>
+                <td>+90 min Instruments session</td>
+            </tr>
+            <tr>
+                <td><a href="08-interop.html">08 — Interop</a></td>
+                <td>65–95 min</td>
+                <td>+75 min hybrid spike</td>
+            </tr>
+            <tr>
+                <td><a href="09-interview-qa.html">09 — Q&amp;A bank</a></td>
+                <td>120–180 min (skim)</td>
+                <td>+ongoing spaced repetition</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h2 id="checkpoints">Checkpoint questions (self-test)</h2>
+
+    <p>Answer each in under two minutes aloud. If you stall, treat the matching chapter as required reading before mocks.</p>
+
+    <h3>Runtime &amp; graph</h3>
+    <ul>
+        <li>What is the difference between a view’s <code>body</code> and a long-lived attribute graph node?</li>
+        <li>How does a transaction affect animation boundaries when multiple properties change in one event?</li>
+        <li>Where would you first attach instrumentation to prove excessive invalidation?</li>
+    </ul>
+
+    <h3>Identity &amp; diffing</h3>
+    <ul>
+        <li>Why can two logically “same” rows behave differently if their <code>id</code> values collide?</li>
+        <li>How does wrapping a subtree in a conditional container affect animation attachment points?</li>
+        <li>When is type erasure a performance or correctness risk?</li>
+    </ul>
+
+    <h3>State</h3>
+    <ul>
+        <li>Which wrapper should own a network-loaded model object referenced by a single screen?</li>
+        <li>How do you prevent environment-based implicit globals from obscuring dependencies in tests?</li>
+        <li>What breaks if you create <code>@StateObject</code> instances inside initializers that run more than once?</li>
+    </ul>
+
+    <h3>Layout &amp; rendering</h3>
+    <ul>
+        <li>Describe a layout feedback loop and how you would break it architecturally.</li>
+        <li>What is the relationship between SwiftUI animations and Core Animation transactions?</li>
+        <li>How do safe-area changes propagate to manual UIKit bridges?</li>
+    </ul>
+
+    <h3>Navigation &amp; interop</h3>
+    <ul>
+        <li>How do you represent a deep-linkable stack without duplicating route state in multiple stores?</li>
+        <li>What responsibilities belong in a representable’s <code>Coordinator</code> vs its SwiftUI parent?</li>
+        <li>How do you size a hosted SwiftUI view inside a self-sizing UIKit container?</li>
+    </ul>
+
+    <h2 id="rubric-alignment">How this maps to common L6 rubrics</h2>
+
+    <p>Staff interviews rarely publish SwiftUI-specific rubrics, but the competencies recur: <em>technical depth</em>, <em>ambiguity navigation</em>, <em>scalability</em>, and <em>collaboration</em>. The table below shows how chapters reinforce each axis.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Rubric axis</th>
+                <th>Primary chapters</th>
+                <th>What to demonstrate</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Technical depth</td>
+                <td>01, 02, 03, 05</td>
+                <td>Precise mechanism explanations with correct vocabulary; no hand-waving about “the framework magic.”</td>
+            </tr>
+            <tr>
+                <td>Dealing with ambiguity</td>
+                <td>06, 08, 09</td>
+                <td>Ask clarifying questions about navigation sources, threading, and hosting constraints before proposing solutions.</td>
+            </tr>
+            <tr>
+                <td>Scalability &amp; maintainability</td>
+                <td>03, 06, 07</td>
+                <td>Show how patterns compose across features; discuss observability, feature flags, and perf guardrails.</td>
+            </tr>
+            <tr>
+                <td>Cross-functional realism</td>
+                <td>05, 07, 08</td>
+                <td>Connect UI work to battery, GPU, accessibility, and release risk — not only code elegance.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h2>Anti-patterns interviewers notice</h2>
+
+    <p>Even strong candidates undermine themselves with a few recurring phrases. Swap these for internals-grounded language:</p>
+
+    <ul>
+        <li><strong>“SwiftUI just decides.”</strong> Replace with invalidation + identity + transaction explanation.</li>
+        <li><strong>“We fixed it by adding <code>id:</code> everywhere.”</strong> Replace with an invariant: what identity should stabilize and why.</li>
+        <li><strong>“ObservedObject vs StateObject is just preference.”</strong> Replace with lifetime and ownership consequences.</li>
+        <li><strong>“Representables are easy glue.”</strong> Replace with sizing, lifecycle, and responder contracts.</li>
+        <li><strong>“Lists are slow, so avoid SwiftUI.”</strong> Replace with measurement of diffing, cell complexity, and asset pipeline.</li>
+    </ul>
+
+    <p>Interviewers are not scoring your loyalty to SwiftUI. They are scoring whether you can own outcomes when the abstraction leaks — because it always does at scale.</p>
+
+    <h2>Closing orientation</h2>
+
+    <p>SwiftUI internals are not academic trivia — they are the language Staff engineers use to coordinate teams, review designs, and de-risk migrations. If you know the pipeline phases, identity invariants, and state ownership rules, you can answer almost any SwiftUI curveball by locating it in the model instead of guessing. Start with <a href="01-swiftui-runtime.html">SwiftUI Runtime &amp; AttributeGraph</a>, keep the Staff vs Senior table nearby for self-checks, and finish with the <a href="09-interview-qa.html">Q&amp;A bank</a> until answers feel conversational.</p>
+
+    <div class="nav-footer">
+        <a href="../index.html">← Home</a>
+        <a href="01-swiftui-runtime.html">Next: SwiftUI Runtime →</a>
+    </div>
+</div>
+</body>
+</html>

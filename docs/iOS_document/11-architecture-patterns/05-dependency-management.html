@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dependency Management — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Architecture Patterns</a><span class="sep">›</span>
+        Dependency Management
+    </nav>
+
+    <h1>Dependency Management</h1>
+    <p class="subtitle">SPM internals including the PubGrub resolution algorithm and Package.resolved mechanics, CocoaPods Podspec lifecycle and CDN, Carthage's decentralized pre-built framework model, XCFramework creation and distribution, version resolution conflicts, and private registry strategies for enterprise apps.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#spm">1. SPM Internals</a></li>
+            <li><a href="#cocoapods">2. CocoaPods Deep Dive</a></li>
+            <li><a href="#carthage">3. Carthage</a></li>
+            <li><a href="#xcframework">4. Binary Frameworks (XCFramework)</a></li>
+            <li><a href="#conflicts">5. Version Resolution Conflicts</a></li>
+            <li><a href="#private">6. Private Registry &amp; Distribution</a></li>
+            <li><a href="#comparison">7. Tool Comparison</a></li>
+            <li><a href="#architect">8. Architect: Enterprise Dependency Strategy</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="spm">1. SPM Internals</h2>
+
+    <h3>1.1 Package.swift Manifest</h3>
+    <p>The <code>Package.swift</code> manifest is a Swift script interpreted by the Swift Package Manager. It uses the <code>PackageDescription</code> library to declare the package's name, platforms, products, dependencies, and targets.</p>
+
+    <pre><code><span class="comment">// swift-tools-version: 5.9</span>
+<span class="keyword">import</span> PackageDescription
+
+<span class="keyword">let</span> package = <span class="type">Package</span>(
+    name: <span class="string">"NetworkKit"</span>,
+    platforms: [
+        .iOS(.v16),
+        .macOS(.v13),
+    ],
+    products: [
+        .<span class="func">library</span>(
+            name: <span class="string">"NetworkKit"</span>,
+            type: .static,
+            targets: [<span class="string">"NetworkKit"</span>]
+        ),
+    ],
+    dependencies: [
+        .<span class="func">package</span>(
+            url: <span class="string">"https://github.com/Alamofire/Alamofire.git"</span>,
+            from: <span class="string">"5.8.0"</span>
+        ),
+        .<span class="func">package</span>(
+            url: <span class="string">"https://github.com/apple/swift-log.git"</span>,
+            .<span class="func">upToNextMinor</span>(from: <span class="string">"1.5.0"</span>)
+        ),
+        .<span class="func">package</span>(
+            url: <span class="string">"https://github.com/company/internal-sdk.git"</span>,
+            exact: <span class="string">"2.3.1"</span>
+        ),
+    ],
+    targets: [
+        .<span class="func">target</span>(
+            name: <span class="string">"NetworkKit"</span>,
+            dependencies: [
+                .<span class="func">product</span>(name: <span class="string">"Alamofire"</span>, package: <span class="string">"Alamofire"</span>),
+                .<span class="func">product</span>(name: <span class="string">"Logging"</span>, package: <span class="string">"swift-log"</span>),
+            ]
+        ),
+        .<span class="func">testTarget</span>(
+            name: <span class="string">"NetworkKitTests"</span>,
+            dependencies: [<span class="string">"NetworkKit"</span>]
+        ),
+    ]
+)</code></pre>
+
+    <h3>1.2 Version Constraint Types</h3>
+
+    <table>
+        <thead>
+            <tr><th>Constraint</th><th>Syntax</th><th>Resolves To</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Up to next major</td><td><code>from: "5.8.0"</code></td><td>5.8.0 ..&lt; 6.0.0</td></tr>
+            <tr><td>Up to next minor</td><td><code>.upToNextMinor(from: "1.5.0")</code></td><td>1.5.0 ..&lt; 1.6.0</td></tr>
+            <tr><td>Exact version</td><td><code>exact: "2.3.1"</code></td><td>Exactly 2.3.1</td></tr>
+            <tr><td>Range</td><td><code>"1.2.0"..."1.5.0"</code></td><td>1.2.0 through 1.5.0</td></tr>
+            <tr><td>Branch</td><td><code>branch: "main"</code></td><td>Latest commit on main</td></tr>
+            <tr><td>Revision</td><td><code>revision: "abc123"</code></td><td>Specific commit</td></tr>
+        </tbody>
+    </table>
+
+    <h3>1.3 PubGrub Resolution Algorithm</h3>
+
+    <p>SPM uses the <strong>PubGrub</strong> algorithm (developed by Natalie Weizenbaum for Dart's pub) for dependency resolution. PubGrub is a conflict-driven solver that provides clear error messages when resolution fails.</p>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│              PubGrub Resolution Process                       │
+│                                                              │
+│  1. Start with root package's dependencies                   │
+│                                                              │
+│  2. For each dependency, fetch available versions             │
+│     (git tags matching semver)                               │
+│                                                              │
+│  3. Select highest compatible version for each package        │
+│                                                              │
+│  4. Fetch selected version's Package.swift                   │
+│     → Discover transitive dependencies                       │
+│                                                              │
+│  5. Check for conflicts:                                     │
+│     App needs Alamofire ≥5.8 AND ≥5.9                        │
+│     → Resolve to ≥5.9 (intersection)                         │
+│                                                              │
+│  6. If conflict is unsolvable:                               │
+│     App needs LibA 1.x, LibA needs LibB 2.x                 │
+│     App needs LibB 1.x                                       │
+│     → CONFLICT: LibB needs to be both 1.x and 2.x           │
+│     → PubGrub backtracks and tries different versions        │
+│                                                              │
+│  7. If no solution exists, PubGrub produces a                │
+│     human-readable "derivation tree" explaining why          │
+│                                                              │
+│  8. Write resolved versions to Package.resolved              │
+└─────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>1.4 Package.resolved</h3>
+
+    <pre><code><span class="comment">// Package.resolved — locks exact versions for reproducible builds</span>
+<span class="comment">// MUST be committed to source control</span>
+{
+  "pins" : [
+    {
+      "identity" : "alamofire",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/Alamofire/Alamofire.git",
+      "state" : {
+        "revision" : "f455c2975872ccd2d9c81594c658af65716e9b9a",
+        "version" : "5.9.1"
+      }
+    },
+    {
+      "identity" : "swift-log",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-log.git",
+      "state" : {
+        "revision" : "e97a6fcb1ab07462881ac165fdbb37f067e205d5",
+        "version" : "1.5.4"
+      }
+    }
+  ],
+  "version" : 3
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Package.resolved vs Podfile.lock</div>
+        <p>Both serve the same purpose — locking dependency versions for reproducible builds. The key difference: <code>Package.resolved</code> is generated by SPM and uses JSON format with git revision hashes. <code>Podfile.lock</code> is generated by CocoaPods and uses YAML. Both should be committed to source control.</p>
+    </div>
+
+    <h3>1.5 SPM Caching and Performance</h3>
+
+    <pre><code><span class="comment">// SPM caches resolved packages in:</span>
+<span class="comment">// ~/Library/Caches/org.swift.swiftpm/</span>
+<span class="comment">//</span>
+<span class="comment">// Xcode caches in DerivedData:</span>
+<span class="comment">// ~/Library/Developer/Xcode/DerivedData/[project]/SourcePackages/</span>
+<span class="comment">//</span>
+<span class="comment">// To force re-resolution:</span>
+<span class="comment">// File → Packages → Reset Package Caches (Xcode)</span>
+<span class="comment">// swift package resolve --skip-update (CLI)</span>
+<span class="comment">//</span>
+<span class="comment">// CI optimization: cache SourcePackages/ between builds</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="cocoapods">2. CocoaPods Deep Dive</h2>
+
+    <p>CocoaPods is a Ruby-based dependency manager that has been the iOS ecosystem's dominant tool since 2011. While SPM is replacing it for new projects, millions of existing projects still use CocoaPods.</p>
+
+    <h3>2.1 Podspec Anatomy</h3>
+
+    <pre><code><span class="comment"># NetworkKit.podspec</span>
+Pod::Spec.new do |s|
+  s.name             = 'NetworkKit'
+  s.version          = '2.3.1'
+  s.summary          = 'Networking layer for iOS apps'
+  s.homepage         = 'https://github.com/company/NetworkKit'
+  s.license          = { :type => 'MIT', :file => 'LICENSE' }
+  s.author           = { 'Company' => 'ios@company.com' }
+  s.source           = { :git => 'https://github.com/company/NetworkKit.git',
+                          :tag => s.version.to_s }
+
+  s.ios.deployment_target = '16.0'
+  s.swift_version = '5.9'
+
+  s.source_files = 'Sources/**/*.swift'
+  s.resource_bundles = {
+    'NetworkKit' => ['Sources/**/*.{xib,storyboard,xcassets}']
+  }
+
+  s.dependency 'Alamofire', '~> 5.8'
+
+  s.subspec 'Core' do |core|
+    core.source_files = 'Sources/Core/**/*.swift'
+  end
+
+  s.subspec 'Mocking' do |mock|
+    mock.source_files = 'Sources/Mocking/**/*.swift'
+    mock.dependency 'NetworkKit/Core'
+  end
+
+  s.test_spec 'Tests' do |test|
+    test.source_files = 'Tests/**/*.swift'
+    test.dependency 'NetworkKit/Mocking'
+  end
+end</code></pre>
+
+    <h3>2.2 pod install vs pod update</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│              pod install vs pod update                        │
+│                                                              │
+│  pod install:                                                │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ 1. Read Podfile                                      │    │
+│  │ 2. If Podfile.lock exists:                           │    │
+│  │    → Use locked versions for existing pods           │    │
+│  │    → Only resolve NEW pods not in Podfile.lock       │    │
+│  │ 3. If Podfile.lock doesn't exist:                    │    │
+│  │    → Resolve all dependencies from scratch           │    │
+│  │ 4. Download pods to Pods/ directory                  │    │
+│  │ 5. Generate Pods.xcodeproj                           │    │
+│  │ 6. Update Podfile.lock                               │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                              │
+│  pod update:                                                 │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ 1. Read Podfile                                      │    │
+│  │ 2. IGNORE Podfile.lock                               │    │
+│  │ 3. Resolve ALL dependencies to latest compatible     │    │
+│  │ 4. Download updated pods                             │    │
+│  │ 5. Regenerate Pods.xcodeproj                         │    │
+│  │ 6. Write new Podfile.lock                            │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                              │
+│  pod update Alamofire:                                       │
+│  → Only update Alamofire (and its dependencies)              │
+│  → Keep all other pods at locked versions                    │
+│                                                              │
+│  Rule: Use `pod install` for CI and team members             │
+│        Use `pod update` only when intentionally upgrading    │
+└─────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>2.3 CocoaPods CDN</h3>
+
+    <pre><code><span class="comment"># Before CDN (slow): cloned entire Specs repo (~3GB)</span>
+<span class="comment"># source 'https://github.com/CocoaPods/Specs.git'</span>
+
+<span class="comment"># After CDN (fast): fetches only needed podspecs</span>
+source 'https://cdn.cocoapods.org/'
+
+<span class="comment"># CDN uses a sharded index:</span>
+<span class="comment"># https://cdn.cocoapods.org/all_pods_versions_a_1_2.txt</span>
+<span class="comment"># Each shard contains pod names and versions</span>
+<span class="comment"># Individual podspecs fetched on demand</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="carthage">3. Carthage</h2>
+
+    <p>Carthage is a decentralized dependency manager that builds frameworks but doesn't modify your Xcode project. It follows the Unix philosophy: do one thing well.</p>
+
+    <h3>3.1 How Carthage Works</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│              Carthage Build Process                           │
+│                                                              │
+│  1. Read Cartfile                                            │
+│     github "Alamofire/Alamofire" ~> 5.8                      │
+│     github "company/NetworkKit" "main"                       │
+│                                                              │
+│  2. Resolve versions → write Cartfile.resolved               │
+│                                                              │
+│  3. Clone repos to Carthage/Checkouts/                       │
+│                                                              │
+│  4. Build frameworks:                                        │
+│     carthage build --platform iOS --use-xcframeworks         │
+│     → xcodebuild each dependency                             │
+│     → Output to Carthage/Build/                              │
+│                                                              │
+│  5. YOU manually:                                            │
+│     → Drag .xcframework into Xcode project                   │
+│     → Add to "Frameworks, Libraries, and Embedded Content"   │
+│                                                              │
+│  Key difference from CocoaPods:                              │
+│  Carthage NEVER modifies your .xcodeproj                     │
+│  You have full control over project configuration            │
+└─────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>3.2 Carthage Advantages and Disadvantages</h3>
+
+    <table>
+        <thead>
+            <tr><th>Advantage</th><th>Disadvantage</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Doesn't modify .xcodeproj</td><td>Manual framework linking</td></tr>
+            <tr><td>Pre-built binaries (fast CI)</td><td>Slow initial build</td></tr>
+            <tr><td>Decentralized (no central spec repo)</td><td>No resource bundle support</td></tr>
+            <tr><td>Simple mental model</td><td>Poor Swift version compatibility</td></tr>
+            <tr><td>Works with any Xcode project</td><td>Maintenance has slowed significantly</td></tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="xcframework">4. Binary Frameworks (XCFramework)</h2>
+
+    <p>XCFrameworks (Xcode 11+) bundle pre-compiled binaries for multiple platforms and architectures in a single distributable artifact. They solve the "fat binary" problem that plagued universal frameworks.</p>
+
+    <h3>4.1 XCFramework Structure</h3>
+
+    <div class="diagram">
+NetworkKit.xcframework/
+├── Info.plist
+├── ios-arm64/
+│   └── NetworkKit.framework/
+│       ├── NetworkKit (binary)
+│       ├── Headers/
+│       ├── Modules/
+│       │   ├── module.modulemap
+│       │   └── NetworkKit.swiftmodule/
+│       │       ├── arm64-apple-ios.swiftinterface
+│       │       └── arm64-apple-ios.private.swiftinterface
+│       └── Info.plist
+├── ios-arm64_x86_64-simulator/
+│   └── NetworkKit.framework/
+│       └── ... (simulator binary)
+└── macos-arm64_x86_64/
+    └── NetworkKit.framework/
+        └── ... (macOS binary)
+    </div>
+
+    <h3>4.2 Creating an XCFramework</h3>
+
+    <pre><code><span class="comment"># Step 1: Build for each platform</span>
+xcodebuild archive \
+  -scheme NetworkKit \
+  -destination "generic/platform=iOS" \
+  -archivePath build/NetworkKit-iOS \
+  SKIP_INSTALL=NO \
+  BUILD_LIBRARY_FOR_DISTRIBUTION=YES
+
+xcodebuild archive \
+  -scheme NetworkKit \
+  -destination "generic/platform=iOS Simulator" \
+  -archivePath build/NetworkKit-Simulator \
+  SKIP_INSTALL=NO \
+  BUILD_LIBRARY_FOR_DISTRIBUTION=YES
+
+<span class="comment"># Step 2: Create XCFramework</span>
+xcodebuild -create-xcframework \
+  -archive build/NetworkKit-iOS.xcarchive \
+    -framework NetworkKit.framework \
+  -archive build/NetworkKit-Simulator.xcarchive \
+    -framework NetworkKit.framework \
+  -output build/NetworkKit.xcframework
+
+<span class="comment"># BUILD_LIBRARY_FOR_DISTRIBUTION=YES generates .swiftinterface files</span>
+<span class="comment"># These enable module stability — the binary works across Swift versions</span></code></pre>
+
+    <h3>4.3 Distributing via SPM</h3>
+
+    <pre><code><span class="comment">// Package.swift with binary target</span>
+<span class="keyword">let</span> package = <span class="type">Package</span>(
+    name: <span class="string">"NetworkKit"</span>,
+    products: [
+        .<span class="func">library</span>(name: <span class="string">"NetworkKit"</span>, targets: [<span class="string">"NetworkKit"</span>]),
+    ],
+    targets: [
+        .<span class="func">binaryTarget</span>(
+            name: <span class="string">"NetworkKit"</span>,
+            url: <span class="string">"https://releases.company.com/NetworkKit-2.3.1.xcframework.zip"</span>,
+            checksum: <span class="string">"a1b2c3d4e5f6..."</span>
+        ),
+        <span class="comment">// Or local path during development:</span>
+        <span class="comment">// .binaryTarget(name: "NetworkKit", path: "NetworkKit.xcframework")</span>
+    ]
+)</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Module Stability</div>
+        <p><code>BUILD_LIBRARY_FOR_DISTRIBUTION=YES</code> generates <code>.swiftinterface</code> files — textual descriptions of the module's public API. These enable <strong>module stability</strong>: a framework compiled with Swift 5.8 can be used by an app compiled with Swift 5.9+. Without this flag, the binary is tied to the exact Swift compiler version.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="conflicts">5. Version Resolution Conflicts</h2>
+
+    <h3>5.1 Common Conflict Scenarios</h3>
+
+    <pre><code><span class="comment">// Scenario 1: Diamond dependency with incompatible versions</span>
+<span class="comment">// App → LibA (needs LibC 1.x)</span>
+<span class="comment">// App → LibB (needs LibC 2.x)</span>
+<span class="comment">// Resolution: IMPOSSIBLE — must update LibA or LibB</span>
+
+<span class="comment">// Scenario 2: Transitive dependency conflict</span>
+<span class="comment">// App → Alamofire ~> 5.8</span>
+<span class="comment">// App → SomeSDK → Alamofire ~> 5.4 (pinned by SDK vendor)</span>
+<span class="comment">// Resolution: SPM resolves to 5.8.x (satisfies both)</span>
+<span class="comment">//             IF SomeSDK's constraint is "from: 5.4" not "exact: 5.4"</span>
+
+<span class="comment">// Scenario 3: Platform mismatch</span>
+<span class="comment">// App targets iOS 16+</span>
+<span class="comment">// LibA requires iOS 17+</span>
+<span class="comment">// Resolution: SPM error — platform requirement not met</span></code></pre>
+
+    <h3>5.2 Resolution Strategies</h3>
+
+    <table>
+        <thead>
+            <tr><th>Strategy</th><th>When to Use</th><th>Risk</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Widen constraints</td><td>Dependency uses overly strict pinning</td><td>May get breaking changes</td></tr>
+            <tr><td>Fork and patch</td><td>Upstream won't update</td><td>Maintenance burden</td></tr>
+            <tr><td>Replace dependency</td><td>Better alternative exists</td><td>Migration effort</td></tr>
+            <tr><td>Vendor (copy source)</td><td>Small dependency, abandoned</td><td>No upstream updates</td></tr>
+            <tr><td>Binary framework</td><td>Isolate conflicting dependency</td><td>Debugging difficulty</td></tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="private">6. Private Registry &amp; Distribution</h2>
+
+    <h3>6.1 SPM Private Registry</h3>
+
+    <pre><code><span class="comment">// SPM supports package registries (SE-0292, Swift 5.7+)</span>
+<span class="comment">// Configure in .swiftpm/configuration/registries.json</span>
+{
+    "registries": {
+        "company.com": {
+            "url": "https://spm-registry.company.com"
+        }
+    },
+    "version": 1
+}
+
+<span class="comment">// Reference packages by identity instead of URL</span>
+<span class="keyword">let</span> package = <span class="type">Package</span>(
+    dependencies: [
+        .<span class="func">package</span>(id: <span class="string">"company.com.network-kit"</span>, from: <span class="string">"2.3.0"</span>),
+    ]
+)</code></pre>
+
+    <h3>6.2 CocoaPods Private Spec Repo</h3>
+
+    <pre><code><span class="comment"># Add private spec repo</span>
+pod repo add company-specs https://github.com/company/podspecs.git
+
+<span class="comment"># Podfile references both public and private sources</span>
+source 'https://cdn.cocoapods.org/'
+source 'https://github.com/company/podspecs.git'
+
+target 'MyApp' do
+  pod 'Alamofire', '~> 5.8'          # Public
+  pod 'CompanyNetworkKit', '~> 2.3'   # Private
+end
+
+<span class="comment"># Push to private spec repo</span>
+pod repo push company-specs NetworkKit.podspec --allow-warnings</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="comparison">7. Tool Comparison</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Feature</th>
+                <th>SPM</th>
+                <th>CocoaPods</th>
+                <th>Carthage</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Maintained by</strong></td>
+                <td>Apple</td>
+                <td>Community (declining)</td>
+                <td>Community (minimal)</td>
+            </tr>
+            <tr>
+                <td><strong>Integration</strong></td>
+                <td>Native Xcode</td>
+                <td>Modifies .xcodeproj</td>
+                <td>Manual framework linking</td>
+            </tr>
+            <tr>
+                <td><strong>Manifest</strong></td>
+                <td>Package.swift</td>
+                <td>Podfile (Ruby DSL)</td>
+                <td>Cartfile (plain text)</td>
+            </tr>
+            <tr>
+                <td><strong>Resolution algorithm</strong></td>
+                <td>PubGrub</td>
+                <td>Molinillo</td>
+                <td>Simple (latest compatible)</td>
+            </tr>
+            <tr>
+                <td><strong>Binary distribution</strong></td>
+                <td>XCFramework targets</td>
+                <td>vendored_frameworks</td>
+                <td>Pre-built frameworks</td>
+            </tr>
+            <tr>
+                <td><strong>Resource support</strong></td>
+                <td>Bundle.module</td>
+                <td>resource_bundles</td>
+                <td>None</td>
+            </tr>
+            <tr>
+                <td><strong>Plugins</strong></td>
+                <td>Build tool + command plugins</td>
+                <td>Podfile hooks</td>
+                <td>None</td>
+            </tr>
+            <tr>
+                <td><strong>Local development</strong></td>
+                <td>.package(path:)</td>
+                <td>:path in Podfile</td>
+                <td>Manual</td>
+            </tr>
+            <tr>
+                <td><strong>Ecosystem size</strong></td>
+                <td>Growing rapidly</td>
+                <td>Largest (90K+ pods)</td>
+                <td>Declining</td>
+            </tr>
+            <tr>
+                <td><strong>Future</strong></td>
+                <td>Apple's investment</td>
+                <td>Maintenance mode</td>
+                <td>Effectively archived</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">8. Architect: Enterprise Dependency Strategy</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: Dependency Management for Enterprise Apps</div>
+        <p>At enterprise scale, dependency management is a security, compliance, and reliability concern. Every third-party dependency is a supply chain risk. The architect must balance developer productivity (easy to add dependencies) with organizational control (security review, license compliance, version stability).</p>
+    </div>
+
+    <h3>8.1 Enterprise Dependency Policy</h3>
+
+    <pre><code><span class="comment">// Enterprise dependency governance:</span>
+<span class="comment">//</span>
+<span class="comment">// 1. APPROVED LIST: Maintain a list of approved dependencies</span>
+<span class="comment">//    - Security team reviews each dependency</span>
+<span class="comment">//    - License compatibility checked (no GPL in proprietary apps)</span>
+<span class="comment">//    - Maintenance health assessed (last commit, open issues)</span>
+<span class="comment">//</span>
+<span class="comment">// 2. VERSION PINNING: Pin major versions, allow patch updates</span>
+<span class="comment">//    - from: "5.8.0" allows 5.8.0 ..< 6.0.0</span>
+<span class="comment">//    - Automated PR for minor/patch updates (Dependabot/Renovate)</span>
+<span class="comment">//    - Manual review for major updates</span>
+<span class="comment">//</span>
+<span class="comment">// 3. PRIVATE MIRROR: Mirror approved packages internally</span>
+<span class="comment">//    - Protects against upstream deletion (left-pad incident)</span>
+<span class="comment">//    - Enables air-gapped builds</span>
+<span class="comment">//    - Adds security scanning layer</span>
+<span class="comment">//</span>
+<span class="comment">// 4. BINARY CACHING: Pre-build dependencies for CI</span>
+<span class="comment">//    - Tuist Cloud or custom Artifactory</span>
+<span class="comment">//    - Saves 5-15 min per CI build</span>
+<span class="comment">//</span>
+<span class="comment">// 5. SBOM (Software Bill of Materials): Track all dependencies</span>
+<span class="comment">//    - Required for compliance (SOC2, HIPAA)</span>
+<span class="comment">//    - Enables vulnerability scanning</span></code></pre>
+
+    <h3>8.2 Migration Path: CocoaPods → SPM</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│              CocoaPods → SPM Migration                        │
+│                                                              │
+│  Phase 1: Audit (1-2 weeks)                                  │
+│  ├── List all CocoaPods dependencies                         │
+│  ├── Check SPM availability for each                         │
+│  ├── Identify pods with no SPM support                       │
+│  └── Plan for alternatives or forks                          │
+│                                                              │
+│  Phase 2: Parallel Setup (1 week)                            │
+│  ├── Add SPM packages alongside CocoaPods                    │
+│  ├── Both systems resolve independently                      │
+│  └── Verify no symbol conflicts                              │
+│                                                              │
+│  Phase 3: Migrate Leaf Dependencies (2-4 weeks)              │
+│  ├── Start with dependencies that have no dependents         │
+│  ├── Remove from Podfile, add to Package.swift               │
+│  └── Run full test suite after each migration                │
+│                                                              │
+│  Phase 4: Migrate Core Dependencies (2-4 weeks)              │
+│  ├── Migrate networking, storage, analytics                  │
+│  └── These affect many modules — test thoroughly             │
+│                                                              │
+│  Phase 5: Remove CocoaPods (1 week)                          │
+│  ├── Delete Podfile, Podfile.lock, Pods/                     │
+│  ├── Remove .xcworkspace (use .xcodeproj directly)           │
+│  └── Update CI scripts                                       │
+└─────────────────────────────────────────────────────────────┘
+    </div>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Dependency Minimalism</div>
+        <p>Every dependency is a liability. Before adding one, ask: (1) Can we implement this in &lt;200 lines? (2) Is this a core competency we should own? (3) What's the maintenance health? (4) What's the transitive dependency cost? The best dependency is the one you don't add.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="04-modularization.html">← Modularization</a>
+        <a href="06-large-scale-patterns.html">Large-Scale Patterns →</a>
+    </div>
+</div>
+</body>
+</html>

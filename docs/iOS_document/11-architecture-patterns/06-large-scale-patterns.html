@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Large-Scale Patterns — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Architecture Patterns</a><span class="sep">›</span>
+        Large-Scale Patterns
+    </nav>
+
+    <h1>Large-Scale Patterns</h1>
+    <p class="subtitle">Feature flags with gradual rollout and kill switches, A/B testing architecture, analytics abstraction layers, structured logging with os_log and Logger, crash reporting integration, remote config systems, and experimentation platforms — the platform infrastructure that enables 20+ feature teams to ship independently.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#feature-flags">1. Feature Flags</a></li>
+            <li><a href="#ab-testing">2. A/B Testing Architecture</a></li>
+            <li><a href="#analytics">3. Analytics Abstraction Layer</a></li>
+            <li><a href="#logging">4. Logging Architecture</a></li>
+            <li><a href="#crash">5. Crash Reporting Integration</a></li>
+            <li><a href="#remote-config">6. Remote Config Systems</a></li>
+            <li><a href="#experimentation">7. Experimentation Platform</a></li>
+            <li><a href="#architect">8. Architect: Platform Infrastructure for 20+ Teams</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="feature-flags">1. Feature Flags</h2>
+
+    <p>Feature flags (feature toggles) decouple deployment from release. Code ships to production behind a flag, and the flag controls whether users see the feature. This enables trunk-based development, gradual rollouts, and instant kill switches.</p>
+
+    <h3>1.1 Feature Flag Types</h3>
+
+    <table>
+        <thead>
+            <tr><th>Type</th><th>Lifetime</th><th>Purpose</th><th>Example</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Release flag</td><td>Days-weeks</td><td>Hide incomplete features</td><td>New checkout flow</td></tr>
+            <tr><td>Experiment flag</td><td>Weeks-months</td><td>A/B test variants</td><td>Button color test</td></tr>
+            <tr><td>Ops flag</td><td>Permanent</td><td>Runtime control</td><td>Kill switch for video</td></tr>
+            <tr><td>Permission flag</td><td>Permanent</td><td>User entitlements</td><td>Premium features</td></tr>
+        </tbody>
+    </table>
+
+    <h3>1.2 Feature Flag Implementation</h3>
+
+    <pre><code><span class="keyword">protocol</span> <span class="type">FeatureFlagProvider</span>: <span class="type">Sendable</span> {
+    <span class="keyword">func</span> <span class="func">isEnabled</span>(_ flag: <span class="type">FeatureFlag</span>) -> <span class="type">Bool</span>
+    <span class="keyword">func</span> <span class="func">value</span>&lt;<span class="type">T</span>: <span class="type">Decodable</span>&gt;(for flag: <span class="type">FeatureFlag</span>) -> <span class="type">T</span>?
+    <span class="keyword">func</span> <span class="func">observe</span>(_ flag: <span class="type">FeatureFlag</span>) -> <span class="type">AsyncStream</span>&lt;<span class="type">Bool</span>&gt;
+}
+
+<span class="keyword">enum</span> <span class="type">FeatureFlag</span>: <span class="type">String</span>, <span class="type">CaseIterable</span>, <span class="type">Sendable</span> {
+    <span class="keyword">case</span> newCheckoutFlow = <span class="string">"new_checkout_flow"</span>
+    <span class="keyword">case</span> aiRecommendations = <span class="string">"ai_recommendations"</span>
+    <span class="keyword">case</span> videoPlayerV2 = <span class="string">"video_player_v2"</span>
+    <span class="keyword">case</span> darkModeAutoSwitch = <span class="string">"dark_mode_auto_switch"</span>
+    <span class="keyword">case</span> killSwitchPayments = <span class="string">"kill_switch_payments"</span>
+
+    <span class="keyword">var</span> defaultValue: <span class="type">Bool</span> {
+        <span class="keyword">switch self</span> {
+        <span class="keyword">case</span> .killSwitchPayments: <span class="keyword">return true</span>
+        <span class="keyword">default</span>: <span class="keyword">return false</span>
+        }
+    }
+}
+
+<span class="keyword">final class</span> <span class="type">FeatureFlagService</span>: <span class="type">FeatureFlagProvider</span>, @unchecked <span class="type">Sendable</span> {
+    <span class="keyword">private let</span> remoteConfig: <span class="type">RemoteConfigProvider</span>
+    <span class="keyword">private let</span> localStorage: <span class="type">UserDefaults</span>
+    <span class="keyword">private let</span> overrides: [<span class="type">FeatureFlag</span>: <span class="type">Bool</span>]
+    <span class="keyword">private let</span> lock = <span class="type">NSLock</span>()
+    <span class="keyword">private var</span> cache: [<span class="type">FeatureFlag</span>: <span class="type">Bool</span>] = [:]
+
+    <span class="keyword">func</span> <span class="func">isEnabled</span>(_ flag: <span class="type">FeatureFlag</span>) -> <span class="type">Bool</span> {
+        <span class="comment">// Priority: debug override > remote config > local cache > default</span>
+        <span class="keyword">if let</span> override = overrides[flag] {
+            <span class="keyword">return</span> override
+        }
+
+        lock.<span class="func">lock</span>()
+        <span class="keyword">defer</span> { lock.<span class="func">unlock</span>() }
+
+        <span class="keyword">if let</span> cached = cache[flag] {
+            <span class="keyword">return</span> cached
+        }
+
+        <span class="keyword">let</span> value = remoteConfig.<span class="func">bool</span>(forKey: flag.rawValue) ?? flag.defaultValue
+        cache[flag] = value
+        <span class="keyword">return</span> value
+    }
+
+    <span class="keyword">func</span> <span class="func">observe</span>(_ flag: <span class="type">FeatureFlag</span>) -> <span class="type">AsyncStream</span>&lt;<span class="type">Bool</span>&gt; {
+        <span class="type">AsyncStream</span> { continuation <span class="keyword">in</span>
+            continuation.<span class="func">yield</span>(<span class="func">isEnabled</span>(flag))
+            <span class="keyword">let</span> observer = remoteConfig.<span class="func">addObserver</span>(forKey: flag.rawValue) { newValue <span class="keyword">in</span>
+                continuation.<span class="func">yield</span>(newValue <span class="keyword">as?</span> <span class="type">Bool</span> ?? flag.defaultValue)
+            }
+            continuation.onTermination = { _ <span class="keyword">in</span>
+                observer.<span class="func">remove</span>()
+            }
+        }
+    }
+}</code></pre>
+
+    <h3>1.3 Gradual Rollout</h3>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">RolloutConfig</span>: <span class="type">Codable</span> {
+    <span class="keyword">let</span> flag: <span class="type">String</span>
+    <span class="keyword">let</span> percentage: <span class="type">Double</span>
+    <span class="keyword">let</span> targetGroups: [<span class="type">String</span>]
+    <span class="keyword">let</span> excludedUserIds: [<span class="type">String</span>]
+    <span class="keyword">let</span> minAppVersion: <span class="type">String</span>?
+}
+
+<span class="keyword">final class</span> <span class="type">GradualRollout</span> {
+    <span class="keyword">func</span> <span class="func">isUserInRollout</span>(userId: <span class="type">String</span>, config: <span class="type">RolloutConfig</span>) -> <span class="type">Bool</span> {
+        <span class="keyword">guard</span> !config.excludedUserIds.<span class="func">contains</span>(userId) <span class="keyword">else</span> {
+            <span class="keyword">return false</span>
+        }
+
+        <span class="keyword">if let</span> minVersion = config.minAppVersion,
+           <span class="type">Bundle</span>.main.appVersion < minVersion {
+            <span class="keyword">return false</span>
+        }
+
+        <span class="comment">// Deterministic bucketing: same user always gets same result</span>
+        <span class="keyword">let</span> hash = <span class="string">"\(userId):\(config.flag)"</span>.<span class="func">hashValue</span>
+        <span class="keyword">let</span> bucket = <span class="type">abs</span>(hash) % <span class="number">100</span>
+        <span class="keyword">return</span> <span class="type">Double</span>(bucket) < config.percentage
+    }
+}</code></pre>
+
+    <h3>1.4 Kill Switch Pattern</h3>
+
+    <pre><code><span class="keyword">final class</span> <span class="type">KillSwitch</span> {
+    <span class="keyword">private let</span> flags: <span class="type">FeatureFlagProvider</span>
+
+    <span class="keyword">func</span> <span class="func">isServiceAvailable</span>(_ service: <span class="type">ServiceType</span>) -> <span class="type">Bool</span> {
+        <span class="keyword">switch</span> service {
+        <span class="keyword">case</span> .payments:
+            <span class="keyword">return</span> flags.<span class="func">isEnabled</span>(.killSwitchPayments)
+        <span class="keyword">case</span> .videoStreaming:
+            <span class="keyword">return</span> flags.<span class="func">isEnabled</span>(.killSwitchVideo)
+        <span class="keyword">case</span> .search:
+            <span class="keyword">return</span> flags.<span class="func">isEnabled</span>(.killSwitchSearch)
+        }
+    }
+}
+
+<span class="comment">// Usage in feature code</span>
+<span class="keyword">func</span> <span class="func">processPayment</span>() <span class="keyword">async throws</span> {
+    <span class="keyword">guard</span> killSwitch.<span class="func">isServiceAvailable</span>(.payments) <span class="keyword">else</span> {
+        <span class="keyword">throw</span> <span class="type">ServiceError</span>.temporarilyUnavailable(
+            message: <span class="string">"Payments are temporarily unavailable. Please try again later."</span>
+        )
+    }
+    <span class="comment">// ... process payment</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="ab-testing">2. A/B Testing Architecture</h2>
+
+    <h3>2.1 Experiment Definition</h3>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">Experiment</span>: <span class="type">Codable</span>, <span class="type">Sendable</span> {
+    <span class="keyword">let</span> id: <span class="type">String</span>
+    <span class="keyword">let</span> name: <span class="type">String</span>
+    <span class="keyword">let</span> variants: [<span class="type">Variant</span>]
+    <span class="keyword">let</span> targetAudience: <span class="type">AudienceFilter</span>
+    <span class="keyword">let</span> startDate: <span class="type">Date</span>
+    <span class="keyword">let</span> endDate: <span class="type">Date</span>?
+}
+
+<span class="keyword">struct</span> <span class="type">Variant</span>: <span class="type">Codable</span>, <span class="type">Sendable</span> {
+    <span class="keyword">let</span> id: <span class="type">String</span>
+    <span class="keyword">let</span> name: <span class="type">String</span>
+    <span class="keyword">let</span> weight: <span class="type">Double</span>
+    <span class="keyword">let</span> parameters: [<span class="type">String</span>: <span class="type">AnyCodable</span>]
+}
+
+<span class="keyword">protocol</span> <span class="type">ExperimentService</span>: <span class="type">Sendable</span> {
+    <span class="keyword">func</span> <span class="func">variant</span>(for experimentId: <span class="type">String</span>) -> <span class="type">Variant</span>?
+    <span class="keyword">func</span> <span class="func">logExposure</span>(experimentId: <span class="type">String</span>, variantId: <span class="type">String</span>)
+}
+
+<span class="keyword">final class</span> <span class="type">ABTestingService</span>: <span class="type">ExperimentService</span>, @unchecked <span class="type">Sendable</span> {
+    <span class="keyword">private var</span> assignments: [<span class="type">String</span>: <span class="type">Variant</span>] = [:]
+    <span class="keyword">private let</span> analytics: <span class="type">AnalyticsProtocol</span>
+
+    <span class="keyword">func</span> <span class="func">variant</span>(for experimentId: <span class="type">String</span>) -> <span class="type">Variant</span>? {
+        <span class="keyword">guard let</span> variant = assignments[experimentId] <span class="keyword">else</span> {
+            <span class="keyword">return nil</span>
+        }
+        <span class="func">logExposure</span>(experimentId: experimentId, variantId: variant.id)
+        <span class="keyword">return</span> variant
+    }
+
+    <span class="keyword">func</span> <span class="func">logExposure</span>(experimentId: <span class="type">String</span>, variantId: <span class="type">String</span>) {
+        analytics.<span class="func">track</span>(<span class="type">ExperimentExposureEvent</span>(
+            experimentId: experimentId,
+            variantId: variantId
+        ))
+    }
+}</code></pre>
+
+    <h3>2.2 A/B Test in UI Code</h3>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">CheckoutView</span>: <span class="type">View</span> {
+    <span class="keyword">@Environment</span>(\.experimentService) <span class="keyword">var</span> experiments
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="keyword">let</span> variant = experiments.<span class="func">variant</span>(for: <span class="string">"checkout_flow_v2"</span>)
+
+        <span class="keyword">switch</span> variant?.id {
+        <span class="keyword">case</span> <span class="string">"single_page"</span>:
+            <span class="type">SinglePageCheckout</span>()
+        <span class="keyword">case</span> <span class="string">"multi_step"</span>:
+            <span class="type">MultiStepCheckout</span>()
+        <span class="keyword">default</span>:
+            <span class="type">LegacyCheckout</span>()
+        }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="analytics">3. Analytics Abstraction Layer</h2>
+
+    <p>An analytics abstraction layer decouples your app code from specific analytics providers (Firebase, Amplitude, Mixpanel). This enables switching providers without touching feature code.</p>
+
+    <h3>3.1 Protocol-Based Abstraction</h3>
+
+    <pre><code><span class="keyword">protocol</span> <span class="type">AnalyticsEvent</span>: <span class="type">Sendable</span> {
+    <span class="keyword">var</span> name: <span class="type">String</span> { <span class="keyword">get</span> }
+    <span class="keyword">var</span> parameters: [<span class="type">String</span>: <span class="keyword">any</span> <span class="type">Sendable</span>] { <span class="keyword">get</span> }
+}
+
+<span class="keyword">protocol</span> <span class="type">AnalyticsProvider</span>: <span class="type">Sendable</span> {
+    <span class="keyword">func</span> <span class="func">track</span>(_ event: <span class="type">AnalyticsEvent</span>)
+    <span class="keyword">func</span> <span class="func">setUserProperty</span>(_ key: <span class="type">String</span>, value: <span class="type">String</span>?)
+    <span class="keyword">func</span> <span class="func">identify</span>(userId: <span class="type">String</span>)
+    <span class="keyword">func</span> <span class="func">reset</span>()
+}
+
+<span class="keyword">final class</span> <span class="type">AnalyticsService</span>: <span class="type">Sendable</span> {
+    <span class="keyword">private let</span> providers: [<span class="type">AnalyticsProvider</span>]
+    <span class="keyword">private let</span> middleware: [<span class="type">AnalyticsMiddleware</span>]
+
+    <span class="keyword">init</span>(providers: [<span class="type">AnalyticsProvider</span>], middleware: [<span class="type">AnalyticsMiddleware</span>] = []) {
+        <span class="keyword">self</span>.providers = providers
+        <span class="keyword">self</span>.middleware = middleware
+    }
+
+    <span class="keyword">func</span> <span class="func">track</span>(_ event: <span class="type">AnalyticsEvent</span>) {
+        <span class="keyword">var</span> processedEvent = event
+        <span class="keyword">for</span> mw <span class="keyword">in</span> middleware {
+            processedEvent = mw.<span class="func">process</span>(processedEvent)
+        }
+        <span class="keyword">for</span> provider <span class="keyword">in</span> providers {
+            provider.<span class="func">track</span>(processedEvent)
+        }
+    }
+}
+
+<span class="comment">// Concrete providers</span>
+<span class="keyword">final class</span> <span class="type">FirebaseAnalyticsProvider</span>: <span class="type">AnalyticsProvider</span> {
+    <span class="keyword">func</span> <span class="func">track</span>(_ event: <span class="type">AnalyticsEvent</span>) {
+        <span class="type">Analytics</span>.<span class="func">logEvent</span>(event.name, parameters: event.parameters)
+    }
+}
+
+<span class="keyword">final class</span> <span class="type">AmplitudeProvider</span>: <span class="type">AnalyticsProvider</span> {
+    <span class="keyword">func</span> <span class="func">track</span>(_ event: <span class="type">AnalyticsEvent</span>) {
+        <span class="type">Amplitude</span>.instance().<span class="func">logEvent</span>(event.name, withEventProperties: event.parameters)
+    }
+}</code></pre>
+
+    <h3>3.2 Type-Safe Event Definitions</h3>
+
+    <pre><code><span class="keyword">enum</span> <span class="type">AppAnalyticsEvent</span>: <span class="type">AnalyticsEvent</span> {
+    <span class="keyword">case</span> screenViewed(name: <span class="type">String</span>, source: <span class="type">String</span>?)
+    <span class="keyword">case</span> productViewed(id: <span class="type">String</span>, category: <span class="type">String</span>)
+    <span class="keyword">case</span> addedToCart(productId: <span class="type">String</span>, price: <span class="type">Decimal</span>, quantity: <span class="type">Int</span>)
+    <span class="keyword">case</span> purchaseCompleted(orderId: <span class="type">String</span>, total: <span class="type">Decimal</span>, itemCount: <span class="type">Int</span>)
+    <span class="keyword">case</span> searchPerformed(query: <span class="type">String</span>, resultCount: <span class="type">Int</span>)
+    <span class="keyword">case</span> errorOccurred(domain: <span class="type">String</span>, code: <span class="type">Int</span>, message: <span class="type">String</span>)
+
+    <span class="keyword">var</span> name: <span class="type">String</span> {
+        <span class="keyword">switch self</span> {
+        <span class="keyword">case</span> .screenViewed: <span class="keyword">return</span> <span class="string">"screen_viewed"</span>
+        <span class="keyword">case</span> .productViewed: <span class="keyword">return</span> <span class="string">"product_viewed"</span>
+        <span class="keyword">case</span> .addedToCart: <span class="keyword">return</span> <span class="string">"added_to_cart"</span>
+        <span class="keyword">case</span> .purchaseCompleted: <span class="keyword">return</span> <span class="string">"purchase_completed"</span>
+        <span class="keyword">case</span> .searchPerformed: <span class="keyword">return</span> <span class="string">"search_performed"</span>
+        <span class="keyword">case</span> .errorOccurred: <span class="keyword">return</span> <span class="string">"error_occurred"</span>
+        }
+    }
+
+    <span class="keyword">var</span> parameters: [<span class="type">String</span>: <span class="keyword">any</span> <span class="type">Sendable</span>] {
+        <span class="keyword">switch self</span> {
+        <span class="keyword">case let</span> .screenViewed(name, source):
+            <span class="keyword">var</span> params: [<span class="type">String</span>: <span class="keyword">any</span> <span class="type">Sendable</span>] = [<span class="string">"screen_name"</span>: name]
+            <span class="keyword">if let</span> source { params[<span class="string">"source"</span>] = source }
+            <span class="keyword">return</span> params
+        <span class="keyword">case let</span> .productViewed(id, category):
+            <span class="keyword">return</span> [<span class="string">"product_id"</span>: id, <span class="string">"category"</span>: category]
+        <span class="keyword">case let</span> .addedToCart(productId, price, quantity):
+            <span class="keyword">return</span> [<span class="string">"product_id"</span>: productId, <span class="string">"price"</span>: <span class="type">NSDecimalNumber</span>(decimal: price), <span class="string">"quantity"</span>: quantity]
+        <span class="keyword">case let</span> .purchaseCompleted(orderId, total, itemCount):
+            <span class="keyword">return</span> [<span class="string">"order_id"</span>: orderId, <span class="string">"total"</span>: <span class="type">NSDecimalNumber</span>(decimal: total), <span class="string">"item_count"</span>: itemCount]
+        <span class="keyword">case let</span> .searchPerformed(query, resultCount):
+            <span class="keyword">return</span> [<span class="string">"query"</span>: query, <span class="string">"result_count"</span>: resultCount]
+        <span class="keyword">case let</span> .errorOccurred(domain, code, message):
+            <span class="keyword">return</span> [<span class="string">"domain"</span>: domain, <span class="string">"code"</span>: code, <span class="string">"message"</span>: message]
+        }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="logging">4. Logging Architecture</h2>
+
+    <h3>4.1 os_log and Logger (Unified Logging)</h3>
+
+    <pre><code><span class="keyword">import</span> os
+
+<span class="keyword">extension</span> <span class="type">Logger</span> {
+    <span class="keyword">static let</span> networking = <span class="type">Logger</span>(
+        subsystem: <span class="type">Bundle</span>.main.bundleIdentifier ?? <span class="string">"com.app"</span>,
+        category: <span class="string">"networking"</span>
+    )
+    <span class="keyword">static let</span> database = <span class="type">Logger</span>(
+        subsystem: <span class="type">Bundle</span>.main.bundleIdentifier ?? <span class="string">"com.app"</span>,
+        category: <span class="string">"database"</span>
+    )
+    <span class="keyword">static let</span> auth = <span class="type">Logger</span>(
+        subsystem: <span class="type">Bundle</span>.main.bundleIdentifier ?? <span class="string">"com.app"</span>,
+        category: <span class="string">"auth"</span>
+    )
+}
+
+<span class="comment">// Usage with privacy levels</span>
+<span class="type">Logger</span>.networking.<span class="func">info</span>(<span class="string">"Request: \(url.absoluteString, privacy: .public)"</span>)
+<span class="type">Logger</span>.networking.<span class="func">debug</span>(<span class="string">"Headers: \(headers, privacy: .private)"</span>)
+<span class="type">Logger</span>.auth.<span class="func">error</span>(<span class="string">"Login failed for user: \(userId, privacy: .private(mask: .hash))"</span>)
+<span class="type">Logger</span>.database.<span class="func">fault</span>(<span class="string">"Database corruption detected at: \(path)"</span>)</code></pre>
+
+    <h3>4.2 Log Levels</h3>
+
+    <table>
+        <thead>
+            <tr><th>Level</th><th>os_log</th><th>Persisted</th><th>Use Case</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Debug</td><td>.debug</td><td>No (memory only)</td><td>Development-time details</td></tr>
+            <tr><td>Info</td><td>.info</td><td>Only during log collect</td><td>Helpful but non-essential</td></tr>
+            <tr><td>Notice</td><td>.default</td><td>Yes (disk)</td><td>Normal operations worth noting</td></tr>
+            <tr><td>Error</td><td>.error</td><td>Yes (disk)</td><td>Recoverable errors</td></tr>
+            <tr><td>Fault</td><td>.fault</td><td>Yes (disk + stack)</td><td>Unrecoverable errors, bugs</td></tr>
+        </tbody>
+    </table>
+
+    <h3>4.3 Structured Logging with OSLogStore</h3>
+
+    <pre><code><span class="keyword">import</span> OSLog
+
+<span class="keyword">func</span> <span class="func">exportRecentLogs</span>() <span class="keyword">throws</span> -> [<span class="type">LogEntry</span>] {
+    <span class="keyword">let</span> store = <span class="keyword">try</span> <span class="type">OSLogStore</span>(scope: .currentProcessIdentifier)
+    <span class="keyword">let</span> position = store.<span class="func">position</span>(
+        date: <span class="type">Date</span>().<span class="func">addingTimeInterval</span>(-<span class="number">3600</span>)
+    )
+    <span class="keyword">let</span> entries = <span class="keyword">try</span> store.<span class="func">getEntries</span>(at: position)
+        .<span class="func">compactMap</span> { $0 <span class="keyword">as?</span> <span class="type">OSLogEntryLog</span> }
+        .<span class="func">filter</span> { $0.subsystem == <span class="type">Bundle</span>.main.bundleIdentifier }
+        .<span class="func">map</span> { entry <span class="keyword">in</span>
+            <span class="type">LogEntry</span>(
+                date: entry.date,
+                level: entry.level.rawValue,
+                category: entry.category,
+                message: entry.composedMessage
+            )
+        }
+    <span class="keyword">return</span> entries
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="crash">5. Crash Reporting Integration</h2>
+
+    <h3>5.1 Crash Reporter Abstraction</h3>
+
+    <pre><code><span class="keyword">protocol</span> <span class="type">CrashReporter</span>: <span class="type">Sendable</span> {
+    <span class="keyword">func</span> <span class="func">recordError</span>(_ error: <span class="type">Error</span>, metadata: [<span class="type">String</span>: <span class="type">String</span>])
+    <span class="keyword">func</span> <span class="func">recordBreadcrumb</span>(_ message: <span class="type">String</span>, category: <span class="type">String</span>)
+    <span class="keyword">func</span> <span class="func">setUserIdentifier</span>(_ id: <span class="type">String</span>?)
+    <span class="keyword">func</span> <span class="func">setCustomKey</span>(_ key: <span class="type">String</span>, value: <span class="type">String</span>)
+}
+
+<span class="keyword">final class</span> <span class="type">CrashReportingService</span>: <span class="type">CrashReporter</span> {
+    <span class="keyword">private let</span> reporters: [<span class="type">CrashReporter</span>]
+
+    <span class="keyword">func</span> <span class="func">recordError</span>(_ error: <span class="type">Error</span>, metadata: [<span class="type">String</span>: <span class="type">String</span>] = [:]) {
+        <span class="keyword">var</span> enrichedMetadata = metadata
+        enrichedMetadata[<span class="string">"app_version"</span>] = <span class="type">Bundle</span>.main.appVersion
+        enrichedMetadata[<span class="string">"build_number"</span>] = <span class="type">Bundle</span>.main.buildNumber
+        enrichedMetadata[<span class="string">"os_version"</span>] = <span class="type">ProcessInfo</span>.processInfo.operatingSystemVersionString
+
+        <span class="keyword">for</span> reporter <span class="keyword">in</span> reporters {
+            reporter.<span class="func">recordError</span>(error, metadata: enrichedMetadata)
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">recordBreadcrumb</span>(_ message: <span class="type">String</span>, category: <span class="type">String</span>) {
+        <span class="keyword">for</span> reporter <span class="keyword">in</span> reporters {
+            reporter.<span class="func">recordBreadcrumb</span>(message, category: category)
+        }
+    }
+}
+
+<span class="comment">// Automatic breadcrumb recording via coordinator</span>
+<span class="keyword">extension</span> <span class="type">Coordinator</span> {
+    <span class="keyword">func</span> <span class="func">trackNavigation</span>(to screen: <span class="type">String</span>) {
+        crashReporter.<span class="func">recordBreadcrumb</span>(
+            <span class="string">"Navigated to \(screen)"</span>,
+            category: <span class="string">"navigation"</span>
+        )
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="remote-config">6. Remote Config Systems</h2>
+
+    <h3>6.1 Remote Config Architecture</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│              Remote Config Data Flow                          │
+│                                                              │
+│  Server                                                      │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ Config Dashboard                                      │   │
+│  │ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐     │   │
+│  │ │ Feature     │ │ A/B Test    │ │ App Config  │     │   │
+│  │ │ Flags       │ │ Variants   │ │ (timeouts,  │     │   │
+│  │ │             │ │            │ │  URLs, etc) │     │   │
+│  │ └──────┬──────┘ └──────┬─────┘ └──────┬──────┘     │   │
+│  │        └───────────┬───┘──────────────┘              │   │
+│  │                    ▼                                  │   │
+│  │           Config API (JSON)                           │   │
+│  └────────────────────┬─────────────────────────────────┘   │
+│                        │                                     │
+│  Client                │ fetch (app launch + periodic)       │
+│  ┌─────────────────────▼────────────────────────────────┐   │
+│  │ RemoteConfigService                                   │   │
+│  │ ┌──────────┐ ┌──────────┐ ┌──────────┐              │   │
+│  │ │ Fetch    │→│ Validate │→│ Cache    │              │   │
+│  │ │ (network)│ │ (schema) │ │ (disk)   │              │   │
+│  │ └──────────┘ └──────────┘ └────┬─────┘              │   │
+│  │                                 │                     │   │
+│  │                          ┌──────▼──────┐              │   │
+│  │                          │ Activate    │              │   │
+│  │                          │ (apply to   │              │   │
+│  │                          │  next launch│              │   │
+│  │                          │  or live)   │              │   │
+│  │                          └─────────────┘              │   │
+│  └───────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>6.2 Implementation</h3>
+
+    <pre><code><span class="keyword">actor</span> <span class="type">RemoteConfigService</span> {
+    <span class="keyword">private var</span> activeConfig: [<span class="type">String</span>: <span class="type">AnyCodable</span>] = [:]
+    <span class="keyword">private var</span> fetchedConfig: [<span class="type">String</span>: <span class="type">AnyCodable</span>] = [:]
+    <span class="keyword">private let</span> defaults: [<span class="type">String</span>: <span class="type">AnyCodable</span>]
+    <span class="keyword">private let</span> networkClient: <span class="type">APIClient</span>
+    <span class="keyword">private let</span> storage: <span class="type">ConfigStorage</span>
+
+    <span class="keyword">func</span> <span class="func">fetchAndActivate</span>() <span class="keyword">async throws</span> {
+        <span class="keyword">let</span> response = <span class="keyword">try await</span> networkClient.<span class="func">fetch</span>(<span class="type">ConfigResponse</span>.<span class="keyword">self</span>, from: .remoteConfig)
+        fetchedConfig = response.values
+        <span class="keyword">try await</span> storage.<span class="func">save</span>(fetchedConfig)
+        <span class="func">activate</span>()
+    }
+
+    <span class="keyword">func</span> <span class="func">activate</span>() {
+        activeConfig = fetchedConfig
+    }
+
+    <span class="keyword">func</span> <span class="func">value</span>&lt;<span class="type">T</span>: <span class="type">Decodable</span>&gt;(forKey key: <span class="type">String</span>) -> <span class="type">T</span>? {
+        <span class="keyword">if let</span> value = activeConfig[key] {
+            <span class="keyword">return</span> value.value <span class="keyword">as?</span> <span class="type">T</span>
+        }
+        <span class="keyword">return</span> defaults[key]?.value <span class="keyword">as?</span> <span class="type">T</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">bool</span>(forKey key: <span class="type">String</span>) -> <span class="type">Bool</span>? {
+        <span class="func">value</span>(forKey: key)
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="experimentation">7. Experimentation Platform</h2>
+
+    <p>An experimentation platform combines feature flags, A/B testing, remote config, and analytics into a unified system. At scale, this becomes a dedicated platform team's responsibility.</p>
+
+    <h3>7.1 Platform Architecture</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│              Experimentation Platform                         │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │                   Platform SDK                        │   │
+│  │                                                       │   │
+│  │  ┌─────────────┐  ┌──────────────┐  ┌────────────┐  │   │
+│  │  │ Feature     │  │ Experiment   │  │ Remote     │  │   │
+│  │  │ Flags       │  │ Service      │  │ Config     │  │   │
+│  │  └──────┬──────┘  └──────┬───────┘  └─────┬──────┘  │   │
+│  │         │                │                 │         │   │
+│  │         └────────────────┼─────────────────┘         │   │
+│  │                          │                            │   │
+│  │                   ┌──────▼──────┐                     │   │
+│  │                   │ Assignment  │                     │   │
+│  │                   │ Engine      │                     │   │
+│  │                   │             │                     │   │
+│  │                   │ User ID +   │                     │   │
+│  │                   │ Attributes  │                     │   │
+│  │                   │ → Variant   │                     │   │
+│  │                   └──────┬──────┘                     │   │
+│  │                          │                            │   │
+│  │                   ┌──────▼──────┐                     │   │
+│  │                   │ Analytics   │                     │   │
+│  │                   │ Pipeline    │                     │   │
+│  │                   │             │                     │   │
+│  │                   │ Exposure +  │                     │   │
+│  │                   │ Outcome     │                     │   │
+│  │                   │ Events      │                     │   │
+│  │                   └─────────────┘                     │   │
+│  └───────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">8. Architect: Platform Infrastructure for 20+ Teams</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: Building Platform Infrastructure</div>
+        <p>At 20+ feature teams, platform infrastructure becomes a product itself. The platform team builds SDKs that feature teams consume. The quality of these SDKs directly impacts every team's velocity, reliability, and ability to experiment safely.</p>
+    </div>
+
+    <h3>8.1 Platform Team Responsibilities</h3>
+
+    <table>
+        <thead>
+            <tr><th>System</th><th>What It Provides</th><th>Impact</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Feature Flags</td><td>Safe rollout, kill switches</td><td>Zero-downtime deployments</td></tr>
+            <tr><td>A/B Testing</td><td>Experiment assignment, exposure tracking</td><td>Data-driven product decisions</td></tr>
+            <tr><td>Analytics</td><td>Event tracking, user properties</td><td>Product insights, funnel analysis</td></tr>
+            <tr><td>Logging</td><td>Structured logs, log aggregation</td><td>Debugging production issues</td></tr>
+            <tr><td>Crash Reporting</td><td>Crash symbolication, alerting</td><td>Reliability monitoring</td></tr>
+            <tr><td>Remote Config</td><td>Runtime configuration</td><td>No-deploy changes</td></tr>
+            <tr><td>Networking</td><td>Shared HTTP client, auth, retry</td><td>Consistent API behavior</td></tr>
+            <tr><td>Design System</td><td>Shared components, tokens</td><td>UI consistency, faster development</td></tr>
+        </tbody>
+    </table>
+
+    <h3>8.2 SDK Design Principles</h3>
+
+    <pre><code><span class="comment">// Platform SDK design principles for internal teams:</span>
+<span class="comment">//</span>
+<span class="comment">// 1. ZERO CONFIGURATION: Works out of the box</span>
+<span class="comment">//    PlatformSDK.initialize() — one line in AppDelegate</span>
+<span class="comment">//</span>
+<span class="comment">// 2. PROTOCOL-BASED: Feature teams depend on protocols, not implementations</span>
+<span class="comment">//    import PlatformInterfaces (protocols only, no implementation)</span>
+<span class="comment">//    import PlatformSDK (implementation, only in app target)</span>
+<span class="comment">//</span>
+<span class="comment">// 3. FAIL-SAFE: SDK failures never crash the app</span>
+<span class="comment">//    Feature flags return defaults if service is down</span>
+<span class="comment">//    Analytics silently drops events if queue is full</span>
+<span class="comment">//</span>
+<span class="comment">// 4. TESTABLE: Mock implementations for unit tests</span>
+<span class="comment">//    import PlatformMocks (in test targets only)</span>
+<span class="comment">//</span>
+<span class="comment">// 5. OBSERVABLE: SDK health metrics exposed</span>
+<span class="comment">//    Config fetch latency, event queue depth, error rates</span></code></pre>
+
+    <h3>8.3 Platform Module Graph</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│              Platform Module Architecture                     │
+│                                                              │
+│  Feature teams import:                                       │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ PlatformInterfaces (protocols only)                   │   │
+│  │  • FeatureFlagProvider                                │   │
+│  │  • AnalyticsProvider                                  │   │
+│  │  • CrashReporter                                      │   │
+│  │  • RemoteConfigProvider                               │   │
+│  │  • LoggingProvider                                    │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                              │
+│  App target imports (composition root):                      │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ PlatformSDK (implementations)                         │   │
+│  │  • FirebaseFeatureFlagProvider                        │   │
+│  │  • AmplitudeAnalyticsProvider                         │   │
+│  │  • CrashlyticsReporter                                │   │
+│  │  • FirebaseRemoteConfig                               │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                              │
+│  Test targets import:                                        │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ PlatformMocks                                         │   │
+│  │  • MockFeatureFlagProvider                            │   │
+│  │  • MockAnalyticsProvider                              │   │
+│  │  • MockCrashReporter                                  │   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+    </div>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Feature Flag Hygiene</div>
+        <p>Feature flags are technical debt. Every flag adds a code path that must be tested. Establish a policy: release flags are removed within 2 sprints of full rollout. Experiment flags are removed when the experiment concludes. Ops flags are the only permanent flags. Track flag age in your dashboard and alert when flags exceed their expected lifetime.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="05-dependency-management.html">← Dependency Management</a>
+        <a href="07-interview-qa.html">Interview Q&amp;A →</a>
+    </div>
+</div>
+</body>
+</html>

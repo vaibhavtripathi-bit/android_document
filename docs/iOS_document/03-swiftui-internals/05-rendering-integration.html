@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rendering &amp; Core Animation Integration — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">SwiftUI Internals</a><span class="sep">›</span>
+        Rendering Integration
+    </nav>
+
+    <h1>Rendering &amp; Core Animation Integration</h1>
+    <p class="subtitle">How SwiftUI’s declarative tree becomes Core Animation layers, Metal-backed surfaces, and display-linked updates — the bridge interviewers expect Staff+ engineers to reason about when debugging jank, layer explosion, or hybrid UIKit integration.</p>
+
+    <p>
+        <span class="tag tag-l6">L6</span>
+        <span class="tag tag-senior">Senior+</span>
+        <span class="tag tag-architect">Systems</span>
+    </p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#swiftui-ca-bridge">1. SwiftUI → Core Animation Bridge</a></li>
+            <li><a href="#uihostingcontroller">2. UIHostingController Internals</a></li>
+            <li><a href="#uihostingview">3. _UIHostingView</a></li>
+            <li><a href="#render-loop">4. Render Loop &amp; CADisplayLink</a></li>
+            <li><a href="#metal-backing">5. Metal Backing</a></li>
+            <li><a href="#drawing-group">6. drawingGroup() — When and Why</a></li>
+            <li><a href="#canvas">7. Canvas (iOS 15) for High-Performance Drawing</a></li>
+            <li><a href="#timeline-view">8. TimelineView for Animations</a></li>
+            <li><a href="#architect-limits">9. When SwiftUI Rendering Hits Its Limits</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="swiftui-ca-bridge">1. SwiftUI → Core Animation Bridge</h2>
+
+    <p>SwiftUI is not a parallel rendering engine that bypasses Core Animation. At runtime, the framework <strong>lowers</strong> your view graph into a form the compositor understands: a tree of layers, layer contents, and animations that ultimately ride the same Core Animation transaction and display pipeline as UIKit.</p>
+
+    <h3>1.1 From SwiftUI Views to CALayers</h3>
+
+    <p>A <code>View</code> in SwiftUI is a lightweight value type describing intent. The runtime maintains a separate representation — often described in public discourse as a <strong>render tree</strong> or <strong>display list</strong> — that maps those intents to concrete rendering primitives. Those primitives are realized as:</p>
+
+    <ul>
+        <li><strong>CALayer subclasses and layer hierarchies</strong> for layout, transforms, masks, and compositing.</li>
+        <li><strong>Layer contents</strong> backed by images, Metal textures, or CPU-rendered bitmaps depending on the content type.</li>
+        <li><strong>CAAnimation</strong> and implicit animations coordinated with SwiftUI’s transaction system.</li>
+    </ul>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Interview Framing</div>
+        <p>Saying “SwiftUI draws with Metal” is directionally true for modern builds, but incomplete. The accurate Staff-level answer: SwiftUI <em>schedules</em> work into a Core Animation–centric pipeline; Metal is often the <em>backing</em> for rasterization and compositing, while CA still owns timing, layer properties, and the relationship to the render server.</p>
+    </div>
+
+    <h3>1.2 Display List / Render Tree (Conceptual Model)</h3>
+
+    <p>Apple does not fully document every private structure name, but the mental model that passes interviews is:</p>
+
+    <ol>
+        <li><strong>View graph</strong> — your <code>body</code> and child views; heavily optimized and type-erased at the ABI level.</li>
+        <li><strong>Layout pass</strong> — resolves frames, alignment, and safe areas; produces geometry for the next stage.</li>
+        <li><strong>Display list / render instructions</strong> — a flattened or semi-flattened set of drawing and layer operations.</li>
+        <li><strong>Layer tree / presentation tree</strong> — Core Animation’s model and presentation layers as animations run.</li>
+    </ol>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Stage</th>
+                <th>Primary responsibility</th>
+                <th>Observable in instruments</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>SwiftUI body evaluation</td>
+                <td>Diffing dependencies; rebuilding subtrees when state changes</td>
+                <td>SwiftUI template bodies; AttributeGraph-style work in deep profiles</td>
+            </tr>
+            <tr>
+                <td>Layout</td>
+                <td>Propose and resolve sizes/positions</td>
+                <td>Layout passes; “Layout” in Time Profiler when bound to UI</td>
+            </tr>
+            <tr>
+                <td>Rendering</td>
+                <td>Rasterize/composite into surfaces</td>
+                <td>Metal/GPU work; Core Animation commits</td>
+            </tr>
+            <tr>
+                <td>Core Animation commit</td>
+                <td>Ship property changes to render server</td>
+                <td>CA commits; frame pacing</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>1.3 _UIHostingView (Private, but Conceptually Central)</h3>
+
+    <p>When SwiftUI is hosted inside UIKit, the concrete <code>UIView</code> that bridges the two worlds is historically implemented as a private subclass often referred to as <code>_UIHostingView</code>. It is the object that:</p>
+
+    <ul>
+        <li>Owns the connection between a SwiftUI <code>Root</code> and UIKit’s responder and layout systems.</li>
+        <li>Hosts the layer subtree that Core Animation actually composites.</li>
+        <li>Participates in size negotiation (<code>intrinsicContentSize</code>, Auto Layout, safe area).</li>
+    </ul>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">App Store &amp; Private API</div>
+        <p>Never reference <code>_UIHostingView</code> in shipping code. In interviews, it is fair game as <em>implementation vocabulary</em> demonstrating you understand where the bridge lives.</p>
+    </div>
+
+    <h3>1.4 Flattening the Hierarchy for CA</h3>
+
+    <p>SwiftUI aggressively merges and elides views when they do not independently affect rendering or interaction. Two sibling <code>Color.clear</code> frames may disappear entirely. A stack of layout-only containers may collapse. Conversely, certain modifiers force <strong>materialization</strong> — a distinct layer or drawing boundary — for effects such as shadows, clipping, compositing groups, or platform-specific interactivity.</p>
+
+    <p>Modifiers that commonly introduce or strengthen layer boundaries include (non-exhaustive): <code>.clipShape</code>, <code>.shadow</code>, <code>.compositingGroup()</code>, <code>.drawingGroup()</code>, <code>.background</code> with materials, and some <code>.overlay</code> combinations with blend modes.</p>
+
+    <h3>1.5 SwiftUI View Count vs CALayer Count</h3>
+
+    <p>There is <strong>no fixed ratio</strong>. A deep SwiftUI hierarchy can produce a shallow layer tree if most nodes are layout-only. Conversely, a small number of SwiftUI views can explode into many layers if each triggers independent compositing, masking, or per-view effects.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Situation</th>
+                <th>Typical layer behavior</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Plain <code>VStack</code> of <code>Text</code></td>
+                <td>Often merged/flattened; fewer layers than naive “one layer per view”</td>
+            </tr>
+            <tr>
+                <td>Each cell with <code>shadow</code> + <code>clipShape</code></td>
+                <td>Higher layer count; offscreen passes more likely</td>
+            </tr>
+            <tr>
+                <td><code>drawingGroup()</code> on a subtree</td>
+                <td>Forces rasterization into a texture; can <em>reduce</em> layer count below or trade CPU/GPU differently</td>
+            </tr>
+            <tr>
+                <td>Heavy use of <code>UIViewRepresentable</code></td>
+                <td>UIKit’s layer rules apply inside the representable; boundary at the bridge</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>1.6 ASCII: SwiftUI → Core Animation Bridge</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         SwiftUI Runtime                                  │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────────┐   │
+│  │  State /     │───▶│  View Graph  │───▶│  Layout + Style resolve  │   │
+│  │  Bindings    │    │  (values)    │    │  (frames, environment)   │   │
+│  └──────────────┘    └──────────────┘    └────────────┬─────────────┘   │
+│                                                        │                 │
+│                        ┌───────────────────────────────▼─────────────┐ │
+│                        │  Render / display instructions (conceptual)  │ │
+│                        └───────────────────────────────┬─────────────┘ │
+└────────────────────────────────────────────────────────┼────────────────┘
+                                                         │
+                    ┌────────────────────────────────────▼────────────────────┐
+                    │  _UIHostingView (private) / Hosting container              │
+                    │  • UIView hierarchy + CALayer subtree                      │
+                    │  • intrinsicContentSize ↔ SwiftUI measurements             │
+                    └────────────────────────────┬───────────────────────────────┘
+                                                 │
+                    ┌────────────────────────────▼────────────────────────────┐
+                    │  Core Animation (render server model)                        │
+                    │  • layer tree • animations • compositing                     │
+                    └────────────────────────────┬───────────────────────────────┘
+                                                 │
+                    ┌────────────────────────────▼────────────────────────────┐
+                    │  Metal / GPU (often backs rasterization & composition)       │
+                    └────────────────────────────────────────────────────────────┘
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="uihostingcontroller">2. UIHostingController Internals</h2>
+
+    <p><code>UIHostingController&lt;Content&gt;</code> is the public, supported bridge that embeds a SwiftUI tree inside UIKit navigation, tab bars, split views, and cells. Understanding its sizing and lifecycle hooks separates mid-level usage from Staff-level integration design.</p>
+
+    <h3>2.1 Wrapping SwiftUI in a UIViewController</h3>
+
+    <p><code>UIHostingController</code> is a <code>UIViewController</code> whose <code>view</code> hosts the SwiftUI content. The controller forwards appearance transitions, trait changes, and system events into SwiftUI’s environment so modifiers like <code>.onAppear</code> and environment keys stay coherent with UIKit.</p>
+
+    <h3>2.2 sizingOptions (iOS 16+)</h3>
+
+    <p>Before iOS 16, sizing SwiftUI inside self-sizing containers (e.g. <code>UITableViewCell</code>, popovers, some collection layouts) was a common pain point. <code>UIHostingController</code> gained <code>sizingOptions</code> to control how the hosting view reports size to Auto Layout.</p>
+
+    <pre><code><span class="keyword">import</span> SwiftUI
+<span class="keyword">import</span> UIKit
+
+<span class="keyword">final</span> <span class="keyword">class</span> <span class="type">NotesCell</span>: <span class="type">UITableViewCell</span> {
+    <span class="keyword">private</span> <span class="keyword">var</span> hosting: <span class="type">UIHostingController</span>&lt;<span class="type">NoteRowView</span>&gt;?
+
+    <span class="func">func</span> <span class="func">configure</span>(<span class="keyword">with</span> model: <span class="type">NoteModel</span>) {
+        <span class="keyword">let</span> root = <span class="type">NoteRowView</span>(model: model)
+        <span class="keyword">if</span> hosting == <span class="keyword">nil</span> {
+            <span class="keyword">let</span> host = <span class="type">UIHostingController</span>(rootView: root)
+            <span class="comment">// Critical for self-sizing cells / embedding:</span>
+            host.sizingOptions = [.intrinsicContentSize]
+            hosting = host
+            contentView.<span class="func">addSubview</span>(host.view)
+            host.view.translatesAutoresizingMaskIntoConstraints = <span class="keyword">false</span>
+            <span class="type">NSLayoutConstraint</span>.<span class="func">activate</span>([
+                host.view.topAnchor.<span class="func">constraint</span>(equalTo: contentView.topAnchor),
+                host.view.bottomAnchor.<span class="func">constraint</span>(equalTo: contentView.bottomAnchor),
+                host.view.leadingAnchor.<span class="func">constraint</span>(equalTo: contentView.leadingAnchor),
+                host.view.trailingAnchor.<span class="func">constraint</span>(equalTo: contentView.trailingAnchor)
+            ])
+        } <span class="keyword">else</span> {
+            hosting?.rootView = root
+        }
+    }
+}</code></pre>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Flag (conceptual)</th>
+                <th>When it matters</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>.intrinsicContentSize</code></td>
+                <td>UIKit asks “how big are you?” — lists, self-sizing cells, compact banners</td>
+            </tr>
+            <tr>
+                <td><code>.preferredContentSize</code></td>
+                <td>Popovers, sheets, adaptive presentations that read preferred content size</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>2.3 safeAreaRegions</h3>
+
+    <p>Safe area is a <strong>UIKit ↔ SwiftUI contract</strong>. The hosting controller’s view receives safe area insets from the window and ancestor layout guides; SwiftUI maps that into the <code>safeAreaInsets</code> environment and layout proposals. Newer APIs allow finer-grained control over which regions participate in layout and hit testing.</p>
+
+    <p>In SwiftUI, <code>SafeAreaRegions</code> appears in the modern layout system (e.g. ignoring or prioritizing keyboard, container regions). In UIKit, <code>UIView</code> exposes safe area–related concepts that the hosting view honors when bridging. Staff discussion: mismatches often come from embedding hosting controllers inside scroll views with incorrect <code>contentInsetAdjustmentBehavior</code>, or from cells that reset safe area incorrectly.</p>
+
+    <pre><code><span class="comment">// SwiftUI side: explicit control of safe-area semantics in iOS 15+</span>
+<span class="type">ContentView</span>()
+    .<span class="func">safeAreaInset</span>(edge: .bottom) {
+        <span class="type">PlayerBar</span>()
+    }
+    .<span class="func">ignoresSafeArea</span>(.keyboard, edges: .bottom)</code></pre>
+
+    <h3>2.4 Lifecycle: viewDidLoad, viewWillAppear</h3>
+
+    <p>UIKit lifecycle methods still fire around the hosting controller. SwiftUI’s <code>onAppear</code> is not identical to <code>viewWillAppear</code>: appearance callbacks can be ordered differently, and SwiftUI may attach/detach subtrees during transitions in ways that surprise developers migrating from UIKit.</p>
+
+    <ul>
+        <li>Use <code>viewWillAppear</code> when integrating with UIKit state (navigation bar, toolbar) that must be updated before the transition animation.</li>
+        <li>Use <code>onAppear</code> for SwiftUI-centric work tied to the view graph’s lifetime.</li>
+        <li>Expect that <strong>multiple body evaluations</strong> can occur within a single UIKit appearance cycle when state changes batch.</li>
+    </ul>
+
+    <h3>2.5 Invalidation and Re-rendering</h3>
+
+    <p>When <code>@State</code>, <code>@Observable</code>, <code>@ObservedObject</code>, or environment dependencies change, SwiftUI invalidates affected nodes. The hosting controller does not automatically “reload” like a storyboard scene; instead, the SwiftUI engine performs targeted updates and then commits the minimal set of changes to Core Animation.</p>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Staff Pattern</div>
+        <p>Throttle expensive work at the <strong>model</strong> layer, not by fighting SwiftUI’s invalidation. Use <code>EquatableView</code>, careful <code>id</code> stability, and value-type models to reduce redundant body evaluations before you reach for manual display link throttling.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="uihostingview">3. _UIHostingView</h2>
+
+    <h3>3.1 Private UIView Subclass</h3>
+
+    <p><code>_UIHostingView</code> is the concrete <code>UIView</code> that sits beneath many <code>UIHostingController</code> presentations. It is responsible for hosting the renderable surface of SwiftUI and plumbing gestures, accessibility, and focus.</p>
+
+    <h3>3.2 Managing the CALayer Tree</h3>
+
+    <p>Unlike classic UIKit where developers often manually compose <code>CALayer</code> hierarchies, SwiftUI owns most layer creation. The hosting view provides the root container; SwiftUI adds, removes, or reorders descendant layers as the display list changes. This is why “debugging layers” with <code>UIView</code> recursive descriptions shows a structure that does not mirror your SwiftUI source line-by-line.</p>
+
+    <h3>3.3 Layout Integration with Auto Layout</h3>
+
+    <p>SwiftUI’s layout engine produces proposed sizes and positions. When embedded in UIKit, those results must reconcile with constraints. The hosting view implements the usual <code>UIView</code> layout hooks so that constraint updates cause SwiftUI to receive new size proposals, triggering layout passes that keep UIKit and SwiftUI in sync.</p>
+
+    <h3>3.4 intrinsicContentSize Bridging</h3>
+
+    <p>UIKit asks for an intrinsic size when using constraints like “ hugging ” content. SwiftUI’s ideal sizes flow through the bridge so Auto Layout can resolve ambiguous height/width in stacks, cells, and compact containers. Misconfigured bridging shows up as <code>UIView-Encapsulated-Layout-Height</code> warnings, zero heights, or clipping.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Symptom</th>
+                <th>Likely bridge cause</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Zero height in stack</td>
+                <td>Missing intrinsic bridging flags; conflicting compression resistance priorities</td>
+            </tr>
+            <tr>
+                <td>Clipped text</td>
+                <td>Fixed frame smaller than ideal text size; incorrect <code>lineLimit</code></td>
+            </tr>
+            <tr>
+                <td>Jumpy resizing</td>
+                <td>State updates during layout; animated constraint changes fighting SwiftUI layout</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="render-loop">4. Render Loop Integration with CADisplayLink</h2>
+
+    <p>Smooth motion requires aligning work with the display’s refresh cadence. SwiftUI participates in the same ecosystem as UIKit: <code>CADisplayLink</code> (and related timing sources) drives periodic updates that culminate in Core Animation commits and GPU presentation.</p>
+
+    <h3>4.1 Render Loop Timing (Conceptual)</h3>
+
+    <p>SwiftUI batches mutations into <strong>transactions</strong>. Within a frame, multiple state changes may coalesce. Animation curves are sampled over time; at each tick, new layer properties or display list deltas are produced, then committed.</p>
+
+    <h3>4.2 Display Refresh &amp; ProMotion (120Hz)</h3>
+
+    <p>On ProMotion devices, the system can present at higher refresh rates when content and power conditions allow. SwiftUI benefits automatically when animations are driven by the framework’s timing — but <strong>your</strong> manual timers or display links must avoid assuming 60Hz. Use display link timestamps and avoid hard-coded frame intervals.</p>
+
+    <h3>4.3 Transaction Batching</h3>
+
+    <p><code>withAnimation</code> and implicit animation contexts group changes. The Staff-level point: fewer commits with coherent timing generally outperform many micro-transactions that each touch layers.</p>
+
+    <h3>4.4 ASCII: Frame Timing</h3>
+
+    <div class="diagram">
+  Display vertical blank / ProMotion tick
+        │
+        ▼
+  ┌─────────────────┐
+  │ Input + runloop │  touches, timers, CA commits scheduled
+  └────────┬────────┘
+           │
+           ▼
+  ┌─────────────────┐
+  │ SwiftUI txn     │  invalidations → layout → display list delta
+  └────────┬────────┘
+           │
+           ▼
+  ┌─────────────────┐
+  │ CA commit       │  layer properties → render server
+  └────────┬────────┘
+           │
+           ▼
+  ┌─────────────────┐
+  │ GPU composite   │  Metal-backed surfaces, final frame
+  └─────────────────┘
+    </div>
+
+    <pre><code><span class="comment">// Never assume 1/60 when sampling; use targetTimestamp (UIKit display link)</span>
+displayLink.preferredFrameRateRange = <span class="type">CAFrameRateRange</span>(minimum: <span class="number">80</span>, maximum: <span class="number">120</span>, preferred: <span class="number">120</span>)</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="metal-backing">5. Metal Backing</h2>
+
+    <p>Modern iOS rendering heavily leverages the GPU. SwiftUI’s implementation uses Metal for substantial parts of rasterization and compositing, especially when views are flattened into textures or when system frameworks optimize path rendering.</p>
+
+    <h3>5.1 CAMetalLayer and Layer Backing</h3>
+
+    <p>While application code rarely sets this up for SwiftUI content directly, the implementation may back certain layers with Metal-compatible surfaces analogous to <code>CAMetalLayer</code> behavior — the same family of techniques used across UIKit’s rendering stack. The interview point: <strong>layers are interfaces; Metal is an implementation strategy</strong> for fulfilling layer contents efficiently.</p>
+
+    <h3>5.2 When Metal vs CPU</h3>
+
+    <p>CPU rendering tends to dominate for small, simple, or extremely dynamic vector paths where GPU setup dominates. GPU paths win for large fills, many blended sprites, and repeated effects. SwiftUI switches strategies internally; forcing behavior with modifiers like <code>drawingGroup()</code> changes the tradeoff explicitly.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Signal</th>
+                <th>Often implies</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>High GPU time in Instruments</td>
+                <td>Heavy compositing, large textures, expensive blur/material</td>
+            </tr>
+            <tr>
+                <td>High CPU in SwiftUI templates</td>
+                <td>Excessive body re-evaluation; unstable identities; huge lists</td>
+            </tr>
+            <tr>
+                <td>Framebuffer spikes</td>
+                <td>Offscreen passes; consider flattening or reducing blend chains</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>5.3 Performance Implications</h3>
+
+    <p>Metal is fast but not free. Textures consume memory bandwidth. Each offscreen pass has a setup cost. Staff engineers reason about <strong>pixel cost</strong> and <strong>pass count</strong> rather than treating GPU acceleration as automatic speedup.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="drawing-group">6. drawingGroup() — When and Why to Use</h2>
+
+    <p><code>drawingGroup(opaque:colorMode:)</code> renders the subtree into an <strong>offscreen representation</strong> (conceptually a Metal-friendly texture) as a single composited unit. It is a compositing optimization tool with sharp edges.</p>
+
+    <h3>6.1 What It Does</h3>
+
+    <ul>
+        <li>Flattens the affected subtree’s output into a single layer-ish result for compositing.</li>
+        <li>Enables GPU-friendly treatment of effects that would otherwise require multi-pass interaction with siblings.</li>
+        <li>Can change <strong>resolution/scaling</strong> behavior relative to vector-perfect continuous rendering — test on non-Retina simulators and with accessibility text sizes.</li>
+    </ul>
+
+    <h3>6.2 When to Use</h3>
+
+    <ul>
+        <li>Complex overlap with <strong>blend modes</strong> and opacity stacks that cause repeated overdraw.</li>
+        <li>Expensive graphical filters applied to a coherent subtree.</li>
+        <li>Reducing per-child layer churn when the subtree is visually one “object.”</li>
+    </ul>
+
+    <h3>6.3 When Not to Use</h3>
+
+    <ul>
+        <li>Text-heavy content where crisp subpixel antialiasing matters.</li>
+        <li>Simple layouts with no compositing pain — you may pay texture cost for no gain.</li>
+        <li>When dynamic content updates every frame — re-rasterizing a large texture can be slower than incremental updates.</li>
+    </ul>
+
+    <h3>6.4 Measurement Strategy</h3>
+
+    <ol>
+        <li>Profile with Instruments: Core Animation (commits, offscreen), GPU, SwiftUI.</li>
+        <li>Compare frame time with and without <code>drawingGroup()</code> on device, not just Simulator.</li>
+        <li>Test accessibility sizes and Reduce Transparency.</li>
+    </ol>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">GlowBadge</span>: <span class="type">View</span> {
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">ZStack</span> {
+            <span class="type">Circle</span>()
+                .<span class="func">fill</span>(<span class="type">Color</span>.cyan)
+                .<span class="func">blur</span>(radius: <span class="number">12</span>)
+            <span class="type">Text</span>(<span class="string">"SwiftUI"</span>)
+                .<span class="func">font</span>(.<span class="func">headline</span>)
+                .<span class="func">foregroundStyle</span>(.<span class="type">white</span>)
+        }
+        .<span class="func">compositingGroup</span>()
+        <span class="comment">// Try toggling drawingGroup() and profile GPU + overdraw:</span>
+        .<span class="func">drawingGroup</span>()
+    }
+}</code></pre>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">PlainStack</span>: <span class="type">View</span> {
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span>(alignment: .leading) {
+            <span class="type">Text</span>(<span class="string">"Title"</span>).<span class="func">font</span>(.<span class="func">title</span>)
+            <span class="type">Text</span>(<span class="string">"Body copy without expensive compositing."</span>)
+        }
+        <span class="comment">// Usually avoid drawingGroup() here — little benefit, possible blur to text.</span>
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="canvas">7. Canvas View (iOS 15) for High-Performance Drawing</h2>
+
+    <p><code>Canvas</code> is SwiftUI’s structured escape hatch for <strong>procedural drawing</strong> that amortizes overhead across many primitives. It is not a replacement for all <code>Shape</code> uses — it is a throughput-oriented API when the bottleneck is view count or repeated layer work.</p>
+
+    <h3>7.1 Canvas vs Shape vs Path</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>API</th>
+                <th>Strength</th>
+                <th>Weakness</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>Shape</code> / <code>Path</code> in <code>View</code> tree</td>
+                <td>Declarative, animation-friendly, simple scenes</td>
+                <td>Thousands of independent shapes → view/layer pressure</td>
+            </tr>
+            <tr>
+                <td><code>Canvas</code></td>
+                <td>Batch draw in one pass; <code>GraphicsContext</code> operations</td>
+                <td>More manual; bridging to accessibility needs care</td>
+            </tr>
+            <tr>
+                <td>CoreGraphics in <code>UIView</code></td>
+                <td>Maximum control in UIKit</td>
+                <td>Less natural in pure SwiftUI; hybrid complexity</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>7.2 GraphicsContext API</h3>
+
+    <p><code>GraphicsContext</code> exposes drawing primitives similar in spirit to Core Graphics: paths, fills, strokes, transforms, and filters — but integrated with SwiftUI’s rendering model. You draw inside the <code>Canvas</code> closure, optionally using a <code>TimelineView</code> or external state to drive updates.</p>
+
+    <h3>7.3 Resolving Symbols, Images, Text</h3>
+
+    <p><code>Canvas</code> allows resolving <code>Image</code> and text for drawing via <code>context.resolve(_:)</code> patterns (e.g. <code>Text</code>, <code>Image</code>) so rasterization can occur consistently with SwiftUI’s asset pipeline. This matters when mixing vector symbols with custom paths in one pass.</p>
+
+    <h3>7.4 Performance Rationale</h3>
+
+    <p>Many separate <code>Rectangle()</code> views imply independent layout and layer management. A single <code>Canvas</code> can emit hundreds of rectangles in one draw cycle, reducing overhead and improving batching — provided you are not forcing unnecessary state-driven redraws of the entire canvas each frame.</p>
+
+    <h3>7.5 Example: Particle System</h3>
+
+    <pre><code><span class="keyword">import</span> SwiftUI
+
+<span class="keyword">struct</span> <span class="type">Particle</span>: <span class="type">Identifiable</span> {
+    <span class="keyword">let</span> id = <span class="type">UUID</span>()
+    <span class="keyword">var</span> position: <span class="type">CGPoint</span>
+    <span class="keyword">var</span> velocity: <span class="type">CGVector</span>
+    <span class="keyword">var</span> color: <span class="type">Color</span>
+    <span class="keyword">var</span> life: <span class="type">Double</span>
+}
+
+<span class="keyword">struct</span> <span class="type">ParticleCanvas</span>: <span class="type">View</span> {
+    <span class="keyword">private</span> <span class="keyword">let</span> maxParticles = <span class="number">800</span>
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> particles: [<span class="type">Particle</span>] = []
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> lastTime: <span class="type">Date</span>?
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">TimelineView</span>(.<span class="func">animation</span>(minimumInterval: <span class="number">1</span> / <span class="number">120</span>)) { timeline <span class="keyword">in</span>
+            <span class="type">GeometryReader</span> { geo <span class="keyword">in</span>
+                <span class="keyword">let</span> layoutSize = geo.size
+                <span class="type">Canvas</span> { context, _ <span class="keyword">in</span>
+                    <span class="keyword">for</span> p <span class="keyword">in</span> particles {
+                        <span class="keyword">var</span> ctx = context
+                        ctx.<span class="func">opacity</span> = p.life
+                        ctx.<span class="func">fill</span>(
+                            <span class="type">Path</span>(ellipseIn: <span class="type">CGRect</span>(x: p.position.x, y: p.position.y, width: <span class="number">6</span>, height: <span class="number">6</span>)),
+                            <span class="func">with</span>: .<span class="func">color</span>(p.color)
+                        )
+                    }
+                }
+                .<span class="func">background</span>(<span class="type">Color</span>.black)
+                .<span class="func">onChange</span>(of: timeline.date) { _, now <span class="keyword">in</span>
+                    <span class="keyword">let</span> dt: <span class="type">TimeInterval</span>
+                    <span class="keyword">if</span> <span class="keyword">let</span> last = lastTime {
+                        dt = <span class="func">min</span>(now.<span class="func">timeIntervalSince</span>(last), <span class="number">1</span> / <span class="number">30</span>)
+                    } <span class="keyword">else</span> {
+                        dt = <span class="number">0</span>
+                    }
+                    lastTime = now
+                    <span class="keyword">if</span> dt &gt; <span class="number">0</span> { <span class="func">step</span>(dt: dt, in: layoutSize) }
+                }
+                .<span class="func">onTapGesture</span> { location <span class="keyword">in</span>
+                    <span class="keyword">guard</span> particles.count &lt; maxParticles <span class="keyword">else</span> { <span class="keyword">return</span> }
+                    particles.<span class="func">append</span>(<span class="type">Particle</span>(
+                        position: location,
+                        velocity: <span class="type">CGVector</span>(dx: .<span class="func">random</span>(in: -<span class="number">40</span>...<span class="number">40</span>), dy: .<span class="func">random</span>(in: -<span class="number">120</span>...-<span class="number">20</span>)),
+                        color: .<span class="func">orange</span>,
+                        life: <span class="number">1</span>
+                    ))
+                }
+            }
+        }
+    }
+
+    <span class="keyword">private</span> <span class="keyword">func</span> <span class="func">step</span>(dt: <span class="type">TimeInterval</span>, in size: <span class="type">CGSize</span>) {
+        particles = particles.<span class="func">map</span> { p <span class="keyword">in</span>
+            <span class="keyword">var</span> q = p
+            q.position.x += q.velocity.dx * dt
+            q.position.y += q.velocity.dy * dt
+            q.velocity.dy += <span class="number">120</span> * dt
+            q.life -= dt * <span class="number">0.35</span>
+            q.position.x = <span class="func">min</span>(<span class="func">max</span>(q.position.x, <span class="number">0</span>), size.width)
+            q.position.y = <span class="func">min</span>(<span class="func">max</span>(q.position.y, <span class="number">0</span>), size.height)
+            <span class="keyword">return</span> q
+        }.<span class="func">filter</span> { $0.life &gt; <span class="number">0</span> }
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Production Hardening</div>
+        <p><code>GeometryReader</code> supplies layout size to the simulation step; <code>dt</code> is clamped to reduce spiral-of-death after backgrounding. For accessibility, expose reduced motion and lower the particle cap.</p>
+    </div>
+
+    <h3>7.6 Example: Custom Chart</h3>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">SeriesPoint</span>: <span class="type">Identifiable</span> {
+        <span class="keyword">let</span> id = <span class="type">UUID</span>()
+        <span class="keyword">let</span> x: <span class="type">Double</span>
+        <span class="keyword">let</span> y: <span class="type">Double</span>
+    }
+
+<span class="keyword">struct</span> <span class="type">MiniLineChart</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> points: [<span class="type">SeriesPoint</span>]   <span class="comment">// sorted by x</span>
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">Canvas</span> { context, size <span class="keyword">in</span>
+            <span class="keyword">guard</span> <span class="keyword">let</span> minX = points.<span class="func">map</span>({ $0.x }).<span class="func">min</span>(),
+                  <span class="keyword">let</span> maxX = points.<span class="func">map</span>({ $0.x }).<span class="func">max</span>(),
+                  <span class="keyword">let</span> minY = points.<span class="func">map</span>({ $0.y }).<span class="func">min</span>(),
+                  <span class="keyword">let</span> maxY = points.<span class="func">map</span>({ $0.y }).<span class="func">max</span>(),
+                  maxX &gt; minX, maxY &gt; minY <span class="keyword">else</span> { <span class="keyword">return</span> }
+
+            <span class="keyword">func</span> <span class="func">mapToScreen</span>(_ p: <span class="type">SeriesPoint</span>) -&gt; <span class="type">CGPoint</span> {
+                <span class="keyword">let</span> nx = (p.x - minX) / (maxX - minX)
+                <span class="keyword">let</span> ny = (p.y - minY) / (maxY - minY)
+                <span class="keyword">return</span> <span class="type">CGPoint</span>(x: nx * size.width, y: size.height - ny * size.height)
+            }
+
+            <span class="keyword">var</span> path = <span class="type">Path</span>()
+            <span class="keyword">if</span> <span class="keyword">let</span> first = points.first {
+                path.<span class="func">move</span>(to: <span class="func">mapToScreen</span>(first))
+                <span class="keyword">for</span> pt <span class="keyword">in</span> points.<span class="func">dropFirst</span>() {
+                    path.<span class="func">addLine</span>(to: <span class="func">mapToScreen</span>(pt))
+                }
+            }
+
+            <span class="keyword">var</span> stroke = context
+            stroke.<span class="func">stroke</span>(
+                path,
+                <span class="func">with</span>: .<span class="func">color</span>(.<span class="func">cyan</span>),
+                style: <span class="type">StrokeStyle</span>(lineWidth: <span class="number">2</span>, lineJoin: .round)
+            )
+
+            <span class="keyword">var</span> fillPath = path
+            <span class="keyword">if</span> <span class="keyword">let</span> first = points.first, <span class="keyword">let</span> last = points.last {
+                <span class="keyword">let</span> a = <span class="func">mapToScreen</span>(first)
+                <span class="keyword">let</span> b = <span class="func">mapToScreen</span>(last)
+                fillPath.<span class="func">addLine</span>(to: <span class="type">CGPoint</span>(x: b.x, y: size.height))
+                fillPath.<span class="func">addLine</span>(to: <span class="type">CGPoint</span>(x: a.x, y: size.height))
+                fillPath.<span class="func">closeSubpath</span>()
+            }
+            context.<span class="func">fill</span>(fillPath, <span class="func">with</span>: .<span class="func">color</span>(.<span class="func">cyan</span>.opacity(<span class="number">0.15</span>)))
+        }
+        .<span class="func">frame</span>(height: <span class="number">140</span>)
+        .<span class="func">padding</span>()
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="timeline-view">8. TimelineView for Animations</h2>
+
+    <p><code>TimelineView</code> schedules periodic re-evaluation of its content aligned with a <code>TimelineSchedule</code>. It is the SwiftUI-native way to drive continuous animation or time-based visuals without owning a manual <code>CADisplayLink</code> in many cases.</p>
+
+    <h3>8.1 Schedules</h3>
+
+    <ul>
+        <li><code>.animation</code> — updates aligned with the animation frame cadence; optional <code>minimumInterval</code> to cap rate.</li>
+        <li><code>.animation(minimumInterval:)</code> — explicit throttle for high refresh displays.</li>
+        <li><code>.everyMinute</code> — wall-clock minute boundaries; great for clock faces and calendars.</li>
+        <li><code>.periodic(from:by:)</code> — deterministic phase from a start date with a repeating step.</li>
+        <li><code>.explicit(_:)</code> — fires on specific <code>Date</code> values; useful for staged animations or tests.</li>
+    </ul>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">ClockFace</span>: <span class="type">View</span> {
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">TimelineView</span>(.<span class="func">everyMinute</span>) { context <span class="keyword">in</span>
+            <span class="type">Text</span>(context.date, style: .time)
+                .<span class="func">font</span>(.<span class="func">largeTitle</span>)
+        }
+    }
+}
+
+<span class="keyword">struct</span> <span class="type">StrobeLabel</span>: <span class="type">View</span> {
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">TimelineView</span>(.<span class="func">periodic</span>(from: .now, by: <span class="number">0.25</span>)) { context <span class="keyword">in</span>
+            <span class="keyword">let</span> on = <span class="type">Int</span>(context.date.<span class="func">timeIntervalSinceReferenceDate</span> / <span class="number">0.25</span>) % <span class="number">2</span> == <span class="number">0</span>
+            <span class="type">Text</span>(on ? <span class="string">"ON"</span> : <span class="string">"OFF"</span>)
+                .<span class="func">foregroundStyle</span>(on ? <span class="type">Color</span>.green : <span class="type">Color</span>.red)
+        }
+    }
+}
+
+<span class="keyword">struct</span> <span class="type">ExplicitPulse</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> beats: [<span class="type">Date</span>]
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">TimelineView</span>(.<span class="func">explicit</span>(beats)) { context <span class="keyword">in</span>
+            <span class="type">Circle</span>()
+                .<span class="func">fill</span>(.<span class="func">accent</span>)
+                .<span class="func">scaleEffect</span>(<span class="number">1.05</span>)
+                .<span class="func">animation</span>(.<span class="func">easeInOut</span>, value: context.date)
+        }
+    }
+}</code></pre>
+
+    <h3>8.2 Combining TimelineView with Canvas</h3>
+
+    <p>Use <code>TimelineView</code> as the outer driver and <code>Canvas</code> as the inner renderer. The schedule controls how often the canvas closure executes; keep per-frame work proportional to the schedule’s frequency — on ProMotion devices, <code>.animation</code> can be very fast unless throttled.</p>
+
+    <pre><code><span class="type">TimelineView</span>(.<span class="func">animation</span>(minimumInterval: <span class="number">1</span> / <span class="number">60</span>)) { timeline <span class="keyword">in</span>
+    <span class="type">Canvas</span> { context, size <span class="keyword">in</span>
+        <span class="keyword">let</span> t = timeline.date.<span class="func">timeIntervalSinceReferenceDate</span>
+        <span class="keyword">let</span> wave = <span class="func">sin</span>(t * <span class="number">2</span> * .pi * <span class="number">0.5</span>) * size.height * <span class="number">0.2</span>
+        <span class="keyword">var</span> path = <span class="type">Path</span>()
+        path.<span class="func">move</span>(to: <span class="type">CGPoint</span>(x: <span class="number">0</span>, y: size.height * <span class="number">0.5</span> + wave))
+        <span class="keyword">for</span> x <span class="keyword">in</span> <span class="type">stride</span>(from: <span class="number">0</span>, to: <span class="type">Int</span>(size.width), by: <span class="number">6</span>) {
+            <span class="keyword">let</span> y = size.height * <span class="number">0.5</span> + <span class="func">sin</span>((<span class="type">Double</span>(x) / size.width + t) * <span class="number">2</span> * .pi) * <span class="number">18</span>
+            path.<span class="func">addLine</span>(to: <span class="type">CGPoint</span>(x: <span class="type">CGFloat</span>(x), y: y))
+        }
+        context.<span class="func">stroke</span>(path, <span class="func">with</span>: .<span class="func">color</span>(.<span class="func">purple</span>), lineWidth: <span class="number">2</span>)
+    }
+    .<span class="func">frame</span>(height: <span class="number">120</span>)
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect-limits">9. Architect Callout: When SwiftUI Rendering Hits Its Limits</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect — Leaving the Garden</div>
+        <p>SwiftUI excels at product velocity and coherent animations for typical interface work. It becomes the wrong <em>sole</em> tool when you need deterministic frame pacing for custom simulations, extremely large bitmap editing, novel Metal pipelines, or low-level touch sampling paths that UIKit or direct Metal handle more predictably.</p>
+    </div>
+
+    <h3>9.1 Signals to Drop to UIKit / Metal</h3>
+
+    <ul>
+        <li><strong>Sustained full-screen GPU effects</strong> with custom shaders — consider <code>MTKView</code> or SceneKit/RealityKit depending on domain.</li>
+        <li><strong>Massive dynamic geometry</strong> (scientific visualization) where SwiftUI’s view invalidation dominates.</li>
+        <li><strong>Pixel-exact editor tooling</strong> requiring rich text layout APIs not yet ergonomic in SwiftUI.</li>
+        <li><strong>Interactive 120Hz drawing</strong> with minimal latency — profile; you may need UIKit gesture coalescing + custom backing.</li>
+    </ul>
+
+    <h3>9.2 Hybrid Strategies</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Pattern</th>
+                <th>Use when</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>UIViewRepresentable</code> for a Metal view</td>
+                <td>SwiftUI chrome + custom central renderer</td>
+            </tr>
+            <tr>
+                <td><code>Canvas</code> + throttled <code>TimelineView</code></td>
+                <td>Thousands of lightweight primitives</td>
+            </tr>
+            <tr>
+                <td>Pre-baked textures / asset catalogs</td>
+                <td>Static complexity, dynamic motion via transforms</td>
+            </tr>
+            <tr>
+                <td><code>drawingGroup</code> selective flattening</td>
+                <td>Localized blend/overdraw storms</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>9.3 Real-World Performance Boundaries</h3>
+
+    <p>Staff interviews reward engineers who connect <strong>metrics</strong> to <strong>mechanisms</strong>: time spent in SwiftUI body evaluation vs GPU vs CA commits; layer count; offscreen passes; memory bandwidth. The boundary is rarely “SwiftUI slow” — it is a specific subsystem hitting its scalability curve. Your job is to localize which bridge — layout, rasterization, compositing, or state invalidation — is the bottleneck, then choose the smallest escape hatch.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Closing Sound Bite</div>
+        <p>SwiftUI is a <em>compiler and runtime for UI</em> that <strong>targets Core Animation</strong> with <strong>Metal-backed rasterization</strong> where profitable. Staff engineers explain rendering issues in those three layers — invalidation, layer structure, GPU cost — not in framework slogans.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="04-layout-system.html">← Layout System</a>
+        <a href="06-navigation-evolution.html">Next: Navigation →</a>
+    </div>
+</div>
+</body>
+</html>

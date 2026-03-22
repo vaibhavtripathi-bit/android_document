@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>State Restoration — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">App Lifecycle</a><span class="sep">›</span>
+        State Restoration
+    </nav>
+
+    <h1>State Restoration</h1>
+    <p class="subtitle">Three generations of state restoration APIs — from NSCoder-based to NSUserActivity to SwiftUI @SceneStorage — and how to build a system that survives app updates.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#overview">1. Why State Restoration Matters</a></li>
+            <li><a href="#nscoder">2. NSCoder-Based Restoration (Legacy)</a></li>
+            <li><a href="#nsuseractivity">3. NSUserActivity-Based Restoration</a></li>
+            <li><a href="#swiftui">4. SwiftUI @SceneStorage</a></li>
+            <li><a href="#restoration-id">5. restorationIdentifier Chain</a></li>
+            <li><a href="#scene-based-break">6. Why State Restoration Broke in Scene-Based Apps</a></li>
+            <li><a href="#codable">7. Codable State Serialization</a></li>
+            <li><a href="#architect">8. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="overview">1. Why State Restoration Matters</h2>
+
+    <p>State restoration is the mechanism by which an app recreates its UI state after process termination. On iOS, this is not a nice-to-have — it's essential because the system routinely kills background apps via Jetsam. Without state restoration, users return to your app and find themselves at the root screen instead of where they left off.</p>
+
+    <div class="diagram">
+User is on Screen C → Switches to Safari → Jetsam kills your app
+                                                    │
+                                                    ▼
+                                        ┌─────────────────────┐
+                                        │  WITHOUT RESTORATION │
+                                        │  User returns → Root │
+                                        │  screen. Frustrating.│
+                                        └─────────────────────┘
+                                                    │
+                                        ┌─────────────────────┐
+                                        │  WITH RESTORATION    │
+                                        │  User returns →      │
+                                        │  Screen C restored.  │
+                                        │  Seamless.           │
+                                        └─────────────────────┘
+    </div>
+
+    <h3>1.1 Three Eras of State Restoration</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Era</th>
+                <th>API</th>
+                <th>iOS Version</th>
+                <th>Status</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Generation 1</td>
+                <td><code>NSCoder</code>-based (<code>UIStateRestoring</code>)</td>
+                <td>iOS 6–12</td>
+                <td>Deprecated for scene-based apps</td>
+            </tr>
+            <tr>
+                <td>Generation 2</td>
+                <td><code>NSUserActivity</code>-based</td>
+                <td>iOS 13+</td>
+                <td>Current UIKit approach</td>
+            </tr>
+            <tr>
+                <td>Generation 3</td>
+                <td><code>@SceneStorage</code></td>
+                <td>iOS 14+</td>
+                <td>SwiftUI native approach</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="nscoder">2. NSCoder-Based Restoration (Legacy)</h2>
+
+    <p>The original state restoration system was deeply integrated into UIKit. The system would walk the view controller hierarchy, encode each controller's state using <code>NSCoder</code>, and save it to disk.</p>
+
+    <h3>2.1 How It Worked</h3>
+
+    <div class="diagram">
+SAVE (entering background):
+UIApplication
+  └── shouldSaveApplicationState → true
+      └── Walk VC hierarchy (by restorationIdentifier)
+          ├── encodeRestorableState(with: NSCoder)
+          ├── encodeRestorableState(with: NSCoder)
+          └── encodeRestorableState(with: NSCoder)
+              └── Write archive to disk
+
+RESTORE (next launch):
+UIApplication
+  └── shouldRestoreApplicationState → true
+      └── Read archive from disk
+          └── For each saved VC:
+              ├── viewControllerWithRestorationIdentifierPath → create VC
+              └── decodeRestorableState(with: NSCoder)
+    </div>
+
+    <h3>2.2 Implementation</h3>
+
+    <pre><code><span class="comment">// AppDelegate: opt in to restoration</span>
+<span class="keyword">func</span> <span class="func">application</span>(<span class="keyword">_</span> app: <span class="type">UIApplication</span>,
+    shouldSaveSecureApplicationState coder: <span class="type">NSCoder</span>) -> <span class="type">Bool</span> {
+    <span class="keyword">return</span> <span class="keyword">true</span>
+}
+
+<span class="keyword">func</span> <span class="func">application</span>(<span class="keyword">_</span> app: <span class="type">UIApplication</span>,
+    shouldRestoreSecureApplicationState coder: <span class="type">NSCoder</span>) -> <span class="type">Bool</span> {
+    <span class="comment">// Check version compatibility</span>
+    <span class="keyword">let</span> savedVersion = coder.<span class="func">decodeObject</span>(
+        of: <span class="type">NSString</span>.<span class="keyword">self</span>,
+        forKey: <span class="type">UIApplication</span>.stateRestorationBundleVersionKey
+    ) <span class="keyword">as?</span> <span class="type">String</span>
+    <span class="keyword">let</span> currentVersion = <span class="type">Bundle</span>.main.infoDictionary?[<span class="string">"CFBundleVersion"</span>] <span class="keyword">as?</span> <span class="type">String</span>
+    <span class="keyword">return</span> savedVersion == currentVersion
+}
+
+<span class="comment">// View Controller: encode/decode state</span>
+<span class="keyword">class</span> <span class="type">DetailViewController</span>: <span class="type">UIViewController</span> {
+    <span class="keyword">var</span> itemID: <span class="type">String</span>?
+    
+    <span class="keyword">override var</span> restorationIdentifier: <span class="type">String</span>? {
+        <span class="keyword">get</span> { <span class="keyword">return</span> <span class="string">"DetailVC"</span> }
+        <span class="keyword">set</span> { }
+    }
+    
+    <span class="keyword">override var</span> restorationClass: <span class="type">UIViewControllerRestoration</span>.<span class="type">Type</span>? {
+        <span class="keyword">return</span> <span class="type">DetailViewController</span>.<span class="keyword">self</span>
+    }
+    
+    <span class="keyword">override func</span> <span class="func">encodeRestorableState</span>(with coder: <span class="type">NSCoder</span>) {
+        <span class="keyword">super</span>.<span class="func">encodeRestorableState</span>(with: coder)
+        coder.<span class="func">encode</span>(itemID, forKey: <span class="string">"itemID"</span>)
+    }
+    
+    <span class="keyword">override func</span> <span class="func">decodeRestorableState</span>(with coder: <span class="type">NSCoder</span>) {
+        <span class="keyword">super</span>.<span class="func">decodeRestorableState</span>(with: coder)
+        itemID = coder.<span class="func">decodeObject</span>(
+            of: <span class="type">NSString</span>.<span class="keyword">self</span>,
+            forKey: <span class="string">"itemID"</span>
+        ) <span class="keyword">as?</span> <span class="type">String</span>
+    }
+}
+
+<span class="comment">// UIViewControllerRestoration: factory method</span>
+<span class="keyword">extension</span> <span class="type">DetailViewController</span>: <span class="type">UIViewControllerRestoration</span> {
+    <span class="keyword">static func</span> <span class="func">viewController</span>(
+        withRestorationIdentifierPath path: [<span class="type">String</span>],
+        coder: <span class="type">NSCoder</span>
+    ) -> <span class="type">UIViewController</span>? {
+        <span class="keyword">return</span> <span class="type">DetailViewController</span>()
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: NSCoder Security</div>
+        <p>The original <code>shouldSaveApplicationState</code> / <code>shouldRestoreApplicationState</code> methods used <strong>insecure</strong> <code>NSCoder</code> decoding. Apple deprecated these in iOS 13.2 and replaced them with <code>shouldSaveSecureApplicationState</code> / <code>shouldRestoreSecureApplicationState</code> which use <code>NSSecureCoding</code>. The insecure versions are vulnerable to object substitution attacks if the restoration archive is tampered with.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="nsuseractivity">3. NSUserActivity-Based Restoration</h2>
+
+    <p>iOS 13's scene-based lifecycle introduced a simpler, more flexible approach using <code>NSUserActivity</code>. Instead of encoding the entire view controller hierarchy, you encode a high-level description of the user's activity.</p>
+
+    <h3>3.1 Saving State</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">SceneDelegate</span>: <span class="type">UIResponder</span>, <span class="type">UIWindowSceneDelegate</span> {
+    
+    <span class="comment">// Called when the system wants to save state for this scene</span>
+    <span class="keyword">func</span> <span class="func">stateRestorationActivity</span>(for scene: <span class="type">UIScene</span>) -> <span class="type">NSUserActivity</span>? {
+        <span class="keyword">let</span> activity = <span class="type">NSUserActivity</span>(activityType: <span class="string">"com.app.browsing"</span>)
+        
+        <span class="comment">// Encode current state</span>
+        <span class="keyword">guard let</span> navController = window?.rootViewController <span class="keyword">as?</span> <span class="type">UINavigationController</span> <span class="keyword">else</span> {
+            <span class="keyword">return</span> <span class="keyword">nil</span>
+        }
+        
+        <span class="keyword">var</span> state: [<span class="type">String</span>: <span class="type">Any</span>] = [:]
+        state[<span class="string">"selectedTab"</span>] = tabController?.selectedIndex ?? <span class="number">0</span>
+        
+        <span class="comment">// Encode navigation stack as route descriptors</span>
+        <span class="keyword">let</span> routes = navController.viewControllers.<span class="func">compactMap</span> { vc -> [<span class="type">String</span>: <span class="type">Any</span>]? <span class="keyword">in</span>
+            <span class="keyword">guard let</span> restorable = vc <span class="keyword">as?</span> <span class="type">StateRestorable</span> <span class="keyword">else</span> { <span class="keyword">return</span> <span class="keyword">nil</span> }
+            <span class="keyword">return</span> restorable.restorationState
+        }
+        state[<span class="string">"navigationStack"</span>] = routes
+        
+        activity.userInfo = state
+        activity.title = <span class="string">"App State"</span>
+        <span class="keyword">return</span> activity
+    }
+}</code></pre>
+
+    <h3>3.2 Restoring State</h3>
+
+    <pre><code><span class="keyword">func</span> <span class="func">scene</span>(<span class="keyword">_</span> scene: <span class="type">UIScene</span>,
+    willConnectTo session: <span class="type">UISceneSession</span>,
+    options: <span class="type">UIScene</span>.<span class="type">ConnectionOptions</span>) {
+    
+    <span class="keyword">guard let</span> windowScene = scene <span class="keyword">as?</span> <span class="type">UIWindowScene</span> <span class="keyword">else</span> { <span class="keyword">return</span> }
+    
+    <span class="comment">// Create window and basic UI</span>
+    <span class="keyword">let</span> window = <span class="type">UIWindow</span>(windowScene: windowScene)
+    <span class="keyword">let</span> rootVC = <span class="type">MainTabController</span>()
+    window.rootViewController = rootVC
+    window.<span class="func">makeKeyAndVisible</span>()
+    <span class="keyword">self</span>.window = window
+    
+    <span class="comment">// Restore state from session's activity</span>
+    <span class="keyword">if let</span> activity = session.stateRestorationActivity,
+       activity.activityType == <span class="string">"com.app.browsing"</span> {
+        <span class="func">restore</span>(from: activity, into: rootVC)
+    }
+    
+    <span class="comment">// Handle incoming URL/activity (takes priority over restoration)</span>
+    <span class="keyword">if let</span> urlContext = options.urlContexts.first {
+        <span class="func">handle</span>(url: urlContext.url, in: rootVC)
+    } <span class="keyword">else if let</span> userActivity = options.userActivities.first {
+        <span class="func">handle</span>(userActivity: userActivity, in: rootVC)
+    }
+}
+
+<span class="keyword">private func</span> <span class="func">restore</span>(from activity: <span class="type">NSUserActivity</span>, into tabController: <span class="type">MainTabController</span>) {
+    <span class="keyword">guard let</span> userInfo = activity.userInfo <span class="keyword">else</span> { <span class="keyword">return</span> }
+    
+    <span class="keyword">if let</span> tabIndex = userInfo[<span class="string">"selectedTab"</span>] <span class="keyword">as?</span> <span class="type">Int</span> {
+        tabController.selectedIndex = tabIndex
+    }
+    
+    <span class="keyword">if let</span> routes = userInfo[<span class="string">"navigationStack"</span>] <span class="keyword">as?</span> [[<span class="type">String</span>: <span class="type">Any</span>]] {
+        <span class="keyword">let</span> viewControllers = routes.<span class="func">compactMap</span> { routeData -> <span class="type">UIViewController</span>? <span class="keyword">in</span>
+            <span class="type">ViewControllerFactory</span>.<span class="func">create</span>(from: routeData)
+        }
+        <span class="keyword">if let</span> nav = tabController.selectedViewController <span class="keyword">as?</span> <span class="type">UINavigationController</span> {
+            nav.<span class="func">setViewControllers</span>(viewControllers, animated: <span class="keyword">false</span>)
+        }
+    }
+}</code></pre>
+
+    <h3>3.3 NSUserActivity Advantages</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Feature</th>
+                <th>NSCoder-based</th>
+                <th>NSUserActivity-based</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Granularity</td>
+                <td>Per-view-controller</td>
+                <td>Per-scene (you choose granularity)</td>
+            </tr>
+            <tr>
+                <td>Handoff support</td>
+                <td>No</td>
+                <td>Yes (same activity powers Handoff)</td>
+            </tr>
+            <tr>
+                <td>Spotlight indexing</td>
+                <td>No</td>
+                <td>Yes (isEligibleForSearch)</td>
+            </tr>
+            <tr>
+                <td>Siri Shortcuts</td>
+                <td>No</td>
+                <td>Yes (isEligibleForPrediction)</td>
+            </tr>
+            <tr>
+                <td>Multi-scene</td>
+                <td>Broken</td>
+                <td>Designed for it</td>
+            </tr>
+            <tr>
+                <td>Complexity</td>
+                <td>High (restoration class, identifier chain)</td>
+                <td>Low (single activity object)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="swiftui">4. SwiftUI @SceneStorage</h2>
+
+    <p>SwiftUI provides the simplest state restoration API yet: <code>@SceneStorage</code>. It automatically persists values per-scene and restores them when the scene reconnects.</p>
+
+    <h3>4.1 Basic Usage</h3>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">ContentView</span>: <span class="type">View</span> {
+    <span class="comment">// Automatically saved and restored per-scene</span>
+    <span class="keyword">@SceneStorage</span>(<span class="string">"selectedTab"</span>) <span class="keyword">private var</span> selectedTab: <span class="type">String</span> = <span class="string">"home"</span>
+    <span class="keyword">@SceneStorage</span>(<span class="string">"searchText"</span>) <span class="keyword">private var</span> searchText: <span class="type">String</span> = <span class="string">""</span>
+    <span class="keyword">@SceneStorage</span>(<span class="string">"scrollPosition"</span>) <span class="keyword">private var</span> scrollPosition: <span class="type">Double</span> = <span class="number">0</span>
+    
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">TabView</span>(selection: $selectedTab) {
+            <span class="type">HomeView</span>(searchText: $searchText)
+                .<span class="func">tag</span>(<span class="string">"home"</span>)
+            <span class="type">SettingsView</span>()
+                .<span class="func">tag</span>(<span class="string">"settings"</span>)
+        }
+    }
+}</code></pre>
+
+    <h3>4.2 Supported Types</h3>
+
+    <p><code>@SceneStorage</code> supports a limited set of types out of the box:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Type</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td><code>Bool</code></td><td>Direct support</td></tr>
+            <tr><td><code>Int</code></td><td>Direct support</td></tr>
+            <tr><td><code>Double</code></td><td>Direct support</td></tr>
+            <tr><td><code>String</code></td><td>Direct support</td></tr>
+            <tr><td><code>URL</code></td><td>Direct support</td></tr>
+            <tr><td><code>Data</code></td><td>Direct support</td></tr>
+            <tr><td><code>RawRepresentable</code></td><td>Where RawValue is Int or String</td></tr>
+        </tbody>
+    </table>
+
+    <h3>4.3 Custom Types via RawRepresentable</h3>
+
+    <pre><code><span class="comment">// Use RawRepresentable to store complex types</span>
+<span class="keyword">enum</span> <span class="type">AppTab</span>: <span class="type">String</span> {
+    <span class="keyword">case</span> home, search, profile, settings
+}
+
+<span class="keyword">struct</span> <span class="type">ContentView</span>: <span class="type">View</span> {
+    <span class="keyword">@SceneStorage</span>(<span class="string">"tab"</span>) <span class="keyword">private var</span> tab: <span class="type">AppTab</span> = .home
+    <span class="comment">// Works because AppTab: String (RawRepresentable)</span>
+}
+
+<span class="comment">// For complex state, encode as Data</span>
+<span class="keyword">struct</span> <span class="type">NavigationState</span>: <span class="type">Codable</span> {
+    <span class="keyword">var</span> path: [<span class="type">String</span>]
+    <span class="keyword">var</span> selectedID: <span class="type">String</span>?
+}
+
+<span class="keyword">extension</span> <span class="type">NavigationState</span>: <span class="type">RawRepresentable</span> {
+    <span class="keyword">var</span> rawValue: <span class="type">String</span> {
+        <span class="keyword">guard let</span> data = <span class="keyword">try</span>? <span class="type">JSONEncoder</span>().<span class="func">encode</span>(<span class="keyword">self</span>),
+              <span class="keyword">let</span> string = <span class="type">String</span>(data: data, encoding: .utf8)
+        <span class="keyword">else</span> { <span class="keyword">return</span> <span class="string">""</span> }
+        <span class="keyword">return</span> string
+    }
+    
+    <span class="keyword">init</span>?(rawValue: <span class="type">String</span>) {
+        <span class="keyword">guard let</span> data = rawValue.<span class="func">data</span>(using: .utf8),
+              <span class="keyword">let</span> decoded = <span class="keyword">try</span>? <span class="type">JSONDecoder</span>().<span class="func">decode</span>(<span class="type">NavigationState</span>.<span class="keyword">self</span>, from: data)
+        <span class="keyword">else</span> { <span class="keyword">return</span> <span class="keyword">nil</span> }
+        <span class="keyword">self</span> = decoded
+    }
+}
+
+<span class="keyword">struct</span> <span class="type">DetailView</span>: <span class="type">View</span> {
+    <span class="keyword">@SceneStorage</span>(<span class="string">"navState"</span>) <span class="keyword">private var</span> navState = <span class="type">NavigationState</span>(path: [], selectedID: <span class="keyword">nil</span>)
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: @SceneStorage Limitations</div>
+        <p><code>@SceneStorage</code> is <strong>not</strong> a general-purpose persistence mechanism. It's specifically for scene state restoration. Key limitations:</p>
+        <ul>
+            <li>Data is <strong>not</strong> shared between scenes (each scene has its own storage)</li>
+            <li>Data may be purged by the system at any time</li>
+            <li>Not suitable for user data — only UI state</li>
+            <li>No encryption — don't store sensitive information</li>
+            <li>Size should be kept small (kilobytes, not megabytes)</li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="restoration-id">5. restorationIdentifier Chain</h2>
+
+    <p>In the legacy NSCoder system, every view controller in the hierarchy needed a <code>restorationIdentifier</code>. The system used the chain of identifiers to uniquely identify each controller:</p>
+
+    <pre><code><span class="comment">// The restoration identifier path for a deeply nested VC:</span>
+<span class="comment">// ["TabBarController", "NavigationController", "DetailVC"]</span>
+
+<span class="comment">// If ANY controller in the chain is missing an identifier,</span>
+<span class="comment">// all its children are excluded from restoration.</span>
+
+<span class="keyword">class</span> <span class="type">MainTabController</span>: <span class="type">UITabBarController</span> {
+    <span class="keyword">override func</span> <span class="func">viewDidLoad</span>() {
+        <span class="keyword">super</span>.<span class="func">viewDidLoad</span>()
+        restorationIdentifier = <span class="string">"MainTab"</span>
+        
+        <span class="keyword">let</span> nav = <span class="type">UINavigationController</span>(rootViewController: <span class="type">HomeViewController</span>())
+        nav.restorationIdentifier = <span class="string">"HomeNav"</span>  <span class="comment">// Must set on nav too!</span>
+        
+        viewControllers = [nav]
+    }
+}
+
+<span class="keyword">class</span> <span class="type">HomeViewController</span>: <span class="type">UIViewController</span> {
+    <span class="keyword">override func</span> <span class="func">viewDidLoad</span>() {
+        <span class="keyword">super</span>.<span class="func">viewDidLoad</span>()
+        restorationIdentifier = <span class="string">"HomeVC"</span>
+    }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Identifier Uniqueness</div>
+        <p>The <code>restorationIdentifier</code> only needs to be unique among siblings — not globally. The system builds a path like <code>["TabBar", "Nav", "Detail"]</code>. However, if you have multiple instances of the same VC class (e.g., in a tab bar), each needs a distinct identifier. A common pattern is to use the tab index or a content identifier as part of the restoration identifier.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="scene-based-break">6. Why State Restoration Broke in Scene-Based Apps</h2>
+
+    <p>The transition to scene-based lifecycle in iOS 13 broke the legacy NSCoder restoration system in several ways:</p>
+
+    <h3>6.1 The Breaking Changes</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Issue</th>
+                <th>Pre-iOS 13</th>
+                <th>iOS 13+ (Scene-based)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Restoration timing</td>
+                <td>Between willFinish and didFinish</td>
+                <td>During scene connection</td>
+            </tr>
+            <tr>
+                <td>Restoration scope</td>
+                <td>Entire app (one window)</td>
+                <td>Per-scene</td>
+            </tr>
+            <tr>
+                <td>Window ownership</td>
+                <td>AppDelegate creates window</td>
+                <td>SceneDelegate creates window</td>
+            </tr>
+            <tr>
+                <td>Save trigger</td>
+                <td><code>applicationDidEnterBackground</code></td>
+                <td><code>stateRestorationActivity(for:)</code></td>
+            </tr>
+            <tr>
+                <td>NSCoder methods</td>
+                <td>Called automatically</td>
+                <td><strong>Not called</strong> for scene-based apps</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>6.2 Migration Path</h3>
+
+    <pre><code><span class="comment">// If you had NSCoder-based restoration and adopted scenes,</span>
+<span class="comment">// you need to migrate to NSUserActivity-based restoration.</span>
+
+<span class="keyword">class</span> <span class="type">SceneDelegate</span>: <span class="type">UIResponder</span>, <span class="type">UIWindowSceneDelegate</span> {
+    
+    <span class="keyword">func</span> <span class="func">stateRestorationActivity</span>(for scene: <span class="type">UIScene</span>) -> <span class="type">NSUserActivity</span>? {
+        <span class="comment">// Replace the entire NSCoder chain with a single activity</span>
+        <span class="keyword">let</span> activity = <span class="type">NSUserActivity</span>(activityType: <span class="string">"com.app.state"</span>)
+        
+        <span class="comment">// Encode your state as a simple dictionary</span>
+        <span class="keyword">var</span> state = <span class="type">AppStateSnapshot</span>()
+        state.selectedTab = tabController.selectedIndex
+        state.navigationStack = <span class="func">captureNavigationStack</span>()
+        state.scrollPositions = <span class="func">captureScrollPositions</span>()
+        
+        <span class="keyword">if let</span> data = <span class="keyword">try</span>? <span class="type">JSONEncoder</span>().<span class="func">encode</span>(state) {
+            activity.addUserInfoEntries(from: [<span class="string">"state"</span>: data])
+        }
+        
+        <span class="keyword">return</span> activity
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="codable">7. Codable State Serialization</h2>
+
+    <h3>7.1 Designing Restorable State</h3>
+
+    <pre><code><span class="comment">// Define a Codable state model for your entire app</span>
+<span class="keyword">struct</span> <span class="type">AppStateSnapshot</span>: <span class="type">Codable</span> {
+    <span class="keyword">var</span> version: <span class="type">Int</span> = <span class="number">1</span>  <span class="comment">// For migration</span>
+    <span class="keyword">var</span> selectedTab: <span class="type">Int</span> = <span class="number">0</span>
+    <span class="keyword">var</span> navigationStacks: [<span class="type">String</span>: [<span class="type">RouteDescriptor</span>]] = [:]
+    <span class="keyword">var</span> scrollPositions: [<span class="type">String</span>: <span class="type">CGFloat</span>] = [:]
+    <span class="keyword">var</span> searchQueries: [<span class="type">String</span>: <span class="type">String</span>] = [:]
+    <span class="keyword">var</span> draftContent: [<span class="type">String</span>: <span class="type">String</span>] = [:]
+}
+
+<span class="keyword">struct</span> <span class="type">RouteDescriptor</span>: <span class="type">Codable</span> {
+    <span class="keyword">let</span> type: <span class="type">String</span>       <span class="comment">// "detail", "profile", "settings"</span>
+    <span class="keyword">let</span> parameters: [<span class="type">String</span>: <span class="type">String</span>]  <span class="comment">// ["id": "123"]</span>
+}
+
+<span class="comment">// Protocol for view controllers that can save/restore state</span>
+<span class="keyword">protocol</span> <span class="type">StateRestorable</span> {
+    <span class="keyword">var</span> routeDescriptor: <span class="type">RouteDescriptor</span> { <span class="keyword">get</span> }
+    <span class="keyword">func</span> <span class="func">restore</span>(from descriptor: <span class="type">RouteDescriptor</span>)
+}
+
+<span class="comment">// Factory to recreate VCs from descriptors</span>
+<span class="keyword">enum</span> <span class="type">ViewControllerFactory</span> {
+    <span class="keyword">static func</span> <span class="func">create</span>(from descriptor: <span class="type">RouteDescriptor</span>) -> <span class="type">UIViewController</span>? {
+        <span class="keyword">switch</span> descriptor.type {
+        <span class="keyword">case</span> <span class="string">"detail"</span>:
+            <span class="keyword">guard let</span> id = descriptor.parameters[<span class="string">"id"</span>] <span class="keyword">else</span> { <span class="keyword">return</span> <span class="keyword">nil</span> }
+            <span class="keyword">return</span> <span class="type">DetailViewController</span>(itemID: id)
+        <span class="keyword">case</span> <span class="string">"profile"</span>:
+            <span class="keyword">guard let</span> userID = descriptor.parameters[<span class="string">"userID"</span>] <span class="keyword">else</span> { <span class="keyword">return</span> <span class="keyword">nil</span> }
+            <span class="keyword">return</span> <span class="type">ProfileViewController</span>(userID: userID)
+        <span class="keyword">default</span>:
+            <span class="keyword">return</span> <span class="keyword">nil</span>
+        }
+    }
+}</code></pre>
+
+    <h3>7.2 Version Migration</h3>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">StateMigrator</span> {
+    <span class="keyword">static func</span> <span class="func">migrate</span>(<span class="keyword">_</span> data: <span class="type">Data</span>) -> <span class="type">AppStateSnapshot</span>? {
+        <span class="keyword">let</span> decoder = <span class="type">JSONDecoder</span>()
+        
+        <span class="comment">// Try current version first</span>
+        <span class="keyword">if let</span> state = <span class="keyword">try</span>? decoder.<span class="func">decode</span>(<span class="type">AppStateSnapshot</span>.<span class="keyword">self</span>, from: data),
+           state.version == <span class="type">AppStateSnapshot</span>.currentVersion {
+            <span class="keyword">return</span> state
+        }
+        
+        <span class="comment">// Try v1 and migrate</span>
+        <span class="keyword">if let</span> v1 = <span class="keyword">try</span>? decoder.<span class="func">decode</span>(<span class="type">AppStateSnapshotV1</span>.<span class="keyword">self</span>, from: data) {
+            <span class="keyword">return</span> <span class="func">migrateV1ToV2</span>(v1)
+        }
+        
+        <span class="comment">// Unrecognized version — return nil (start fresh)</span>
+        <span class="keyword">return</span> <span class="keyword">nil</span>
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">8. Architect Considerations</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: Building Robust State Restoration Across App Updates</div>
+        <p>State restoration that works within a single app version is easy. Building a system that works <strong>across app updates</strong> — where view controllers may be renamed, navigation flows restructured, and data models changed — is an architectural challenge.</p>
+    </div>
+
+    <h3>8.1 Design Principles</h3>
+
+    <pre><code><span class="comment">// Principle 1: Restore INTENT, not UI structure</span>
+<span class="comment">// BAD: "User was on DetailViewController with itemID 123"</span>
+<span class="comment">// GOOD: "User was viewing item 123"</span>
+
+<span class="comment">// Principle 2: Version your state format</span>
+<span class="keyword">struct</span> <span class="type">RestorationState</span>: <span class="type">Codable</span> {
+    <span class="keyword">static let</span> currentVersion = <span class="number">3</span>
+    <span class="keyword">let</span> version: <span class="type">Int</span>
+    <span class="keyword">let</span> intent: <span class="type">UserIntent</span>  <span class="comment">// What the user was doing</span>
+}
+
+<span class="comment">// Principle 3: Use route descriptors, not class names</span>
+<span class="keyword">enum</span> <span class="type">UserIntent</span>: <span class="type">Codable</span> {
+    <span class="keyword">case</span> viewingItem(id: <span class="type">String</span>)
+    <span class="keyword">case</span> composingMessage(draftID: <span class="type">String</span>?)
+    <span class="keyword">case</span> browsing(category: <span class="type">String</span>, page: <span class="type">Int</span>)
+    <span class="keyword">case</span> searching(query: <span class="type">String</span>)
+}
+
+<span class="comment">// Principle 4: Graceful degradation</span>
+<span class="keyword">func</span> <span class="func">restore</span>(intent: <span class="type">UserIntent</span>) {
+    <span class="keyword">switch</span> intent {
+    <span class="keyword">case</span> .viewingItem(<span class="keyword">let</span> id):
+        <span class="keyword">if</span> <span class="func">canNavigateToItem</span>(id) {
+            <span class="func">navigateToItem</span>(id)
+        } <span class="keyword">else</span> {
+            <span class="comment">// Item may have been deleted — fall back gracefully</span>
+            <span class="func">navigateToHome</span>()
+        }
+    <span class="keyword">case</span> .composingMessage(<span class="keyword">let</span> draftID):
+        <span class="keyword">if let</span> draftID, <span class="func">draftExists</span>(draftID) {
+            <span class="func">openComposer</span>(draftID: draftID)
+        } <span class="keyword">else</span> {
+            <span class="func">openComposer</span>(draftID: <span class="keyword">nil</span>)
+        }
+    <span class="keyword">default</span>:
+        <span class="func">navigateToHome</span>()
+    }
+}
+
+<span class="comment">// Principle 5: Test restoration with process kill</span>
+<span class="comment">// In Xcode: Debug → Simulate Background Fetch</span>
+<span class="comment">// Or: stop the app from Xcode while it's backgrounded</span></code></pre>
+
+    <h3>8.2 Unified Restoration System</h3>
+
+    <pre><code><span class="comment">// A unified system that works for both UIKit and SwiftUI</span>
+<span class="keyword">@MainActor</span>
+<span class="keyword">final class</span> <span class="type">RestorationManager</span>: <span class="type">ObservableObject</span> {
+    <span class="keyword">@Published</span> <span class="keyword">var</span> currentIntent: <span class="type">UserIntent</span>?
+    
+    <span class="keyword">private let</span> encoder = <span class="type">JSONEncoder</span>()
+    <span class="keyword">private let</span> decoder = <span class="type">JSONDecoder</span>()
+    
+    <span class="comment">// Save to NSUserActivity for UIKit scene restoration</span>
+    <span class="keyword">func</span> <span class="func">activity</span>() -> <span class="type">NSUserActivity</span>? {
+        <span class="keyword">guard let</span> intent = currentIntent,
+              <span class="keyword">let</span> data = <span class="keyword">try</span>? encoder.<span class="func">encode</span>(intent)
+        <span class="keyword">else</span> { <span class="keyword">return</span> <span class="keyword">nil</span> }
+        
+        <span class="keyword">let</span> activity = <span class="type">NSUserActivity</span>(activityType: <span class="string">"com.app.restore"</span>)
+        activity.addUserInfoEntries(from: [<span class="string">"intent"</span>: data])
+        
+        <span class="comment">// Bonus: make it eligible for Handoff and Spotlight</span>
+        activity.isEligibleForHandoff = <span class="keyword">true</span>
+        activity.isEligibleForSearch = <span class="keyword">true</span>
+        activity.title = intent.displayTitle
+        
+        <span class="keyword">return</span> activity
+    }
+    
+    <span class="comment">// Restore from NSUserActivity</span>
+    <span class="keyword">func</span> <span class="func">restore</span>(from activity: <span class="type">NSUserActivity</span>) {
+        <span class="keyword">guard let</span> data = activity.userInfo?[<span class="string">"intent"</span>] <span class="keyword">as?</span> <span class="type">Data</span>,
+              <span class="keyword">let</span> intent = <span class="keyword">try</span>? decoder.<span class="func">decode</span>(<span class="type">UserIntent</span>.<span class="keyword">self</span>, from: data)
+        <span class="keyword">else</span> { <span class="keyword">return</span> }
+        
+        currentIntent = intent
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: State Restoration Testing</div>
+        <p>State restoration is notoriously hard to test because it requires process death. Strategies:</p>
+        <ul>
+            <li>In Xcode: background your app, then stop it from Xcode. Relaunch to test restoration.</li>
+            <li>Write unit tests that encode/decode your state models to verify round-trip fidelity</li>
+            <li>Test migration by keeping old state snapshots as test fixtures</li>
+            <li>Test graceful degradation: what happens when restored state references deleted content?</li>
+            <li>Use <code>XCUIApplication.terminate()</code> in UI tests to simulate process death</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="03-process-lifecycle.html">← Process Lifecycle</a>
+        <a href="05-deep-links-universal-links.html">Next: Deep Links &amp; Universal Links →</a>
+    </div>
+</div>
+</body>
+</html>

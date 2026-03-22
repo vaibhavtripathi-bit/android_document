@@ -1,0 +1,875 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Xcode Build System — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Build &amp; Toolchain</a><span class="sep">›</span>
+        Xcode Build System
+    </nav>
+
+    <h1>Xcode Build System</h1>
+    <p class="subtitle">The complete xcodebuild pipeline — from xcconfig layering and build settings inheritance through compilation, linking, resource copying, and script phases. Understanding how Xcode orchestrates builds is foundational for optimizing build times and architecting multi-target projects at scale.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#pipeline">1. xcodebuild Pipeline Phases</a></li>
+            <li><a href="#xcconfig">2. xcconfig Files &amp; Layered Configuration</a></li>
+            <li><a href="#inheritance">3. Build Settings Inheritance</a></li>
+            <li><a href="#derived-data">4. Derived Data Structure</a></li>
+            <li><a href="#build-phases">5. Build Phases Deep Dive</a></li>
+            <li><a href="#script-phases">6. Script Phases &amp; Incremental Builds</a></li>
+            <li><a href="#compilation-mode">7. SWIFT_COMPILATION_MODE</a></li>
+            <li><a href="#parallelism">8. Build Parallelism</a></li>
+            <li><a href="#new-build-system">9. New Build System (llbuild)</a></li>
+            <li><a href="#architect">10. Architect: Build Configuration for Debug/Staging/Release</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="pipeline">1. xcodebuild Pipeline Phases</h2>
+
+    <p>When you press Cmd+B or run <code>xcodebuild</code> from the command line, the build system executes a well-defined pipeline. Understanding each phase is critical for diagnosing build failures and optimizing build times.</p>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────┐
+│                    xcodebuild Pipeline                               │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  1. Resolve Package Dependencies                                     │
+│     └─ SPM resolution, checkout, build package graph                 │
+│                                                                      │
+│  2. Create Build Description                                         │
+│     └─ Evaluate build settings, resolve $(inherited), $(SRCROOT)     │
+│     └─ Generate dependency graph of all tasks                        │
+│                                                                      │
+│  3. Compile Sources                                                  │
+│     ├─ Swift: swiftc (whole module or incremental)                   │
+│     ├─ Obj-C: clang per-file compilation                             │
+│     ├─ C/C++: clang per-file compilation                             │
+│     └─ Storyboards/XIBs: ibtool compilation                         │
+│                                                                      │
+│  4. Link Binary                                                      │
+│     └─ ld64/ld-prime: link .o files + frameworks → executable        │
+│                                                                      │
+│  5. Copy Resources                                                   │
+│     ├─ Asset catalogs → actool → Assets.car                         │
+│     ├─ Strings files → compiled .strings                             │
+│     └─ Other resources copied to bundle                              │
+│                                                                      │
+│  6. Run Script Phases                                                │
+│     └─ Custom scripts (SwiftLint, code generation, etc.)             │
+│                                                                      │
+│  7. Code Sign                                                        │
+│     └─ codesign with entitlements and provisioning profile            │
+│                                                                      │
+│  8. Validate                                                         │
+│     └─ Product validation for archive/export                         │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>1.1 Build Description Generation</h3>
+
+    <p>The build system first creates a <strong>build description</strong> — a directed acyclic graph (DAG) of all tasks that need to execute. This is where build settings are fully resolved, file lists are computed, and the dependency graph is established. The new build system (llbuild) uses this graph to determine maximum parallelism.</p>
+
+    <pre><code><span class="comment">// View the build description with verbose logging</span>
+xcodebuild build \
+    -project MyApp.xcodeproj \
+    -scheme MyApp \
+    -showBuildSettings \
+    -configuration Debug</code></pre>
+
+    <h3>1.2 Key xcodebuild Commands</h3>
+
+    <pre><code><span class="comment"># Build with specific settings</span>
+xcodebuild -workspace MyApp.xcworkspace \
+    -scheme MyApp \
+    -configuration Release \
+    -destination <span class="string">'platform=iOS Simulator,name=iPhone 15'</span> \
+    SWIFT_COMPILATION_MODE=wholemodule \
+    build
+
+<span class="comment"># Archive for distribution</span>
+xcodebuild archive \
+    -workspace MyApp.xcworkspace \
+    -scheme MyApp \
+    -archivePath ./build/MyApp.xcarchive
+
+<span class="comment"># Export IPA from archive</span>
+xcodebuild -exportArchive \
+    -archivePath ./build/MyApp.xcarchive \
+    -exportPath ./build/output \
+    -exportOptionsPlist ExportOptions.plist
+
+<span class="comment"># Build timing summary</span>
+xcodebuild build -showBuildTimingSummary</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Build Timing Summary</div>
+        <p>The <code>-showBuildTimingSummary</code> flag (Xcode 10+) outputs the wall-clock time for each build phase. This is your first tool for identifying bottlenecks. Look for script phases that don't use input/output file lists — they run on every build regardless of changes.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="xcconfig">2. xcconfig Files &amp; Layered Configuration</h2>
+
+    <p>Build configuration files (<code>.xcconfig</code>) are plain-text files that define build settings. They're the preferred way to manage build settings because they're diffable, mergeable, and composable — unlike the opaque <code>.pbxproj</code> file.</p>
+
+    <h3>2.1 xcconfig Syntax</h3>
+
+    <pre><code><span class="comment">// Base.xcconfig — shared settings</span>
+PRODUCT_BUNDLE_IDENTIFIER = com.company.myapp
+SWIFT_VERSION = 5.9
+IPHONEOS_DEPLOYMENT_TARGET = 16.0
+ENABLE_BITCODE = NO
+
+<span class="comment">// Variable substitution</span>
+MY_FRAMEWORK_SEARCH_PATHS = $(SRCROOT)/Frameworks
+
+<span class="comment">// Conditional settings (SDK-specific)</span>
+OTHER_LDFLAGS[sdk=iphoneos*] = -lz -lsqlite3
+OTHER_LDFLAGS[sdk=iphonesimulator*] = -lz
+
+<span class="comment">// Conditional settings (architecture-specific)</span>
+EXCLUDED_ARCHS[sdk=iphonesimulator*] = arm64
+
+<span class="comment">// Conditional settings (configuration-specific)</span>
+SWIFT_OPTIMIZATION_LEVEL[config=Debug] = -Onone
+SWIFT_OPTIMIZATION_LEVEL[config=Release] = -O
+
+<span class="comment">// Include other xcconfig files</span>
+#include "Warnings.xcconfig"
+#include? "Local.xcconfig"  <span class="comment">// Optional include (won't fail if missing)</span></code></pre>
+
+    <h3>2.2 Layered Configuration Pattern</h3>
+
+    <p>For large projects, use a layered xcconfig architecture that separates concerns:</p>
+
+    <div class="diagram">
+Configurations/
+├── Base.xcconfig                 ← Shared across all targets/configs
+├── Warnings.xcconfig             ← Warning flags only
+├── Debug.xcconfig                ← #include "Base.xcconfig" + debug overrides
+├── Staging.xcconfig              ← #include "Base.xcconfig" + staging overrides
+├── Release.xcconfig              ← #include "Base.xcconfig" + release overrides
+├── Targets/
+│   ├── App.xcconfig              ← App-specific (bundle ID, entitlements)
+│   ├── AppTests.xcconfig         ← Test-specific settings
+│   ├── Framework-Core.xcconfig   ← Core framework settings
+│   └── Framework-UI.xcconfig     ← UI framework settings
+└── Local.xcconfig                ← .gitignored, developer-specific overrides
+    </div>
+
+    <pre><code><span class="comment">// Debug.xcconfig</span>
+#include "Base.xcconfig"
+#include "Warnings.xcconfig"
+
+SWIFT_OPTIMIZATION_LEVEL = -Onone
+SWIFT_COMPILATION_MODE = incremental
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) DEBUG=1
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) DEBUG
+MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE
+ENABLE_TESTABILITY = YES
+ONLY_ACTIVE_ARCH = YES
+COPY_PHASE_STRIP = NO</code></pre>
+
+    <pre><code><span class="comment">// Release.xcconfig</span>
+#include "Base.xcconfig"
+#include "Warnings.xcconfig"
+
+SWIFT_OPTIMIZATION_LEVEL = -O
+SWIFT_COMPILATION_MODE = wholemodule
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) NDEBUG=1
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited)
+ENABLE_TESTABILITY = NO
+COPY_PHASE_STRIP = YES
+STRIP_INSTALLED_PRODUCT = YES
+DEAD_CODE_STRIPPING = YES</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">xcconfig Pitfall: $(inherited)</div>
+        <p>Forgetting <code>$(inherited)</code> silently replaces parent values instead of appending. This is the #1 source of mysterious build failures with xcconfig files. Always use <code>$(inherited)</code> for list-type settings like <code>OTHER_LDFLAGS</code>, <code>FRAMEWORK_SEARCH_PATHS</code>, and <code>SWIFT_ACTIVE_COMPILATION_CONDITIONS</code>.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="inheritance">3. Build Settings Inheritance</h2>
+
+    <p>Build settings resolve through a strict precedence chain. Understanding this chain is essential for debugging "why is this setting not taking effect?"</p>
+
+    <div class="diagram">
+Build Setting Resolution Order (highest to lowest priority):
+
+┌──────────────────────────────────────────────────────────────┐
+│  1. Command-line overrides (xcodebuild FOO=bar)              │  ← Highest
+├──────────────────────────────────────────────────────────────┤
+│  2. Target-level settings (Build Settings tab)               │
+├──────────────────────────────────────────────────────────────┤
+│  3. Target-level xcconfig file                               │
+├──────────────────────────────────────────────────────────────┤
+│  4. Project-level settings (Build Settings tab)              │
+├──────────────────────────────────────────────────────────────┤
+│  5. Project-level xcconfig file                              │
+├──────────────────────────────────────────────────────────────┤
+│  6. Xcode default values                                     │  ← Lowest
+└──────────────────────────────────────────────────────────────┘
+
+$(inherited) walks UP this chain, collecting values from each level.
+    </div>
+
+    <h3>3.1 How $(inherited) Works</h3>
+
+    <pre><code><span class="comment">// Project-level xcconfig</span>
+OTHER_LDFLAGS = -lz -lsqlite3
+
+<span class="comment">// Target-level xcconfig</span>
+OTHER_LDFLAGS = $(inherited) -lxml2
+
+<span class="comment">// Resolved value: -lz -lsqlite3 -lxml2</span>
+
+<span class="comment">// WITHOUT $(inherited):</span>
+OTHER_LDFLAGS = -lxml2
+<span class="comment">// Resolved value: -lxml2  (project-level values LOST!)</span></code></pre>
+
+    <h3>3.2 Debugging Build Settings</h3>
+
+    <pre><code><span class="comment"># Show all resolved build settings for a target</span>
+xcodebuild -showBuildSettings \
+    -project MyApp.xcodeproj \
+    -target MyApp \
+    -configuration Debug
+
+<span class="comment"># Filter for specific setting</span>
+xcodebuild -showBuildSettings | grep SWIFT_COMPILATION_MODE
+
+<span class="comment"># In Xcode: Build Settings tab → "Levels" view</span>
+<span class="comment"># Shows: Resolved | Target | Target xcconfig | Project | Project xcconfig | Default</span></code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Use the Levels View</div>
+        <p>In Xcode's Build Settings tab, switch to the "Levels" view (top-left segmented control). This shows exactly where each setting value comes from — resolved, target, target xcconfig, project, project xcconfig, or default. It's the fastest way to debug build setting inheritance issues.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="derived-data">4. Derived Data Structure</h2>
+
+    <p>Derived data is where Xcode stores all build artifacts, indexes, and logs. Understanding its structure helps you debug build issues, manage disk space, and configure CI caching.</p>
+
+    <div class="diagram">
+~/Library/Developer/Xcode/DerivedData/
+└── MyApp-{hash}/
+    ├── Build/
+    │   ├── Intermediates.noindex/
+    │   │   └── MyApp.build/
+    │   │       └── Debug-iphonesimulator/
+    │   │           └── MyApp.build/
+    │   │               ├── Objects-normal/
+    │   │               │   └── arm64/
+    │   │               │       ├── *.o              ← Compiled object files
+    │   │               │       ├── *.swiftmodule     ← Swift module interfaces
+    │   │               │       ├── *.d               ← Dependency files
+    │   │               │       └── *.dia             ← Serialized diagnostics
+    │   │               ├── DerivedSources/           ← Generated source files
+    │   │               │   ├── GeneratedAssetSymbols.swift
+    │   │               │   └── resource_bundle_accessor.swift
+    │   │               └── MyApp-Swift.h             ← Generated ObjC header
+    │   └── Products/
+    │       └── Debug-iphonesimulator/
+    │           └── MyApp.app/                        ← Final product
+    ├── Index.noindex/                                ← Source index (code completion)
+    │   └── DataStore/                                ← IndexStoreDB data
+    ├── Logs/
+    │   ├── Build/                                    ← Build logs (.xcactivitylog)
+    │   └── Test/                                     ← Test logs
+    └── info.plist                                    ← Workspace reference
+    </div>
+
+    <h3>4.1 Key Derived Data Paths</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Path</th>
+                <th>Contents</th>
+                <th>CI Caching?</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>Build/Intermediates.noindex/</code></td>
+                <td>Object files, Swift modules, dependency info</td>
+                <td>Yes — most impactful for incremental builds</td>
+            </tr>
+            <tr>
+                <td><code>Build/Products/</code></td>
+                <td>Final .app, .framework, .xctest bundles</td>
+                <td>Yes — useful for test-only CI runs</td>
+            </tr>
+            <tr>
+                <td><code>Index.noindex/</code></td>
+                <td>Source index for code completion and navigation</td>
+                <td>No — machine-specific, large</td>
+            </tr>
+            <tr>
+                <td><code>Logs/Build/</code></td>
+                <td>Build logs in .xcactivitylog format</td>
+                <td>No — but useful for post-build analysis</td>
+            </tr>
+            <tr>
+                <td><code>ModuleCache.noindex/</code></td>
+                <td>Clang module cache (PCM files)</td>
+                <td>Sometimes — invalidated by SDK changes</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment"># Custom derived data path (useful for CI)</span>
+xcodebuild -derivedDataPath ./build/DerivedData build
+
+<span class="comment"># Clean derived data for a specific project</span>
+<span class="keyword">rm</span> -rf ~/Library/Developer/Xcode/DerivedData/MyApp-*
+
+<span class="comment"># Parse build logs</span>
+xclogparser parse --project MyApp --reporter html</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="build-phases">5. Build Phases Deep Dive</h2>
+
+    <p>Build phases define the ordered steps that transform source code into a product. Each phase type has specific semantics that affect incremental builds.</p>
+
+    <h3>5.1 Compile Sources</h3>
+
+    <p>This phase invokes the compiler for each source file. For Swift, the behavior depends on <code>SWIFT_COMPILATION_MODE</code>:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Incremental Mode</th>
+                <th>Whole Module Mode</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Compilation unit</td>
+                <td>Per-file (primary file + all others for type info)</td>
+                <td>All files in module at once</td>
+            </tr>
+            <tr>
+                <td>Parallelism</td>
+                <td>Multiple swiftc processes</td>
+                <td>Single swiftc, internal parallelism</td>
+            </tr>
+            <tr>
+                <td>Incremental?</td>
+                <td>Yes — only recompiles changed files + dependents</td>
+                <td>No — recompiles everything</td>
+            </tr>
+            <tr>
+                <td>Optimization</td>
+                <td>Limited (per-file visibility)</td>
+                <td>Full (cross-file inlining, devirtualization)</td>
+            </tr>
+            <tr>
+                <td>Typical use</td>
+                <td>Debug builds</td>
+                <td>Release builds</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>5.2 Link Binary With Libraries</h3>
+
+    <p>Specifies which frameworks and libraries to link against. The linker (ld64 or the new ld-prime in Xcode 15) resolves symbols and produces the final executable.</p>
+
+    <pre><code><span class="comment">// Build settings that affect linking</span>
+OTHER_LDFLAGS = -framework CoreData -lsqlite3
+LD_RUNPATH_SEARCH_PATHS = @executable_path/Frameworks
+DEAD_CODE_STRIPPING = YES
+STRIP_STYLE = all  <span class="comment">// or debugging, non-global</span></code></pre>
+
+    <h3>5.3 Copy Bundle Resources</h3>
+
+    <p>Copies non-code assets into the app bundle. Asset catalogs are compiled by <code>actool</code> into a single <code>Assets.car</code> file. Storyboards and XIBs are compiled by <code>ibtool</code> into <code>.storyboardc</code> and <code>.nib</code> files.</p>
+
+    <h3>5.4 Build Phase Ordering</h3>
+
+    <div class="diagram">
+Execution Order (within a single target):
+
+  ┌─ Target Dependencies (other targets built first)
+  │
+  ├─ Compile Sources
+  │   ├─ Swift files → swiftc → .o + .swiftmodule
+  │   ├─ ObjC files → clang → .o
+  │   └─ Storyboards → ibtool → .storyboardc
+  │
+  ├─ Link Binary With Libraries
+  │   └─ ld64: .o files + frameworks → executable
+  │
+  ├─ Copy Bundle Resources
+  │   ├─ Asset catalogs → actool → Assets.car
+  │   ├─ Compiled storyboards → bundle
+  │   └─ Other resources → bundle
+  │
+  ├─ Run Script Phases (in declared order)
+  │   └─ Custom scripts (linting, code gen, etc.)
+  │
+  ├─ Copy Headers (for frameworks)
+  │
+  ├─ Embed Frameworks
+  │   └─ Copy .framework bundles into Frameworks/
+  │
+  └─ Code Sign
+      └─ codesign with entitlements
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="script-phases">6. Script Phases &amp; Incremental Builds</h2>
+
+    <p>Run Script phases are the most common cause of unnecessary build time. Without proper input/output file configuration, they run on <strong>every single build</strong>, even when nothing has changed.</p>
+
+    <h3>6.1 Input/Output Files for Incremental Builds</h3>
+
+    <p>The build system uses input/output file lists to determine if a script phase needs to re-run. If all output files exist and are newer than all input files, the phase is skipped.</p>
+
+    <pre><code><span class="comment"># SwiftLint script phase — WRONG (runs every build)</span>
+<span class="comment"># Shell: /bin/sh</span>
+swiftlint lint --config .swiftlint.yml
+
+<span class="comment"># SwiftLint script phase — RIGHT (incremental)</span>
+<span class="comment"># Input Files: $(SRCROOT)/.swiftlint.yml</span>
+<span class="comment"># Input File Lists: $(SRCROOT)/SwiftLintInputFiles.xcfilelist</span>
+<span class="comment"># Output Files: $(DERIVED_FILE_DIR)/swiftlint_result.txt</span>
+swiftlint lint --config .swiftlint.yml > <span class="string">"${DERIVED_FILE_DIR}/swiftlint_result.txt"</span> 2>&amp;1 || true</code></pre>
+
+    <h3>6.2 File Lists (.xcfilelist)</h3>
+
+    <p>For phases with many input/output files, use <code>.xcfilelist</code> files instead of listing each file individually:</p>
+
+    <pre><code><span class="comment">// SwiftLintInputFiles.xcfilelist</span>
+$(SRCROOT)/Sources/App/AppDelegate.swift
+$(SRCROOT)/Sources/App/SceneDelegate.swift
+$(SRCROOT)/Sources/Features/Home/HomeViewController.swift
+<span class="comment">// ... all Swift files that SwiftLint should check</span></code></pre>
+
+    <h3>6.3 Common Script Phase Patterns</h3>
+
+    <pre><code><span class="comment"># SwiftGen — code generation from assets</span>
+<span class="comment"># Input Files: $(SRCROOT)/Resources/Assets.xcassets</span>
+<span class="comment"># Output Files: $(SRCROOT)/Sources/Generated/Assets.swift</span>
+<span class="keyword">if</span> [ <span class="string">"$ENABLE_PREVIEWS"</span> = <span class="string">"NO"</span> ]; then
+    swiftgen config run --config swiftgen.yml
+<span class="keyword">fi</span>
+
+<span class="comment"># Build number from git</span>
+<span class="comment"># Output Files: $(DERIVED_FILE_DIR)/build_number.txt</span>
+git rev-list --count HEAD > <span class="string">"${DERIVED_FILE_DIR}/build_number.txt"</span>
+/usr/libexec/PlistBuddy -c <span class="string">"Set :CFBundleVersion $(cat ${DERIVED_FILE_DIR}/build_number.txt)"</span> \
+    <span class="string">"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}"</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Script Phase Pitfall: "Based on dependency analysis"</div>
+        <p>In Xcode 14+, there's a checkbox "Based on dependency analysis" for script phases. When enabled AND you provide input/output files, the build system can reorder the script phase for better parallelism. Without input/output files, this option is ignored and the script runs every time. Always provide file lists.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="compilation-mode">7. SWIFT_COMPILATION_MODE</h2>
+
+    <p>This build setting controls how the Swift compiler processes files within a module. It has a dramatic impact on both build time and runtime performance.</p>
+
+    <h3>7.1 Incremental Mode (<code>incremental</code>)</h3>
+
+    <p>The Swift driver launches separate compilation jobs for each file. Each job receives one "primary" file to compile, plus all other files in the module for type information (but doesn't generate code for them). The driver tracks cross-file dependencies and only recompiles files affected by changes.</p>
+
+    <div class="diagram">
+Incremental Compilation:
+
+  Source Files:    A.swift   B.swift   C.swift   D.swift
+                      │         │         │         │
+  Compiler Jobs:   swiftc    swiftc    swiftc    swiftc
+  (parallel)       -primary  -primary  -primary  -primary
+                    A.swift   B.swift   C.swift   D.swift
+                      │         │         │         │
+  Object Files:    A.o       B.o       C.o       D.o
+
+  Change B.swift → only recompile B.o (+ dependents)
+    </div>
+
+    <h3>7.2 Whole Module Mode (<code>wholemodule</code>)</h3>
+
+    <p>A single compiler invocation processes all files in the module together. This enables cross-file optimizations but means any change recompiles everything.</p>
+
+    <div class="diagram">
+Whole Module Compilation:
+
+  Source Files:    A.swift   B.swift   C.swift   D.swift
+                      │         │         │         │
+                      └─────────┼─────────┼─────────┘
+                                │
+                          Single swiftc
+                          (all files)
+                                │
+                      ┌─────────┼─────────┐─────────┐
+                      │         │         │         │
+  Object Files:    A.o       B.o       C.o       D.o
+
+  Change B.swift → recompile ALL files
+    </div>
+
+    <h3>7.3 Optimization Differences</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Optimization</th>
+                <th>Incremental</th>
+                <th>Whole Module</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Cross-file inlining</td>
+                <td>No (only @inlinable)</td>
+                <td>Yes</td>
+            </tr>
+            <tr>
+                <td>Devirtualization</td>
+                <td>Limited</td>
+                <td>Full (can see all conformances)</td>
+            </tr>
+            <tr>
+                <td>Generic specialization</td>
+                <td>Limited</td>
+                <td>Full (can specialize across files)</td>
+            </tr>
+            <tr>
+                <td>Dead code elimination</td>
+                <td>Per-file only</td>
+                <td>Module-wide</td>
+            </tr>
+            <tr>
+                <td>Typical speedup</td>
+                <td>Baseline</td>
+                <td>2-5x runtime improvement</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Build settings</span>
+<span class="comment">// Debug (fast iteration)</span>
+SWIFT_COMPILATION_MODE = incremental
+SWIFT_OPTIMIZATION_LEVEL = -Onone
+
+<span class="comment">// Release (maximum performance)</span>
+SWIFT_COMPILATION_MODE = wholemodule
+SWIFT_OPTIMIZATION_LEVEL = -O
+
+<span class="comment">// Size-optimized release</span>
+SWIFT_COMPILATION_MODE = wholemodule
+SWIFT_OPTIMIZATION_LEVEL = -Osize</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="parallelism">8. Build Parallelism</h2>
+
+    <p>The Xcode build system exploits parallelism at multiple levels. Understanding these levels helps you structure projects for maximum build speed.</p>
+
+    <h3>8.1 Levels of Parallelism</h3>
+
+    <div class="diagram">
+Level 1: Target Parallelism
+  ┌─────────┐  ┌─────────┐  ┌─────────┐
+  │ Core.fw │  │  UI.fw  │  │Network.fw│   ← Independent targets build in parallel
+  └────┬────┘  └────┬────┘  └────┬────┘
+       │            │            │
+       └────────────┼────────────┘
+                    │
+              ┌─────┴─────┐
+              │  App.app  │                 ← Waits for all dependencies
+              └───────────┘
+
+Level 2: File Parallelism (within a target)
+  swiftc -primary A.swift  ┐
+  swiftc -primary B.swift  ├── Run in parallel (incremental mode)
+  swiftc -primary C.swift  ┘
+
+Level 3: Compiler-Internal Parallelism
+  Single swiftc invocation uses multiple threads for:
+  - Type checking (limited parallelism)
+  - SIL optimization passes
+  - LLVM code generation (per-function)
+    </div>
+
+    <h3>8.2 Parallelism-Limiting Factors</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Factor</th>
+                <th>Impact</th>
+                <th>Mitigation</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Deep dependency chains</td>
+                <td>Serializes target builds</td>
+                <td>Flatten dependency graph, extract shared modules</td>
+            </tr>
+            <tr>
+                <td>Large monolithic targets</td>
+                <td>Single long compilation</td>
+                <td>Split into smaller modules</td>
+            </tr>
+            <tr>
+                <td>Script phases without file lists</td>
+                <td>Block subsequent phases</td>
+                <td>Add input/output files, enable dependency analysis</td>
+            </tr>
+            <tr>
+                <td>Bridging header</td>
+                <td>Serializes Swift/ObjC compilation</td>
+                <td>Migrate to explicit modules</td>
+            </tr>
+            <tr>
+                <td>Whole module mode in debug</td>
+                <td>No file-level parallelism</td>
+                <td>Use incremental mode for debug</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Control parallelism</span>
+<span class="comment">// Maximum parallel compile tasks (default: number of CPU cores)</span>
+xcodebuild -jobs 8 build
+
+<span class="comment">// In Xcode: Xcode → Settings → Locations → Build System</span>
+<span class="comment">// "Parallelize Build" checkbox in scheme editor</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="new-build-system">9. New Build System (llbuild)</h2>
+
+    <p>Xcode 10 introduced the "new build system" (now the only option since Xcode 14). It's built on <strong>llbuild</strong>, an open-source build engine from the Swift project.</p>
+
+    <h3>9.1 llbuild Architecture</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│                     Xcode IDE / xcodebuild                   │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    XCBBuildService                            │
+│  (separate process — XPC service)                            │
+│                                                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ Build Request│  │ Dependency   │  │ Build Description│   │
+│  │ Parser       │→ │ Graph Builder│→ │ Generator        │   │
+│  └──────────────┘  └──────────────┘  └────────┬─────────┘   │
+│                                                │             │
+└────────────────────────────────────────────────┼─────────────┘
+                                                 │
+                                                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│                        llbuild                               │
+│                                                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ Task Graph   │  │ Build Engine │  │ Execution Engine  │   │
+│  │ (DAG)        │→ │ (scheduling) │→ │ (parallel exec)   │   │
+│  └──────────────┘  └──────────────┘  └──────────────────┘   │
+│                                                              │
+│  Features:                                                   │
+│  • Deterministic builds                                      │
+│  • Automatic dependency discovery                            │
+│  • Build manifest caching                                    │
+│  • Parallel task execution                                   │
+└─────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>9.2 Key Improvements Over Legacy Build System</h3>
+
+    <ul>
+        <li><strong>Dependency-based scheduling</strong> — Tasks execute as soon as dependencies are satisfied, not in fixed order</li>
+        <li><strong>Better parallelism</strong> — More fine-grained task graph enables higher parallelism</li>
+        <li><strong>Deterministic builds</strong> — Same inputs always produce same task ordering</li>
+        <li><strong>Cycle detection</strong> — Detects dependency cycles at build description time, not at runtime</li>
+        <li><strong>Build description caching</strong> — Reuses build descriptions across builds when project structure hasn't changed</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">10. Architect: Build Configuration for Debug/Staging/Release</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>At the Staff level, you're expected to design the build configuration architecture for a multi-target app with debug, staging, and release environments, feature flags, and CI/CD integration. Here's a production-grade approach.</p>
+    </div>
+
+    <h3>10.1 Multi-Environment Configuration</h3>
+
+    <pre><code><span class="comment">// Configurations/Environments/Debug.xcconfig</span>
+#include "../Base.xcconfig"
+#include "../Warnings.xcconfig"
+
+APP_DISPLAY_NAME = MyApp (Dev)
+PRODUCT_BUNDLE_IDENTIFIER = com.company.myapp.debug
+API_BASE_URL = https:\/\/api-dev.company.com
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) DEBUG MOCK_ENABLED
+SWIFT_COMPILATION_MODE = incremental
+SWIFT_OPTIMIZATION_LEVEL = -Onone
+ENABLE_TESTABILITY = YES
+CODE_SIGN_IDENTITY = Apple Development
+PROVISIONING_PROFILE_SPECIFIER = MyApp Debug</code></pre>
+
+    <pre><code><span class="comment">// Configurations/Environments/Staging.xcconfig</span>
+#include "../Base.xcconfig"
+#include "../Warnings.xcconfig"
+
+APP_DISPLAY_NAME = MyApp (Staging)
+PRODUCT_BUNDLE_IDENTIFIER = com.company.myapp.staging
+API_BASE_URL = https:\/\/api-staging.company.com
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) STAGING
+SWIFT_COMPILATION_MODE = wholemodule
+SWIFT_OPTIMIZATION_LEVEL = -O
+ENABLE_TESTABILITY = NO
+CODE_SIGN_IDENTITY = Apple Distribution
+PROVISIONING_PROFILE_SPECIFIER = MyApp Staging AdHoc</code></pre>
+
+    <pre><code><span class="comment">// Configurations/Environments/Release.xcconfig</span>
+#include "../Base.xcconfig"
+#include "../Warnings.xcconfig"
+
+APP_DISPLAY_NAME = MyApp
+PRODUCT_BUNDLE_IDENTIFIER = com.company.myapp
+API_BASE_URL = https:\/\/api.company.com
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited)
+SWIFT_COMPILATION_MODE = wholemodule
+SWIFT_OPTIMIZATION_LEVEL = -O
+ENABLE_TESTABILITY = NO
+DEAD_CODE_STRIPPING = YES
+STRIP_INSTALLED_PRODUCT = YES
+CODE_SIGN_IDENTITY = Apple Distribution
+PROVISIONING_PROFILE_SPECIFIER = MyApp App Store</code></pre>
+
+    <h3>10.2 Feature Flags via Build Settings</h3>
+
+    <pre><code><span class="comment">// In xcconfig</span>
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) FEATURE_NEW_ONBOARDING FEATURE_DARK_MODE
+
+<span class="comment">// In Swift code</span>
+<span class="keyword">struct</span> <span class="type">FeatureFlags</span> {
+    <span class="keyword">static var</span> isNewOnboardingEnabled: <span class="type">Bool</span> {
+        <span class="keyword">#if</span> FEATURE_NEW_ONBOARDING
+        <span class="keyword">return true</span>
+        <span class="keyword">#else</span>
+        <span class="keyword">return false</span>
+        <span class="keyword">#endif</span>
+    }
+
+    <span class="keyword">static var</span> isDarkModeEnabled: <span class="type">Bool</span> {
+        <span class="keyword">#if</span> FEATURE_DARK_MODE
+        <span class="keyword">return true</span>
+        <span class="keyword">#else</span>
+        <span class="keyword">return false</span>
+        <span class="keyword">#endif</span>
+    }
+}
+
+<span class="comment">// Better approach: Runtime feature flags with compile-time defaults</span>
+<span class="keyword">enum</span> <span class="type">Feature</span>: <span class="type">String</span>, <span class="type">CaseIterable</span> {
+    <span class="keyword">case</span> newOnboarding
+    <span class="keyword">case</span> darkMode
+    <span class="keyword">case</span> performanceMonitoring
+
+    <span class="keyword">var</span> isEnabled: <span class="type">Bool</span> {
+        <span class="keyword">if let</span> override = <span class="type">RemoteConfig</span>.shared.value(<span class="keyword">for</span>: rawValue) {
+            <span class="keyword">return</span> override
+        }
+        <span class="keyword">return</span> defaultValue
+    }
+
+    <span class="keyword">private var</span> defaultValue: <span class="type">Bool</span> {
+        <span class="keyword">switch self</span> {
+        <span class="keyword">case</span> .newOnboarding:
+            <span class="keyword">#if</span> DEBUG
+            <span class="keyword">return true</span>
+            <span class="keyword">#else</span>
+            <span class="keyword">return false</span>
+            <span class="keyword">#endif</span>
+        <span class="keyword">case</span> .darkMode: <span class="keyword">return true</span>
+        <span class="keyword">case</span> .performanceMonitoring:
+            <span class="keyword">#if</span> DEBUG
+            <span class="keyword">return false</span>
+            <span class="keyword">#else</span>
+            <span class="keyword">return true</span>
+            <span class="keyword">#endif</span>
+        }
+    }
+}</code></pre>
+
+    <h3>10.3 CI/CD Build Script</h3>
+
+    <pre><code><span class="comment">#!/bin/bash</span>
+<span class="comment"># ci-build.sh — Production CI build script</span>
+
+<span class="keyword">set</span> -euo pipefail
+
+SCHEME=<span class="string">"MyApp"</span>
+WORKSPACE=<span class="string">"MyApp.xcworkspace"</span>
+CONFIGURATION=<span class="string">"${1:-Release}"</span>
+DERIVED_DATA=<span class="string">"./build/DerivedData"</span>
+ARCHIVE_PATH=<span class="string">"./build/MyApp.xcarchive"</span>
+
+<span class="comment"># Resolve SPM dependencies (cached separately)</span>
+xcodebuild -resolvePackageDependencies \
+    -workspace <span class="string">"$WORKSPACE"</span> \
+    -scheme <span class="string">"$SCHEME"</span> \
+    -clonedSourcePackagesDirPath ./build/SourcePackages
+
+<span class="comment"># Build with timing summary</span>
+xcodebuild archive \
+    -workspace <span class="string">"$WORKSPACE"</span> \
+    -scheme <span class="string">"$SCHEME"</span> \
+    -configuration <span class="string">"$CONFIGURATION"</span> \
+    -archivePath <span class="string">"$ARCHIVE_PATH"</span> \
+    -derivedDataPath <span class="string">"$DERIVED_DATA"</span> \
+    -clonedSourcePackagesDirPath ./build/SourcePackages \
+    -showBuildTimingSummary \
+    COMPILER_INDEX_STORE_ENABLE=NO \
+    CODE_SIGN_IDENTITY=<span class="string">"Apple Distribution"</span> \
+    | xcbeautify
+
+<span class="comment"># Export IPA</span>
+xcodebuild -exportArchive \
+    -archivePath <span class="string">"$ARCHIVE_PATH"</span> \
+    -exportPath ./build/output \
+    -exportOptionsPlist <span class="string">"ExportOptions-${CONFIGURATION}.plist"</span></code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Build Time Optimization Checklist</div>
+        <ul>
+            <li>Use incremental compilation mode for debug builds</li>
+            <li>Add input/output file lists to all script phases</li>
+            <li>Set <code>ONLY_ACTIVE_ARCH = YES</code> for debug</li>
+            <li>Disable index-while-building on CI (<code>COMPILER_INDEX_STORE_ENABLE=NO</code>)</li>
+            <li>Cache derived data and SPM packages on CI</li>
+            <li>Use <code>-parallelizeTargets</code> in xcodebuild</li>
+            <li>Split large targets into smaller modules for better parallelism</li>
+            <li>Avoid bridging headers — use explicit module imports</li>
+            <li>Profile with <code>-showBuildTimingSummary</code> and <code>xclogparser</code></li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="index.html">← Build &amp; Toolchain</a>
+        <a href="02-swift-compiler.html">Next: Swift Compiler →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Retain Cycles — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Memory &amp; Performance</a><span class="sep">›</span>
+        Retain Cycles
+    </nav>
+
+    <h1>Retain Cycles</h1>
+    <p class="subtitle">Every pattern that leaks memory in iOS apps — from closure captures to Combine sinks — and how to detect them before production.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#what-is">What Is a Retain Cycle?</a></li>
+            <li><a href="#capture-lists">Closure Capture Lists</a></li>
+            <li><a href="#weak-vs-unowned">When to Use [weak self] vs [unowned self]</a></li>
+            <li><a href="#delegate-pattern">Delegate Pattern Leaks</a></li>
+            <li><a href="#notification-center">NotificationCenter Observer Leaks</a></li>
+            <li><a href="#timer-cycles">Timer Retain Cycles</a></li>
+            <li><a href="#combine-leaks">Combine Sink Leaks</a></li>
+            <li><a href="#mainactor-captures">@MainActor Closure Captures</a></li>
+            <li><a href="#uikit-patterns">Common UIKit Retain Cycle Patterns</a></li>
+            <li><a href="#swiftui-patterns">SwiftUI Retain Cycle Patterns</a></li>
+            <li><a href="#detection">Leak Detection Strategies</a></li>
+            <li><a href="#ci-integration">Building Leak Detection into CI</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="what-is">What Is a Retain Cycle?</h2>
+
+    <p>A retain cycle occurs when two or more objects hold strong references to each other, forming a cycle that prevents any of them from being deallocated. Since ARC cannot detect cycles (unlike tracing GC), the memory is leaked for the lifetime of the process.</p>
+
+    <div class="diagram">
+Retain Cycle:
+┌──────────┐  strong   ┌──────────┐
+│ Object A │─────────▶│ Object B │
+│ (RC = 1) │          │ (RC = 1) │
+│          │◀─────────│          │
+└──────────┘  strong   └──────────┘
+
+Neither can reach RC = 0 → Memory leaked forever
+
+Broken Cycle (with weak):
+┌──────────┐  strong   ┌──────────┐
+│ Object A │─────────▶│ Object B │
+│ (RC = 1) │          │ (RC = 0) │ ← can be freed
+│          │◀ ─ ─ ─ ─ │          │
+└──────────┘  weak     └──────────┘
+    </div>
+
+    <p>The insidious nature of retain cycles: they don't crash. They silently consume memory until Jetsam kills the app. In long-running apps (messaging, navigation, media), even small leaks compound into hundreds of megabytes.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="capture-lists">Closure Capture Lists</h2>
+
+    <p>Closures are the #1 source of retain cycles in Swift. When a closure captures <code>self</code> (or any reference type), it creates a strong reference by default.</p>
+
+    <h3>How Capture Works</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">ViewController</span>: <span class="type">UIViewController</span> {
+    <span class="keyword">var</span> name = <span class="string">"Home"</span>
+    <span class="keyword">var</span> onTap: (() -> <span class="type">Void</span>)?
+
+    <span class="keyword">func</span> <span class="func">setupHandler</span>() {
+        <span class="comment">// 💥 RETAIN CYCLE: closure captures self strongly</span>
+        <span class="comment">// self → onTap (strong) → closure → self (strong)</span>
+        onTap = {
+            <span class="func">print</span>(<span class="keyword">self</span>.name)
+        }
+    }
+}</code></pre>
+
+    <div class="diagram">
+The Cycle:
+┌──────────────────┐
+│  ViewController  │
+│  ┌─────────────┐ │     ┌─────────────────┐
+│  │ onTap ──────│─│────▶│    Closure       │
+│  └─────────────┘ │     │ ┌─────────────┐  │
+│                  │     │ │ self (strong)│──│──┐
+│                  │◀────│─│─────────────│──│──┘
+│                  │     │ └─────────────┘  │
+└──────────────────┘     └─────────────────┘
+    </div>
+
+    <h3>Capture List Syntax</h3>
+
+    <pre><code><span class="comment">// Capture list goes before parameters</span>
+<span class="keyword">let</span> closure = { [<span class="keyword">weak self</span>, capturedValue = someValue] (param: <span class="type">Int</span>) <span class="keyword">in</span>
+    <span class="keyword">guard let</span> self <span class="keyword">else</span> { <span class="keyword">return</span> }
+    <span class="func">print</span>(self.name, capturedValue, param)
+}
+
+<span class="comment">// Capture semantics:</span>
+<span class="keyword">var</span> x = <span class="number">10</span>
+<span class="keyword">let</span> byReference = { <span class="func">print</span>(x) }  <span class="comment">// Captures x by reference</span>
+x = <span class="number">20</span>
+<span class="func">byReference</span>()                    <span class="comment">// Prints 20</span>
+
+<span class="keyword">let</span> byValue = { [x] <span class="keyword">in</span> <span class="func">print</span>(x) } <span class="comment">// Captures x by value (copy)</span>
+x = <span class="number">30</span>
+<span class="func">byValue</span>()                        <span class="comment">// Prints 20 (captured at creation)</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="weak-vs-unowned">When to Use [weak self] vs [unowned self]</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Scenario</th>
+                <th>Use</th>
+                <th>Reason</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Network completion handler</td>
+                <td><code>[weak self]</code></td>
+                <td>VC may be dismissed before response arrives</td>
+            </tr>
+            <tr>
+                <td>Animation completion</td>
+                <td><code>[weak self]</code></td>
+                <td>View may be removed during animation</td>
+            </tr>
+            <tr>
+                <td>Timer callback</td>
+                <td><code>[weak self]</code></td>
+                <td>Timer outlives the object that created it</td>
+            </tr>
+            <tr>
+                <td>Parent-child (child references parent)</td>
+                <td><code>[unowned self]</code></td>
+                <td>Parent always outlives child by design</td>
+            </tr>
+            <tr>
+                <td>Lazy property initialization</td>
+                <td><code>[unowned self]</code></td>
+                <td>Property can't exist without self</td>
+            </tr>
+            <tr>
+                <td>Combine sink on self's publisher</td>
+                <td><code>[weak self]</code></td>
+                <td>Subscription may outlive subscriber</td>
+            </tr>
+            <tr>
+                <td>DispatchQueue.async</td>
+                <td><code>[weak self]</code></td>
+                <td>Block may execute after deallocation</td>
+            </tr>
+            <tr>
+                <td>Escaping closure stored as property</td>
+                <td><code>[weak self]</code></td>
+                <td>Creates direct retain cycle</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>The guard let self Pattern</h3>
+
+    <pre><code><span class="comment">// Modern Swift (5.7+): guard let self</span>
+<span class="keyword">class</span> <span class="type">ProfileViewModel</span> {
+    <span class="keyword">var</span> name: <span class="type">String</span> = <span class="string">""</span>
+
+    <span class="keyword">func</span> <span class="func">fetchProfile</span>() {
+        <span class="type">APIClient</span>.<span class="func">fetch</span>(<span class="string">"/profile"</span>) { [<span class="keyword">weak self</span>] result <span class="keyword">in</span>
+            <span class="keyword">guard let</span> self <span class="keyword">else</span> { <span class="keyword">return</span> }
+            <span class="comment">// self is now a strong reference for the rest of the closure</span>
+            <span class="keyword">self</span>.name = result.name
+            <span class="keyword">self</span>.<span class="func">updateUI</span>()
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: guard let self Extends Lifetime</div>
+        <p>After <code>guard let self</code>, you hold a strong reference to <code>self</code> for the remainder of the closure. If the closure does long-running work after the guard, the object stays alive for that entire duration even if it would otherwise be deallocated. For short callbacks this is fine; for long-running operations, consider checking <code>self</code> at multiple points.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="delegate-pattern">Delegate Pattern Leaks</h2>
+
+    <p>The delegate pattern is a classic source of retain cycles. The delegating object holds a reference to its delegate, and if that reference is strong, a cycle forms when the delegate also holds the delegating object.</p>
+
+    <pre><code><span class="comment">// ❌ WRONG: Strong delegate creates retain cycle</span>
+<span class="keyword">protocol</span> <span class="type">DataManagerDelegate</span>: <span class="type">AnyObject</span> {
+    <span class="keyword">func</span> <span class="func">didLoadData</span>(_ data: [<span class="type">Item</span>])
+}
+
+<span class="keyword">class</span> <span class="type">DataManager</span> {
+    <span class="keyword">var</span> delegate: <span class="type">DataManagerDelegate</span>?  <span class="comment">// 💥 Strong reference!</span>
+}
+
+<span class="keyword">class</span> <span class="type">ViewController</span>: <span class="type">UIViewController</span>, <span class="type">DataManagerDelegate</span> {
+    <span class="keyword">let</span> manager = <span class="type">DataManager</span>()  <span class="comment">// VC → manager (strong)</span>
+
+    <span class="keyword">override func</span> <span class="func">viewDidLoad</span>() {
+        <span class="keyword">super</span>.<span class="func">viewDidLoad</span>()
+        manager.delegate = <span class="keyword">self</span>   <span class="comment">// manager → VC (strong) 💥 CYCLE</span>
+    }
+}
+
+<span class="comment">// ✅ CORRECT: Weak delegate</span>
+<span class="keyword">class</span> <span class="type">DataManager</span> {
+    <span class="keyword">weak var</span> delegate: <span class="type">DataManagerDelegate</span>?  <span class="comment">// Weak breaks cycle</span>
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Protocol Constraints for Weak Delegates</div>
+        <p>Always constrain delegate protocols to <code>AnyObject</code> (or <code>class</code> in older Swift). This is required for <code>weak</code> references and also documents that the delegate must be a reference type. Without this constraint, you can't declare the delegate property as <code>weak</code>.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="notification-center">NotificationCenter Observer Leaks</h2>
+
+    <h3>Pre-iOS 9: Manual Removal Required</h3>
+
+    <pre><code><span class="comment">// Pre-iOS 9: Forgetting to remove observer → crash (dangling pointer)</span>
+<span class="keyword">class</span> <span class="type">OldViewController</span>: <span class="type">UIViewController</span> {
+    <span class="keyword">override func</span> <span class="func">viewDidLoad</span>() {
+        <span class="keyword">super</span>.<span class="func">viewDidLoad</span>()
+        <span class="type">NotificationCenter</span>.default.<span class="func">addObserver</span>(
+            <span class="keyword">self</span>,
+            selector: <span class="keyword">#selector</span>(<span class="func">handleNotification</span>),
+            name: .someNotification,
+            object: <span class="keyword">nil</span>
+        )
+    }
+
+    <span class="keyword">deinit</span> {
+        <span class="comment">// REQUIRED pre-iOS 9, or crash when notification fires</span>
+        <span class="type">NotificationCenter</span>.default.<span class="func">removeObserver</span>(<span class="keyword">self</span>)
+    }
+}</code></pre>
+
+    <h3>Post-iOS 9: Automatic Removal (Mostly)</h3>
+
+    <p>Starting with iOS 9, <code>NotificationCenter</code> uses weak references for selector-based observers, so they're automatically removed on deallocation. However, <strong>block-based observers still require manual management</strong>:</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">ModernViewController</span>: <span class="type">UIViewController</span> {
+    <span class="keyword">var</span> observer: <span class="type">NSObjectProtocol</span>?
+
+    <span class="keyword">override func</span> <span class="func">viewDidLoad</span>() {
+        <span class="keyword">super</span>.<span class="func">viewDidLoad</span>()
+
+        <span class="comment">// ❌ Block-based: closure captures self, observer token retained</span>
+        observer = <span class="type">NotificationCenter</span>.default.<span class="func">addObserver</span>(
+            forName: .someNotification,
+            object: <span class="keyword">nil</span>,
+            queue: .main
+        ) { [<span class="keyword">weak self</span>] notification <span class="keyword">in</span>
+            self?.<span class="func">handleNotification</span>(notification)
+        }
+    }
+
+    <span class="keyword">deinit</span> {
+        <span class="comment">// Still needed for block-based observers</span>
+        <span class="keyword">if let</span> observer = observer {
+            <span class="type">NotificationCenter</span>.default.<span class="func">removeObserver</span>(observer)
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Why Block-Based Observers Leak</div>
+        <p>The block-based <code>addObserver(forName:object:queue:using:)</code> returns an opaque <code>NSObjectProtocol</code> token. NotificationCenter holds a strong reference to this token, and the token holds a strong reference to the closure. If the closure captures <code>self</code> strongly and <code>self</code> holds the token, you get: <code>self → token → closure → self</code>. Using <code>[weak self]</code> in the closure breaks the cycle, but you still need to remove the observer to stop receiving notifications after deallocation.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="timer-cycles">Timer Retain Cycles</h2>
+
+    <p><code>Timer</code> (NSTimer) is one of the most common sources of retain cycles because the RunLoop holds a strong reference to the timer, and the timer holds a strong reference to its target.</p>
+
+    <div class="diagram">
+Timer Retain Cycle:
+┌──────────┐  strong   ┌──────────┐  strong   ┌──────────┐
+│ RunLoop  │─────────▶│  Timer   │─────────▶│  self    │
+│ (main)   │          │          │          │ (VC)     │
+└──────────┘          └──────────┘          └──────────┘
+                                                  │
+                                            strong │
+                                                  ▼
+                                            ┌──────────┐
+                                            │  Timer   │
+                                            │ (stored) │
+                                            └──────────┘
+
+Even if VC is dismissed, RunLoop → Timer → VC keeps it alive!
+    </div>
+
+    <pre><code><span class="keyword">class</span> <span class="type">PollingViewController</span>: <span class="type">UIViewController</span> {
+    <span class="keyword">var</span> timer: <span class="type">Timer</span>?
+
+    <span class="keyword">override func</span> <span class="func">viewDidLoad</span>() {
+        <span class="keyword">super</span>.<span class="func">viewDidLoad</span>()
+
+        <span class="comment">// ❌ LEAKS: Timer retains self, RunLoop retains timer</span>
+        timer = <span class="type">Timer</span>.<span class="func">scheduledTimer</span>(
+            timeInterval: <span class="number">5.0</span>,
+            target: <span class="keyword">self</span>,
+            selector: <span class="keyword">#selector</span>(<span class="func">poll</span>),
+            userInfo: <span class="keyword">nil</span>,
+            repeats: <span class="keyword">true</span>
+        )
+    }
+
+    <span class="keyword">deinit</span> {
+        <span class="func">print</span>(<span class="string">"Never called! 💥"</span>)
+    }
+}
+
+<span class="comment">// ✅ Solution 1: Block-based timer with [weak self]</span>
+<span class="keyword">class</span> <span class="type">FixedPollingVC</span>: <span class="type">UIViewController</span> {
+    <span class="keyword">var</span> timer: <span class="type">Timer</span>?
+
+    <span class="keyword">override func</span> <span class="func">viewDidLoad</span>() {
+        <span class="keyword">super</span>.<span class="func">viewDidLoad</span>()
+        timer = <span class="type">Timer</span>.<span class="func">scheduledTimer</span>(withTimeInterval: <span class="number">5.0</span>, repeats: <span class="keyword">true</span>) { [<span class="keyword">weak self</span>] _ <span class="keyword">in</span>
+            self?.<span class="func">poll</span>()
+        }
+    }
+
+    <span class="keyword">override func</span> <span class="func">viewDidDisappear</span>(_ animated: <span class="type">Bool</span>) {
+        <span class="keyword">super</span>.<span class="func">viewDidDisappear</span>(animated)
+        timer?.<span class="func">invalidate</span>()
+    }
+}
+
+<span class="comment">// ✅ Solution 2: Proxy pattern (for target/selector API)</span>
+<span class="keyword">class</span> <span class="type">WeakTimerProxy</span> {
+    <span class="keyword">weak var</span> target: <span class="type">AnyObject</span>?
+    <span class="keyword">let</span> selector: <span class="type">Selector</span>
+
+    <span class="keyword">init</span>(target: <span class="type">AnyObject</span>, selector: <span class="type">Selector</span>) {
+        <span class="keyword">self</span>.target = target
+        <span class="keyword">self</span>.selector = selector
+    }
+
+    <span class="keyword">@objc func</span> <span class="func">fire</span>(_ timer: <span class="type">Timer</span>) {
+        <span class="keyword">if let</span> target = target {
+            _ = target.<span class="func">perform</span>(selector, with: timer)
+        } <span class="keyword">else</span> {
+            timer.<span class="func">invalidate</span>()
+        }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="combine-leaks">Combine Sink Leaks</h2>
+
+    <p>Combine's <code>sink</code> operator returns an <code>AnyCancellable</code> that must be stored. If the closure captures <code>self</code> strongly and the cancellable is stored on <code>self</code>, you get a retain cycle.</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">SearchViewModel</span>: <span class="type">ObservableObject</span> {
+    <span class="keyword">@Published var</span> query = <span class="string">""</span>
+    <span class="keyword">@Published var</span> results: [<span class="type">SearchResult</span>] = []
+    <span class="keyword">private var</span> cancellables = <span class="type">Set</span>&lt;<span class="type">AnyCancellable</span>&gt;()
+
+    <span class="keyword">init</span>() {
+        <span class="comment">// ❌ RETAIN CYCLE:</span>
+        <span class="comment">// self → cancellables → AnyCancellable → closure → self</span>
+        $query
+            .<span class="func">debounce</span>(for: <span class="number">.milliseconds(300)</span>, scheduler: <span class="type">RunLoop</span>.main)
+            .<span class="func">sink</span> { query <span class="keyword">in</span>
+                <span class="keyword">self</span>.<span class="func">performSearch</span>(query)  <span class="comment">// 💥 Strong capture</span>
+            }
+            .<span class="func">store</span>(in: &amp;cancellables)
+
+        <span class="comment">// ✅ FIXED: [weak self]</span>
+        $query
+            .<span class="func">debounce</span>(for: <span class="number">.milliseconds(300)</span>, scheduler: <span class="type">RunLoop</span>.main)
+            .<span class="func">sink</span> { [<span class="keyword">weak self</span>] query <span class="keyword">in</span>
+                self?.<span class="func">performSearch</span>(query)
+            }
+            .<span class="func">store</span>(in: &amp;cancellables)
+    }
+}
+
+<span class="comment">// ✅ Alternative: Use .assign(to:) for @Published properties</span>
+<span class="comment">// .assign(to: &amp;$results) uses an unowned reference internally</span>
+<span class="comment">// and doesn't return an AnyCancellable (no storage needed)</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: .assign(to:on:) vs .assign(to:)</div>
+        <p><code>.assign(to:on:)</code> captures the object <strong>strongly</strong> and returns an <code>AnyCancellable</code> — it can create retain cycles. <code>.assign(to: &amp;$property)</code> (introduced in iOS 14) uses an <strong>unowned</strong> reference and doesn't return a cancellable — it's cycle-safe. Always prefer the <code>&amp;$</code> variant when assigning to a <code>@Published</code> property on self.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="mainactor-captures">@MainActor Closure Captures</h2>
+
+    <p>With Swift concurrency, <code>@MainActor</code> closures introduce subtle capture behavior:</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">ViewModel</span> {
+    <span class="keyword">var</span> data: [<span class="type">String</span>] = []
+
+    <span class="keyword">func</span> <span class="func">loadData</span>() {
+        <span class="comment">// Task captures self strongly by default</span>
+        <span class="type">Task</span> { <span class="keyword">@MainActor in</span>
+            <span class="comment">// self is captured strongly for the Task's lifetime</span>
+            <span class="keyword">self</span>.data = <span class="keyword">await</span> <span class="func">fetchData</span>()
+        }
+
+        <span class="comment">// ✅ Better: use [weak self]</span>
+        <span class="type">Task</span> { [<span class="keyword">weak self</span>] <span class="keyword">@MainActor in</span>
+            <span class="keyword">guard let</span> self <span class="keyword">else</span> { <span class="keyword">return</span> }
+            self.data = <span class="keyword">await</span> <span class="func">fetchData</span>()
+        }
+    }
+}
+
+<span class="comment">// Note: Task doesn't create a retain cycle per se (it's not stored</span>
+<span class="comment">// on self), but it extends self's lifetime until the task completes.</span>
+<span class="comment">// For short-lived tasks this is fine; for long-running ones, use weak.</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Task Capture Semantics</div>
+        <p>A <code>Task { }</code> closure is <code>@Sendable</code> and <code>@escaping</code>. It captures variables by value for <code>Sendable</code> types and by strong reference for reference types. Unlike stored closures, a <code>Task</code> doesn't create a retain cycle because it's not stored on <code>self</code> — but it does keep <code>self</code> alive until the task completes. If the task takes 30 seconds and the user navigates away, the view controller stays in memory for those 30 seconds. Use <code>[weak self]</code> to allow early deallocation.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="uikit-patterns">Common UIKit Retain Cycle Patterns</h2>
+
+    <h3>1. UIAlertAction Closures</h3>
+
+    <pre><code><span class="comment">// UIAlertController retains its actions, actions retain closures</span>
+<span class="keyword">func</span> <span class="func">showAlert</span>() {
+    <span class="keyword">let</span> alert = <span class="type">UIAlertController</span>(title: <span class="string">"Error"</span>, message: <span class="string">"Retry?"</span>, preferredStyle: .alert)
+
+    <span class="comment">// ✅ Safe: UIAlertController is presented briefly, then dismissed</span>
+    <span class="comment">// The cycle (self → present alert → action → closure → self)</span>
+    <span class="comment">// is broken when the alert is dismissed and released.</span>
+    <span class="comment">// But if you store the alert as a property, use [weak self].</span>
+    alert.<span class="func">addAction</span>(<span class="type">UIAlertAction</span>(title: <span class="string">"Retry"</span>, style: .default) { _ <span class="keyword">in</span>
+        <span class="keyword">self</span>.<span class="func">retryRequest</span>()
+    })
+    <span class="func">present</span>(alert, animated: <span class="keyword">true</span>)
+}</code></pre>
+
+    <h3>2. UIView.animate Closures</h3>
+
+    <pre><code><span class="comment">// ✅ Safe: animation closures are non-escaping in practice</span>
+<span class="comment">// They execute and are released by the animation system</span>
+<span class="type">UIView</span>.<span class="func">animate</span>(withDuration: <span class="number">0.3</span>) {
+    <span class="keyword">self</span>.view.alpha = <span class="number">0</span>  <span class="comment">// No [weak self] needed</span>
+}
+
+<span class="comment">// ⚠️ But completion handlers can be delayed:</span>
+<span class="type">UIView</span>.<span class="func">animate</span>(withDuration: <span class="number">0.3</span>, animations: {
+    <span class="keyword">self</span>.view.alpha = <span class="number">0</span>
+}) { _ <span class="keyword">in</span>
+    <span class="comment">// This runs after animation completes — self kept alive</span>
+    <span class="comment">// Usually fine, but use [weak self] for long animations</span>
+    <span class="keyword">self</span>.view.<span class="func">removeFromSuperview</span>()
+}</code></pre>
+
+    <h3>3. Lazy Properties with Closures</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">ProfileView</span>: <span class="type">UIView</span> {
+    <span class="comment">// ❌ RETAIN CYCLE: lazy closure captures self strongly</span>
+    <span class="keyword">lazy var</span> nameLabel: <span class="type">UILabel</span> = {
+        <span class="keyword">let</span> label = <span class="type">UILabel</span>()
+        label.textColor = <span class="keyword">self</span>.tintColor  <span class="comment">// captures self</span>
+        <span class="keyword">return</span> label
+    }()
+    <span class="comment">// Actually ✅: The closure executes once and is released.</span>
+    <span class="comment">// The closure is not stored — it's called immediately on first access.</span>
+    <span class="comment">// This is NOT a retain cycle despite capturing self.</span>
+
+    <span class="comment">// ❌ REAL CYCLE: lazy property that stores a closure</span>
+    <span class="keyword">lazy var</span> formatter: () -> <span class="type">String</span> = {
+        <span class="keyword">return</span> <span class="keyword">self</span>.name.<span class="func">uppercased</span>()  <span class="comment">// 💥 stored closure → self</span>
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="swiftui-patterns">SwiftUI Retain Cycle Patterns</h2>
+
+    <p>SwiftUI's value-type views largely avoid retain cycles, but <code>ObservableObject</code> classes and closures can still leak:</p>
+
+    <pre><code><span class="comment">// ❌ ObservableObject with Combine cycle</span>
+<span class="keyword">class</span> <span class="type">ContentViewModel</span>: <span class="type">ObservableObject</span> {
+    <span class="keyword">@Published var</span> items: [<span class="type">Item</span>] = []
+    <span class="keyword">let</span> service: <span class="type">DataService</span>
+    <span class="keyword">var</span> cancellables = <span class="type">Set</span>&lt;<span class="type">AnyCancellable</span>&gt;()
+
+    <span class="keyword">init</span>(service: <span class="type">DataService</span>) {
+        <span class="keyword">self</span>.service = service
+        service.itemsPublisher
+            .<span class="func">sink</span> { [<span class="keyword">weak self</span>] items <span class="keyword">in</span>  <span class="comment">// ✅ weak self</span>
+                self?.items = items
+            }
+            .<span class="func">store</span>(in: &amp;cancellables)
+    }
+}
+
+<span class="comment">// ⚠️ SwiftUI .task modifier: captures are handled by the runtime</span>
+<span class="comment">// The task is cancelled when the view disappears, so strong capture</span>
+<span class="comment">// of the view model is usually fine (task lifetime ≤ view lifetime)</span>
+<span class="keyword">struct</span> <span class="type">ContentView</span>: <span class="type">View</span> {
+    <span class="keyword">@StateObject var</span> viewModel = <span class="type">ContentViewModel</span>()
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">List</span>(viewModel.items) { item <span class="keyword">in</span>
+            <span class="type">Text</span>(item.name)
+        }
+        .<span class="func">task</span> {
+            <span class="keyword">await</span> viewModel.<span class="func">loadItems</span>()
+        }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="detection">Leak Detection Strategies</h2>
+
+    <h3>1. Xcode Memory Graph Debugger</h3>
+
+    <p>The Memory Graph Debugger (Debug Navigator → Memory Graph) shows all live objects and their reference relationships. Look for:</p>
+
+    <ul>
+        <li>Objects with unexpected strong references</li>
+        <li>Cycles highlighted with purple indicators</li>
+        <li>Objects that should have been deallocated (e.g., dismissed view controllers)</li>
+    </ul>
+
+    <h3>2. Instruments Leaks Template</h3>
+
+    <p>The Leaks instrument periodically scans the heap for objects that are unreachable from any root but still allocated. It catches cycles that the Memory Graph Debugger might miss during manual inspection.</p>
+
+    <h3>3. deinit Assertions</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">BaseViewController</span>: <span class="type">UIViewController</span> {
+    <span class="keyword">deinit</span> {
+        <span class="keyword">#if</span> DEBUG
+        <span class="func">print</span>(<span class="string">"✅ \(type(of: self)) deallocated"</span>)
+        <span class="keyword">#endif</span>
+    }
+}
+
+<span class="comment">// In tests: verify deallocation</span>
+<span class="keyword">func</span> <span class="func">testViewControllerDeallocates</span>() {
+    <span class="keyword">weak var</span> weakVC: <span class="type">MyViewController</span>?
+    <span class="func">autoreleasepool</span> {
+        <span class="keyword">let</span> vc = <span class="type">MyViewController</span>()
+        weakVC = vc
+        vc.<span class="func">loadViewIfNeeded</span>()
+        vc.<span class="func">viewDidLoad</span>()
+    }
+    <span class="type">XCTAssertNil</span>(weakVC, <span class="string">"ViewController should be deallocated"</span>)
+}</code></pre>
+
+    <h3>4. Runtime Leak Checker</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">LeakDetector</span> {
+    <span class="keyword">static let</span> shared = <span class="type">LeakDetector</span>()
+    <span class="keyword">private var</span> trackedObjects: [<span class="type">String</span>: <span class="type">WeakBox</span>] = [:]
+
+    <span class="keyword">func</span> <span class="func">track</span>(_ object: <span class="type">AnyObject</span>, file: <span class="type">String</span> = <span class="keyword">#file</span>, line: <span class="type">Int</span> = <span class="keyword">#line</span>) {
+        <span class="keyword">let</span> key = <span class="string">"\(type(of: object))_\(file):\(line)"</span>
+        trackedObjects[key] = <span class="type">WeakBox</span>(object)
+    }
+
+    <span class="keyword">func</span> <span class="func">expectDeallocation</span>(after delay: <span class="type">TimeInterval</span> = <span class="number">2.0</span>) {
+        <span class="type">DispatchQueue</span>.main.<span class="func">asyncAfter</span>(deadline: .now() + delay) { [<span class="keyword">weak self</span>] <span class="keyword">in</span>
+            <span class="keyword">guard let</span> self <span class="keyword">else</span> { <span class="keyword">return</span> }
+            <span class="keyword">for</span> (key, box) <span class="keyword">in</span> self.trackedObjects {
+                <span class="keyword">if</span> box.object != <span class="keyword">nil</span> {
+                    <span class="func">assertionFailure</span>(<span class="string">"🔴 LEAK: \(key) not deallocated"</span>)
+                }
+            }
+            self.trackedObjects.<span class="func">removeAll</span>()
+        }
+    }
+}
+
+<span class="keyword">private class</span> <span class="type">WeakBox</span> {
+    <span class="keyword">weak var</span> object: <span class="type">AnyObject</span>?
+    <span class="keyword">init</span>(_ object: <span class="type">AnyObject</span>) { <span class="keyword">self</span>.object = object }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="ci-integration">Building Leak Detection into CI</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: CI-Integrated Leak Detection</div>
+        <p>At the Staff level, you should be able to design a leak detection pipeline that catches retain cycles before they reach production:</p>
+        <ol>
+            <li><strong>Unit test deallocation assertions</strong> — every view controller and view model gets a test that verifies deallocation after use. Use the <code>weak var</code> + <code>autoreleasepool</code> pattern shown above.</li>
+            <li><strong>UI test memory snapshots</strong> — run UI tests that navigate through every screen, then check that dismissed screens are deallocated. Use <code>XCTMemoryMetric</code> to track peak memory.</li>
+            <li><strong>Instruments automation</strong> — use <code>xctrace</code> CLI to run the Leaks template in CI:
+                <pre><code>xctrace record --template Leaks \
+  --launch MyApp.app \
+  --output leaks.trace</code></pre>
+            </li>
+            <li><strong>Memory Graph export</strong> — use <code>leaks</code> command-line tool on the simulator process to detect cycles programmatically.</li>
+            <li><strong>Production monitoring</strong> — use <code>MetricKit</code>'s <code>MXMemoryMetric</code> to track peak memory and Jetsam events in production. Alert on regressions.</li>
+        </ol>
+        <p>The goal: <strong>no retain cycle survives past code review</strong>. Make leak detection as automated as linting.</p>
+    </div>
+
+    <h3>Automated Deallocation Test Pattern</h3>
+
+    <pre><code><span class="keyword">import</span> <span class="type">XCTest</span>
+
+<span class="keyword">class</span> <span class="type">MemoryLeakTests</span>: <span class="type">XCTestCase</span> {
+
+    <span class="keyword">func</span> <span class="func">assertDeallocated</span>&lt;<span class="type">T</span>: <span class="type">AnyObject</span>&gt;(
+        _ factory: () -> <span class="type">T</span>,
+        file: <span class="type">StaticString</span> = <span class="keyword">#file</span>,
+        line: <span class="type">UInt</span> = <span class="keyword">#line</span>
+    ) {
+        <span class="keyword">weak var</span> weakRef: <span class="type">T</span>?
+        <span class="func">autoreleasepool</span> {
+            <span class="keyword">let</span> instance = <span class="func">factory</span>()
+            weakRef = instance
+        }
+        <span class="type">XCTAssertNil</span>(weakRef,
+            <span class="string">"Expected \(T.self) to be deallocated"</span>,
+            file: file, line: line)
+    }
+
+    <span class="keyword">func</span> <span class="func">testProfileViewModelDeallocates</span>() {
+        <span class="func">assertDeallocated</span> {
+            <span class="keyword">let</span> vm = <span class="type">ProfileViewModel</span>()
+            vm.<span class="func">loadProfile</span>()
+            <span class="keyword">return</span> vm
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">testSettingsViewControllerDeallocates</span>() {
+        <span class="func">assertDeallocated</span> {
+            <span class="keyword">let</span> vc = <span class="type">SettingsViewController</span>()
+            vc.<span class="func">loadViewIfNeeded</span>()
+            <span class="keyword">return</span> vc
+        }
+    }
+}</code></pre>
+
+    <h2>Summary: Retain Cycle Cheat Sheet</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Pattern</th>
+                <th>Cycle?</th>
+                <th>Fix</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Stored closure capturing self</td>
+                <td>Yes</td>
+                <td><code>[weak self]</code></td>
+            </tr>
+            <tr>
+                <td>Strong delegate</td>
+                <td>Yes</td>
+                <td><code>weak var delegate</code></td>
+            </tr>
+            <tr>
+                <td>Timer target/selector</td>
+                <td>Yes</td>
+                <td>Block-based + <code>[weak self]</code> or proxy</td>
+            </tr>
+            <tr>
+                <td>Combine .sink on self's publisher</td>
+                <td>Yes</td>
+                <td><code>[weak self]</code> or <code>.assign(to: &amp;$prop)</code></td>
+            </tr>
+            <tr>
+                <td>NotificationCenter block observer</td>
+                <td>Possible</td>
+                <td><code>[weak self]</code> + remove in deinit</td>
+            </tr>
+            <tr>
+                <td>UIView.animate closure</td>
+                <td>No</td>
+                <td>None needed (temporary)</td>
+            </tr>
+            <tr>
+                <td>DispatchQueue.async</td>
+                <td>No</td>
+                <td><code>[weak self]</code> if long-running</td>
+            </tr>
+            <tr>
+                <td>Task { } (not stored)</td>
+                <td>No</td>
+                <td><code>[weak self]</code> for long tasks</td>
+            </tr>
+            <tr>
+                <td>Lazy property (immediate closure)</td>
+                <td>No</td>
+                <td>None needed (closure released)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="nav-footer">
+        <a href="01-arc-internals.html">← Previous: ARC Internals</a>
+        <a href="03-memory-regions.html">Next: Memory Regions →</a>
+    </div>
+</div>
+</body>
+</html>

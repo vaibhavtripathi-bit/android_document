@@ -1,0 +1,1914 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>URLSession Internals — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Networking &amp; Data</a><span class="sep">›</span>
+        URLSession Internals
+    </nav>
+
+    <h1>URLSession Internals</h1>
+    <p class="subtitle">A deep dive into Apple's networking stack — from configuration and task hierarchy to HTTP/2 multiplexing, URLProtocol interception, certificate pinning, background transfers, and building a production-grade network layer.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#architecture-overview">1. URLSession Architecture Overview</a></li>
+            <li><a href="#configuration-deep-dive">2. URLSessionConfiguration Deep Dive</a></li>
+            <li><a href="#task-hierarchy">3. URLSessionTask Hierarchy</a></li>
+            <li><a href="#http2-multiplexing">4. HTTP/2 Multiplexing</a></li>
+            <li><a href="#urlprotocol-interception">5. URLProtocol Interception</a></li>
+            <li><a href="#urlcache">6. URLCache</a></li>
+            <li><a href="#tls-ats">7. TLS &amp; App Transport Security</a></li>
+            <li><a href="#certificate-pinning">8. Certificate Pinning</a></li>
+            <li><a href="#background-transfers">9. Background Transfers</a></li>
+            <li><a href="#websocket">10. URLSessionWebSocketTask</a></li>
+            <li><a href="#production-network-layer">11. Building a Production Network Layer</a></li>
+        </ul>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 1: Architecture Overview                                   -->
+    <!-- ================================================================== -->
+    <h2 id="architecture-overview">1. URLSession Architecture Overview</h2>
+
+    <p><code>URLSession</code> is Apple's primary networking API, built on top of a sophisticated layered architecture. Understanding these layers is essential for debugging, performance tuning, and building robust networking code at scale.</p>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│                        Your Application                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌──────────────┐    creates    ┌──────────────────────────┐   │
+│   │  URLSession   │─────────────▶│ URLSessionConfiguration  │   │
+│   │  .shared      │              │  .default                │   │
+│   │  .custom      │              │  .ephemeral              │   │
+│   └──────┬───────┘              │  .background(id:)        │   │
+│          │                       └──────────────────────────┘   │
+│          │ creates                                               │
+│          ▼                                                       │
+│   ┌──────────────────────────────────────────────┐              │
+│   │           URLSessionTask                      │              │
+│   │  ┌────────────┐ ┌────────────┐ ┌───────────┐ │              │
+│   │  │ DataTask   │ │UploadTask  │ │DownloadTk │ │              │
+│   │  └────────────┘ └────────────┘ └───────────┘ │              │
+│   │  ┌────────────┐ ┌────────────┐               │              │
+│   │  │ StreamTask │ │WebSocketTk │               │              │
+│   │  └────────────┘ └────────────┘               │              │
+│   └──────────────────────┬───────────────────────┘              │
+│                          │                                       │
+│                          ▼ delegate callbacks                    │
+│   ┌──────────────────────────────────────────────┐              │
+│   │         URLSessionDelegate                    │              │
+│   │  URLSessionTaskDelegate                       │              │
+│   │  URLSessionDataDelegate                       │              │
+│   │  URLSessionDownloadDelegate                   │              │
+│   └──────────────────────┬───────────────────────┘              │
+│                          │                                       │
+├──────────────────────────┼───────────────────────────────────────┤
+│                          ▼                                       │
+│   ┌──────────────────────────────────────────────┐              │
+│   │         URLProtocol Layer                     │              │
+│   │  (Registered protocols checked in LIFO order) │              │
+│   │  ┌─────────────────────────────────────────┐  │              │
+│   │  │  Custom URLProtocol subclasses          │  │              │
+│   │  │  (mock, intercept, transform)           │  │              │
+│   │  └─────────────────────────────────────────┘  │              │
+│   │  ┌─────────────────────────────────────────┐  │              │
+│   │  │  _NSURLHTTPProtocol (system default)    │  │              │
+│   │  └─────────────────────────────────────────┘  │              │
+│   └──────────────────────┬───────────────────────┘              │
+│                          │                                       │
+├──────────────────────────┼───────────────────────────────────────┤
+│                          ▼                                       │
+│   ┌──────────────────────────────────────────────┐              │
+│   │         CFNetwork / libcurl                   │              │
+│   │  HTTP/1.1, HTTP/2, HTTP/3 (QUIC)            │              │
+│   │  TLS (SecureTransport / BoringSSL)           │              │
+│   │  DNS resolution, connection pooling          │              │
+│   └──────────────────────┬───────────────────────┘              │
+│                          │                                       │
+│                          ▼                                       │
+│   ┌──────────────────────────────────────────────┐              │
+│   │         BSD Sockets / Network.framework       │              │
+│   └──────────────────────────────────────────────┘              │
+└─────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: The Shared Session</div>
+        <p><code>URLSession.shared</code> is a singleton with no delegate and uses <code>URLSessionConfiguration.default</code>. It is suitable only for simple, fire-and-forget requests. You cannot customize caching, authentication challenges, or background transfers with the shared session. For any production app, always create a custom session.</p>
+    </div>
+
+    <p>The key insight is that <code>URLSession</code> copies the configuration at init time. Mutating the configuration object after session creation has no effect. This is a common interview pitfall.</p>
+
+<pre><code><span class="keyword">let</span> config = <span class="type">URLSessionConfiguration</span>.<span class="func">default</span>
+config.<span class="func">timeoutIntervalForRequest</span> = <span class="number">30</span>
+
+<span class="keyword">let</span> session = <span class="type">URLSession</span>(configuration: config)
+
+<span class="comment">// This has NO effect on the session — config was copied</span>
+config.<span class="func">timeoutIntervalForRequest</span> = <span class="number">60</span>
+</code></pre>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 2: URLSessionConfiguration Deep Dive                       -->
+    <!-- ================================================================== -->
+    <h2 id="configuration-deep-dive">2. URLSessionConfiguration Deep Dive</h2>
+
+    <p><code>URLSessionConfiguration</code> defines the behavior and policies for a <code>URLSession</code>. There are three factory configurations, each with distinct characteristics.</p>
+
+    <h3>Creating Each Configuration Type</h3>
+
+<pre><code><span class="comment">// 1. Default — persistent storage (cookies, cache, credentials)</span>
+<span class="keyword">let</span> defaultConfig = <span class="type">URLSessionConfiguration</span>.<span class="func">default</span>
+
+<span class="comment">// 2. Ephemeral — in-memory only, no persistent storage</span>
+<span class="keyword">let</span> ephemeralConfig = <span class="type">URLSessionConfiguration</span>.<span class="func">ephemeral</span>
+
+<span class="comment">// 3. Background — survives app termination, system-managed</span>
+<span class="keyword">let</span> backgroundConfig = <span class="type">URLSessionConfiguration</span>.<span class="func">background</span>(
+    withIdentifier: <span class="string">"com.myapp.background-download"</span>
+)
+</code></pre>
+
+    <h3>Configuration Properties Comparison</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Property</th>
+                <th><code>.default</code></th>
+                <th><code>.ephemeral</code></th>
+                <th><code>.background</code></th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>urlCache</code></td>
+                <td>Shared disk + memory cache</td>
+                <td>RAM-only cache</td>
+                <td>nil (no caching)</td>
+            </tr>
+            <tr>
+                <td><code>httpCookieStorage</code></td>
+                <td>Shared persistent</td>
+                <td>In-memory only</td>
+                <td>Shared persistent</td>
+            </tr>
+            <tr>
+                <td><code>urlCredentialStorage</code></td>
+                <td>Shared Keychain-backed</td>
+                <td>In-memory only</td>
+                <td>Shared Keychain-backed</td>
+            </tr>
+            <tr>
+                <td><code>allowsCellularAccess</code></td>
+                <td>true</td>
+                <td>true</td>
+                <td>true</td>
+            </tr>
+            <tr>
+                <td><code>timeoutIntervalForRequest</code></td>
+                <td>60s</td>
+                <td>60s</td>
+                <td>60s</td>
+            </tr>
+            <tr>
+                <td><code>timeoutIntervalForResource</code></td>
+                <td>7 days</td>
+                <td>7 days</td>
+                <td>7 days</td>
+            </tr>
+            <tr>
+                <td><code>waitsForConnectivity</code></td>
+                <td>false</td>
+                <td>false</td>
+                <td>true (always)</td>
+            </tr>
+            <tr>
+                <td><code>isDiscretionary</code></td>
+                <td>false</td>
+                <td>false</td>
+                <td>System decides</td>
+            </tr>
+            <tr>
+                <td><code>httpAdditionalHeaders</code></td>
+                <td>nil</td>
+                <td>nil</td>
+                <td>nil</td>
+            </tr>
+            <tr>
+                <td><code>httpMaximumConnectionsPerHost</code></td>
+                <td>6 (iOS) / 4 (macOS)</td>
+                <td>6 (iOS) / 4 (macOS)</td>
+                <td>6 (iOS) / 4 (macOS)</td>
+            </tr>
+            <tr>
+                <td>Survives app termination</td>
+                <td>No</td>
+                <td>No</td>
+                <td>Yes</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Advanced Configuration</h3>
+
+<pre><code><span class="keyword">let</span> config = <span class="type">URLSessionConfiguration</span>.<span class="func">default</span>
+
+<span class="comment">// Global headers applied to every request</span>
+config.<span class="func">httpAdditionalHeaders</span> = [
+    <span class="string">"Accept"</span>: <span class="string">"application/json"</span>,
+    <span class="string">"X-App-Version"</span>: <span class="string">"3.2.1"</span>,
+    <span class="string">"Accept-Language"</span>: <span class="type">Locale</span>.<span class="func">preferredLanguages</span>.<span class="func">joined</span>(separator: <span class="string">", "</span>)
+]
+
+<span class="comment">// Wait for connectivity instead of failing immediately</span>
+config.<span class="func">waitsForConnectivity</span> = <span class="keyword">true</span>
+
+<span class="comment">// Multipathservice for WiFi + cellular aggregation</span>
+config.<span class="func">multipathServiceType</span> = .<span class="func">handover</span>
+
+<span class="comment">// Custom cache: 50MB memory, 500MB disk</span>
+config.<span class="func">urlCache</span> = <span class="type">URLCache</span>(
+    memoryCapacity: <span class="number">50</span> * <span class="number">1024</span> * <span class="number">1024</span>,
+    diskCapacity: <span class="number">500</span> * <span class="number">1024</span> * <span class="number">1024</span>,
+    directory: <span class="type">FileManager</span>.<span class="func">default</span>
+        .<span class="func">urls</span>(for: .<span class="func">cachesDirectory</span>, in: .<span class="func">userDomainMask</span>).<span class="func">first</span>?
+        .<span class="func">appendingPathComponent</span>(<span class="string">"NetworkCache"</span>)
+)
+
+<span class="comment">// TLS minimum version</span>
+config.<span class="func">tlsMinimumSupportedProtocolVersion</span> = .<span class="func">TLSv12</span>
+
+<span class="keyword">let</span> session = <span class="type">URLSession</span>(
+    configuration: config,
+    delegate: <span class="keyword">self</span>,
+    delegateQueue: .<span class="func">main</span>
+)
+</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: When to Use Each Configuration</div>
+        <ul>
+            <li><strong>Default</strong> — Most API calls, where you want persistent cookies and caching.</li>
+            <li><strong>Ephemeral</strong> — Sensitive operations (login, payment), incognito browsing, or when you need a clean slate per session.</li>
+            <li><strong>Background</strong> — Large file downloads/uploads that must complete even if the user kills the app. Think podcast downloads, photo uploads, OS update-style transfers.</li>
+        </ul>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 3: URLSessionTask Hierarchy                                -->
+    <!-- ================================================================== -->
+    <h2 id="task-hierarchy">3. URLSessionTask Hierarchy</h2>
+
+    <p><code>URLSessionTask</code> is the abstract base class for all work performed by a session. The class hierarchy reflects the different transfer semantics.</p>
+
+    <div class="diagram">
+                    URLSessionTask (abstract)
+                    ├── state: .running | .suspended | .canceling | .completed
+                    ├── priority: 0.0 ... 1.0
+                    ├── countOfBytesReceived / countOfBytesExpectedToReceive
+                    ├── progress: Progress
+                    │
+                    ├── URLSessionDataTask
+                    │   └── Receives data in memory via delegate/completion
+                    │
+                    ├── URLSessionUploadTask (extends DataTask)
+                    │   └── Sends body data (file, stream, Data)
+                    │
+                    ├── URLSessionDownloadTask
+                    │   └── Downloads to temp file on disk
+                    │   └── Supports resume data
+                    │
+                    ├── URLSessionStreamTask
+                    │   └── Raw TCP/TLS streams
+                    │   └── Read/write byte buffers
+                    │
+                    └── URLSessionWebSocketTask (extends DataTask)
+                        └── WebSocket frames (text/binary)
+                        └── Ping/pong support
+    </div>
+
+    <h3>Task State Machine</h3>
+
+    <div class="diagram">
+                    ┌───────────┐
+                    │ suspended │ ◀── initial state after creation
+                    └─────┬─────┘
+                          │ resume()
+                          ▼
+                    ┌───────────┐
+              ┌────▶│  running  │◀────┐
+              │     └─────┬─────┘     │
+              │           │           │
+              │  resume() │  suspend()│
+              │           ▼           │
+              │     ┌───────────┐     │
+              └─────│ suspended │─────┘
+                    └─────┬─────┘
+                          │ cancel()
+                          ▼
+                    ┌───────────┐
+                    │ canceling │
+                    └─────┬─────┘
+                          │ (system completes)
+                          ▼
+                    ┌───────────┐
+                    │ completed │ ── terminal state
+                    └───────────┘
+    </div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Tasks Start Suspended</div>
+        <p>All newly created tasks start in the <strong>suspended</strong> state. You must call <code>resume()</code> to begin execution. This is the #1 beginner mistake with URLSession. If you forget <code>resume()</code>, the request never fires and no error is thrown.</p>
+    </div>
+
+    <h3>DataTask — In-Memory Response</h3>
+
+<pre><code><span class="comment">// Completion handler style</span>
+<span class="keyword">let</span> url = <span class="type">URL</span>(string: <span class="string">"https://api.example.com/users"</span>)!
+<span class="keyword">let</span> task = session.<span class="func">dataTask</span>(with: url) { data, response, error <span class="keyword">in</span>
+    <span class="keyword">guard let</span> httpResponse = response <span class="keyword">as?</span> <span class="type">HTTPURLResponse</span>,
+          (<span class="number">200</span>...<span class="number">299</span>).<span class="func">contains</span>(httpResponse.<span class="func">statusCode</span>),
+          <span class="keyword">let</span> data = data <span class="keyword">else</span> {
+        <span class="keyword">return</span>
+    }
+    <span class="keyword">let</span> users = <span class="keyword">try?</span> <span class="type">JSONDecoder</span>().<span class="func">decode</span>([<span class="type">User</span>].<span class="keyword">self</span>, from: data)
+}
+task.<span class="func">resume</span>()
+
+<span class="comment">// async/await style (iOS 15+)</span>
+<span class="keyword">func</span> <span class="func">fetchUsers</span>() <span class="keyword">async throws</span> -> [<span class="type">User</span>] {
+    <span class="keyword">let</span> (data, response) = <span class="keyword">try await</span> session.<span class="func">data</span>(from: url)
+    <span class="keyword">guard let</span> httpResponse = response <span class="keyword">as?</span> <span class="type">HTTPURLResponse</span>,
+          httpResponse.<span class="func">statusCode</span> == <span class="number">200</span> <span class="keyword">else</span> {
+        <span class="keyword">throw</span> <span class="type">NetworkError</span>.<span class="func">invalidResponse</span>
+    }
+    <span class="keyword">return try</span> <span class="type">JSONDecoder</span>().<span class="func">decode</span>([<span class="type">User</span>].<span class="keyword">self</span>, from: data)
+}
+</code></pre>
+
+    <h3>UploadTask — Sending Data</h3>
+
+<pre><code><span class="keyword">func</span> <span class="func">uploadImage</span>(_ imageData: <span class="type">Data</span>) <span class="keyword">async throws</span> -> <span class="type">UploadResponse</span> {
+    <span class="keyword">var</span> request = <span class="type">URLRequest</span>(url: <span class="type">URL</span>(string: <span class="string">"https://api.example.com/upload"</span>)!)
+    request.<span class="func">httpMethod</span> = <span class="string">"POST"</span>
+    request.<span class="func">setValue</span>(<span class="string">"image/jpeg"</span>, forHTTPHeaderField: <span class="string">"Content-Type"</span>)
+
+    <span class="keyword">let</span> (data, response) = <span class="keyword">try await</span> session.<span class="func">upload</span>(for: request, from: imageData)
+    <span class="keyword">guard let</span> httpResponse = response <span class="keyword">as?</span> <span class="type">HTTPURLResponse</span>,
+          httpResponse.<span class="func">statusCode</span> == <span class="number">201</span> <span class="keyword">else</span> {
+        <span class="keyword">throw</span> <span class="type">NetworkError</span>.<span class="func">uploadFailed</span>
+    }
+    <span class="keyword">return try</span> <span class="type">JSONDecoder</span>().<span class="func">decode</span>(<span class="type">UploadResponse</span>.<span class="keyword">self</span>, from: data)
+}
+
+<span class="comment">// Upload from file (better for large files — avoids loading into memory)</span>
+<span class="keyword">func</span> <span class="func">uploadFile</span>(at fileURL: <span class="type">URL</span>) <span class="keyword">async throws</span> -> <span class="type">UploadResponse</span> {
+    <span class="keyword">var</span> request = <span class="type">URLRequest</span>(url: <span class="type">URL</span>(string: <span class="string">"https://api.example.com/upload"</span>)!)
+    request.<span class="func">httpMethod</span> = <span class="string">"PUT"</span>
+
+    <span class="keyword">let</span> (data, _) = <span class="keyword">try await</span> session.<span class="func">upload</span>(for: request, fromFile: fileURL)
+    <span class="keyword">return try</span> <span class="type">JSONDecoder</span>().<span class="func">decode</span>(<span class="type">UploadResponse</span>.<span class="keyword">self</span>, from: data)
+}
+</code></pre>
+
+    <h3>DownloadTask — File Downloads with Resume</h3>
+
+<pre><code><span class="keyword">func</span> <span class="func">downloadFile</span>(from url: <span class="type">URL</span>) <span class="keyword">async throws</span> -> <span class="type">URL</span> {
+    <span class="keyword">let</span> (tempURL, response) = <span class="keyword">try await</span> session.<span class="func">download</span>(from: url)
+
+    <span class="keyword">guard let</span> httpResponse = response <span class="keyword">as?</span> <span class="type">HTTPURLResponse</span>,
+          httpResponse.<span class="func">statusCode</span> == <span class="number">200</span> <span class="keyword">else</span> {
+        <span class="keyword">throw</span> <span class="type">NetworkError</span>.<span class="func">downloadFailed</span>
+    }
+
+    <span class="comment">// tempURL is deleted after this scope — move it</span>
+    <span class="keyword">let</span> documentsURL = <span class="type">FileManager</span>.<span class="func">default</span>
+        .<span class="func">urls</span>(for: .<span class="func">documentDirectory</span>, in: .<span class="func">userDomainMask</span>).<span class="func">first</span>!
+    <span class="keyword">let</span> destinationURL = documentsURL.<span class="func">appendingPathComponent</span>(url.<span class="func">lastPathComponent</span>)
+
+    <span class="keyword">try</span> <span class="type">FileManager</span>.<span class="func">default</span>.<span class="func">moveItem</span>(at: tempURL, to: destinationURL)
+    <span class="keyword">return</span> destinationURL
+}
+
+<span class="comment">// Resumable download with delegate for progress</span>
+<span class="keyword">class</span> <span class="type">DownloadManager</span>: <span class="type">NSObject</span>, <span class="type">URLSessionDownloadDelegate</span> {
+    <span class="keyword">private var</span> resumeData: <span class="type">Data</span>?
+    <span class="keyword">private var</span> session: <span class="type">URLSession</span>!
+
+    <span class="keyword">func</span> <span class="func">urlSession</span>(
+        _ session: <span class="type">URLSession</span>,
+        downloadTask: <span class="type">URLSessionDownloadTask</span>,
+        didFinishDownloadingTo location: <span class="type">URL</span>
+    ) {
+        <span class="comment">// Move file from temp location before this method returns</span>
+        <span class="keyword">let</span> dest = <span class="type">FileManager</span>.<span class="func">default</span>.<span class="func">temporaryDirectory</span>
+            .<span class="func">appendingPathComponent</span>(<span class="type">UUID</span>().<span class="func">uuidString</span>)
+        <span class="keyword">try?</span> <span class="type">FileManager</span>.<span class="func">default</span>.<span class="func">moveItem</span>(at: location, to: dest)
+    }
+
+    <span class="keyword">func</span> <span class="func">urlSession</span>(
+        _ session: <span class="type">URLSession</span>,
+        downloadTask: <span class="type">URLSessionDownloadTask</span>,
+        didWriteData bytesWritten: <span class="type">Int64</span>,
+        totalBytesWritten: <span class="type">Int64</span>,
+        totalBytesExpectedToWrite: <span class="type">Int64</span>
+    ) {
+        <span class="keyword">let</span> progress = <span class="type">Double</span>(totalBytesWritten) / <span class="type">Double</span>(totalBytesExpectedToWrite)
+        <span class="func">print</span>(<span class="string">"Download progress: \(</span><span class="type">Int</span>(progress * <span class="number">100</span>)<span class="string">)%"</span>)
+    }
+
+    <span class="keyword">func</span> <span class="func">urlSession</span>(
+        _ session: <span class="type">URLSession</span>,
+        task: <span class="type">URLSessionTask</span>,
+        didCompleteWithError error: <span class="type">Error</span>?
+    ) {
+        <span class="keyword">if let</span> error = error <span class="keyword">as?</span> <span class="type">NSError</span>,
+           <span class="keyword">let</span> data = error.<span class="func">userInfo</span>[<span class="type">NSURLSessionDownloadTaskResumeData</span>] <span class="keyword">as?</span> <span class="type">Data</span> {
+            <span class="keyword">self</span>.resumeData = data
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">resumeDownload</span>() {
+        <span class="keyword">guard let</span> resumeData = resumeData <span class="keyword">else</span> { <span class="keyword">return</span> }
+        <span class="keyword">let</span> task = session.<span class="func">downloadTask</span>(withResumeData: resumeData)
+        task.<span class="func">resume</span>()
+    }
+}
+</code></pre>
+
+    <h3>StreamTask — Raw TCP/TLS</h3>
+
+<pre><code><span class="keyword">let</span> streamTask = session.<span class="func">streamTask</span>(withHostName: <span class="string">"chat.example.com"</span>, port: <span class="number">8080</span>)
+streamTask.<span class="func">resume</span>()
+
+<span class="comment">// Upgrade to TLS</span>
+streamTask.<span class="func">startSecureConnection</span>()
+
+<span class="comment">// Read exactly 1024 bytes</span>
+streamTask.<span class="func">readData</span>(ofMinLength: <span class="number">1</span>, maxLength: <span class="number">1024</span>, timeout: <span class="number">30</span>) { data, atEOF, error <span class="keyword">in</span>
+    <span class="keyword">guard let</span> data = data <span class="keyword">else</span> { <span class="keyword">return</span> }
+    <span class="func">print</span>(<span class="string">"Received \(data.count) bytes"</span>)
+}
+
+<span class="comment">// Write data</span>
+<span class="keyword">let</span> message = <span class="string">"HELLO\r\n"</span>.<span class="func">data</span>(using: .<span class="func">utf8</span>)!
+streamTask.<span class="func">write</span>(message, timeout: <span class="number">10</span>) { error <span class="keyword">in</span>
+    <span class="keyword">if let</span> error = error { <span class="func">print</span>(<span class="string">"Write failed: \(error)"</span>) }
+}
+</code></pre>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 4: HTTP/2 Multiplexing                                     -->
+    <!-- ================================================================== -->
+    <h2 id="http2-multiplexing">4. HTTP/2 Multiplexing</h2>
+
+    <p><code>URLSession</code> transparently negotiates HTTP/2 via ALPN (Application-Layer Protocol Negotiation) during the TLS handshake. No code changes are required — the same API works for HTTP/1.1 and HTTP/2.</p>
+
+    <h3>HTTP/1.1 vs HTTP/2 Connection Model</h3>
+
+    <div class="diagram">
+HTTP/1.1 — One request per connection (head-of-line blocking)
+═══════════════════════════════════════════════════════════
+
+Connection 1: ──[Request A]────────[Response A]──────────────────▶
+Connection 2: ──[Request B]────────[Response B]──────────────────▶
+Connection 3: ──[Request C]────────[Response C]──────────────────▶
+Connection 4: ──[Request D]──(waiting for connection)────────────▶
+Connection 5: ──[Request E]──(waiting for connection)────────────▶
+Connection 6: ──[Request F]──(waiting for connection)────────────▶
+
+  ⚠ Limited to httpMaximumConnectionsPerHost (default: 6 on iOS)
+  ⚠ Each connection = separate TCP handshake + TLS negotiation
+
+
+HTTP/2 — Multiplexed streams over single connection
+═══════════════════════════════════════════════════
+
+Single Connection:
+  Stream 1: ──[Req A]──[Resp A frames]──────────────────▶
+  Stream 3: ──[Req B]────[Resp B frames]────────────────▶
+  Stream 5: ──[Req C]──────[Resp C frames]──────────────▶
+  Stream 7: ──[Req D]────────[Resp D frames]────────────▶
+  Stream 9: ──[Req E]──────────[Resp E frames]──────────▶
+  Stream 11:──[Req F]────────────[Resp F frames]────────▶
+
+  ✓ Single TCP connection, single TLS handshake
+  ✓ Frames from different streams interleaved
+  ✓ Server can prioritize streams
+  ✓ Header compression (HPACK)
+    </div>
+
+    <h3>Connection Coalescing</h3>
+
+    <p>HTTP/2 connection coalescing allows <code>URLSession</code> to reuse a single TCP connection for multiple hostnames if they resolve to the same IP and share a TLS certificate (via SAN — Subject Alternative Name). For example, <code>api.example.com</code> and <code>cdn.example.com</code> can share one connection if the certificate covers both.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Head-of-Line Blocking</div>
+        <p>HTTP/2 solves <strong>HTTP-level</strong> head-of-line blocking (multiple requests on one connection), but <strong>TCP-level</strong> HOL blocking remains: if a TCP packet is lost, all streams on that connection stall until retransmission. This is why HTTP/3 (QUIC) uses UDP — each stream has independent loss recovery. iOS 15+ supports HTTP/3 experimentally via <code>assumesHTTP3Capable</code> on <code>URLSessionConfiguration</code>.</p>
+    </div>
+
+<pre><code><span class="comment">// Opt into HTTP/3 (QUIC) — iOS 15+</span>
+<span class="keyword">let</span> config = <span class="type">URLSessionConfiguration</span>.<span class="func">default</span>
+config.<span class="func">assumesHTTP3Capable</span> = <span class="keyword">true</span>
+
+<span class="comment">// Check which protocol was negotiated</span>
+<span class="keyword">let</span> (data, response) = <span class="keyword">try await</span> session.<span class="func">data</span>(from: url)
+<span class="keyword">if let</span> httpResponse = response <span class="keyword">as?</span> <span class="type">HTTPURLResponse</span> {
+    <span class="comment">// Access via task metrics for protocol details</span>
+}
+
+<span class="comment">// Collect detailed metrics including protocol version</span>
+<span class="keyword">func</span> <span class="func">urlSession</span>(
+    _ session: <span class="type">URLSession</span>,
+    task: <span class="type">URLSessionTask</span>,
+    didFinishCollecting metrics: <span class="type">URLSessionTaskMetrics</span>
+) {
+    <span class="keyword">for</span> tx <span class="keyword">in</span> metrics.<span class="func">transactionMetrics</span> {
+        <span class="func">print</span>(<span class="string">"Protocol: \(tx.networkProtocolName ?? "unknown")"</span>)
+        <span class="comment">// "h2" for HTTP/2, "h3" for HTTP/3</span>
+        <span class="func">print</span>(<span class="string">"Reused connection: \(tx.isReusedConnection)"</span>)
+        <span class="func">print</span>(<span class="string">"DNS: \(tx.domainLookupStartDate) → \(tx.domainLookupEndDate)"</span>)
+        <span class="func">print</span>(<span class="string">"TLS: \(tx.secureConnectionStartDate) → \(tx.secureConnectionEndDate)"</span>)
+    }
+}
+</code></pre>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Feature</th>
+                <th>HTTP/1.1</th>
+                <th>HTTP/2</th>
+                <th>HTTP/3 (QUIC)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Transport</td>
+                <td>TCP</td>
+                <td>TCP</td>
+                <td>UDP (QUIC)</td>
+            </tr>
+            <tr>
+                <td>Multiplexing</td>
+                <td>No (pipelining rarely used)</td>
+                <td>Yes</td>
+                <td>Yes</td>
+            </tr>
+            <tr>
+                <td>Header compression</td>
+                <td>No</td>
+                <td>HPACK</td>
+                <td>QPACK</td>
+            </tr>
+            <tr>
+                <td>TCP HOL blocking</td>
+                <td>Yes</td>
+                <td>Yes</td>
+                <td>No</td>
+            </tr>
+            <tr>
+                <td>Server push</td>
+                <td>No</td>
+                <td>Yes</td>
+                <td>Yes</td>
+            </tr>
+            <tr>
+                <td>Connection migration</td>
+                <td>No</td>
+                <td>No</td>
+                <td>Yes (connection ID)</td>
+            </tr>
+            <tr>
+                <td>0-RTT handshake</td>
+                <td>No</td>
+                <td>No</td>
+                <td>Yes</td>
+            </tr>
+            <tr>
+                <td>iOS support</td>
+                <td>All versions</td>
+                <td>iOS 9+</td>
+                <td>iOS 15+ (experimental)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 5: URLProtocol Interception                                -->
+    <!-- ================================================================== -->
+    <h2 id="urlprotocol-interception">5. URLProtocol Interception</h2>
+
+    <p><code>URLProtocol</code> is an abstract class that lets you intercept, modify, or completely replace the loading behavior of URL requests. Registered protocols are checked in LIFO order — the last registered protocol gets first chance to handle a request.</p>
+
+    <h3>URLProtocol Lifecycle</h3>
+
+    <div class="diagram">
+URLSession creates a request
+        │
+        ▼
+┌───────────────────────────────────┐
+│ For each registered URLProtocol   │
+│ (LIFO order):                     │
+│                                   │
+│   canInit(with: URLRequest) ?     │──── false ──▶ try next protocol
+│        │                          │
+│       true                        │
+│        │                          │
+│        ▼                          │
+│   canonicalRequest(for:)          │
+│   (normalize the request)         │
+│        │                          │
+│        ▼                          │
+│   init(request:cachedResponse:    │
+│        client:)                   │
+│        │                          │
+│        ▼                          │
+│   startLoading()                  │
+│   ┌─ client.urlProtocol(         │
+│   │    didReceive: response)      │
+│   │  client.urlProtocol(         │
+│   │    didLoad: data)             │
+│   │  client.urlProtocolDidFinish │
+│   │    Loading()                  │
+│   └──────────────────────────────│
+│        │                          │
+│        ▼                          │
+│   stopLoading()                   │
+│   (cancel/cleanup)                │
+└───────────────────────────────────┘
+    </div>
+
+    <h3>Complete Mock URLProtocol for Testing</h3>
+
+<pre><code><span class="keyword">final class</span> <span class="type">MockURLProtocol</span>: <span class="type">URLProtocol</span> {
+
+    <span class="keyword">static var</span> requestHandler: ((<span class="type">URLRequest</span>) <span class="keyword">throws</span> -> (<span class="type">HTTPURLResponse</span>, <span class="type">Data</span>))?
+
+    <span class="keyword">override class func</span> <span class="func">canInit</span>(with request: <span class="type">URLRequest</span>) -> <span class="type">Bool</span> {
+        <span class="keyword">return true</span>
+    }
+
+    <span class="keyword">override class func</span> <span class="func">canonicalRequest</span>(for request: <span class="type">URLRequest</span>) -> <span class="type">URLRequest</span> {
+        <span class="keyword">return</span> request
+    }
+
+    <span class="keyword">override func</span> <span class="func">startLoading</span>() {
+        <span class="keyword">guard let</span> handler = <span class="type">MockURLProtocol</span>.requestHandler <span class="keyword">else</span> {
+            client?.<span class="func">urlProtocol</span>(<span class="keyword">self</span>, didFailWithError: <span class="type">URLError</span>(.<span class="func">badURL</span>))
+            <span class="keyword">return</span>
+        }
+
+        <span class="keyword">do</span> {
+            <span class="keyword">let</span> (response, data) = <span class="keyword">try</span> <span class="func">handler</span>(request)
+            client?.<span class="func">urlProtocol</span>(<span class="keyword">self</span>, didReceive: response, cacheStoragePolicy: .<span class="func">notAllowed</span>)
+            client?.<span class="func">urlProtocol</span>(<span class="keyword">self</span>, didLoad: data)
+            client?.<span class="func">urlProtocolDidFinishLoading</span>(<span class="keyword">self</span>)
+        } <span class="keyword">catch</span> {
+            client?.<span class="func">urlProtocol</span>(<span class="keyword">self</span>, didFailWithError: error)
+        }
+    }
+
+    <span class="keyword">override func</span> <span class="func">stopLoading</span>() {
+        <span class="comment">// No-op for mock</span>
+    }
+}
+
+<span class="comment">// Usage in tests</span>
+<span class="keyword">final class</span> <span class="type">APIClientTests</span>: <span class="type">XCTestCase</span> {
+
+    <span class="keyword">var</span> session: <span class="type">URLSession</span>!
+
+    <span class="keyword">override func</span> <span class="func">setUp</span>() {
+        <span class="keyword">let</span> config = <span class="type">URLSessionConfiguration</span>.<span class="func">ephemeral</span>
+        config.<span class="func">protocolClasses</span> = [<span class="type">MockURLProtocol</span>.<span class="keyword">self</span>]
+        session = <span class="type">URLSession</span>(configuration: config)
+    }
+
+    <span class="keyword">func</span> <span class="func">testFetchUsersReturnsDecodedData</span>() <span class="keyword">async throws</span> {
+        <span class="keyword">let</span> mockUsers = [<span class="type">User</span>(id: <span class="number">1</span>, name: <span class="string">"Alice"</span>)]
+        <span class="keyword">let</span> mockData = <span class="keyword">try</span> <span class="type">JSONEncoder</span>().<span class="func">encode</span>(mockUsers)
+
+        <span class="type">MockURLProtocol</span>.requestHandler = { request <span class="keyword">in</span>
+            <span class="keyword">let</span> response = <span class="type">HTTPURLResponse</span>(
+                url: request.<span class="func">url</span>!,
+                statusCode: <span class="number">200</span>,
+                httpVersion: <span class="keyword">nil</span>,
+                headerFields: [<span class="string">"Content-Type"</span>: <span class="string">"application/json"</span>]
+            )!
+            <span class="keyword">return</span> (response, mockData)
+        }
+
+        <span class="keyword">let</span> client = <span class="type">APIClient</span>(session: session)
+        <span class="keyword">let</span> users = <span class="keyword">try await</span> client.<span class="func">fetchUsers</span>()
+        <span class="type">XCTAssertEqual</span>(users.<span class="func">count</span>, <span class="number">1</span>)
+        <span class="type">XCTAssertEqual</span>(users.<span class="func">first</span>?.<span class="func">name</span>, <span class="string">"Alice"</span>)
+    }
+}
+</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: URLProtocol Registration Scope</div>
+        <p><strong>Global registration</strong> via <code>URLProtocol.registerClass(_:)</code> only works with <code>URLSession.shared</code> and legacy <code>NSURLConnection</code>. For custom <code>URLSession</code> instances, you must set <code>protocolClasses</code> on the <code>URLSessionConfiguration</code> before creating the session. This is a frequent source of bugs where a mock protocol "doesn't work" in tests.</p>
+        <p>Also beware: <code>URLProtocol</code> callbacks happen on an arbitrary background thread. If your protocol interacts with UI or non-thread-safe state, you must dispatch to the correct queue.</p>
+    </div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: URLProtocol and Background Sessions</div>
+        <p><code>URLProtocol</code> subclasses are <strong>not supported</strong> with background session configurations. The system handles background transfers in a separate daemon process (<code>nsurlsessiond</code>) that cannot load your custom protocol classes.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 6: URLCache                                                -->
+    <!-- ================================================================== -->
+    <h2 id="urlcache">6. URLCache</h2>
+
+    <p><code>URLCache</code> provides a composite in-memory and on-disk cache for URL responses. It sits between your code and the network, transparently caching responses based on HTTP cache semantics.</p>
+
+    <h3>Cache Architecture</h3>
+
+    <div class="diagram">
+┌──────────────┐     miss      ┌──────────────┐     miss      ┌──────────┐
+│  Memory Cache │─────────────▶│  Disk Cache   │─────────────▶│  Network │
+│  (fast, RAM)  │              │  (SQLite DB)  │              │          │
+│              │◀─────────────│              │◀─────────────│          │
+│              │    populate   │              │    populate   │          │
+└──────────────┘              └──────────────┘              └──────────┘
+
+Default sizes:
+  Memory: 512 KB (URLSession.shared) or 4 MB (.default config)
+  Disk:   10 MB (URLSession.shared) or 20 MB (.default config)
+
+Location: &lt;app-sandbox&gt;/Library/Caches/&lt;bundle-id&gt;/Cache.db
+    </div>
+
+    <h3>CachePolicy Enum</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Policy</th>
+                <th>Behavior</th>
+                <th>Use Case</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>.useProtocolCachePolicy</code></td>
+                <td>Follows HTTP cache headers (Cache-Control, Expires, ETag, Last-Modified). Default.</td>
+                <td>Standard API calls</td>
+            </tr>
+            <tr>
+                <td><code>.reloadIgnoringLocalCacheData</code></td>
+                <td>Always fetches from network. Ignores local cache entirely.</td>
+                <td>Pull-to-refresh, force reload</td>
+            </tr>
+            <tr>
+                <td><code>.returnCacheDataElseLoad</code></td>
+                <td>Returns cached data regardless of age. Only goes to network if no cache exists.</td>
+                <td>Offline-first, stale-while-revalidate</td>
+            </tr>
+            <tr>
+                <td><code>.returnCacheDataDontLoad</code></td>
+                <td>Returns cached data or fails. Never goes to network.</td>
+                <td>Strict offline mode</td>
+            </tr>
+            <tr>
+                <td><code>.reloadRevalidatingCacheData</code></td>
+                <td>Validates cached data with server (conditional GET with ETag/If-Modified-Since).</td>
+                <td>Ensure freshness with minimal bandwidth</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Custom Cache Configuration</h3>
+
+<pre><code><span class="comment">// Custom cache with generous limits</span>
+<span class="keyword">let</span> cache = <span class="type">URLCache</span>(
+    memoryCapacity: <span class="number">50</span> * <span class="number">1024</span> * <span class="number">1024</span>,   <span class="comment">// 50 MB memory</span>
+    diskCapacity: <span class="number">500</span> * <span class="number">1024</span> * <span class="number">1024</span>,    <span class="comment">// 500 MB disk</span>
+    directory: <span class="type">FileManager</span>.<span class="func">default</span>
+        .<span class="func">urls</span>(for: .<span class="func">cachesDirectory</span>, in: .<span class="func">userDomainMask</span>).<span class="func">first</span>?
+        .<span class="func">appendingPathComponent</span>(<span class="string">"APICache"</span>)
+)
+
+<span class="keyword">let</span> config = <span class="type">URLSessionConfiguration</span>.<span class="func">default</span>
+config.<span class="func">urlCache</span> = cache
+config.<span class="func">requestCachePolicy</span> = .<span class="func">useProtocolCachePolicy</span>
+
+<span class="comment">// Per-request cache policy override</span>
+<span class="keyword">var</span> request = <span class="type">URLRequest</span>(url: url)
+request.<span class="func">cachePolicy</span> = .<span class="func">reloadIgnoringLocalCacheData</span>
+
+<span class="comment">// Manually store a cached response</span>
+<span class="keyword">let</span> cachedResponse = <span class="type">CachedURLResponse</span>(
+    response: httpResponse,
+    data: responseData,
+    storagePolicy: .<span class="func">allowed</span>
+)
+cache.<span class="func">storeCachedResponse</span>(cachedResponse, for: request)
+
+<span class="comment">// Query cache without making a network request</span>
+<span class="keyword">if let</span> cached = cache.<span class="func">cachedResponse</span>(for: request) {
+    <span class="keyword">let</span> data = cached.<span class="func">data</span>
+    <span class="keyword">let</span> response = cached.<span class="func">response</span>
+    <span class="func">print</span>(<span class="string">"Cache hit: \(data.count) bytes"</span>)
+}
+
+<span class="comment">// Clear specific or all cached data</span>
+cache.<span class="func">removeCachedResponse</span>(for: request)
+cache.<span class="func">removeAllCachedResponses</span>()
+cache.<span class="func">removeCachedResponses</span>(since: <span class="type">Date</span>().<span class="func">addingTimeInterval</span>(-<span class="number">3600</span>))
+</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Cache-Control Headers</div>
+        <p>The default <code>.useProtocolCachePolicy</code> respects standard HTTP cache headers:</p>
+        <ul>
+            <li><code>Cache-Control: max-age=3600</code> — cache for 1 hour</li>
+            <li><code>Cache-Control: no-cache</code> — must revalidate before using</li>
+            <li><code>Cache-Control: no-store</code> — never cache (sensitive data)</li>
+            <li><code>ETag</code> / <code>If-None-Match</code> — conditional GET, server returns 304 if unchanged</li>
+            <li><code>Last-Modified</code> / <code>If-Modified-Since</code> — date-based conditional GET</li>
+        </ul>
+        <p>If the server sends <code>no-store</code>, <code>URLCache</code> will not cache the response regardless of your local cache policy. POST requests are never cached by default.</p>
+    </div>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Cache Strategy</div>
+        <p>For production apps, configure generous disk cache sizes (200–500 MB) and use <code>.useProtocolCachePolicy</code> as the default. Override per-request for pull-to-refresh (<code>.reloadIgnoringLocalCacheData</code>) and offline mode (<code>.returnCacheDataElseLoad</code>). Monitor cache hit rates via <code>URLSessionTaskMetrics</code> to tune server cache headers.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 7: TLS & App Transport Security                            -->
+    <!-- ================================================================== -->
+    <h2 id="tls-ats">7. TLS &amp; App Transport Security</h2>
+
+    <p>App Transport Security (ATS) is a security feature introduced in iOS 9 that enforces best-practice HTTPS connections. It is enabled by default and requires all network connections to use TLS 1.2+ with forward secrecy.</p>
+
+    <h3>ATS Requirements</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Requirement</th>
+                <th>Minimum</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Protocol</td>
+                <td>TLS 1.2</td>
+                <td>TLS 1.0/1.1 rejected. TLS 1.3 preferred when available.</td>
+            </tr>
+            <tr>
+                <td>Cipher suites</td>
+                <td>Forward secrecy (ECDHE)</td>
+                <td>AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305</td>
+            </tr>
+            <tr>
+                <td>Certificate</td>
+                <td>SHA-256+ signature</td>
+                <td>RSA 2048-bit or ECC 256-bit minimum key size</td>
+            </tr>
+            <tr>
+                <td>Scheme</td>
+                <td>HTTPS only</td>
+                <td>Plain HTTP blocked unless explicitly excepted</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>ATS Exception Configuration (Info.plist)</h3>
+
+<pre><code><span class="comment">&lt;!-- Info.plist ATS exceptions --&gt;</span>
+&lt;key&gt;NSAppTransportSecurity&lt;/key&gt;
+&lt;dict&gt;
+    <span class="comment">&lt;!-- NEVER do this in production — disables ALL ATS --&gt;</span>
+    <span class="comment">&lt;!-- &lt;key&gt;NSAllowsArbitraryLoads&lt;/key&gt; --&gt;</span>
+    <span class="comment">&lt;!-- &lt;true/&gt; --&gt;</span>
+
+    <span class="comment">&lt;!-- Per-domain exceptions --&gt;</span>
+    &lt;key&gt;NSExceptionDomains&lt;/key&gt;
+    &lt;dict&gt;
+        <span class="comment">&lt;!-- Legacy API that only supports TLS 1.0 --&gt;</span>
+        &lt;key&gt;legacy-api.example.com&lt;/key&gt;
+        &lt;dict&gt;
+            &lt;key&gt;NSExceptionMinimumTLSVersion&lt;/key&gt;
+            &lt;string&gt;TLSv1.0&lt;/string&gt;
+            &lt;key&gt;NSExceptionRequiresForwardSecrecy&lt;/key&gt;
+            &lt;false/&gt;
+        &lt;/dict&gt;
+
+        <span class="comment">&lt;!-- Local development server --&gt;</span>
+        &lt;key&gt;localhost&lt;/key&gt;
+        &lt;dict&gt;
+            &lt;key&gt;NSExceptionAllowsInsecureHTTPLoads&lt;/key&gt;
+            &lt;true/&gt;
+        &lt;/dict&gt;
+    &lt;/dict&gt;
+
+    <span class="comment">&lt;!-- Allow media loads over HTTP (AVFoundation) --&gt;</span>
+    &lt;key&gt;NSAllowsArbitraryLoadsForMedia&lt;/key&gt;
+    &lt;true/&gt;
+
+    <span class="comment">&lt;!-- Allow web view loads (WKWebView) --&gt;</span>
+    &lt;key&gt;NSAllowsArbitraryLoadsInWebContent&lt;/key&gt;
+    &lt;true/&gt;
+&lt;/dict&gt;
+</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: ATS and App Review</div>
+        <p>Apple requires justification for ATS exceptions during App Store review. Using <code>NSAllowsArbitraryLoads = true</code> will trigger review scrutiny and may result in rejection. Always use per-domain exceptions with the minimum necessary relaxation. The App Store review team specifically checks for blanket ATS disabling.</p>
+    </div>
+
+<pre><code><span class="comment">// Programmatic TLS configuration via URLSessionConfiguration</span>
+<span class="keyword">let</span> config = <span class="type">URLSessionConfiguration</span>.<span class="func">default</span>
+
+<span class="comment">// Require TLS 1.2 minimum (matches ATS default)</span>
+config.<span class="func">tlsMinimumSupportedProtocolVersion</span> = .<span class="func">TLSv12</span>
+
+<span class="comment">// Prefer TLS 1.3 when available</span>
+config.<span class="func">tlsMaximumSupportedProtocolVersion</span> = .<span class="func">TLSv13</span>
+</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Forward Secrecy</div>
+        <p>Forward secrecy (via ECDHE key exchange) ensures that even if the server's private key is compromised in the future, past recorded traffic cannot be decrypted. Each session uses a unique ephemeral key pair. ATS requires forward secrecy by default because without it, a single key compromise exposes all historical traffic — a catastrophic failure mode for any app handling user data.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 8: Certificate Pinning                                     -->
+    <!-- ================================================================== -->
+    <h2 id="certificate-pinning">8. Certificate Pinning</h2>
+
+    <p>Certificate pinning restricts which certificates your app trusts for a given domain, protecting against man-in-the-middle attacks even if a rogue CA issues a valid certificate for your domain.</p>
+
+    <h3>Certificate Pinning vs Public Key Pinning</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Approach</th>
+                <th>Pins</th>
+                <th>Rotation</th>
+                <th>Pros</th>
+                <th>Cons</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Certificate pinning</td>
+                <td>Entire X.509 certificate</td>
+                <td>Must update app when cert rotates</td>
+                <td>Simple to implement</td>
+                <td>Brittle — cert rotation breaks app</td>
+            </tr>
+            <tr>
+                <td>Public key pinning</td>
+                <td>Subject Public Key Info (SPKI)</td>
+                <td>Survives cert renewal if key unchanged</td>
+                <td>More resilient to rotation</td>
+                <td>Slightly more complex extraction</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Complete Certificate Pinning Implementation</h3>
+
+<pre><code><span class="keyword">final class</span> <span class="type">PinnedSessionDelegate</span>: <span class="type">NSObject</span>, <span class="type">URLSessionDelegate</span> {
+
+    <span class="keyword">private let</span> pinnedCertificates: [<span class="type">SecCertificate</span>]
+
+    <span class="keyword">init</span>(pinnedCertificateNames: [<span class="type">String</span>]) {
+        <span class="keyword">self</span>.pinnedCertificates = pinnedCertificateNames.<span class="func">compactMap</span> { name <span class="keyword">in</span>
+            <span class="keyword">guard let</span> url = <span class="type">Bundle</span>.<span class="func">main</span>.<span class="func">url</span>(forResource: name, withExtension: <span class="string">"cer"</span>),
+                  <span class="keyword">let</span> data = <span class="keyword">try?</span> <span class="type">Data</span>(contentsOf: url),
+                  <span class="keyword">let</span> cert = <span class="type">SecCertificateCreateWithData</span>(<span class="keyword">nil</span>, data <span class="keyword">as</span> <span class="type">CFData</span>) <span class="keyword">else</span> {
+                <span class="keyword">return nil</span>
+            }
+            <span class="keyword">return</span> cert
+        }
+        <span class="keyword">super</span>.<span class="func">init</span>()
+    }
+
+    <span class="keyword">func</span> <span class="func">urlSession</span>(
+        _ session: <span class="type">URLSession</span>,
+        didReceive challenge: <span class="type">URLAuthenticationChallenge</span>,
+        completionHandler: @<span class="keyword">escaping</span> (<span class="type">URLSession</span>.<span class="type">AuthChallengeDisposition</span>, <span class="type">URLCredential</span>?) -> <span class="type">Void</span>
+    ) {
+        <span class="keyword">guard</span> challenge.<span class="func">protectionSpace</span>.<span class="func">authenticationMethod</span>
+                == <span class="type">NSURLAuthenticationMethodServerTrust</span>,
+              <span class="keyword">let</span> serverTrust = challenge.<span class="func">protectionSpace</span>.<span class="func">serverTrust</span> <span class="keyword">else</span> {
+            completionHandler(.<span class="func">performDefaultHandling</span>, <span class="keyword">nil</span>)
+            <span class="keyword">return</span>
+        }
+
+        <span class="comment">// Set pinned certificates as the only trusted anchors</span>
+        <span class="type">SecTrustSetAnchorCertificates</span>(serverTrust, pinnedCertificates <span class="keyword">as</span> <span class="type">CFArray</span>)
+        <span class="type">SecTrustSetAnchorCertificatesOnly</span>(serverTrust, <span class="keyword">true</span>)
+
+        <span class="comment">// Evaluate the trust chain</span>
+        <span class="keyword">var</span> error: <span class="type">CFError</span>?
+        <span class="keyword">let</span> isTrusted = <span class="type">SecTrustEvaluateWithError</span>(serverTrust, &amp;error)
+
+        <span class="keyword">if</span> isTrusted {
+            <span class="keyword">let</span> credential = <span class="type">URLCredential</span>(trust: serverTrust)
+            completionHandler(.<span class="func">useCredential</span>, credential)
+        } <span class="keyword">else</span> {
+            completionHandler(.<span class="func">cancelAuthenticationChallenge</span>, <span class="keyword">nil</span>)
+        }
+    }
+}
+</code></pre>
+
+    <h3>Public Key Pinning (More Resilient)</h3>
+
+<pre><code><span class="keyword">final class</span> <span class="type">PublicKeyPinningDelegate</span>: <span class="type">NSObject</span>, <span class="type">URLSessionDelegate</span> {
+
+    <span class="comment">// SHA-256 hashes of the Subject Public Key Info (SPKI)</span>
+    <span class="keyword">private let</span> pinnedKeyHashes: <span class="type">Set</span>&lt;<span class="type">String</span>&gt; = [
+        <span class="string">"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="</span>,  <span class="comment">// primary</span>
+        <span class="string">"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC="</span>,  <span class="comment">// backup</span>
+    ]
+
+    <span class="keyword">func</span> <span class="func">urlSession</span>(
+        _ session: <span class="type">URLSession</span>,
+        didReceive challenge: <span class="type">URLAuthenticationChallenge</span>,
+        completionHandler: @<span class="keyword">escaping</span> (<span class="type">URLSession</span>.<span class="type">AuthChallengeDisposition</span>, <span class="type">URLCredential</span>?) -> <span class="type">Void</span>
+    ) {
+        <span class="keyword">guard</span> challenge.<span class="func">protectionSpace</span>.<span class="func">authenticationMethod</span>
+                == <span class="type">NSURLAuthenticationMethodServerTrust</span>,
+              <span class="keyword">let</span> serverTrust = challenge.<span class="func">protectionSpace</span>.<span class="func">serverTrust</span> <span class="keyword">else</span> {
+            completionHandler(.<span class="func">performDefaultHandling</span>, <span class="keyword">nil</span>)
+            <span class="keyword">return</span>
+        }
+
+        <span class="comment">// Standard trust evaluation first</span>
+        <span class="keyword">var</span> error: <span class="type">CFError</span>?
+        <span class="keyword">guard</span> <span class="type">SecTrustEvaluateWithError</span>(serverTrust, &amp;error) <span class="keyword">else</span> {
+            completionHandler(.<span class="func">cancelAuthenticationChallenge</span>, <span class="keyword">nil</span>)
+            <span class="keyword">return</span>
+        }
+
+        <span class="comment">// Extract and verify public key from the leaf certificate</span>
+        <span class="keyword">let</span> certCount = <span class="type">SecTrustGetCertificateCount</span>(serverTrust)
+        <span class="keyword">guard</span> certCount > <span class="number">0</span>,
+              <span class="keyword">let</span> serverCert = <span class="type">SecTrustCopyCertificateChain</span>(serverTrust)
+                <span class="keyword">as?</span> [<span class="type">SecCertificate</span>],
+              <span class="keyword">let</span> leafCert = serverCert.<span class="func">first</span>,
+              <span class="keyword">let</span> publicKey = <span class="type">SecCertificateCopyKey</span>(leafCert),
+              <span class="keyword">let</span> publicKeyData = <span class="type">SecKeyCopyExternalRepresentation</span>(publicKey, <span class="keyword">nil</span>)
+                <span class="keyword">as?</span> <span class="type">Data</span> <span class="keyword">else</span> {
+            completionHandler(.<span class="func">cancelAuthenticationChallenge</span>, <span class="keyword">nil</span>)
+            <span class="keyword">return</span>
+        }
+
+        <span class="keyword">let</span> keyHash = publicKeyData.<span class="func">sha256Base64</span>()
+
+        <span class="keyword">if</span> pinnedKeyHashes.<span class="func">contains</span>(keyHash) {
+            <span class="keyword">let</span> credential = <span class="type">URLCredential</span>(trust: serverTrust)
+            completionHandler(.<span class="func">useCredential</span>, credential)
+        } <span class="keyword">else</span> {
+            completionHandler(.<span class="func">cancelAuthenticationChallenge</span>, <span class="keyword">nil</span>)
+        }
+    }
+}
+
+<span class="keyword">extension</span> <span class="type">Data</span> {
+    <span class="keyword">func</span> <span class="func">sha256Base64</span>() -> <span class="type">String</span> {
+        <span class="keyword">var</span> hash = [<span class="type">UInt8</span>](repeating: <span class="number">0</span>, count: <span class="type">Int</span>(<span class="type">CC_SHA256_DIGEST_LENGTH</span>))
+        <span class="keyword">self</span>.<span class="func">withUnsafeBytes</span> { buffer <span class="keyword">in</span>
+            _ = <span class="type">CC_SHA256</span>(buffer.<span class="func">baseAddress</span>, <span class="type">CC_LONG</span>(<span class="keyword">self</span>.<span class="func">count</span>), &amp;hash)
+        }
+        <span class="keyword">return</span> <span class="type">Data</span>(hash).<span class="func">base64EncodedString</span>()
+    }
+}
+</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Pinning Strategy</div>
+        <ul>
+            <li><strong>Always pin public keys</strong>, not certificates — survives certificate renewal.</li>
+            <li><strong>Pin at least two keys</strong> — a primary and a backup. If you lose the primary key, the backup prevents a total lockout.</li>
+            <li><strong>Pin the intermediate CA</strong>, not the leaf — more stable and survives leaf rotation.</li>
+            <li><strong>Include a kill switch</strong> — a remote config flag to disable pinning if you need to rotate keys in an emergency.</li>
+            <li><strong>Monitor failures</strong> — log pinning failures to detect MITM attacks vs. legitimate cert changes.</li>
+        </ul>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 9: Background Transfers                                    -->
+    <!-- ================================================================== -->
+    <h2 id="background-transfers">9. Background Transfers</h2>
+
+    <p>Background sessions allow downloads and uploads to continue even after the user switches apps or the system terminates the app. The system daemon <code>nsurlsessiond</code> manages the actual transfer.</p>
+
+    <h3>Background Transfer Lifecycle</h3>
+
+    <div class="diagram">
+┌──────────────────────────────────────────────────────────────────┐
+│ 1. App creates background session with unique identifier         │
+│    URLSessionConfiguration.background(withIdentifier: "...")     │
+│                                                                  │
+│ 2. App creates download/upload task and calls resume()           │
+│    Task is handed off to nsurlsessiond daemon                    │
+│                                                                  │
+│ 3. App may be suspended or terminated by the system              │
+│    Transfer continues in nsurlsessiond                           │
+│                                                                  │
+│ 4. Transfer completes while app is not running                   │
+│    System wakes/relaunches the app                               │
+│                                                                  │
+│ 5. AppDelegate receives:                                         │
+│    application(_:handleEventsForBackgroundURLSession:             │
+│                completionHandler:)                                │
+│    ⚠ Store the completionHandler!                                │
+│                                                                  │
+│ 6. App recreates URLSession with SAME identifier                 │
+│    Delegate callbacks fire (didFinishDownloadingTo, etc.)         │
+│                                                                  │
+│ 7. After all delegate callbacks:                                 │
+│    urlSessionDidFinishEvents(forBackgroundURLSession:)            │
+│    ⚠ Call the stored completionHandler here!                     │
+└──────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>Complete Background Download Implementation</h3>
+
+<pre><code><span class="comment">// MARK: - AppDelegate</span>
+
+<span class="keyword">class</span> <span class="type">AppDelegate</span>: <span class="type">UIResponder</span>, <span class="type">UIApplicationDelegate</span> {
+
+    <span class="keyword">var</span> backgroundCompletionHandlers: [<span class="type">String</span>: () -> <span class="type">Void</span>] = [:]
+
+    <span class="keyword">func</span> <span class="func">application</span>(
+        _ application: <span class="type">UIApplication</span>,
+        handleEventsForBackgroundURLSession identifier: <span class="type">String</span>,
+        completionHandler: @<span class="keyword">escaping</span> () -> <span class="type">Void</span>
+    ) {
+        backgroundCompletionHandlers[identifier] = completionHandler
+        <span class="comment">// Recreate the session — this reconnects to the daemon</span>
+        _ = <span class="type">BackgroundDownloadManager</span>.<span class="func">shared</span>
+    }
+}
+
+<span class="comment">// MARK: - BackgroundDownloadManager</span>
+
+<span class="keyword">final class</span> <span class="type">BackgroundDownloadManager</span>: <span class="type">NSObject</span> {
+
+    <span class="keyword">static let</span> shared = <span class="type">BackgroundDownloadManager</span>()
+    <span class="keyword">static let</span> sessionIdentifier = <span class="string">"com.myapp.background-download"</span>
+
+    <span class="keyword">private lazy var</span> session: <span class="type">URLSession</span> = {
+        <span class="keyword">let</span> config = <span class="type">URLSessionConfiguration</span>.<span class="func">background</span>(
+            withIdentifier: <span class="type">BackgroundDownloadManager</span>.sessionIdentifier
+        )
+        config.<span class="func">isDiscretionary</span> = <span class="keyword">false</span>
+        config.<span class="func">sessionSendsLaunchEvents</span> = <span class="keyword">true</span>
+        config.<span class="func">allowsCellularAccess</span> = <span class="keyword">true</span>
+
+        <span class="keyword">return</span> <span class="type">URLSession</span>(
+            configuration: config,
+            delegate: <span class="keyword">self</span>,
+            delegateQueue: <span class="keyword">nil</span>
+        )
+    }()
+
+    <span class="keyword">func</span> <span class="func">startDownload</span>(url: <span class="type">URL</span>) {
+        <span class="keyword">let</span> task = session.<span class="func">downloadTask</span>(with: url)
+        task.<span class="func">earliestBeginDate</span> = <span class="type">Date</span>().<span class="func">addingTimeInterval</span>(<span class="number">60</span>)
+        task.<span class="func">countOfBytesClientExpectsToSend</span> = <span class="number">200</span>
+        task.<span class="func">countOfBytesClientExpectsToReceive</span> = <span class="number">50</span> * <span class="number">1024</span> * <span class="number">1024</span>
+        task.<span class="func">resume</span>()
+    }
+}
+
+<span class="keyword">extension</span> <span class="type">BackgroundDownloadManager</span>: <span class="type">URLSessionDownloadDelegate</span> {
+
+    <span class="keyword">func</span> <span class="func">urlSession</span>(
+        _ session: <span class="type">URLSession</span>,
+        downloadTask: <span class="type">URLSessionDownloadTask</span>,
+        didFinishDownloadingTo location: <span class="type">URL</span>
+    ) {
+        <span class="keyword">let</span> fileName = downloadTask.<span class="func">originalRequest</span>?.<span class="func">url</span>?.<span class="func">lastPathComponent</span>
+            ?? <span class="type">UUID</span>().<span class="func">uuidString</span>
+        <span class="keyword">let</span> destination = <span class="type">FileManager</span>.<span class="func">default</span>
+            .<span class="func">urls</span>(for: .<span class="func">documentDirectory</span>, in: .<span class="func">userDomainMask</span>).<span class="func">first</span>!
+            .<span class="func">appendingPathComponent</span>(fileName)
+
+        <span class="keyword">try?</span> <span class="type">FileManager</span>.<span class="func">default</span>.<span class="func">removeItem</span>(at: destination)
+        <span class="keyword">try?</span> <span class="type">FileManager</span>.<span class="func">default</span>.<span class="func">moveItem</span>(at: location, to: destination)
+
+        <span class="type">NotificationCenter</span>.<span class="func">default</span>.<span class="func">post</span>(
+            name: .<span class="func">backgroundDownloadComplete</span>,
+            object: <span class="keyword">nil</span>,
+            userInfo: [<span class="string">"fileURL"</span>: destination]
+        )
+    }
+
+    <span class="keyword">func</span> <span class="func">urlSession</span>(
+        _ session: <span class="type">URLSession</span>,
+        downloadTask: <span class="type">URLSessionDownloadTask</span>,
+        didWriteData bytesWritten: <span class="type">Int64</span>,
+        totalBytesWritten: <span class="type">Int64</span>,
+        totalBytesExpectedToWrite: <span class="type">Int64</span>
+    ) {
+        <span class="keyword">let</span> progress = <span class="type">Double</span>(totalBytesWritten) / <span class="type">Double</span>(totalBytesExpectedToWrite)
+        <span class="func">print</span>(<span class="string">"Background download: \(</span><span class="type">Int</span>(progress * <span class="number">100</span>)<span class="string">)%"</span>)
+    }
+
+    <span class="keyword">func</span> <span class="func">urlSession</span>(
+        _ session: <span class="type">URLSession</span>,
+        task: <span class="type">URLSessionTask</span>,
+        didCompleteWithError error: <span class="type">Error</span>?
+    ) {
+        <span class="keyword">if let</span> error = error {
+            <span class="func">print</span>(<span class="string">"Background transfer failed: \(error.localizedDescription)"</span>)
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">urlSessionDidFinishEvents</span>(
+        forBackgroundURLSession session: <span class="type">URLSession</span>
+    ) {
+        <span class="type">DispatchQueue</span>.<span class="func">main</span>.<span class="func">async</span> {
+            <span class="keyword">let</span> appDelegate = <span class="type">UIApplication</span>.<span class="func">shared</span>.<span class="func">delegate</span> <span class="keyword">as?</span> <span class="type">AppDelegate</span>
+            <span class="keyword">let</span> handler = appDelegate?.backgroundCompletionHandlers
+                .<span class="func">removeValue</span>(forKey: <span class="type">BackgroundDownloadManager</span>.sessionIdentifier)
+            handler?()
+        }
+    }
+}
+
+<span class="keyword">extension</span> <span class="type">Notification</span>.<span class="type">Name</span> {
+    <span class="keyword">static let</span> backgroundDownloadComplete = <span class="type">Notification</span>.<span class="type">Name</span>(
+        <span class="string">"BackgroundDownloadComplete"</span>
+    )
+}
+</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Background Session Rules</div>
+        <ul>
+            <li><strong>Unique identifier required</strong> — each background session must have a globally unique identifier. If you create two sessions with the same ID, behavior is undefined.</li>
+            <li><strong>Only download and upload tasks</strong> — data tasks are not supported in background sessions (they are automatically converted to download tasks in iOS 13+).</li>
+            <li><strong>Delegate required</strong> — completion handler-based tasks are not supported. You must use the delegate pattern.</li>
+            <li><strong>System scheduling</strong> — the system may delay discretionary transfers based on battery, network conditions, and thermal state. Set <code>isDiscretionary = false</code> for user-initiated transfers.</li>
+            <li><strong>Recreate with same ID</strong> — when the app relaunches, you must recreate the session with the exact same identifier to reconnect to pending transfers.</li>
+            <li><strong>No URLProtocol</strong> — custom <code>URLProtocol</code> subclasses are not supported in background sessions.</li>
+            <li><strong>Call the completion handler</strong> — failing to call the system-provided completion handler in <code>urlSessionDidFinishEvents</code> causes the app snapshot to not update and wastes system resources.</li>
+        </ul>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 10: URLSessionWebSocketTask                                -->
+    <!-- ================================================================== -->
+    <h2 id="websocket">10. URLSessionWebSocketTask</h2>
+
+    <p><code>URLSessionWebSocketTask</code> (iOS 13+) provides native WebSocket support without third-party dependencies. It handles the HTTP upgrade handshake, frame encoding/decoding, ping/pong, and close handshake.</p>
+
+    <h3>WebSocket API</h3>
+
+<pre><code><span class="keyword">final class</span> <span class="type">WebSocketClient</span> {
+
+    <span class="keyword">private var</span> webSocketTask: <span class="type">URLSessionWebSocketTask</span>?
+    <span class="keyword">private let</span> session: <span class="type">URLSession</span>
+
+    <span class="keyword">init</span>() {
+        <span class="keyword">self</span>.session = <span class="type">URLSession</span>(configuration: .<span class="func">default</span>)
+    }
+
+    <span class="comment">// MARK: - Connect</span>
+
+    <span class="keyword">func</span> <span class="func">connect</span>(to url: <span class="type">URL</span>) {
+        webSocketTask = session.<span class="func">webSocketTask</span>(with: url)
+        webSocketTask?.<span class="func">resume</span>()
+        <span class="func">listenForMessages</span>()
+        <span class="func">schedulePing</span>()
+    }
+
+    <span class="comment">// MARK: - Send</span>
+
+    <span class="keyword">func</span> <span class="func">send</span>(text: <span class="type">String</span>) <span class="keyword">async throws</span> {
+        <span class="keyword">let</span> message = <span class="type">URLSessionWebSocketTask</span>.<span class="type">Message</span>.<span class="func">string</span>(text)
+        <span class="keyword">try await</span> webSocketTask?.<span class="func">send</span>(message)
+    }
+
+    <span class="keyword">func</span> <span class="func">send</span>(data: <span class="type">Data</span>) <span class="keyword">async throws</span> {
+        <span class="keyword">let</span> message = <span class="type">URLSessionWebSocketTask</span>.<span class="type">Message</span>.<span class="func">data</span>(data)
+        <span class="keyword">try await</span> webSocketTask?.<span class="func">send</span>(message)
+    }
+
+    <span class="comment">// MARK: - Receive (recursive listener)</span>
+
+    <span class="keyword">private func</span> <span class="func">listenForMessages</span>() {
+        webSocketTask?.<span class="func">receive</span> { [<span class="keyword">weak self</span>] result <span class="keyword">in</span>
+            <span class="keyword">switch</span> result {
+            <span class="keyword">case</span> .<span class="func">success</span>(<span class="keyword">let</span> message):
+                <span class="keyword">switch</span> message {
+                <span class="keyword">case</span> .<span class="func">string</span>(<span class="keyword">let</span> text):
+                    <span class="func">print</span>(<span class="string">"Received text: \(text)"</span>)
+                <span class="keyword">case</span> .<span class="func">data</span>(<span class="keyword">let</span> data):
+                    <span class="func">print</span>(<span class="string">"Received data: \(data.count) bytes"</span>)
+                @unknown <span class="keyword">default</span>:
+                    <span class="keyword">break</span>
+                }
+                <span class="keyword">self</span>?.<span class="func">listenForMessages</span>()
+
+            <span class="keyword">case</span> .<span class="func">failure</span>(<span class="keyword">let</span> error):
+                <span class="func">print</span>(<span class="string">"WebSocket error: \(error)"</span>)
+            }
+        }
+    }
+
+    <span class="comment">// MARK: - Ping/Pong</span>
+
+    <span class="keyword">private func</span> <span class="func">schedulePing</span>() {
+        webSocketTask?.<span class="func">sendPing</span> { [<span class="keyword">weak self</span>] error <span class="keyword">in</span>
+            <span class="keyword">if let</span> error = error {
+                <span class="func">print</span>(<span class="string">"Ping failed: \(error)"</span>)
+                <span class="keyword">return</span>
+            }
+            <span class="comment">// Schedule next ping in 30 seconds</span>
+            <span class="type">DispatchQueue</span>.<span class="func">main</span>.<span class="func">asyncAfter</span>(deadline: .<span class="func">now</span>() + <span class="number">30</span>) {
+                <span class="keyword">self</span>?.<span class="func">schedulePing</span>()
+            }
+        }
+    }
+
+    <span class="comment">// MARK: - Disconnect</span>
+
+    <span class="keyword">func</span> <span class="func">disconnect</span>() {
+        webSocketTask?.<span class="func">cancel</span>(with: .<span class="func">goingAway</span>, reason: <span class="keyword">nil</span>)
+        webSocketTask = <span class="keyword">nil</span>
+    }
+}
+</code></pre>
+
+    <h3>async/await WebSocket (iOS 15+)</h3>
+
+<pre><code><span class="keyword">func</span> <span class="func">listenAsync</span>() <span class="keyword">async</span> {
+    <span class="keyword">guard let</span> task = webSocketTask <span class="keyword">else</span> { <span class="keyword">return</span> }
+
+    <span class="keyword">do</span> {
+        <span class="keyword">while</span> task.<span class="func">state</span> == .<span class="func">running</span> {
+            <span class="keyword">let</span> message = <span class="keyword">try await</span> task.<span class="func">receive</span>()
+            <span class="keyword">switch</span> message {
+            <span class="keyword">case</span> .<span class="func">string</span>(<span class="keyword">let</span> text):
+                <span class="keyword">await</span> <span class="func">handleText</span>(text)
+            <span class="keyword">case</span> .<span class="func">data</span>(<span class="keyword">let</span> data):
+                <span class="keyword">await</span> <span class="func">handleData</span>(data)
+            @unknown <span class="keyword">default</span>:
+                <span class="keyword">break</span>
+            }
+        }
+    } <span class="keyword">catch</span> {
+        <span class="func">print</span>(<span class="string">"WebSocket stream ended: \(error)"</span>)
+    }
+}
+</code></pre>
+
+    <h3>URLSessionWebSocketTask vs Third-Party Libraries</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Feature</th>
+                <th>URLSessionWebSocketTask</th>
+                <th>Starscream / SocketRocket</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Platform</td>
+                <td>iOS 13+ only</td>
+                <td>iOS 9+</td>
+            </tr>
+            <tr>
+                <td>Dependencies</td>
+                <td>None (system framework)</td>
+                <td>Third-party pod/package</td>
+            </tr>
+            <tr>
+                <td>Auto-reconnect</td>
+                <td>No (manual)</td>
+                <td>Built-in (Starscream)</td>
+            </tr>
+            <tr>
+                <td>Custom headers</td>
+                <td>Via URLRequest</td>
+                <td>Full control</td>
+            </tr>
+            <tr>
+                <td>Compression</td>
+                <td>permessage-deflate supported</td>
+                <td>Varies by library</td>
+            </tr>
+            <tr>
+                <td>Background support</td>
+                <td>No</td>
+                <td>No (TCP connections die on suspend)</td>
+            </tr>
+            <tr>
+                <td>Certificate pinning</td>
+                <td>Via URLSessionDelegate</td>
+                <td>Library-specific API</td>
+            </tr>
+            <tr>
+                <td>async/await</td>
+                <td>Native (iOS 15+)</td>
+                <td>Wrapper needed</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: WebSocket Connection Lifecycle</div>
+        <p>WebSocket connections do not survive app backgrounding. When iOS suspends your app, the TCP connection is torn down. You must implement reconnection logic. For real-time features, consider using APNs (push notifications) as a fallback when the WebSocket is disconnected. The <code>URLSessionWebSocketTask</code> does not provide automatic reconnection — you must detect disconnection via the receive callback failure and reconnect manually.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 11: Production Network Layer                               -->
+    <!-- ================================================================== -->
+    <h2 id="production-network-layer">11. Building a Production Network Layer</h2>
+
+    <p>A Staff/L6 engineer is expected to design and implement a robust, production-grade networking layer. This section demonstrates a comprehensive <code>NetworkManager</code> that handles auth token refresh with retry, exponential backoff, request deduplication, and structured error handling.</p>
+
+    <h3>Architecture Overview</h3>
+
+    <div class="diagram">
+┌──────────────────────────────────────────────────────────────────┐
+│                      NetworkManager                              │
+│                                                                  │
+│  ┌─────────────┐   ┌──────────────┐   ┌──────────────────────┐  │
+│  │ RequestQueue │──▶│ Auth Injector │──▶│ URLSession.data(for:)│  │
+│  │ (dedup)      │   │ (token mgmt) │   │                      │  │
+│  └─────────────┘   └──────────────┘   └──────────┬───────────┘  │
+│                                                   │              │
+│                                                   ▼              │
+│                                        ┌──────────────────────┐  │
+│                                        │  Response Handler    │  │
+│                                        │  ┌────────────────┐  │  │
+│                                        │  │ 401? → refresh  │  │  │
+│                                        │  │   token + retry │  │  │
+│                                        │  ├────────────────┤  │  │
+│                                        │  │ 429/5xx? →     │  │  │
+│                                        │  │   exp. backoff  │  │  │
+│                                        │  ├────────────────┤  │  │
+│                                        │  │ 200? → decode   │  │  │
+│                                        │  └────────────────┘  │  │
+│                                        └──────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>Error Types</h3>
+
+<pre><code><span class="keyword">enum</span> <span class="type">NetworkError</span>: <span class="type">Error</span>, <span class="type">LocalizedError</span> {
+    <span class="keyword">case</span> <span class="func">invalidURL</span>
+    <span class="keyword">case</span> <span class="func">invalidResponse</span>
+    <span class="keyword">case</span> <span class="func">httpError</span>(statusCode: <span class="type">Int</span>, data: <span class="type">Data</span>)
+    <span class="keyword">case</span> <span class="func">decodingError</span>(<span class="type">DecodingError</span>)
+    <span class="keyword">case</span> <span class="func">noData</span>
+    <span class="keyword">case</span> <span class="func">unauthorized</span>
+    <span class="keyword">case</span> <span class="func">rateLimited</span>(retryAfter: <span class="type">TimeInterval</span>?)
+    <span class="keyword">case</span> <span class="func">networkUnavailable</span>
+    <span class="keyword">case</span> <span class="func">timeout</span>
+    <span class="keyword">case</span> <span class="func">cancelled</span>
+    <span class="keyword">case</span> <span class="func">maxRetriesExceeded</span>
+    <span class="keyword">case</span> <span class="func">tokenRefreshFailed</span>
+
+    <span class="keyword">var</span> errorDescription: <span class="type">String</span>? {
+        <span class="keyword">switch self</span> {
+        <span class="keyword">case</span> .<span class="func">invalidURL</span>: <span class="keyword">return</span> <span class="string">"Invalid URL"</span>
+        <span class="keyword">case</span> .<span class="func">invalidResponse</span>: <span class="keyword">return</span> <span class="string">"Invalid server response"</span>
+        <span class="keyword">case</span> .<span class="func">httpError</span>(<span class="keyword">let</span> code, _): <span class="keyword">return</span> <span class="string">"HTTP error \(code)"</span>
+        <span class="keyword">case</span> .<span class="func">decodingError</span>(<span class="keyword">let</span> err): <span class="keyword">return</span> <span class="string">"Decoding failed: \(err.localizedDescription)"</span>
+        <span class="keyword">case</span> .<span class="func">noData</span>: <span class="keyword">return</span> <span class="string">"No data received"</span>
+        <span class="keyword">case</span> .<span class="func">unauthorized</span>: <span class="keyword">return</span> <span class="string">"Authentication required"</span>
+        <span class="keyword">case</span> .<span class="func">rateLimited</span>: <span class="keyword">return</span> <span class="string">"Rate limited"</span>
+        <span class="keyword">case</span> .<span class="func">networkUnavailable</span>: <span class="keyword">return</span> <span class="string">"Network unavailable"</span>
+        <span class="keyword">case</span> .<span class="func">timeout</span>: <span class="keyword">return</span> <span class="string">"Request timed out"</span>
+        <span class="keyword">case</span> .<span class="func">cancelled</span>: <span class="keyword">return</span> <span class="string">"Request cancelled"</span>
+        <span class="keyword">case</span> .<span class="func">maxRetriesExceeded</span>: <span class="keyword">return</span> <span class="string">"Max retries exceeded"</span>
+        <span class="keyword">case</span> .<span class="func">tokenRefreshFailed</span>: <span class="keyword">return</span> <span class="string">"Token refresh failed"</span>
+        }
+    }
+}
+</code></pre>
+
+    <h3>Token Manager with Thread-Safe Refresh</h3>
+
+<pre><code><span class="keyword">actor</span> <span class="type">TokenManager</span> {
+
+    <span class="keyword">private var</span> accessToken: <span class="type">String</span>?
+    <span class="keyword">private var</span> refreshToken: <span class="type">String</span>?
+    <span class="keyword">private var</span> refreshTask: <span class="type">Task</span>&lt;<span class="type">String</span>, <span class="type">Error</span>&gt;?
+
+    <span class="keyword">func</span> <span class="func">setTokens</span>(access: <span class="type">String</span>, refresh: <span class="type">String</span>) {
+        <span class="keyword">self</span>.accessToken = access
+        <span class="keyword">self</span>.refreshToken = refresh
+    }
+
+    <span class="keyword">func</span> <span class="func">currentAccessToken</span>() -> <span class="type">String</span>? {
+        <span class="keyword">return</span> accessToken
+    }
+
+    <span class="keyword">func</span> <span class="func">refreshAccessToken</span>(using session: <span class="type">URLSession</span>) <span class="keyword">async throws</span> -> <span class="type">String</span> {
+        <span class="comment">// Coalesce concurrent refresh requests into a single network call</span>
+        <span class="keyword">if let</span> existingTask = refreshTask {
+            <span class="keyword">return try await</span> existingTask.<span class="func">value</span>
+        }
+
+        <span class="keyword">let</span> task = <span class="type">Task</span> { [refreshToken] () -> <span class="type">String</span> <span class="keyword">in</span>
+            <span class="keyword">guard let</span> refreshToken = refreshToken <span class="keyword">else</span> {
+                <span class="keyword">throw</span> <span class="type">NetworkError</span>.<span class="func">tokenRefreshFailed</span>
+            }
+
+            <span class="keyword">var</span> request = <span class="type">URLRequest</span>(
+                url: <span class="type">URL</span>(string: <span class="string">"https://api.example.com/auth/refresh"</span>)!
+            )
+            request.<span class="func">httpMethod</span> = <span class="string">"POST"</span>
+            request.<span class="func">setValue</span>(<span class="string">"application/json"</span>, forHTTPHeaderField: <span class="string">"Content-Type"</span>)
+            request.<span class="func">httpBody</span> = <span class="keyword">try</span> <span class="type">JSONEncoder</span>().<span class="func">encode</span>(
+                [<span class="string">"refresh_token"</span>: refreshToken]
+            )
+
+            <span class="keyword">let</span> (data, response) = <span class="keyword">try await</span> session.<span class="func">data</span>(for: request)
+            <span class="keyword">guard let</span> httpResponse = response <span class="keyword">as?</span> <span class="type">HTTPURLResponse</span>,
+                  httpResponse.<span class="func">statusCode</span> == <span class="number">200</span> <span class="keyword">else</span> {
+                <span class="keyword">throw</span> <span class="type">NetworkError</span>.<span class="func">tokenRefreshFailed</span>
+            }
+
+            <span class="keyword">let</span> tokenResponse = <span class="keyword">try</span> <span class="type">JSONDecoder</span>().<span class="func">decode</span>(
+                <span class="type">TokenResponse</span>.<span class="keyword">self</span>, from: data
+            )
+            <span class="keyword">return</span> tokenResponse.<span class="func">accessToken</span>
+        }
+
+        <span class="keyword">self</span>.refreshTask = task
+
+        <span class="keyword">do</span> {
+            <span class="keyword">let</span> newToken = <span class="keyword">try await</span> task.<span class="func">value</span>
+            <span class="keyword">self</span>.accessToken = newToken
+            <span class="keyword">self</span>.refreshTask = <span class="keyword">nil</span>
+            <span class="keyword">return</span> newToken
+        } <span class="keyword">catch</span> {
+            <span class="keyword">self</span>.refreshTask = <span class="keyword">nil</span>
+            <span class="keyword">throw</span> error
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">clearTokens</span>() {
+        accessToken = <span class="keyword">nil</span>
+        refreshToken = <span class="keyword">nil</span>
+        refreshTask = <span class="keyword">nil</span>
+    }
+}
+
+<span class="keyword">struct</span> <span class="type">TokenResponse</span>: <span class="type">Decodable</span> {
+    <span class="keyword">let</span> accessToken: <span class="type">String</span>
+    <span class="keyword">let</span> refreshToken: <span class="type">String</span>
+    <span class="keyword">let</span> expiresIn: <span class="type">Int</span>
+}
+</code></pre>
+
+    <h3>Request Deduplication</h3>
+
+<pre><code><span class="keyword">actor</span> <span class="type">RequestDeduplicator</span> {
+
+    <span class="keyword">private var</span> inFlightRequests: [<span class="type">String</span>: <span class="type">Task</span>&lt;<span class="type">Data</span>, <span class="type">Error</span>&gt;] = [:]
+
+    <span class="keyword">func</span> <span class="func">deduplicated</span>(
+        key: <span class="type">String</span>,
+        work: @<span class="keyword">escaping</span> () <span class="keyword">async throws</span> -> <span class="type">Data</span>
+    ) <span class="keyword">async throws</span> -> <span class="type">Data</span> {
+        <span class="keyword">if let</span> existing = inFlightRequests[key] {
+            <span class="keyword">return try await</span> existing.<span class="func">value</span>
+        }
+
+        <span class="keyword">let</span> task = <span class="type">Task</span> {
+            <span class="keyword">try await</span> <span class="func">work</span>()
+        }
+
+        inFlightRequests[key] = task
+
+        <span class="keyword">do</span> {
+            <span class="keyword">let</span> result = <span class="keyword">try await</span> task.<span class="func">value</span>
+            inFlightRequests.<span class="func">removeValue</span>(forKey: key)
+            <span class="keyword">return</span> result
+        } <span class="keyword">catch</span> {
+            inFlightRequests.<span class="func">removeValue</span>(forKey: key)
+            <span class="keyword">throw</span> error
+        }
+    }
+}
+</code></pre>
+
+    <h3>Comprehensive NetworkManager</h3>
+
+<pre><code><span class="keyword">final class</span> <span class="type">NetworkManager</span>: @<span class="keyword">unchecked</span> <span class="type">Sendable</span> {
+
+    <span class="keyword">static let</span> shared = <span class="type">NetworkManager</span>()
+
+    <span class="keyword">private let</span> session: <span class="type">URLSession</span>
+    <span class="keyword">private let</span> tokenManager = <span class="type">TokenManager</span>()
+    <span class="keyword">private let</span> deduplicator = <span class="type">RequestDeduplicator</span>()
+    <span class="keyword">private let</span> decoder: <span class="type">JSONDecoder</span>
+
+    <span class="keyword">private let</span> maxRetries = <span class="number">3</span>
+    <span class="keyword">private let</span> baseDelay: <span class="type">TimeInterval</span> = <span class="number">1.0</span>
+
+    <span class="keyword">private init</span>() {
+        <span class="keyword">let</span> config = <span class="type">URLSessionConfiguration</span>.<span class="func">default</span>
+        config.<span class="func">waitsForConnectivity</span> = <span class="keyword">true</span>
+        config.<span class="func">timeoutIntervalForRequest</span> = <span class="number">30</span>
+        config.<span class="func">timeoutIntervalForResource</span> = <span class="number">300</span>
+        config.<span class="func">httpAdditionalHeaders</span> = [
+            <span class="string">"Accept"</span>: <span class="string">"application/json"</span>,
+            <span class="string">"Accept-Encoding"</span>: <span class="string">"gzip, deflate, br"</span>
+        ]
+        config.<span class="func">urlCache</span> = <span class="type">URLCache</span>(
+            memoryCapacity: <span class="number">50</span> * <span class="number">1024</span> * <span class="number">1024</span>,
+            diskCapacity: <span class="number">200</span> * <span class="number">1024</span> * <span class="number">1024</span>
+        )
+
+        <span class="keyword">self</span>.session = <span class="type">URLSession</span>(configuration: config)
+
+        <span class="keyword">self</span>.decoder = <span class="type">JSONDecoder</span>()
+        <span class="keyword">self</span>.decoder.<span class="func">keyDecodingStrategy</span> = .<span class="func">convertFromSnakeCase</span>
+        <span class="keyword">self</span>.decoder.<span class="func">dateDecodingStrategy</span> = .<span class="func">iso8601</span>
+    }
+
+    <span class="comment">// MARK: - Public API</span>
+
+    <span class="keyword">func</span> <span class="func">request</span>&lt;<span class="type">T</span>: <span class="type">Decodable</span>&gt;(
+        _ endpoint: <span class="type">Endpoint</span>,
+        deduplicate: <span class="type">Bool</span> = <span class="keyword">false</span>
+    ) <span class="keyword">async throws</span> -> <span class="type">T</span> {
+        <span class="keyword">let</span> urlRequest = <span class="keyword">try</span> endpoint.<span class="func">asURLRequest</span>()
+
+        <span class="keyword">let</span> data: <span class="type">Data</span>
+        <span class="keyword">if</span> deduplicate {
+            <span class="keyword">let</span> key = endpoint.<span class="func">deduplicationKey</span>
+            data = <span class="keyword">try await</span> deduplicator.<span class="func">deduplicated</span>(key: key) {
+                <span class="keyword">try await self</span>.<span class="func">performRequest</span>(urlRequest, attempt: <span class="number">0</span>)
+            }
+        } <span class="keyword">else</span> {
+            data = <span class="keyword">try await</span> <span class="func">performRequest</span>(urlRequest, attempt: <span class="number">0</span>)
+        }
+
+        <span class="keyword">do</span> {
+            <span class="keyword">return try</span> decoder.<span class="func">decode</span>(<span class="type">T</span>.<span class="keyword">self</span>, from: data)
+        } <span class="keyword">catch let</span> error <span class="keyword">as</span> <span class="type">DecodingError</span> {
+            <span class="keyword">throw</span> <span class="type">NetworkError</span>.<span class="func">decodingError</span>(error)
+        }
+    }
+
+    <span class="comment">// MARK: - Core Request with Retry + Token Refresh</span>
+
+    <span class="keyword">private func</span> <span class="func">performRequest</span>(
+        _ request: <span class="type">URLRequest</span>,
+        attempt: <span class="type">Int</span>
+    ) <span class="keyword">async throws</span> -> <span class="type">Data</span> {
+        <span class="keyword">var</span> mutableRequest = request
+
+        <span class="comment">// Inject auth token</span>
+        <span class="keyword">if let</span> token = <span class="keyword">await</span> tokenManager.<span class="func">currentAccessToken</span>() {
+            mutableRequest.<span class="func">setValue</span>(
+                <span class="string">"Bearer \(token)"</span>,
+                forHTTPHeaderField: <span class="string">"Authorization"</span>
+            )
+        }
+
+        <span class="keyword">do</span> {
+            <span class="keyword">let</span> (data, response) = <span class="keyword">try await</span> session.<span class="func">data</span>(for: mutableRequest)
+
+            <span class="keyword">guard let</span> httpResponse = response <span class="keyword">as?</span> <span class="type">HTTPURLResponse</span> <span class="keyword">else</span> {
+                <span class="keyword">throw</span> <span class="type">NetworkError</span>.<span class="func">invalidResponse</span>
+            }
+
+            <span class="keyword">switch</span> httpResponse.<span class="func">statusCode</span> {
+            <span class="keyword">case</span> <span class="number">200</span>...<span class="number">299</span>:
+                <span class="keyword">return</span> data
+
+            <span class="keyword">case</span> <span class="number">401</span>:
+                <span class="keyword">return try await</span> <span class="func">handleUnauthorized</span>(
+                    originalRequest: request,
+                    attempt: attempt
+                )
+
+            <span class="keyword">case</span> <span class="number">429</span>:
+                <span class="keyword">let</span> retryAfter = httpResponse.<span class="func">value</span>(
+                    forHTTPHeaderField: <span class="string">"Retry-After"</span>
+                ).<span class="func">flatMap</span>(<span class="type">TimeInterval</span>.<span class="func">init</span>)
+                <span class="keyword">return try await</span> <span class="func">retryWithBackoff</span>(
+                    request: request,
+                    attempt: attempt,
+                    overrideDelay: retryAfter
+                )
+
+            <span class="keyword">case</span> <span class="number">500</span>...<span class="number">599</span>:
+                <span class="keyword">return try await</span> <span class="func">retryWithBackoff</span>(
+                    request: request,
+                    attempt: attempt
+                )
+
+            <span class="keyword">default</span>:
+                <span class="keyword">throw</span> <span class="type">NetworkError</span>.<span class="func">httpError</span>(
+                    statusCode: httpResponse.<span class="func">statusCode</span>,
+                    data: data
+                )
+            }
+
+        } <span class="keyword">catch let</span> error <span class="keyword">as</span> <span class="type">URLError</span> {
+            <span class="keyword">switch</span> error.<span class="func">code</span> {
+            <span class="keyword">case</span> .<span class="func">notConnectedToInternet</span>, .<span class="func">networkConnectionLost</span>:
+                <span class="keyword">throw</span> <span class="type">NetworkError</span>.<span class="func">networkUnavailable</span>
+            <span class="keyword">case</span> .<span class="func">timedOut</span>:
+                <span class="keyword">return try await</span> <span class="func">retryWithBackoff</span>(
+                    request: request,
+                    attempt: attempt
+                )
+            <span class="keyword">case</span> .<span class="func">cancelled</span>:
+                <span class="keyword">throw</span> <span class="type">NetworkError</span>.<span class="func">cancelled</span>
+            <span class="keyword">default</span>:
+                <span class="keyword">throw</span> error
+            }
+        }
+    }
+
+    <span class="comment">// MARK: - 401 Handler: Refresh Token + Retry</span>
+
+    <span class="keyword">private func</span> <span class="func">handleUnauthorized</span>(
+        originalRequest: <span class="type">URLRequest</span>,
+        attempt: <span class="type">Int</span>
+    ) <span class="keyword">async throws</span> -> <span class="type">Data</span> {
+        <span class="keyword">guard</span> attempt == <span class="number">0</span> <span class="keyword">else</span> {
+            <span class="keyword">await</span> tokenManager.<span class="func">clearTokens</span>()
+            <span class="keyword">throw</span> <span class="type">NetworkError</span>.<span class="func">unauthorized</span>
+        }
+
+        <span class="keyword">do</span> {
+            _ = <span class="keyword">try await</span> tokenManager.<span class="func">refreshAccessToken</span>(using: session)
+            <span class="keyword">return try await</span> <span class="func">performRequest</span>(originalRequest, attempt: attempt + <span class="number">1</span>)
+        } <span class="keyword">catch</span> {
+            <span class="keyword">await</span> tokenManager.<span class="func">clearTokens</span>()
+            <span class="keyword">throw</span> <span class="type">NetworkError</span>.<span class="func">unauthorized</span>
+        }
+    }
+
+    <span class="comment">// MARK: - Exponential Backoff with Jitter</span>
+
+    <span class="keyword">private func</span> <span class="func">retryWithBackoff</span>(
+        request: <span class="type">URLRequest</span>,
+        attempt: <span class="type">Int</span>,
+        overrideDelay: <span class="type">TimeInterval</span>? = <span class="keyword">nil</span>
+    ) <span class="keyword">async throws</span> -> <span class="type">Data</span> {
+        <span class="keyword">guard</span> attempt < maxRetries <span class="keyword">else</span> {
+            <span class="keyword">throw</span> <span class="type">NetworkError</span>.<span class="func">maxRetriesExceeded</span>
+        }
+
+        <span class="keyword">let</span> delay: <span class="type">TimeInterval</span>
+        <span class="keyword">if let</span> overrideDelay = overrideDelay {
+            delay = overrideDelay
+        } <span class="keyword">else</span> {
+            <span class="comment">// Exponential backoff: 1s, 2s, 4s + random jitter</span>
+            <span class="keyword">let</span> exponential = baseDelay * <span class="func">pow</span>(<span class="number">2.0</span>, <span class="type">Double</span>(attempt))
+            <span class="keyword">let</span> jitter = <span class="type">Double</span>.<span class="func">random</span>(in: <span class="number">0</span>...<span class="number">0.5</span>)
+            delay = exponential + jitter
+        }
+
+        <span class="keyword">try await</span> <span class="type">Task</span>.<span class="func">sleep</span>(nanoseconds: <span class="type">UInt64</span>(delay * <span class="number">1_000_000_000</span>))
+
+        <span class="keyword">try</span> <span class="type">Task</span>.<span class="func">checkCancellation</span>()
+
+        <span class="keyword">return try await</span> <span class="func">performRequest</span>(request, attempt: attempt + <span class="number">1</span>)
+    }
+}
+</code></pre>
+
+    <h3>Endpoint Abstraction</h3>
+
+<pre><code><span class="keyword">struct</span> <span class="type">Endpoint</span> {
+    <span class="keyword">let</span> path: <span class="type">String</span>
+    <span class="keyword">let</span> method: <span class="type">HTTPMethod</span>
+    <span class="keyword">let</span> queryItems: [<span class="type">URLQueryItem</span>]?
+    <span class="keyword">let</span> body: <span class="type">Data</span>?
+    <span class="keyword">let</span> headers: [<span class="type">String</span>: <span class="type">String</span>]
+
+    <span class="keyword">static let</span> baseURL = <span class="string">"https://api.example.com/v2"</span>
+
+    <span class="keyword">var</span> deduplicationKey: <span class="type">String</span> {
+        <span class="keyword">return</span> <span class="string">"\(method.rawValue):\(path):\(queryItems?.description ?? "")"</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">asURLRequest</span>() <span class="keyword">throws</span> -> <span class="type">URLRequest</span> {
+        <span class="keyword">guard var</span> components = <span class="type">URLComponents</span>(
+            string: <span class="type">Endpoint</span>.baseURL + path
+        ) <span class="keyword">else</span> {
+            <span class="keyword">throw</span> <span class="type">NetworkError</span>.<span class="func">invalidURL</span>
+        }
+        components.<span class="func">queryItems</span> = queryItems
+
+        <span class="keyword">guard let</span> url = components.<span class="func">url</span> <span class="keyword">else</span> {
+            <span class="keyword">throw</span> <span class="type">NetworkError</span>.<span class="func">invalidURL</span>
+        }
+
+        <span class="keyword">var</span> request = <span class="type">URLRequest</span>(url: url)
+        request.<span class="func">httpMethod</span> = method.<span class="func">rawValue</span>
+        request.<span class="func">httpBody</span> = body
+
+        <span class="keyword">for</span> (key, value) <span class="keyword">in</span> headers {
+            request.<span class="func">setValue</span>(value, forHTTPHeaderField: key)
+        }
+
+        <span class="keyword">if</span> body != <span class="keyword">nil</span> {
+            request.<span class="func">setValue</span>(<span class="string">"application/json"</span>, forHTTPHeaderField: <span class="string">"Content-Type"</span>)
+        }
+
+        <span class="keyword">return</span> request
+    }
+}
+
+<span class="keyword">enum</span> <span class="type">HTTPMethod</span>: <span class="type">String</span> {
+    <span class="keyword">case</span> <span class="func">GET</span>, <span class="func">POST</span>, <span class="func">PUT</span>, <span class="func">PATCH</span>, <span class="func">DELETE</span>
+}
+
+<span class="comment">// Convenience factory methods</span>
+<span class="keyword">extension</span> <span class="type">Endpoint</span> {
+    <span class="keyword">static func</span> <span class="func">getUsers</span>(page: <span class="type">Int</span> = <span class="number">1</span>) -> <span class="type">Endpoint</span> {
+        <span class="type">Endpoint</span>(
+            path: <span class="string">"/users"</span>,
+            method: .<span class="func">GET</span>,
+            queryItems: [<span class="type">URLQueryItem</span>(name: <span class="string">"page"</span>, value: <span class="string">"\(page)"</span>)],
+            body: <span class="keyword">nil</span>,
+            headers: [:]
+        )
+    }
+
+    <span class="keyword">static func</span> <span class="func">createUser</span>(_ user: <span class="type">CreateUserRequest</span>) <span class="keyword">throws</span> -> <span class="type">Endpoint</span> {
+        <span class="type">Endpoint</span>(
+            path: <span class="string">"/users"</span>,
+            method: .<span class="func">POST</span>,
+            queryItems: <span class="keyword">nil</span>,
+            body: <span class="keyword">try</span> <span class="type">JSONEncoder</span>().<span class="func">encode</span>(user),
+            headers: [:]
+        )
+    }
+}
+</code></pre>
+
+    <h3>Usage Examples</h3>
+
+<pre><code><span class="comment">// Simple GET with deduplication</span>
+<span class="keyword">let</span> users: [<span class="type">User</span>] = <span class="keyword">try await</span> <span class="type">NetworkManager</span>.<span class="func">shared</span>.<span class="func">request</span>(
+    .<span class="func">getUsers</span>(page: <span class="number">1</span>),
+    deduplicate: <span class="keyword">true</span>
+)
+
+<span class="comment">// POST — no deduplication (mutations should not be deduplicated)</span>
+<span class="keyword">let</span> newUser: <span class="type">User</span> = <span class="keyword">try await</span> <span class="type">NetworkManager</span>.<span class="func">shared</span>.<span class="func">request</span>(
+    <span class="keyword">try</span> .<span class="func">createUser</span>(<span class="type">CreateUserRequest</span>(name: <span class="string">"Alice"</span>, email: <span class="string">"alice@example.com"</span>))
+)
+
+<span class="comment">// Concurrent requests with structured concurrency</span>
+<span class="keyword">async let</span> users: [<span class="type">User</span>] = <span class="type">NetworkManager</span>.<span class="func">shared</span>.<span class="func">request</span>(.<span class="func">getUsers</span>())
+<span class="keyword">async let</span> profile: <span class="type">Profile</span> = <span class="type">NetworkManager</span>.<span class="func">shared</span>.<span class="func">request</span>(.<span class="func">getProfile</span>())
+
+<span class="keyword">let</span> (fetchedUsers, fetchedProfile) = <span class="keyword">try await</span> (users, profile)
+</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: Production Network Layer Design</div>
+        <p>At Staff/L6 level, you are expected to design a network layer that handles these concerns:</p>
+        <ul>
+            <li><strong>Auth token lifecycle</strong> — automatic injection, 401 detection, token refresh with request coalescing (multiple concurrent 401s should trigger only one refresh), and retry of the original request. The <code>actor</code>-based <code>TokenManager</code> above guarantees thread safety and single-flight refresh.</li>
+            <li><strong>Exponential backoff with jitter</strong> — prevents thundering herd on server recovery. Jitter randomizes retry timing so thousands of clients don't all retry at the same instant. Respect <code>Retry-After</code> headers from 429 responses.</li>
+            <li><strong>Request deduplication</strong> — identical GET requests fired within a short window should share a single network call. This prevents redundant traffic when multiple UI components request the same data simultaneously. Never deduplicate mutations (POST/PUT/DELETE).</li>
+            <li><strong>Structured error handling</strong> — map <code>URLError</code> codes and HTTP status codes to domain-specific errors. Distinguish between retryable errors (timeout, 5xx, 429) and terminal errors (4xx, decoding failures).</li>
+            <li><strong>Cancellation propagation</strong> — use <code>Task.checkCancellation()</code> between retries to respect Swift concurrency's cooperative cancellation model.</li>
+            <li><strong>Observability</strong> — collect <code>URLSessionTaskMetrics</code> for every request. Log DNS time, TLS handshake time, request/response sizes, protocol version, and whether the connection was reused. Feed these into your monitoring system.</li>
+            <li><strong>Configuration as a first-class concern</strong> — base URL, timeouts, cache sizes, and retry policies should be injectable, not hardcoded. This enables different configurations for debug/staging/production and makes the layer testable via <code>MockURLProtocol</code>.</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="index.html">← Series Overview</a>
+        <a href="02-core-data.html">Next: Core Data →</a>
+    </div>
+</div>
+</body>
+</html>

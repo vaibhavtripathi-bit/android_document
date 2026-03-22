@@ -1,0 +1,1643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>App Sandbox &amp; Data Protection — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Security &amp; Privacy</a><span class="sep">›</span>
+        App Sandbox
+    </nav>
+
+    <h1>App Sandbox &amp; Data Protection</h1>
+    <p class="subtitle">Kernel-enforced process isolation, entitlements, container structure, file protection classes, the Data Protection key hierarchy, jailbreak detection realities, and defense-in-depth architecture for Staff-level iOS interviews.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#sandbox-model">1. iOS Sandbox Model</a></li>
+            <li><a href="#sandbox-vs-android">2. iOS Sandbox vs Android Isolation</a></li>
+            <li><a href="#entitlements">3. Entitlements System</a></li>
+            <li><a href="#container-structure">4. Container Structure</a></li>
+            <li><a href="#file-protection-classes">5. File Protection Classes</a></li>
+            <li><a href="#data-protection-api">6. Data Protection API &amp; Key Hierarchy</a></li>
+            <li><a href="#jailbreak-detection">7. Jailbreak Detection Techniques</a></li>
+            <li><a href="#jailbreak-unreliable">8. Why Jailbreak Detection Is Unreliable</a></li>
+            <li><a href="#sandbox-escapes">9. Sandbox Escape History</a></li>
+            <li><a href="#defense-in-depth">10. Defense in Depth — Architect's Guide</a></li>
+            <li><a href="#interview-questions">11. Interview Questions</a></li>
+        </ul>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 1: iOS SANDBOX MODEL                                       -->
+    <!-- ================================================================== -->
+
+    <h2 id="sandbox-model">1. iOS Sandbox Model</h2>
+
+    <p>Every third-party app on iOS runs inside a <strong>sandbox</strong> — a kernel-enforced jail that restricts what system resources the process can access. Unlike advisory security mechanisms (which can be bypassed by a determined process), the iOS sandbox is <em>mandatory</em>: it is enforced by the XNU kernel itself, and no userspace code can opt out of it.</p>
+
+    <h3>1.1 Kernel-Level Enforcement: TrustedBSD MAC Framework</h3>
+
+    <p>The iOS sandbox is built on the <strong>TrustedBSD Mandatory Access Control (MAC) framework</strong>, which Apple integrated into XNU. This is the same framework used in FreeBSD and macOS. The key components are:</p>
+
+    <ul>
+        <li><strong>MAC Framework</strong> — a kernel subsystem that intercepts every system call (open, read, write, socket, mmap, exec, etc.) and checks it against a policy before allowing it to proceed</li>
+        <li><strong>Sandbox.kext</strong> (kernel extension) — Apple's MAC policy module, historically called "seatbelt." It registers hooks with the MAC framework for every security-relevant operation</li>
+        <li><strong>Sandbox profiles</strong> — declarative policy files (written in a Scheme-like DSL called SBPL — Sandbox Profile Language) that define what a process can and cannot do</li>
+        <li><strong>libsandbox</strong> — userspace library that parses profiles and communicates them to the kernel via <code>sandbox_init()</code> or the <code>MAC_SANDBOX</code> policy</li>
+    </ul>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Seatbelt Internals</div>
+        <p>The name "seatbelt" comes from the original macOS sandbox implementation (circa 10.5 Leopard). On iOS, the sandbox profile for third-party apps is called <code>container</code> (previously <code>mobile</code>). System daemons each have their own profile — <code>securityd</code>, <code>mediaserverd</code>, <code>SpringBoard</code>, etc. You can find macOS profiles at <code>/System/Library/Sandbox/Profiles/</code>; iOS profiles are compiled into the kernel cache.</p>
+    </div>
+
+    <h3>1.2 How the Sandbox Is Applied at Process Creation</h3>
+
+    <p>The sandbox is not something an app "enters" — it is imposed <em>before the app's code ever runs</em>. The sequence is:</p>
+
+    <ol>
+        <li><strong>launchd</strong> (PID 1) receives a request to launch the app (from SpringBoard via XPC)</li>
+        <li><strong>posix_spawn()</strong> is called with the <code>POSIX_SPAWN_SETEXEC</code> attribute, which includes sandbox configuration</li>
+        <li>The kernel's <code>exec</code> handler checks the binary's <strong>code signature</strong> and extracts <strong>entitlements</strong></li>
+        <li>Based on the entitlements (specifically <code>com.apple.security.app-sandbox</code> and the app's bundle ID), the kernel applies the <strong>container sandbox profile</strong></li>
+        <li>The MAC framework hooks are now active — every subsequent system call is filtered through the sandbox policy</li>
+        <li>The app's <code>main()</code> function executes inside the sandbox — it has <strong>never</strong> had unrestricted access</li>
+    </ol>
+
+    <div class="diagram">
+┌──────────────────────────────────────────────────────────────────────────┐
+│                     iOS SANDBOX ARCHITECTURE                             │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐                   │
+│  │   App A      │   │   App B      │   │   App C      │   USER SPACE    │
+│  │  (sandbox)   │   │  (sandbox)   │   │  (sandbox)   │                 │
+│  │  container/  │   │  container/  │   │  container/  │                 │
+│  │  profile     │   │  profile     │   │  profile     │                 │
+│  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘                 │
+│         │                  │                  │                          │
+│  ═══════╪══════════════════╪══════════════════╪════════════════════════  │
+│         │      SYSTEM CALL BOUNDARY           │                          │
+│  ═══════╪══════════════════╪══════════════════╪════════════════════════  │
+│         ▼                  ▼                  ▼                          │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │                   TrustedBSD MAC Framework                       │   │
+│  │                                                                  │   │
+│  │  ┌──────────────────────────────────────────────────────────┐   │   │
+│  │  │  mac_vnode_check_open()   mac_socket_check_connect()     │   │   │
+│  │  │  mac_proc_check_fork()   mac_file_check_mmap()          │   │   │
+│  │  │  mac_iokit_check_*()     mac_system_check_*()           │   │   │
+│  │  └──────────────────────────────────────────────────────────┘   │   │
+│  │                          │                                       │   │
+│  │                          ▼                                       │   │
+│  │  ┌──────────────────────────────────────────────────────────┐   │   │
+│  │  │              Sandbox.kext (seatbelt)                      │   │   │
+│  │  │                                                          │   │   │
+│  │  │  Profile: "container"  ──▶  ALLOW / DENY decision        │   │   │
+│  │  │  Entitlements check    ──▶  Per-process policy            │   │   │
+│  │  │  Path-based rules      ──▶  /var/mobile/Containers/...   │   │   │
+│  │  └──────────────────────────────────────────────────────────┘   │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                                                                  KERNEL │
+└──────────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>1.3 What the Sandbox Restricts</h3>
+
+    <p>The <code>container</code> sandbox profile for third-party apps enforces these restrictions:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Category</th>
+                <th>Restriction</th>
+                <th>Exceptions</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>File System</strong></td>
+                <td>Can only read/write within its own container directories</td>
+                <td>System frameworks (read-only), shared group containers (with entitlement)</td>
+            </tr>
+            <tr>
+                <td><strong>Network</strong></td>
+                <td>Allowed by default (outbound TCP/UDP)</td>
+                <td>Listening sockets restricted; multicast/broadcast may require entitlement</td>
+            </tr>
+            <tr>
+                <td><strong>IPC</strong></td>
+                <td>Cannot send Mach messages to arbitrary services</td>
+                <td>Specific XPC services whitelisted (e.g., <code>securityd</code>, <code>mediaserverd</code>)</td>
+            </tr>
+            <tr>
+                <td><strong>Process</strong></td>
+                <td>Cannot <code>fork()</code>, <code>exec()</code>, or <code>posix_spawn()</code></td>
+                <td>None for third-party apps</td>
+            </tr>
+            <tr>
+                <td><strong>Hardware</strong></td>
+                <td>Cannot access IOKit drivers directly</td>
+                <td>Camera, microphone via framework APIs (with user permission)</td>
+            </tr>
+            <tr>
+                <td><strong>Kernel</strong></td>
+                <td>Cannot load kexts, modify sysctl, or access <code>/dev</code> devices</td>
+                <td>None</td>
+            </tr>
+            <tr>
+                <td><strong>Dynamic Code</strong></td>
+                <td>Cannot map writable+executable memory (W^X policy)</td>
+                <td>JavaScriptCore JIT has a special entitlement (<code>dynamic-codesigning</code>)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Interview Pitfall</div>
+        <p>Many candidates say "the sandbox prevents apps from accessing other apps' data." This is true but incomplete. The sandbox also prevents <code>fork()</code>, direct hardware access, kernel interaction, and writable+executable memory mapping. The W^X (write XOR execute) policy is particularly important — it prevents JIT compilation exploits and is why only Apple's own JavaScriptCore has the <code>dynamic-codesigning</code> entitlement.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 2: iOS vs ANDROID COMPARISON                               -->
+    <!-- ================================================================== -->
+
+    <h2 id="sandbox-vs-android">2. iOS Sandbox vs Android Isolation</h2>
+
+    <p>Both platforms isolate apps, but the mechanisms are fundamentally different. Understanding this comparison is valuable for Staff-level interviews at companies like Google that work on both platforms.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Dimension</th>
+                <th>iOS (Sandbox/Seatbelt)</th>
+                <th>Android (UID-based + SELinux)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Isolation Mechanism</strong></td>
+                <td>TrustedBSD MAC + sandbox profiles</td>
+                <td>Linux UID per app + SELinux MAC</td>
+            </tr>
+            <tr>
+                <td><strong>File System</strong></td>
+                <td>Path-based rules in sandbox profile</td>
+                <td>Unix DAC (file ownership by app UID) + SELinux labels</td>
+            </tr>
+            <tr>
+                <td><strong>Process Isolation</strong></td>
+                <td>fork() denied by sandbox policy</td>
+                <td>Zygote forks for each app; seccomp-bpf filters syscalls</td>
+            </tr>
+            <tr>
+                <td><strong>IPC</strong></td>
+                <td>Mach ports (kernel-mediated)</td>
+                <td>Binder (kernel driver)</td>
+            </tr>
+            <tr>
+                <td><strong>Dynamic Code</strong></td>
+                <td>W^X enforced; no JIT except JSCore</td>
+                <td>ART compiles to native; JIT allowed in app process</td>
+            </tr>
+            <tr>
+                <td><strong>Permissions</strong></td>
+                <td>Entitlements (compile-time) + runtime prompts</td>
+                <td>Manifest permissions + runtime prompts (API 23+)</td>
+            </tr>
+            <tr>
+                <td><strong>Code Signing</strong></td>
+                <td>Every page verified at load time (AMFI)</td>
+                <td>APK signature checked at install time only</td>
+            </tr>
+            <tr>
+                <td><strong>Escape Difficulty</strong></td>
+                <td>Requires kernel exploit (very hard)</td>
+                <td>Requires SELinux bypass + root (hard but more surface area)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>The key architectural difference: iOS verifies code signatures <em>at page fault time</em> via AMFI (Apple Mobile File Integrity). Every memory page loaded from disk is checked against the code signature. Android checks the APK signature only at install time. This means a modified iOS binary is caught the moment the tampered page is loaded, while a modified Android binary (if you bypass install verification) runs unchecked. This is why iOS jailbreaks must patch the kernel — there's no userspace-only path to running unsigned code.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 3: ENTITLEMENTS SYSTEM                                     -->
+    <!-- ================================================================== -->
+
+    <h2 id="entitlements">3. Entitlements System</h2>
+
+    <p>Entitlements are <strong>key-value pairs embedded in the app binary's code signature</strong> that declare what capabilities the app requires. They are the primary mechanism by which the sandbox is customized per-app. Think of them as a "capability passport" — the kernel checks this passport at every security-relevant operation.</p>
+
+    <h3>3.1 How Entitlements Work</h3>
+
+    <ol>
+        <li><strong>Declaration</strong> — the developer declares entitlements in an <code>.entitlements</code> plist file in Xcode</li>
+        <li><strong>Provisioning Profile</strong> — Apple's signing infrastructure verifies the developer is allowed to use each entitlement and includes them in the provisioning profile</li>
+        <li><strong>Code Signing</strong> — during <code>codesign</code>, entitlements are embedded in the binary's code signature blob (specifically in the <code>CodeDirectory</code> as a DER-encoded entitlements blob)</li>
+        <li><strong>Kernel Extraction</strong> — at process creation, AMFI extracts entitlements from the code signature and attaches them to the process's <code>task</code> structure in the kernel</li>
+        <li><strong>Runtime Checks</strong> — when the sandbox or any kernel subsystem needs to check a capability, it queries the process's entitlements via <code>IOTaskHasEntitlement()</code> or the MAC framework</li>
+    </ol>
+
+    <h3>3.2 Important Entitlements Reference</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Entitlement Key</th>
+                <th>Purpose</th>
+                <th>Who Can Use</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>com.apple.security.app-sandbox</code></td>
+                <td>Enables the app sandbox (macOS; iOS always sandboxed)</td>
+                <td>All apps</td>
+            </tr>
+            <tr>
+                <td><code>aps-environment</code></td>
+                <td>Push notification environment (development/production)</td>
+                <td>All apps</td>
+            </tr>
+            <tr>
+                <td><code>keychain-access-groups</code></td>
+                <td>Keychain sharing between apps from same team</td>
+                <td>All apps</td>
+            </tr>
+            <tr>
+                <td><code>com.apple.developer.associated-domains</code></td>
+                <td>Universal Links, Shared Web Credentials</td>
+                <td>All apps</td>
+            </tr>
+            <tr>
+                <td><code>com.apple.security.application-groups</code></td>
+                <td>App Groups — shared container for extensions/apps</td>
+                <td>All apps</td>
+            </tr>
+            <tr>
+                <td><code>com.apple.developer.networking.networkextension</code></td>
+                <td>VPN / content filter / DNS proxy</td>
+                <td>Requires Apple approval</td>
+            </tr>
+            <tr>
+                <td><code>com.apple.developer.nfc.readersession.formats</code></td>
+                <td>NFC tag reading</td>
+                <td>All apps</td>
+            </tr>
+            <tr>
+                <td><code>com.apple.developer.healthkit</code></td>
+                <td>HealthKit data access</td>
+                <td>All apps (with review)</td>
+            </tr>
+            <tr>
+                <td><code>com.apple.developer.devicecheck.appattest-environment</code></td>
+                <td>App Attest for server-side integrity verification</td>
+                <td>All apps</td>
+            </tr>
+            <tr>
+                <td><code>dynamic-codesigning</code></td>
+                <td>JIT compilation (W^X exception)</td>
+                <td>Apple only (JavaScriptCore)</td>
+            </tr>
+            <tr>
+                <td><code>platform-application</code></td>
+                <td>Marks process as a platform (Apple) binary</td>
+                <td>Apple only</td>
+            </tr>
+            <tr>
+                <td><code>com.apple.private.security.no-sandbox</code></td>
+                <td>Exempts process from sandboxing entirely</td>
+                <td>Apple system daemons only</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>3.3 Reading Entitlements at Runtime</h3>
+
+    <p>While you cannot modify entitlements at runtime, you can inspect them. This is useful for debugging and for verifying your app's configuration:</p>
+
+    <pre><code><span class="keyword">import</span> Foundation
+<span class="keyword">import</span> Security
+
+<span class="comment">// Read the current process's entitlements using Security framework</span>
+<span class="keyword">func</span> <span class="func">readEntitlements</span>() -> [<span class="type">String</span>: <span class="type">Any</span>]? {
+    <span class="keyword">var</span> code: <span class="type">SecStaticCode</span>?
+    <span class="keyword">let</span> status = <span class="func">SecCodeCopySelf</span>([], &amp;code)
+    <span class="keyword">guard</span> status == errSecSuccess, <span class="keyword">let</span> code = code <span class="keyword">else</span> {
+        <span class="keyword">return</span> <span class="keyword">nil</span>
+    }
+
+    <span class="keyword">var</span> info: <span class="type">CFDictionary</span>?
+    <span class="keyword">let</span> infoStatus = <span class="func">SecCodeCopySigningInformation</span>(
+        code,
+        SecCSFlags(rawValue: kSecCSSigningInformation),
+        &amp;info
+    )
+    <span class="keyword">guard</span> infoStatus == errSecSuccess,
+          <span class="keyword">let</span> dict = info <span class="keyword">as</span>? [<span class="type">String</span>: <span class="type">Any</span>],
+          <span class="keyword">let</span> entitlements = dict[kSecCodeInfoEntitlementsDict <span class="keyword">as</span> <span class="type">String</span>]
+              <span class="keyword">as</span>? [<span class="type">String</span>: <span class="type">Any</span>] <span class="keyword">else</span> {
+        <span class="keyword">return</span> <span class="keyword">nil</span>
+    }
+    <span class="keyword">return</span> entitlements
+}
+
+<span class="comment">// Check a specific entitlement</span>
+<span class="keyword">func</span> <span class="func">hasAppGroupEntitlement</span>() -> <span class="type">Bool</span> {
+    <span class="keyword">guard let</span> entitlements = <span class="func">readEntitlements</span>(),
+          <span class="keyword">let</span> groups = entitlements[<span class="string">"com.apple.security.application-groups"</span>]
+              <span class="keyword">as</span>? [<span class="type">String</span>] <span class="keyword">else</span> {
+        <span class="keyword">return</span> <span class="keyword">false</span>
+    }
+    <span class="keyword">return</span> !groups.isEmpty
+}</code></pre>
+
+    <p>From the command line, you can inspect an app's entitlements with:</p>
+
+    <pre><code><span class="comment"># Extract entitlements from a signed binary</span>
+codesign -d --entitlements :- /path/to/YourApp.app
+
+<span class="comment"># From an IPA (extract first, then inspect)</span>
+unzip YourApp.ipa -d /tmp/app
+codesign -d --entitlements :- /tmp/app/Payload/YourApp.app
+
+<span class="comment"># Using ldid on a jailbroken device</span>
+ldid -e /var/containers/Bundle/Application/.../YourApp.app/YourApp</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Entitlement Encoding</div>
+        <p>Entitlements are stored in two formats within the code signature: a plist-encoded XML blob (for legacy compatibility) and a DER-encoded blob (used by the kernel since iOS 15 for faster parsing). The DER format is critical for performance — the kernel parses entitlements on every <code>exec()</code>, and DER parsing is O(1) for key lookup vs O(n) for plist XML. This is why Apple introduced the <code>com.apple.developer.entitlements-validation</code> entitlement to enforce DER-only validation.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 4: CONTAINER STRUCTURE                                     -->
+    <!-- ================================================================== -->
+
+    <h2 id="container-structure">4. Container Structure</h2>
+
+    <p>Every iOS app gets its own <strong>container</strong> — an isolated directory tree that the sandbox restricts the app to. The container is created by <code>installd</code> when the app is first installed and has a UUID-based path that changes on every installation.</p>
+
+    <h3>4.1 Container Layout</h3>
+
+    <div class="diagram">
+/var/mobile/Containers/
+├── Bundle/
+│   └── Application/
+│       └── {UUID}/
+│           └── YourApp.app/              ◀── BUNDLE CONTAINER (read-only)
+│               ├── YourApp                   (executable binary)
+│               ├── Info.plist                (app metadata)
+│               ├── embedded.mobileprovision  (provisioning profile)
+│               ├── _CodeSignature/           (code signature)
+│               ├── Assets.car                (compiled asset catalog)
+│               ├── Base.lproj/               (localized resources)
+│               └── Frameworks/               (embedded frameworks)
+│
+├── Data/
+│   └── Application/
+│       └── {DIFFERENT-UUID}/             ◀── DATA CONTAINER (read-write)
+│           ├── Documents/                    User-visible data, backed up
+│           │   ├── user-data.sqlite
+│           │   └── exported-files/
+│           ├── Library/
+│           │   ├── Application Support/      App-specific data, backed up
+│           │   ├── Caches/                   Purgeable by system, NOT backed up
+│           │   ├── Preferences/              UserDefaults plists, backed up
+│           │   │   └── com.yourapp.plist
+│           │   ├── Cookies/                  HTTP cookies
+│           │   ├── WebKit/                   WKWebView data
+│           │   └── SplashBoard/              Launch storyboard snapshots
+│           └── tmp/                          Temporary files, NOT backed up
+│                                             Purged when app not running
+│
+└── Shared/
+    └── AppGroup/
+        └── {GROUP-UUID}/                 ◀── GROUP CONTAINER (shared)
+            └── group.com.yourteam.shared/
+                ├── Library/
+                │   ├── Caches/
+                │   └── Application Support/
+                └── Documents/
+    </div>
+
+    <h3>4.2 Bundle Container (Read-Only)</h3>
+
+    <p>The bundle container holds the signed app binary and all resources. It is <strong>read-only</strong> at runtime — the sandbox denies all write operations to this directory. This is critical for code integrity: since every page is signature-verified at load time (AMFI), any modification would invalidate the signature and crash the app.</p>
+
+    <ul>
+        <li>The UUID path changes on every app update (the old bundle is replaced atomically)</li>
+        <li>The data container UUID remains stable across updates</li>
+        <li><code>Bundle.main.bundlePath</code> returns the path to this container</li>
+    </ul>
+
+    <h3>4.3 Data Container (Read-Write)</h3>
+
+    <p>The data container is the app's writable storage. It has a <strong>different UUID</strong> from the bundle container (this is a common interview question). The key directories:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Directory</th>
+                <th>Purpose</th>
+                <th>Backed Up</th>
+                <th>Purged by System</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>Documents/</code></td>
+                <td>User-generated content, files visible in Files app (if <code>UIFileSharingEnabled</code>)</td>
+                <td>Yes</td>
+                <td>No</td>
+            </tr>
+            <tr>
+                <td><code>Library/Application Support/</code></td>
+                <td>App-specific data not visible to user</td>
+                <td>Yes</td>
+                <td>No</td>
+            </tr>
+            <tr>
+                <td><code>Library/Caches/</code></td>
+                <td>Regenerable cached data</td>
+                <td>No</td>
+                <td>Yes (low disk space)</td>
+            </tr>
+            <tr>
+                <td><code>Library/Preferences/</code></td>
+                <td><code>UserDefaults</code> plist files</td>
+                <td>Yes</td>
+                <td>No</td>
+            </tr>
+            <tr>
+                <td><code>tmp/</code></td>
+                <td>Temporary files</td>
+                <td>No</td>
+                <td>Yes (app not running)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>4.4 Group Containers (Shared)</h3>
+
+    <p>App Groups allow multiple apps and extensions from the same development team to share a container. This is the <em>only</em> sanctioned way for apps to share files on iOS (besides the pasteboard and document providers).</p>
+
+    <pre><code><span class="keyword">import</span> Foundation
+
+<span class="comment">// Accessing container directories</span>
+<span class="keyword">let</span> fm = <span class="type">FileManager</span>.<span class="keyword">default</span>
+
+<span class="comment">// Bundle container (read-only)</span>
+<span class="keyword">let</span> bundlePath = <span class="type">Bundle</span>.main.bundlePath
+<span class="keyword">let</span> infoPlist = <span class="type">Bundle</span>.main.url(forResource: <span class="string">"Info"</span>, withExtension: <span class="string">"plist"</span>)
+
+<span class="comment">// Data container — Documents</span>
+<span class="keyword">let</span> documentsURL = fm.<span class="func">urls</span>(for: .documentDirectory, in: .userDomainMask).first!
+
+<span class="comment">// Data container — Library/Application Support</span>
+<span class="keyword">let</span> appSupportURL = fm.<span class="func">urls</span>(
+    for: .applicationSupportDirectory,
+    in: .userDomainMask
+).first!
+
+<span class="comment">// Data container — Library/Caches</span>
+<span class="keyword">let</span> cachesURL = fm.<span class="func">urls</span>(for: .cachesDirectory, in: .userDomainMask).first!
+
+<span class="comment">// Data container — tmp</span>
+<span class="keyword">let</span> tmpURL = fm.temporaryDirectory
+
+<span class="comment">// Group container (requires App Groups entitlement)</span>
+<span class="keyword">if let</span> groupURL = fm.<span class="func">containerURL</span>(
+    forSecurityApplicationGroupIdentifier: <span class="string">"group.com.yourteam.shared"</span>
+) {
+    <span class="keyword">let</span> sharedDB = groupURL.<span class="func">appendingPathComponent</span>(<span class="string">"shared.sqlite"</span>)
+    <span class="func">print</span>(<span class="string">"Shared DB at: \(sharedDB.path)"</span>)
+}
+
+<span class="comment">// Shared UserDefaults via App Groups</span>
+<span class="keyword">let</span> sharedDefaults = <span class="type">UserDefaults</span>(suiteName: <span class="string">"group.com.yourteam.shared"</span>)
+sharedDefaults?.<span class="func">set</span>(<span class="string">"value"</span>, forKey: <span class="string">"sharedKey"</span>)</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall — Container UUID Confusion</div>
+        <p>The bundle container and data container have <strong>different UUIDs</strong>. Never hardcode or cache absolute paths — they change on every install/update (bundle) or device restore (data). Always use <code>FileManager</code> APIs to resolve paths at runtime. Also note: on the iOS Simulator, the container structure is different from a real device (paths are under <code>~/Library/Developer/CoreSimulator/</code>).</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 5: FILE PROTECTION CLASSES                                 -->
+    <!-- ================================================================== -->
+
+    <h2 id="file-protection-classes">5. File Protection Classes</h2>
+
+    <p>iOS provides four <strong>Data Protection classes</strong> that control when files can be read and written based on the device's lock state. Each class has a corresponding encryption key that is derived from the user's passcode and a hardware key in the Secure Enclave. When the key is unavailable (because the device is locked), the file is cryptographically inaccessible.</p>
+
+    <h3>5.1 The Four Protection Classes</h3>
+
+    <h4>NSFileProtectionComplete</h4>
+    <p>The most secure class. The file's class key is evicted from memory 10 seconds after the device locks. The file is completely inaccessible until the user unlocks the device again.</p>
+    <ul>
+        <li><strong>Key available:</strong> Only while device is unlocked (or within ~10s grace period after lock)</li>
+        <li><strong>Use for:</strong> Highly sensitive data — health records, financial data, authentication tokens</li>
+        <li><strong>Limitation:</strong> Background operations cannot read/write these files</li>
+    </ul>
+
+    <h4>NSFileProtectionCompleteUnlessOpen</h4>
+    <p>Uses an asymmetric key scheme. A file can be <em>created</em> while locked (using the public key), but can only be <em>opened for reading</em> while unlocked. If a file handle is already open when the device locks, it remains accessible.</p>
+    <ul>
+        <li><strong>Key available:</strong> Public key always available (for writes); private key only while unlocked</li>
+        <li><strong>Use for:</strong> Files that need background writes but sensitive reads — email attachments downloading in background, photo uploads</li>
+        <li><strong>Mechanism:</strong> Per-file key wrapped with ECDH — public key encrypts, private key (protected) decrypts</li>
+    </ul>
+
+    <h4>NSFileProtectionCompleteUntilFirstUserAuthentication</h4>
+    <p>The <strong>default</strong> protection class for most app files. The class key is loaded into memory at first unlock after boot and remains available until the device is rebooted. This is sometimes called "After First Unlock" (AFU).</p>
+    <ul>
+        <li><strong>Key available:</strong> From first unlock until reboot</li>
+        <li><strong>Use for:</strong> Most app data — databases, cached content, preferences</li>
+        <li><strong>Why it's the default:</strong> Balances security with usability — background operations work, but data is protected at rest before first unlock (e.g., if device is seized while powered off)</li>
+    </ul>
+
+    <h4>NSFileProtectionNone</h4>
+    <p>The file is encrypted with a key that is always available, even before first unlock. The key is derived from the hardware UID only (no passcode component). This provides protection against physical extraction of the flash storage but not against a running device.</p>
+    <ul>
+        <li><strong>Key available:</strong> Always (even before first unlock)</li>
+        <li><strong>Use for:</strong> Data that must be accessible immediately at boot — device management profiles, certain system databases</li>
+        <li><strong>Warning:</strong> Avoid for any sensitive data</li>
+    </ul>
+
+    <h3>5.2 Protection Class Comparison</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Protection Class</th>
+                <th>Before First Unlock</th>
+                <th>After First Unlock (Locked)</th>
+                <th>Unlocked</th>
+                <th>Background Access</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Complete</strong></td>
+                <td>No</td>
+                <td>No</td>
+                <td>Yes</td>
+                <td>No</td>
+            </tr>
+            <tr>
+                <td><strong>CompleteUnlessOpen</strong></td>
+                <td>No</td>
+                <td>Write-only (new files)</td>
+                <td>Yes</td>
+                <td>Write-only</td>
+            </tr>
+            <tr>
+                <td><strong>CompleteUntilFirstAuth</strong> (default)</td>
+                <td>No</td>
+                <td>Yes</td>
+                <td>Yes</td>
+                <td>Yes</td>
+            </tr>
+            <tr>
+                <td><strong>None</strong></td>
+                <td>Yes</td>
+                <td>Yes</td>
+                <td>Yes</td>
+                <td>Yes</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>5.3 Setting File Protection in Swift</h3>
+
+    <pre><code><span class="keyword">import</span> Foundation
+
+<span class="comment">// Method 1: Set protection when creating a file</span>
+<span class="keyword">let</span> sensitiveData = <span class="string">"secret-token-12345"</span>.<span class="func">data</span>(using: .utf8)!
+<span class="keyword">let</span> fileURL = <span class="type">FileManager</span>.<span class="keyword">default</span>
+    .<span class="func">urls</span>(for: .documentDirectory, in: .userDomainMask)[<span class="number">0</span>]
+    .<span class="func">appendingPathComponent</span>(<span class="string">"secrets.dat"</span>)
+
+<span class="keyword">try</span> sensitiveData.<span class="func">write</span>(
+    to: fileURL,
+    options: [.completeFileProtection]  <span class="comment">// NSFileProtectionComplete</span>
+)
+
+<span class="comment">// Method 2: Set protection on an existing file</span>
+<span class="keyword">try</span> <span class="type">FileManager</span>.<span class="keyword">default</span>.<span class="func">setAttributes</span>(
+    [.protectionKey: <span class="type">FileProtectionType</span>.complete],
+    ofItemAtPath: fileURL.path
+)
+
+<span class="comment">// Method 3: Set default protection for a directory</span>
+<span class="keyword">let</span> secureDir = <span class="type">FileManager</span>.<span class="keyword">default</span>
+    .<span class="func">urls</span>(for: .documentDirectory, in: .userDomainMask)[<span class="number">0</span>]
+    .<span class="func">appendingPathComponent</span>(<span class="string">"secure"</span>)
+
+<span class="keyword">try</span> <span class="type">FileManager</span>.<span class="keyword">default</span>.<span class="func">createDirectory</span>(
+    at: secureDir,
+    withIntermediateDirectories: <span class="keyword">true</span>,
+    attributes: [.protectionKey: <span class="type">FileProtectionType</span>.complete]
+)
+
+<span class="comment">// Method 4: Verify protection class of a file</span>
+<span class="keyword">let</span> attrs = <span class="keyword">try</span> <span class="type">FileManager</span>.<span class="keyword">default</span>.<span class="func">attributesOfItem</span>(atPath: fileURL.path)
+<span class="keyword">if let</span> protection = attrs[.protectionKey] <span class="keyword">as</span>? <span class="type">FileProtectionType</span> {
+    <span class="keyword">switch</span> protection {
+    <span class="keyword">case</span> .complete:
+        <span class="func">print</span>(<span class="string">"NSFileProtectionComplete"</span>)
+    <span class="keyword">case</span> .completeUnlessOpen:
+        <span class="func">print</span>(<span class="string">"NSFileProtectionCompleteUnlessOpen"</span>)
+    <span class="keyword">case</span> .completeUntilFirstUserAuthentication:
+        <span class="func">print</span>(<span class="string">"NSFileProtectionCompleteUntilFirstUserAuthentication"</span>)
+    <span class="keyword">case</span> .none:
+        <span class="func">print</span>(<span class="string">"NSFileProtectionNone"</span>)
+    <span class="keyword">default</span>:
+        <span class="func">print</span>(<span class="string">"Unknown protection: \(protection)"</span>)
+    }
+}
+
+<span class="comment">// Method 5: Handle protection errors in background</span>
+<span class="keyword">func</span> <span class="func">readSecureFile</span>(at url: <span class="type">URL</span>) -> <span class="type">Data</span>? {
+    <span class="keyword">do</span> {
+        <span class="keyword">return</span> <span class="keyword">try</span> <span class="type">Data</span>(contentsOf: url)
+    } <span class="keyword">catch let</span> error <span class="keyword">as</span> <span class="type">NSError</span>
+        <span class="keyword">where</span> error.domain == <span class="type">NSCocoaErrorDomain</span>
+           &amp;&amp; error.code == <span class="type">NSFileReadNoPermissionError</span> {
+        <span class="comment">// File is protected and device is locked</span>
+        <span class="func">print</span>(<span class="string">"File inaccessible — device locked, protection class active"</span>)
+        <span class="keyword">return</span> <span class="keyword">nil</span>
+    } <span class="keyword">catch</span> {
+        <span class="func">print</span>(<span class="string">"Read error: \(error)"</span>)
+        <span class="keyword">return</span> <span class="keyword">nil</span>
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Protection Class Selection</div>
+        <p>Use <code>NSFileProtectionComplete</code> for authentication tokens, encryption keys, health data, and financial records. Use <code>CompleteUnlessOpen</code> for files that need background download completion. Use the default <code>CompleteUntilFirstUserAuthentication</code> for general app data. Never use <code>None</code> unless you have a specific technical reason (e.g., boot-time configuration). Also set the <code>NSFileProtectionComplete</code> capability in your app's entitlements to change the <em>default</em> protection class for all new files.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 6: DATA PROTECTION API & KEY HIERARCHY                     -->
+    <!-- ================================================================== -->
+
+    <h2 id="data-protection-api">6. Data Protection API &amp; Key Hierarchy</h2>
+
+    <p>Data Protection is not just a file attribute — it's a full <strong>cryptographic key management system</strong> that integrates the Secure Enclave, the user's passcode, and hardware-fused keys to create a hierarchy of encryption keys. Understanding this hierarchy is essential for Staff-level security discussions.</p>
+
+    <h3>6.1 Key Hierarchy</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────┐
+│                    DATA PROTECTION KEY HIERARCHY                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │                    SECURE ENCLAVE                            │    │
+│  │                                                             │    │
+│  │  ┌─────────────┐    ┌──────────────────────────────────┐   │    │
+│  │  │  Hardware    │    │  UID Key (256-bit AES)            │   │    │
+│  │  │  UID Fuse    │───▶│  Fused at manufacturing           │   │    │
+│  │  │  (unique per │    │  Never leaves Secure Enclave      │   │    │
+│  │  │   device)    │    │  Cannot be read by software       │   │    │
+│  │  └─────────────┘    └──────────────┬───────────────────┘   │    │
+│  │                                    │                        │    │
+│  └────────────────────────────────────┼────────────────────────┘    │
+│                                       │                              │
+│                                       ▼                              │
+│  ┌────────────────────────────────────────────────────────────┐     │
+│  │              PASSCODE KEY DERIVATION                        │     │
+│  │                                                            │     │
+│  │  User Passcode ──▶ PBKDF2 (80ms calibrated) ──┐           │     │
+│  │                                                │           │     │
+│  │  UID Key ─────────────────────────────────────┤           │     │
+│  │                                                ▼           │     │
+│  │                                         Passcode Key       │     │
+│  │                                    (entangled with UID)    │     │
+│  └────────────────────────────────────────┬───────────────────┘     │
+│                                           │                          │
+│                                           ▼                          │
+│  ┌────────────────────────────────────────────────────────────┐     │
+│  │                    CLASS KEYS                               │     │
+│  │                                                            │     │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │     │
+│  │  │  Class A Key  │  │  Class B Key  │  │  Class C Key  │    │     │
+│  │  │  (Complete)   │  │  (UnlessOpen) │  │  (UntilFirst) │    │     │
+│  │  │              │  │              │  │              │    │     │
+│  │  │  Wrapped by  │  │  Wrapped by  │  │  Wrapped by  │    │     │
+│  │  │  Passcode Key│  │  Passcode Key│  │  Passcode Key│    │     │
+│  │  │              │  │  + ECDH pair  │  │              │    │     │
+│  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘    │     │
+│  │         │                 │                 │             │     │
+│  └─────────┼─────────────────┼─────────────────┼─────────────┘     │
+│            │                 │                 │                     │
+│            ▼                 ▼                 ▼                     │
+│  ┌────────────────────────────────────────────────────────────┐     │
+│  │                  PER-FILE KEYS                              │     │
+│  │                                                            │     │
+│  │  File 1 Key ◀── wrapped by Class A Key                     │     │
+│  │  File 2 Key ◀── wrapped by Class B Key                     │     │
+│  │  File 3 Key ◀── wrapped by Class C Key                     │     │
+│  │                                                            │     │
+│  │  Each file has a unique 256-bit AES key                    │     │
+│  │  Stored in file metadata (wrapped/encrypted)               │     │
+│  │  AES-XTS mode for file content encryption                  │     │
+│  └────────────────────────────────────────────────────────────┘     │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>6.2 How File Encryption Works</h3>
+
+    <ol>
+        <li><strong>File creation:</strong> A new random 256-bit AES per-file key is generated</li>
+        <li><strong>Key wrapping:</strong> The per-file key is wrapped (encrypted) with the appropriate class key based on the file's protection class</li>
+        <li><strong>Metadata storage:</strong> The wrapped per-file key is stored in the file's metadata (in the APFS filesystem metadata, not in the file content)</li>
+        <li><strong>Content encryption:</strong> The file content is encrypted with AES-XTS using the per-file key</li>
+        <li><strong>On read:</strong> The class key unwraps the per-file key, which decrypts the file content</li>
+        <li><strong>On lock:</strong> Class A keys are evicted from memory — files in that class become cryptographically inaccessible</li>
+    </ol>
+
+    <h3>6.3 Secure Enclave Integration</h3>
+
+    <p>The Secure Enclave Processor (SEP) is a hardware coprocessor with its own encrypted memory, secure boot chain, and hardware random number generator. Its role in Data Protection:</p>
+
+    <ul>
+        <li><strong>UID key storage:</strong> The 256-bit UID key is fused into the SEP at manufacturing and can never be read — only used for cryptographic operations inside the SEP</li>
+        <li><strong>Passcode verification:</strong> The SEP enforces escalating delays between passcode attempts (1s, 5s, 15s, 1min, 1hr) and can be configured to wipe after 10 failed attempts</li>
+        <li><strong>Key derivation:</strong> The passcode-to-key derivation happens inside the SEP, entangling the passcode with the UID key — this means brute-forcing the passcode requires the physical device</li>
+        <li><strong>Effaceable Storage:</strong> The SEP manages a region of flash storage that can be instantly wiped, destroying all class keys and making all data irrecoverable</li>
+    </ul>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know — Why This Matters</div>
+        <p>The key insight for architects: because the UID key never leaves the Secure Enclave and is entangled with the passcode, an attacker who extracts the flash storage cannot brute-force the passcode offline. They must use the physical device, which enforces rate limiting. This is fundamentally different from full-disk encryption on a laptop, where the encryption key can be brute-forced on any hardware. This is why iOS devices are considered secure even with a 6-digit passcode — the SEP makes each guess take 80ms minimum, making brute-force impractical.</p>
+    </div>
+
+    <h3>6.4 Observing Data Protection State Changes</h3>
+
+    <pre><code><span class="keyword">import</span> UIKit
+
+<span class="keyword">class</span> <span class="type">DataProtectionMonitor</span> {
+    <span class="keyword">func</span> <span class="func">startMonitoring</span>() {
+        <span class="type">NotificationCenter</span>.<span class="keyword">default</span>.<span class="func">addObserver</span>(
+            <span class="keyword">self</span>,
+            selector: <span class="keyword">#selector</span>(<span class="func">protectionDidBecomeAvailable</span>),
+            name: <span class="type">UIApplication</span>.protectedDataDidBecomeAvailableNotification,
+            object: <span class="keyword">nil</span>
+        )
+        <span class="type">NotificationCenter</span>.<span class="keyword">default</span>.<span class="func">addObserver</span>(
+            <span class="keyword">self</span>,
+            selector: <span class="keyword">#selector</span>(<span class="func">protectionWillBecomeUnavailable</span>),
+            name: <span class="type">UIApplication</span>.protectedDataWillBecomeUnavailableNotification,
+            object: <span class="keyword">nil</span>
+        )
+    }
+
+    <span class="keyword">@objc func</span> <span class="func">protectionDidBecomeAvailable</span>() {
+        <span class="comment">// Device unlocked — Class A files now accessible</span>
+        <span class="comment">// Good time to process queued secure operations</span>
+        <span class="func">processSecureQueue</span>()
+    }
+
+    <span class="keyword">@objc func</span> <span class="func">protectionWillBecomeUnavailable</span>() {
+        <span class="comment">// Device about to lock — flush and close Class A file handles</span>
+        <span class="func">flushSecureFileHandles</span>()
+    }
+
+    <span class="keyword">func</span> <span class="func">isDataProtectionActive</span>() -> <span class="type">Bool</span> {
+        <span class="keyword">return</span> <span class="type">UIApplication</span>.shared.isProtectedDataAvailable
+    }
+
+    <span class="keyword">private func</span> <span class="func">processSecureQueue</span>() { <span class="comment">/* ... */</span> }
+    <span class="keyword">private func</span> <span class="func">flushSecureFileHandles</span>() { <span class="comment">/* ... */</span> }
+}</code></pre>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 7: JAILBREAK DETECTION                                     -->
+    <!-- ================================================================== -->
+
+    <h2 id="jailbreak-detection">7. Jailbreak Detection Techniques</h2>
+
+    <p>Jailbreak detection attempts to determine whether the device has been compromised — whether the sandbox and code signing enforcement have been bypassed. While these checks are common in banking and enterprise apps, understanding their limitations is more important than knowing the techniques themselves.</p>
+
+    <h3>7.1 Common Detection Techniques</h3>
+
+    <pre><code><span class="keyword">import</span> Foundation
+<span class="keyword">import</span> UIKit
+<span class="keyword">import</span> Darwin
+
+<span class="keyword">struct</span> <span class="type">JailbreakDetector</span> {
+
+    <span class="comment">// Technique 1: Check for known jailbreak file paths</span>
+    <span class="keyword">static func</span> <span class="func">checkJailbreakFiles</span>() -> <span class="type">Bool</span> {
+        <span class="keyword">let</span> suspiciousPaths = [
+            <span class="string">"/Applications/Cydia.app"</span>,
+            <span class="string">"/Applications/Sileo.app"</span>,
+            <span class="string">"/Library/MobileSubstrate/MobileSubstrate.dylib"</span>,
+            <span class="string">"/usr/sbin/sshd"</span>,
+            <span class="string">"/usr/bin/ssh"</span>,
+            <span class="string">"/etc/apt"</span>,
+            <span class="string">"/private/var/lib/apt/"</span>,
+            <span class="string">"/usr/lib/TweakInject"</span>,
+            <span class="string">"/var/jb"</span>,                    <span class="comment">// rootless jailbreaks (iOS 15+)</span>
+            <span class="string">"/var/binpack"</span>,
+            <span class="string">"/Library/PreferenceBundles"</span>,
+        ]
+        <span class="keyword">for</span> path <span class="keyword">in</span> suspiciousPaths {
+            <span class="keyword">if</span> <span class="type">FileManager</span>.<span class="keyword">default</span>.<span class="func">fileExists</span>(atPath: path) {
+                <span class="keyword">return</span> <span class="keyword">true</span>
+            }
+        }
+        <span class="keyword">return</span> <span class="keyword">false</span>
+    }
+
+    <span class="comment">// Technique 2: Check if we can write outside our sandbox</span>
+    <span class="keyword">static func</span> <span class="func">checkSandboxViolation</span>() -> <span class="type">Bool</span> {
+        <span class="keyword">let</span> testPath = <span class="string">"/private/jailbreak_test_\(UUID().uuidString)"</span>
+        <span class="keyword">do</span> {
+            <span class="keyword">try</span> <span class="string">"test"</span>.<span class="func">write</span>(toFile: testPath, atomically: <span class="keyword">true</span>, encoding: .utf8)
+            <span class="keyword">try</span> <span class="type">FileManager</span>.<span class="keyword">default</span>.<span class="func">removeItem</span>(atPath: testPath)
+            <span class="keyword">return</span> <span class="keyword">true</span>  <span class="comment">// Should not be possible in sandbox</span>
+        } <span class="keyword">catch</span> {
+            <span class="keyword">return</span> <span class="keyword">false</span>
+        }
+    }
+
+    <span class="comment">// Technique 3: Check for fork() ability</span>
+    <span class="keyword">static func</span> <span class="func">checkForkAbility</span>() -> <span class="type">Bool</span> {
+        <span class="keyword">let</span> pid = <span class="func">fork</span>()
+        <span class="keyword">if</span> pid >= <span class="number">0</span> {
+            <span class="keyword">if</span> pid > <span class="number">0</span> {
+                <span class="comment">// Parent: kill the child</span>
+                <span class="func">kill</span>(pid, SIGTERM)
+                <span class="keyword">var</span> status: <span class="type">Int32</span> = <span class="number">0</span>
+                <span class="func">waitpid</span>(pid, &amp;status, <span class="number">0</span>)
+            }
+            <span class="keyword">return</span> <span class="keyword">true</span>  <span class="comment">// fork() succeeded — sandbox is broken</span>
+        }
+        <span class="keyword">return</span> <span class="keyword">false</span>
+    }
+
+    <span class="comment">// Technique 4: Check for injected dylibs</span>
+    <span class="keyword">static func</span> <span class="func">checkDyldInjection</span>() -> <span class="type">Bool</span> {
+        <span class="keyword">let</span> suspiciousLibs = [
+            <span class="string">"SubstrateLoader"</span>,
+            <span class="string">"MobileSubstrate"</span>,
+            <span class="string">"TweakInject"</span>,
+            <span class="string">"libhooker"</span>,
+            <span class="string">"substitute"</span>,
+            <span class="string">"ellekit"</span>,       <span class="comment">// modern jailbreak hooking framework</span>
+        ]
+        <span class="keyword">let</span> imageCount = _dyld_image_count()
+        <span class="keyword">for</span> i <span class="keyword">in</span> <span class="number">0</span>..&lt;imageCount {
+            <span class="keyword">guard let</span> name = _dyld_get_image_name(i) <span class="keyword">else</span> { <span class="keyword">continue</span> }
+            <span class="keyword">let</span> imageName = <span class="type">String</span>(cString: name)
+            <span class="keyword">for</span> lib <span class="keyword">in</span> suspiciousLibs {
+                <span class="keyword">if</span> imageName.<span class="func">contains</span>(lib) {
+                    <span class="keyword">return</span> <span class="keyword">true</span>
+                }
+            }
+        }
+        <span class="keyword">return</span> <span class="keyword">false</span>
+    }
+
+    <span class="comment">// Technique 5: Check for symbolic links</span>
+    <span class="keyword">static func</span> <span class="func">checkSymbolicLinks</span>() -> <span class="type">Bool</span> {
+        <span class="keyword">let</span> pathsToCheck = [
+            <span class="string">"/Applications"</span>,
+            <span class="string">"/var/stash"</span>,
+            <span class="string">"/Library/Ringtones"</span>,
+            <span class="string">"/Library/Wallpaper"</span>,
+        ]
+        <span class="keyword">for</span> path <span class="keyword">in</span> pathsToCheck {
+            <span class="keyword">var</span> statInfo = stat()
+            <span class="keyword">if</span> <span class="func">lstat</span>(path, &amp;statInfo) == <span class="number">0</span> {
+                <span class="keyword">if</span> (statInfo.st_mode &amp; S_IFLNK) == S_IFLNK {
+                    <span class="keyword">return</span> <span class="keyword">true</span>
+                }
+            }
+        }
+        <span class="keyword">return</span> <span class="keyword">false</span>
+    }
+
+    <span class="comment">// Technique 6: Check URL scheme for Cydia/Sileo</span>
+    <span class="keyword">static func</span> <span class="func">checkJailbreakURLSchemes</span>() -> <span class="type">Bool</span> {
+        <span class="keyword">let</span> schemes = [
+            <span class="string">"cydia://package/com.example"</span>,
+            <span class="string">"sileo://package/com.example"</span>,
+            <span class="string">"zbra://packages"</span>,
+        ]
+        <span class="keyword">for</span> scheme <span class="keyword">in</span> schemes {
+            <span class="keyword">if let</span> url = <span class="type">URL</span>(string: scheme),
+               <span class="type">UIApplication</span>.shared.<span class="func">canOpenURL</span>(url) {
+                <span class="keyword">return</span> <span class="keyword">true</span>
+            }
+        }
+        <span class="keyword">return</span> <span class="keyword">false</span>
+    }
+
+    <span class="comment">// Technique 7: Check environment variables for injection</span>
+    <span class="keyword">static func</span> <span class="func">checkEnvironmentVariables</span>() -> <span class="type">Bool</span> {
+        <span class="keyword">let</span> suspiciousVars = [
+            <span class="string">"DYLD_INSERT_LIBRARIES"</span>,
+            <span class="string">"_MSSafeMode"</span>,
+            <span class="string">"DYLD_LIBRARY_PATH"</span>,
+        ]
+        <span class="keyword">for</span> envVar <span class="keyword">in</span> suspiciousVars {
+            <span class="keyword">if</span> <span class="func">getenv</span>(envVar) != <span class="keyword">nil</span> {
+                <span class="keyword">return</span> <span class="keyword">true</span>
+            }
+        }
+        <span class="keyword">return</span> <span class="keyword">false</span>
+    }
+
+    <span class="comment">// Combined check</span>
+    <span class="keyword">static func</span> <span class="func">isJailbroken</span>() -> <span class="type">Bool</span> {
+        <span class="keyword">return</span> <span class="func">checkJailbreakFiles</span>()
+            || <span class="func">checkSandboxViolation</span>()
+            || <span class="func">checkForkAbility</span>()
+            || <span class="func">checkDyldInjection</span>()
+            || <span class="func">checkSymbolicLinks</span>()
+            || <span class="func">checkJailbreakURLSchemes</span>()
+            || <span class="func">checkEnvironmentVariables</span>()
+    }
+}</code></pre>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 8: WHY JAILBREAK DETECTION IS UNRELIABLE                   -->
+    <!-- ================================================================== -->
+
+    <h2 id="jailbreak-unreliable">8. Why Jailbreak Detection Is Unreliable</h2>
+
+    <p>This is one of the most important sections for Staff-level interviews. The question isn't "how do you detect jailbreaks?" — it's "why is jailbreak detection fundamentally a losing game?"</p>
+
+    <h3>8.1 The Cat-and-Mouse Game</h3>
+
+    <p>Every jailbreak detection technique listed above has a known bypass. The jailbreak community maintains tools specifically designed to defeat these checks:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Detection Technique</th>
+                <th>Bypass Method</th>
+                <th>Tools</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>File path checks</td>
+                <td>Hook <code>stat()</code>, <code>access()</code>, <code>fileExistsAtPath:</code> to return "not found" for known paths</td>
+                <td>Shadow, A-Bypass, Hestia</td>
+            </tr>
+            <tr>
+                <td>Sandbox write test</td>
+                <td>Hook <code>open()</code> with <code>O_CREAT</code> to deny writes to test paths</td>
+                <td>Liberty Lite, Choicy</td>
+            </tr>
+            <tr>
+                <td>fork() check</td>
+                <td>Hook <code>fork()</code> to return -1 (EPERM) for the target app</td>
+                <td>KernBypass, vnodebypass</td>
+            </tr>
+            <tr>
+                <td>dyld image check</td>
+                <td>Hook <code>_dyld_image_count()</code> and <code>_dyld_get_image_name()</code> to hide injected libraries</td>
+                <td>Shadow, FlyJB</td>
+            </tr>
+            <tr>
+                <td>URL scheme check</td>
+                <td>Hook <code>canOpenURL:</code> to return NO for jailbreak URLs</td>
+                <td>Shadow, A-Bypass</td>
+            </tr>
+            <tr>
+                <td>Environment variables</td>
+                <td>Hook <code>getenv()</code> to return NULL for suspicious variables</td>
+                <td>Most bypass tweaks</td>
+            </tr>
+            <tr>
+                <td>Symbolic link check</td>
+                <td>Hook <code>lstat()</code> to report regular files instead of symlinks</td>
+                <td>Shadow, vnodebypass</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>8.2 The Fundamental Problem</h3>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know — The Halting Problem of Integrity</div>
+        <p>Jailbreak detection is fundamentally impossible to do reliably because of a simple principle: <strong>you cannot verify the integrity of a system from within that system if the system is compromised</strong>. This is analogous to the halting problem in computer science.</p>
+        <p>When your app calls <code>stat("/Applications/Cydia.app")</code>, that call goes through the kernel. On a jailbroken device, the kernel itself may be patched — your system call never reaches the real filesystem. You're asking a potentially compromised system "are you compromised?" and trusting the answer.</p>
+        <p>Even "advanced" techniques like checking code signatures, verifying kernel integrity, or using syscall timing analysis can be defeated because the jailbreak operates at a privilege level <em>above</em> your app. The attacker controls the kernel; you're in userspace.</p>
+    </div>
+
+    <h3>8.3 Why Modern Jailbreaks Are Harder to Detect</h3>
+
+    <ul>
+        <li><strong>Rootless jailbreaks (iOS 15+):</strong> Tools like Dopamine and palera1n don't modify the root filesystem at all. They use <code>/var/jb</code> as a prefix, making traditional path checks useless</li>
+        <li><strong>Kernel-level hooking:</strong> Modern jailbreaks patch the kernel's MAC framework hooks directly, so sandbox checks return "clean" results even though the sandbox is compromised</li>
+        <li><strong>Per-app bypass:</strong> Tools like Choicy and Shadow can selectively disable jailbreak tweaks for specific apps, so the app sees a "clean" environment while the rest of the system is jailbroken</li>
+        <li><strong>Kernel memory protection:</strong> Some jailbreaks use KPP/KTRR bypass techniques that make kernel patches invisible to integrity checks</li>
+    </ul>
+
+    <h3>8.4 What To Do Instead</h3>
+
+    <p>Rather than trying to detect jailbreaks (which is unreliable), focus on <strong>protecting your data assuming the device is compromised</strong>:</p>
+
+    <ul>
+        <li>Use <strong>Apple's App Attest</strong> (<code>DCAppAttestService</code>) — hardware-backed attestation that the app binary is genuine and running on a non-compromised device. The attestation is verified server-side, not on-device</li>
+        <li>Use <strong>DeviceCheck</strong> — server-side per-device bits that persist across app installs</li>
+        <li>Implement <strong>server-side validation</strong> — never trust client-side security decisions</li>
+        <li>Use <strong>Secure Enclave keys</strong> — even a jailbroken kernel cannot extract keys from the SEP</li>
+        <li>Encrypt sensitive data with keys derived from <strong>server-provided secrets</strong>, not just local storage</li>
+    </ul>
+
+    <pre><code><span class="keyword">import</span> DeviceCheck
+
+<span class="comment">// App Attest — hardware-backed integrity verification</span>
+<span class="keyword">func</span> <span class="func">attestApp</span>() <span class="keyword">async throws</span> {
+    <span class="keyword">let</span> service = <span class="type">DCAppAttestService</span>.shared
+
+    <span class="keyword">guard</span> service.isSupported <span class="keyword">else</span> {
+        <span class="keyword">throw</span> <span class="type">AttestError</span>.unsupported
+    }
+
+    <span class="comment">// Step 1: Generate a key pair in the Secure Enclave</span>
+    <span class="keyword">let</span> keyId = <span class="keyword">try await</span> service.<span class="func">generateKey</span>()
+
+    <span class="comment">// Step 2: Get a server challenge</span>
+    <span class="keyword">let</span> challenge = <span class="keyword">try await</span> <span class="func">fetchChallengeFromServer</span>()
+    <span class="keyword">let</span> challengeHash = <span class="type">Data</span>(<span class="type">SHA256</span>.<span class="func">hash</span>(data: challenge))
+
+    <span class="comment">// Step 3: Attest the key (sends to Apple for verification)</span>
+    <span class="keyword">let</span> attestation = <span class="keyword">try await</span> service.<span class="func">attestKey</span>(
+        keyId,
+        clientDataHash: challengeHash
+    )
+
+    <span class="comment">// Step 4: Send attestation to YOUR server for verification</span>
+    <span class="comment">// Server verifies with Apple's attestation root CA</span>
+    <span class="keyword">try await</span> <span class="func">sendAttestationToServer</span>(
+        keyId: keyId,
+        attestation: attestation
+    )
+}
+
+<span class="comment">// For subsequent requests, generate assertions</span>
+<span class="keyword">func</span> <span class="func">generateAssertion</span>(keyId: <span class="type">String</span>, request: <span class="type">Data</span>) <span class="keyword">async throws</span> -> <span class="type">Data</span> {
+    <span class="keyword">let</span> requestHash = <span class="type">Data</span>(<span class="type">SHA256</span>.<span class="func">hash</span>(data: request))
+    <span class="keyword">return</span> <span class="keyword">try await</span> <span class="type">DCAppAttestService</span>.shared.<span class="func">generateAssertion</span>(
+        keyId,
+        clientDataHash: requestHash
+    )
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Server-Side Attestation</div>
+        <p>App Attest moves the trust decision to the server. The Secure Enclave generates a key pair, Apple's attestation service verifies the device and app integrity, and your server validates the attestation certificate chain. A jailbroken device cannot forge a valid attestation because it would need to compromise the Secure Enclave hardware — which is a fundamentally different (and much harder) attack than patching the kernel.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 9: SANDBOX ESCAPE HISTORY                                  -->
+    <!-- ================================================================== -->
+
+    <h2 id="sandbox-escapes">9. Sandbox Escape History</h2>
+
+    <p>Understanding historical sandbox escapes is important for two reasons: it demonstrates the real-world effectiveness of defense in depth, and it shows what attack surfaces exist. These are not theoretical — they were used in the wild.</p>
+
+    <h3>9.1 Notable Sandbox Escapes</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>CVE / Name</th>
+                <th>Year</th>
+                <th>Attack Vector</th>
+                <th>What Was Exploited</th>
+                <th>Apple's Fix</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>CVE-2016-4655/4656/4657</strong> (Trident / Pegasus)</td>
+                <td>2016</td>
+                <td>Safari WebKit → kernel</td>
+                <td>WebKit memory corruption → kernel info leak → kernel code execution. Used by NSO Group's Pegasus spyware</td>
+                <td>Patched WebKit, added KPP (Kernel Patch Protection)</td>
+            </tr>
+            <tr>
+                <td><strong>CVE-2019-8605</strong> (SockPuppet)</td>
+                <td>2019</td>
+                <td>In-app socket operations</td>
+                <td>Use-after-free in <code>in6_pcbdetach()</code> — a networking kernel function accessible from the sandbox via socket syscalls</td>
+                <td>Fixed the UAF, added additional socket operation validation</td>
+            </tr>
+            <tr>
+                <td><strong>CVE-2021-30883</strong> (IOMobileFrameBuffer)</td>
+                <td>2021</td>
+                <td>IOKit user client</td>
+                <td>Integer overflow in IOMobileFrameBuffer (GPU driver) accessible from sandbox via IOKit connection</td>
+                <td>Patched the overflow, reduced IOKit attack surface for sandboxed apps</td>
+            </tr>
+            <tr>
+                <td><strong>CVE-2023-32434</strong> (Triangulation)</td>
+                <td>2023</td>
+                <td>iMessage → kernel</td>
+                <td>Zero-click exploit chain: iMessage attachment → WebKit → kernel via undocumented MMIO registers. Discovered by Kaspersky, attributed to sophisticated state actor</td>
+                <td>Patched kernel, locked down MMIO access, added Lockdown Mode protections</td>
+            </tr>
+            <tr>
+                <td><strong>CVE-2023-42824</strong></td>
+                <td>2023</td>
+                <td>Local privilege escalation</td>
+                <td>XNU kernel vulnerability allowing sandbox escape from a malicious app. Used in targeted attacks before patch</td>
+                <td>Kernel patch in iOS 17.0.3</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>9.2 Common Attack Surfaces</h3>
+
+    <p>Sandbox escapes typically exploit one of these attack surfaces:</p>
+
+    <ul>
+        <li><strong>IOKit user clients:</strong> GPU drivers, USB, audio — complex C/C++ code with large attack surface accessible from the sandbox</li>
+        <li><strong>Mach port IPC:</strong> Messages to system services (securityd, mediaserverd) can trigger parsing bugs in the receiving daemon</li>
+        <li><strong>XPC services:</strong> Deserialization of XPC messages can trigger type confusion or buffer overflows</li>
+        <li><strong>Kernel sockets:</strong> The networking stack is complex and has historically had use-after-free and race condition bugs</li>
+        <li><strong>WebKit:</strong> The JavaScript engine (JSC) has JIT compilation, which is inherently a large attack surface (writable+executable memory)</li>
+    </ul>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Interview Pitfall — "iOS Is Secure"</div>
+        <p>Never say "iOS is secure" in an interview without qualification. iOS has a strong security architecture, but sandbox escapes happen regularly (Apple patches them in every iOS update). The correct framing is: "iOS provides defense in depth — even when one layer is breached, other layers (Data Protection, Secure Enclave, code signing) continue to protect user data." This demonstrates architectural thinking rather than blind trust in a platform.</p>
+    </div>
+
+    <h3>9.3 Why This Matters for App Developers</h3>
+
+    <p>You cannot control whether the OS has a zero-day vulnerability. But you can design your app so that a sandbox escape doesn't automatically compromise user data:</p>
+
+    <ul>
+        <li>Encrypt sensitive data with Secure Enclave keys (survives kernel compromise)</li>
+        <li>Don't store secrets in plaintext files (even within the sandbox)</li>
+        <li>Use <code>NSFileProtectionComplete</code> so data is inaccessible when the device is locked</li>
+        <li>Implement server-side validation for security-critical operations</li>
+        <li>Use App Attest to detect compromised devices server-side</li>
+    </ul>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 10: DEFENSE IN DEPTH                                       -->
+    <!-- ================================================================== -->
+
+    <h2 id="defense-in-depth">10. Defense in Depth — Architect's Guide</h2>
+
+    <p>Defense in depth is the principle that <strong>no single security mechanism should be trusted in isolation</strong>. Each layer assumes the layer below it might be compromised. This is the most important concept for Staff-level security architecture.</p>
+
+    <h3>10.1 Multi-Layer Security Architecture</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  DEFENSE IN DEPTH — COMPLETE ARCHITECTURE                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  LAYER 7: SERVER-SIDE VALIDATION                                        │
+│  ┌────────────────────────────────────────────────────────────────┐     │
+│  │  • App Attest verification (is this a genuine app/device?)     │     │
+│  │  • Server-side business logic validation                       │     │
+│  │  • Rate limiting and anomaly detection                         │     │
+│  │  • JWT token validation with short expiry                      │     │
+│  │  • Certificate pinning verification                            │     │
+│  └────────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+│  LAYER 6: TRANSPORT SECURITY                                            │
+│  ┌────────────────────────────────────────────────────────────────┐     │
+│  │  • TLS 1.3 (ATS enforced)                                     │     │
+│  │  • Certificate pinning (public key pinning preferred)          │     │
+│  │  • Certificate transparency monitoring                         │     │
+│  │  • No HTTP fallback                                            │     │
+│  └────────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+│  LAYER 5: APPLICATION-LEVEL ENCRYPTION                                  │
+│  ┌────────────────────────────────────────────────────────────────┐     │
+│  │  • Encrypt sensitive data BEFORE writing to disk               │     │
+│  │  • Use CryptoKit AES-GCM with Secure Enclave-derived keys     │     │
+│  │  • Key material never in plaintext outside Secure Enclave      │     │
+│  │  • Separate encryption keys per data category                  │     │
+│  └────────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+│  LAYER 4: DATA PROTECTION (FILE-LEVEL)                                  │
+│  ┌────────────────────────────────────────────────────────────────┐     │
+│  │  • NSFileProtectionComplete for sensitive files                │     │
+│  │  • Keychain with kSecAttrAccessibleWhenUnlocked               │     │
+│  │  • Biometric-protected keychain items (SecAccessControl)       │     │
+│  │  • Proper protection class for each data category              │     │
+│  └────────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+│  LAYER 3: SANDBOX ISOLATION                                             │
+│  ┌────────────────────────────────────────────────────────────────┐     │
+│  │  • Kernel-enforced process isolation                           │     │
+│  │  • Minimal entitlements (principle of least privilege)         │     │
+│  │  • App Groups only where necessary                             │     │
+│  │  • No unnecessary URL scheme handlers                          │     │
+│  └────────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+│  LAYER 2: CODE INTEGRITY                                                │
+│  ┌────────────────────────────────────────────────────────────────┐     │
+│  │  • Code signing (AMFI page-level verification)                 │     │
+│  │  • Provisioning profile validation                             │     │
+│  │  • W^X enforcement (no JIT)                                    │     │
+│  │  • ASLR + PAC (pointer authentication)                         │     │
+│  └────────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+│  LAYER 1: HARDWARE SECURITY                                             │
+│  ┌────────────────────────────────────────────────────────────────┐     │
+│  │  • Secure Enclave (isolated processor, own secure boot)        │     │
+│  │  • Hardware UID key (fused at manufacturing)                   │     │
+│  │  • Secure Boot chain (from Boot ROM to kernel)                 │     │
+│  │  • Memory encryption engine                                    │     │
+│  └────────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>10.2 Practical Implementation</h3>
+
+    <p>Here's how to implement defense in depth for a banking app — a common Staff-level interview scenario:</p>
+
+    <pre><code><span class="keyword">import</span> Foundation
+<span class="keyword">import</span> CryptoKit
+<span class="keyword">import</span> Security
+<span class="keyword">import</span> LocalAuthentication
+
+<span class="comment">// Defense in Depth: Secure Data Manager</span>
+<span class="keyword">final class</span> <span class="type">SecureDataManager</span> {
+
+    <span class="comment">// LAYER 5: Application-level encryption using Secure Enclave key</span>
+    <span class="keyword">private let</span> encryptionKeyTag = <span class="string">"com.bank.app.encryption.key"</span>
+
+    <span class="keyword">func</span> <span class="func">getOrCreateSecureEnclaveKey</span>() <span class="keyword">throws</span> -> <span class="type">SecKey</span> {
+        <span class="keyword">let</span> tag = encryptionKeyTag.<span class="func">data</span>(using: .utf8)!
+
+        <span class="comment">// Try to load existing key</span>
+        <span class="keyword">let</span> query: [<span class="type">String</span>: <span class="type">Any</span>] = [
+            kSecClass <span class="keyword">as</span> <span class="type">String</span>: kSecClassKey,
+            kSecAttrApplicationTag <span class="keyword">as</span> <span class="type">String</span>: tag,
+            kSecAttrKeyType <span class="keyword">as</span> <span class="type">String</span>: kSecAttrKeyTypeECSECPrimeRandom,
+            kSecReturnRef <span class="keyword">as</span> <span class="type">String</span>: <span class="keyword">true</span>,
+        ]
+        <span class="keyword">var</span> item: <span class="type">CFTypeRef</span>?
+        <span class="keyword">if</span> <span class="func">SecItemCopyMatching</span>(query <span class="keyword">as</span> <span class="type">CFDictionary</span>, &amp;item) == errSecSuccess {
+            <span class="keyword">return</span> item <span class="keyword">as!</span> <span class="type">SecKey</span>
+        }
+
+        <span class="comment">// Create new key in Secure Enclave with biometric protection</span>
+        <span class="keyword">var</span> error: <span class="type">Unmanaged</span>&lt;<span class="type">CFError</span>&gt;?
+        <span class="keyword">guard let</span> accessControl = <span class="func">SecAccessControlCreateWithFlags</span>(
+            kCFAllocatorDefault,
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            [.privateKeyUsage, .biometryCurrentSet],
+            &amp;error
+        ) <span class="keyword">else</span> {
+            <span class="keyword">throw</span> error!.takeRetainedValue() <span class="keyword">as</span> <span class="type">Error</span>
+        }
+
+        <span class="keyword">let</span> attributes: [<span class="type">String</span>: <span class="type">Any</span>] = [
+            kSecAttrKeyType <span class="keyword">as</span> <span class="type">String</span>: kSecAttrKeyTypeECSECPrimeRandom,
+            kSecAttrKeySizeInBits <span class="keyword">as</span> <span class="type">String</span>: <span class="number">256</span>,
+            kSecAttrTokenID <span class="keyword">as</span> <span class="type">String</span>: kSecAttrTokenIDSecureEnclave,
+            kSecPrivateKeyAttrs <span class="keyword">as</span> <span class="type">String</span>: [
+                kSecAttrIsPermanent <span class="keyword">as</span> <span class="type">String</span>: <span class="keyword">true</span>,
+                kSecAttrApplicationTag <span class="keyword">as</span> <span class="type">String</span>: tag,
+                kSecAttrAccessControl <span class="keyword">as</span> <span class="type">String</span>: accessControl,
+            ],
+        ]
+
+        <span class="keyword">guard let</span> privateKey = <span class="func">SecKeyCreateRandomKey</span>(
+            attributes <span class="keyword">as</span> <span class="type">CFDictionary</span>, &amp;error
+        ) <span class="keyword">else</span> {
+            <span class="keyword">throw</span> error!.takeRetainedValue() <span class="keyword">as</span> <span class="type">Error</span>
+        }
+        <span class="keyword">return</span> privateKey
+    }
+
+    <span class="comment">// LAYER 4: Write encrypted data with file protection</span>
+    <span class="keyword">func</span> <span class="func">secureWrite</span>(_ data: <span class="type">Data</span>, to filename: <span class="type">String</span>) <span class="keyword">throws</span> {
+        <span class="comment">// Encrypt with app-level key (Layer 5)</span>
+        <span class="keyword">let</span> symmetricKey = <span class="type">SymmetricKey</span>(size: .bits256)
+        <span class="keyword">let</span> sealed = <span class="keyword">try</span> <span class="type">AES</span>.<span class="type">GCM</span>.<span class="func">seal</span>(data, using: symmetricKey)
+        <span class="keyword">guard let</span> encrypted = sealed.combined <span class="keyword">else</span> {
+            <span class="keyword">throw</span> <span class="type">SecureError</span>.encryptionFailed
+        }
+
+        <span class="comment">// Write with file-level protection (Layer 4)</span>
+        <span class="keyword">let</span> url = <span class="func">secureDirectory</span>().<span class="func">appendingPathComponent</span>(filename)
+        <span class="keyword">try</span> encrypted.<span class="func">write</span>(to: url, options: [.completeFileProtection])
+
+        <span class="comment">// Store symmetric key in Keychain with biometric protection</span>
+        <span class="keyword">try</span> <span class="func">storeKeyInKeychain</span>(symmetricKey, forFile: filename)
+    }
+
+    <span class="keyword">private func</span> <span class="func">secureDirectory</span>() -> <span class="type">URL</span> {
+        <span class="keyword">let</span> dir = <span class="type">FileManager</span>.<span class="keyword">default</span>
+            .<span class="func">urls</span>(for: .applicationSupportDirectory, in: .userDomainMask)[<span class="number">0</span>]
+            .<span class="func">appendingPathComponent</span>(<span class="string">"secure_vault"</span>)
+        <span class="keyword">try</span>? <span class="type">FileManager</span>.<span class="keyword">default</span>.<span class="func">createDirectory</span>(
+            at: dir,
+            withIntermediateDirectories: <span class="keyword">true</span>,
+            attributes: [.protectionKey: <span class="type">FileProtectionType</span>.complete]
+        )
+        <span class="keyword">return</span> dir
+    }
+
+    <span class="keyword">private func</span> <span class="func">storeKeyInKeychain</span>(
+        _ key: <span class="type">SymmetricKey</span>,
+        forFile filename: <span class="type">String</span>
+    ) <span class="keyword">throws</span> {
+        <span class="keyword">let</span> keyData = key.<span class="func">withUnsafeBytes</span> { <span class="type">Data</span>($0) }
+        <span class="keyword">let</span> query: [<span class="type">String</span>: <span class="type">Any</span>] = [
+            kSecClass <span class="keyword">as</span> <span class="type">String</span>: kSecClassGenericPassword,
+            kSecAttrService <span class="keyword">as</span> <span class="type">String</span>: <span class="string">"com.bank.app.filekeys"</span>,
+            kSecAttrAccount <span class="keyword">as</span> <span class="type">String</span>: filename,
+            kSecValueData <span class="keyword">as</span> <span class="type">String</span>: keyData,
+            kSecAttrAccessible <span class="keyword">as</span> <span class="type">String</span>:
+                kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        ]
+        <span class="keyword">let</span> status = <span class="func">SecItemAdd</span>(query <span class="keyword">as</span> <span class="type">CFDictionary</span>, <span class="keyword">nil</span>)
+        <span class="keyword">guard</span> status == errSecSuccess || status == errSecDuplicateItem <span class="keyword">else</span> {
+            <span class="keyword">throw</span> <span class="type">SecureError</span>.keychainWriteFailed(status)
+        }
+    }
+}
+
+<span class="keyword">enum</span> <span class="type">SecureError</span>: <span class="type">Error</span> {
+    <span class="keyword">case</span> encryptionFailed
+    <span class="keyword">case</span> keychainWriteFailed(<span class="type">OSStatus</span>)
+    <span class="keyword">case</span> attestationFailed
+}</code></pre>
+
+    <h3>10.3 Security Architecture Decision Matrix</h3>
+
+    <p>Use this matrix when designing security for different data categories:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Data Category</th>
+                <th>File Protection</th>
+                <th>Keychain</th>
+                <th>App-Level Encryption</th>
+                <th>Secure Enclave</th>
+                <th>Server Validation</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Auth tokens</strong></td>
+                <td>N/A (Keychain)</td>
+                <td>WhenUnlocked + biometric</td>
+                <td>No (Keychain handles it)</td>
+                <td>Yes (key generation)</td>
+                <td>Short expiry, refresh flow</td>
+            </tr>
+            <tr>
+                <td><strong>Financial records</strong></td>
+                <td>Complete</td>
+                <td>Encryption key storage</td>
+                <td>AES-GCM</td>
+                <td>Yes (key wrapping)</td>
+                <td>App Attest + request signing</td>
+            </tr>
+            <tr>
+                <td><strong>Health data</strong></td>
+                <td>Complete</td>
+                <td>Encryption key storage</td>
+                <td>AES-GCM</td>
+                <td>Yes</td>
+                <td>Consent verification</td>
+            </tr>
+            <tr>
+                <td><strong>User preferences</strong></td>
+                <td>UntilFirstAuth (default)</td>
+                <td>No</td>
+                <td>No</td>
+                <td>No</td>
+                <td>No</td>
+            </tr>
+            <tr>
+                <td><strong>Cached images</strong></td>
+                <td>UntilFirstAuth (default)</td>
+                <td>No</td>
+                <td>No</td>
+                <td>No</td>
+                <td>No</td>
+            </tr>
+            <tr>
+                <td><strong>Encryption keys</strong></td>
+                <td>N/A (Keychain/SE)</td>
+                <td>WhenUnlocked + ThisDeviceOnly</td>
+                <td>N/A</td>
+                <td>Required</td>
+                <td>Key attestation</td>
+            </tr>
+            <tr>
+                <td><strong>Biometric templates</strong></td>
+                <td>N/A (Secure Enclave)</td>
+                <td>N/A</td>
+                <td>N/A</td>
+                <td>Managed by SEP</td>
+                <td>N/A</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know — The Golden Rule</div>
+        <p>The golden rule of iOS security architecture: <strong>never rely on a single layer</strong>. The sandbox might be escaped (CVEs happen every year). File protection might be bypassed (device is unlocked when stolen). The Keychain might be dumped (on a jailbroken device with the right tools). But if you layer all of these together — sandbox + file protection + Keychain + Secure Enclave + server-side validation — an attacker must breach <em>every</em> layer simultaneously. That's the power of defense in depth.</p>
+        <p>In an interview, when asked "how would you secure sensitive data?", walk through each layer and explain what threat it defends against. This demonstrates architectural thinking, not just API knowledge.</p>
+    </div>
+
+    <h3>10.4 Don't Trust Local State</h3>
+
+    <p>A critical principle that many apps violate: <strong>never make security decisions based on local state alone</strong>.</p>
+
+    <pre><code><span class="comment">// BAD: Security decision based on local state</span>
+<span class="keyword">func</span> <span class="func">checkPremiumAccess</span>() -> <span class="type">Bool</span> {
+    <span class="keyword">return</span> <span class="type">UserDefaults</span>.standard.<span class="func">bool</span>(forKey: <span class="string">"isPremium"</span>)
+    <span class="comment">// Trivially bypassed: modify the plist on a jailbroken device</span>
+}
+
+<span class="comment">// GOOD: Server-validated with signed token</span>
+<span class="keyword">func</span> <span class="func">checkPremiumAccess</span>() <span class="keyword">async throws</span> -> <span class="type">Bool</span> {
+    <span class="keyword">let</span> token = <span class="keyword">try</span> <span class="func">getAuthToken</span>()
+    <span class="keyword">let</span> response = <span class="keyword">try await</span> <span class="func">apiClient</span>.<span class="func">verifyEntitlement</span>(
+        token: token,
+        entitlement: <span class="string">"premium"</span>
+    )
+    <span class="comment">// Server checks subscription status, returns signed response</span>
+    <span class="keyword">return</span> response.isValid &amp;&amp; <span class="func">verifyServerSignature</span>(response)
+}
+
+<span class="comment">// BAD: Jailbreak check gates functionality</span>
+<span class="keyword">func</span> <span class="func">performTransaction</span>() {
+    <span class="keyword">if</span> <span class="type">JailbreakDetector</span>.<span class="func">isJailbroken</span>() {
+        <span class="func">showError</span>(<span class="string">"Device compromised"</span>)
+        <span class="keyword">return</span>
+    }
+    <span class="comment">// Bypassed by any jailbreak hiding tool</span>
+    <span class="func">processPayment</span>()
+}
+
+<span class="comment">// GOOD: Server validates device integrity via App Attest</span>
+<span class="keyword">func</span> <span class="func">performTransaction</span>(_ transaction: <span class="type">Transaction</span>) <span class="keyword">async throws</span> {
+    <span class="keyword">let</span> requestData = <span class="keyword">try</span> <span class="type">JSONEncoder</span>().<span class="func">encode</span>(transaction)
+    <span class="keyword">let</span> assertion = <span class="keyword">try await</span> <span class="func">generateAssertion</span>(
+        keyId: attestKeyId,
+        request: requestData
+    )
+    <span class="comment">// Server verifies assertion, checks device integrity,</span>
+    <span class="comment">// validates transaction server-side</span>
+    <span class="keyword">try await</span> <span class="func">apiClient</span>.<span class="func">submitTransaction</span>(
+        transaction,
+        assertion: assertion
+    )
+}</code></pre>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 11: INTERVIEW QUESTIONS                                    -->
+    <!-- ================================================================== -->
+
+    <h2 id="interview-questions">11. Interview Questions</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>Q1: Explain how the iOS sandbox is enforced at the kernel level. What prevents an app from bypassing it?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>The iOS sandbox is enforced by the TrustedBSD MAC (Mandatory Access Control) framework integrated into XNU. The Sandbox.kext kernel extension registers hooks for every security-relevant system call — open, read, write, socket, mmap, fork, exec, iokit, etc. When a sandboxed process makes any system call, the MAC framework invokes the sandbox policy check <em>before</em> the operation proceeds. The policy is defined by a sandbox profile (written in SBPL — Sandbox Profile Language) that specifies allow/deny rules based on the operation type, file paths, and the process's entitlements.</p>
+                <p>An app cannot bypass the sandbox because: (1) the sandbox is applied by the kernel at process creation via <code>posix_spawn()</code> — the app's code never runs without it; (2) the MAC framework hooks are in the kernel, not in userspace libraries that could be swapped out; (3) code signing enforcement (AMFI) prevents loading modified binaries; (4) the W^X policy prevents generating new executable code at runtime. To bypass the sandbox, you would need a kernel exploit — which is why sandbox escapes are high-severity vulnerabilities.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>Q2: What is the difference between the bundle container and the data container? Why do they have different UUIDs?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>The bundle container holds the signed app binary and resources (read-only). The data container holds the app's writable data (Documents, Library, tmp). They have different UUIDs for several reasons: (1) the bundle container is replaced atomically on every app update (new UUID), while the data container persists across updates (stable UUID) — this ensures user data survives updates; (2) separating them allows the system to verify code integrity independently of data; (3) it enables the system to purge the bundle container (e.g., app offloading) while preserving user data.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>Q3: Explain all four Data Protection classes and when you would use each one.</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>NSFileProtectionComplete:</strong> Key evicted from memory ~10s after lock. Use for highly sensitive data (auth tokens, health records, financial data). Cannot be accessed in background. <strong>NSFileProtectionCompleteUnlessOpen:</strong> Uses asymmetric crypto — can create new files while locked (public key), but can only open existing files while unlocked (private key). Open file handles remain valid. Use for background downloads of sensitive content. <strong>NSFileProtectionCompleteUntilFirstUserAuthentication:</strong> (Default) Key loaded at first unlock, stays in memory until reboot. Use for general app data — balances security with background access. <strong>NSFileProtectionNone:</strong> Key always available, derived from hardware UID only. Use only when data must be accessible before first unlock (rare). The key architectural insight is that each class represents a different tradeoff between security and availability, and you should choose based on the sensitivity of the data and whether background access is needed.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>Q4: Why is jailbreak detection fundamentally unreliable? What should you do instead?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Jailbreak detection is unreliable because it attempts to verify system integrity from within a potentially compromised system. Every detection technique (file checks, fork tests, dylib enumeration, URL scheme checks) relies on system calls that go through the kernel — and on a jailbroken device, the kernel is compromised. Jailbreak bypass tools (Shadow, Liberty Lite, Choicy) hook these system calls to return "clean" results. It's a cat-and-mouse game that the defender always loses because the attacker operates at a higher privilege level.</p>
+                <p>Instead, use: (1) <strong>App Attest</strong> — hardware-backed attestation verified server-side, not on-device; (2) <strong>Server-side validation</strong> — never trust client-side security decisions; (3) <strong>Secure Enclave keys</strong> — even a compromised kernel can't extract SEP keys; (4) <strong>Defense in depth</strong> — encrypt data with multiple layers so a single compromise doesn't expose everything.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>Q5: How does the Data Protection key hierarchy work? Why can't an attacker brute-force the passcode offline?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>The key hierarchy has four levels: (1) Hardware UID key — 256-bit AES key fused into the Secure Enclave at manufacturing, never readable by software; (2) Passcode key — derived from the user's passcode entangled with the UID key via PBKDF2 inside the Secure Enclave; (3) Class keys — one per protection class, wrapped by the passcode key; (4) Per-file keys — unique 256-bit AES key per file, wrapped by the appropriate class key.</p>
+                <p>Offline brute-force is impossible because the passcode derivation happens <em>inside</em> the Secure Enclave and requires the hardware UID key. An attacker who extracts the flash storage has encrypted data + wrapped keys, but cannot derive the passcode key without the UID key, which is physically fused into the SEP chip. They must use the physical device, which enforces escalating delays (1s → 5s → 15s → 1min → 1hr) and optional wipe after 10 attempts. Even a 6-digit passcode (1M combinations) would take ~22 hours at minimum with the rate limiting.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>Q6: How would you architect the security for a banking app that handles sensitive financial transactions?</span>
+                <span class="level"><span class="tag tag-architect">Architect</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>I would implement defense in depth across all layers: <strong>Transport:</strong> TLS 1.3 with public key pinning (not certificate pinning — easier rotation), backup pins, and a max-age policy. <strong>Authentication:</strong> OAuth 2.0 + PKCE with short-lived access tokens stored in the Keychain with <code>kSecAttrAccessibleWhenUnlockedThisDeviceOnly</code> and biometric protection via <code>SecAccessControl</code>. Refresh tokens in Keychain with the same protection. <strong>Data at rest:</strong> All financial data encrypted with AES-GCM using keys derived from a Secure Enclave P-256 key. File protection class set to <code>NSFileProtectionComplete</code>. <strong>Transaction integrity:</strong> App Attest for device integrity verification. Each transaction request signed with the attested key and verified server-side. <strong>Server-side:</strong> All business logic validation server-side. Rate limiting. Anomaly detection. Never trust client-reported state (premium status, account balance, etc.). <strong>No jailbreak detection:</strong> Instead, rely on App Attest and server-side validation. If App Attest fails, degrade gracefully (e.g., require additional authentication steps) rather than blocking entirely.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>Q7: Compare iOS sandbox enforcement with Android's app isolation. What are the architectural tradeoffs?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>iOS uses TrustedBSD MAC (Mandatory Access Control) with sandbox profiles — a policy-based system where the kernel checks every syscall against a declarative profile. Android uses Linux UID-based isolation (each app gets a unique UID) combined with SELinux MAC policies. Key differences: (1) <strong>Code signing:</strong> iOS verifies code signatures at page-fault time (AMFI), while Android verifies at install time only — this means iOS catches binary tampering at runtime. (2) <strong>Dynamic code:</strong> iOS enforces W^X (no JIT except JSCore), while Android allows JIT in ART — this gives iOS a smaller attack surface for code injection. (3) <strong>Process model:</strong> iOS denies fork() entirely, while Android's Zygote model forks for every app launch — Android uses seccomp-bpf to filter syscalls post-fork. (4) <strong>IPC:</strong> iOS uses Mach ports (kernel-mediated), Android uses Binder (kernel driver) — both are kernel-level but have different attack surfaces. The tradeoff: iOS is more restrictive (better security) but less flexible (no sideloading, no JIT, limited IPC). Android is more open but has a larger attack surface.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>Q8: What are entitlements and how does the kernel use them? Give examples of entitlements that change sandbox behavior.</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Entitlements are key-value pairs embedded in the app's code signature that declare capabilities. At process creation, AMFI extracts them from the code signature and attaches them to the kernel's task structure. When the sandbox evaluates a policy rule, it can check entitlements via <code>IOTaskHasEntitlement()</code>. Examples: <code>keychain-access-groups</code> allows access to shared Keychain groups; <code>com.apple.security.application-groups</code> enables shared containers; <code>aps-environment</code> enables push notifications; <code>com.apple.developer.associated-domains</code> enables Universal Links. The critical insight is that entitlements are verified at two levels: Apple's signing infrastructure ensures you're allowed to claim them (provisioning profile), and the kernel enforces them at runtime. You cannot add entitlements without re-signing, and re-signing requires Apple's approval chain.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>Q9: A background download completes while the device is locked. The file needs NSFileProtectionComplete. How do you handle this?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>You can't directly write a file with <code>NSFileProtectionComplete</code> while the device is locked — the class key isn't available. Solutions: (1) Use <code>NSFileProtectionCompleteUnlessOpen</code> for the download destination — this allows writing via the public key while locked. When the device is unlocked, re-encrypt with <code>NSFileProtectionComplete</code> by reading and rewriting the file. (2) Write to a temporary file with <code>NSFileProtectionCompleteUntilFirstUserAuthentication</code>, then listen for <code>protectedDataDidBecomeAvailableNotification</code> and move/re-protect the file. (3) If the data is highly sensitive, keep it in memory (if small enough) and write it only when <code>UIApplication.shared.isProtectedDataAvailable</code> is true. The architectural choice depends on the data size and sensitivity — option 1 is best for large files, option 3 for small secrets.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>Q10: Explain the Triangulation attack (CVE-2023-32434). What does it teach us about defense in depth?</span>
+                <span class="level"><span class="tag tag-architect">Architect</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Triangulation was a zero-click exploit chain discovered by Kaspersky in 2023. It used an iMessage attachment to trigger a WebKit vulnerability, then chained to a kernel exploit via undocumented MMIO (Memory-Mapped I/O) hardware registers to achieve full device compromise — all without user interaction. It was attributed to a sophisticated state actor and was active for years before discovery.</p>
+                <p>Lessons for defense in depth: (1) Even Apple's sandbox can be bypassed by a sufficiently motivated attacker with zero-day exploits. (2) Data encrypted with Secure Enclave keys would have remained protected even after kernel compromise — the SEP is a separate processor with its own security boundary. (3) Server-side detection (anomalous network traffic, unexpected API patterns) might catch compromised devices even when on-device detection fails. (4) Apple's response — Lockdown Mode — demonstrates that reducing attack surface (disabling iMessage attachment previews, WebKit JIT, etc.) is a valid security strategy for high-risk users. (5) This is why we encrypt sensitive data even within the sandbox — the sandbox is a defense layer, not an absolute guarantee.</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="nav-footer">
+        <a href="index.html">← Series Overview</a>
+        <a href="02-transport-security.html">Next: Transport Security →</a>
+    </div>
+</div>
+
+<script>
+document.querySelectorAll('.qa-question').forEach(function(el) {
+    el.addEventListener('click', function() {
+        this.nextElementSibling.classList.toggle('open');
+    });
+});
+</script>
+</body>
+</html>

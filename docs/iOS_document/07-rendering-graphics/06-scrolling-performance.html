@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scrolling Performance — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Rendering &amp; Graphics</a><span class="sep">›</span>
+        Scrolling Performance
+    </nav>
+
+    <h1>Scrolling Performance</h1>
+    <p class="subtitle">The 60fps scroll checklist: cell preparation cost, background image decoding, prefetching APIs, shouldRasterize strategy, blended layers, misaligned images, and systematic approaches to diagnosing and fixing scroll jank.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#frame-budget">1. The Frame Budget</a></li>
+            <li><a href="#checklist">2. The 60fps Scroll Checklist</a></li>
+            <li><a href="#cell-prep">3. Cell Preparation Cost Reduction</a></li>
+            <li><a href="#image-decoding">4. Image Decoding on Background Thread</a></li>
+            <li><a href="#prefetching">5. Prefetching API</a></li>
+            <li><a href="#rasterize">6. shouldRasterize for Complex Cells</a></li>
+            <li><a href="#blended">7. Blended Layers Detection</a></li>
+            <li><a href="#misaligned">8. Misaligned Images</a></li>
+            <li><a href="#compositing">9. Compositing Cost</a></li>
+            <li><a href="#instruments">10. Instruments Core Animation Template</a></li>
+            <li><a href="#systematic">11. Systematic Jank Diagnosis</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="frame-budget">1. The Frame Budget</h2>
+
+    <div class="diagram">
+Frame Budget During Scroll:
+═══════════════════════════
+
+60Hz Display: 16.67ms per frame
+120Hz Display: 8.33ms per frame
+
+Within each frame during scroll:
+┌──────────────────────────────────────────────────────────────┐
+│                                                              │
+│  ┌───────────┐  ┌──────────┐  ┌────────┐  ┌──────────────┐│
+│  │ Cell      │  │ Layout   │  │ Draw   │  │ Commit to    ││
+│  │ Dequeue / │  │ Subviews │  │ (if    │  │ Render       ││
+│  │ Configure │  │          │  │ needed)│  │ Server       ││
+│  │           │  │          │  │        │  │              ││
+│  │ ~2-4ms    │  │ ~1-2ms   │  │ ~0-2ms │  │ ~1-2ms       ││
+│  └───────────┘  └──────────┘  └────────┘  └──────────────┘│
+│                                                              │
+│  Total app work: ~4-10ms                                     │
+│  Remaining for render server: ~6-12ms                        │
+│  If app takes > 10ms → FRAME DROP                            │
+└──────────────────────────────────────────────────────────────┘
+    </div>
+
+    <p>During scrolling, the system must dequeue a cell, configure it with data, lay it out, and commit the layer tree — all within the frame budget. Any work that exceeds this budget causes a visible hitch (jank).</p>
+
+    <!-- ============================================================ -->
+    <h2 id="checklist">2. The 60fps Scroll Checklist</h2>
+
+    <table>
+        <thead>
+            <tr><th>#</th><th>Check</th><th>Impact</th><th>Priority</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>1</td>
+                <td>Images decoded on background thread</td>
+                <td>Eliminates 5-50ms main thread decode</td>
+                <td>Critical</td>
+            </tr>
+            <tr>
+                <td>2</td>
+                <td>Images downsampled to display size</td>
+                <td>Reduces memory 10-100x, faster decode</td>
+                <td>Critical</td>
+            </tr>
+            <tr>
+                <td>3</td>
+                <td>No off-screen rendering in cells</td>
+                <td>Eliminates GPU context switches</td>
+                <td>Critical</td>
+            </tr>
+            <tr>
+                <td>4</td>
+                <td>shadowPath set for all shadows</td>
+                <td>Eliminates shadow outline computation</td>
+                <td>High</td>
+            </tr>
+            <tr>
+                <td>5</td>
+                <td>Opaque backgrounds on all cell subviews</td>
+                <td>Eliminates alpha blending cost</td>
+                <td>High</td>
+            </tr>
+            <tr>
+                <td>6</td>
+                <td>Pixel-aligned frames (no fractional points)</td>
+                <td>Eliminates anti-aliasing cost</td>
+                <td>Medium</td>
+            </tr>
+            <tr>
+                <td>7</td>
+                <td>Prefetching enabled for data/images</td>
+                <td>Hides latency of data preparation</td>
+                <td>Medium</td>
+            </tr>
+            <tr>
+                <td>8</td>
+                <td>Cell height pre-calculated and cached</td>
+                <td>Eliminates layout computation per cell</td>
+                <td>Medium</td>
+            </tr>
+            <tr>
+                <td>9</td>
+                <td>shouldRasterize for complex static cells</td>
+                <td>Caches composited cell as single bitmap</td>
+                <td>Situational</td>
+            </tr>
+            <tr>
+                <td>10</td>
+                <td>No Auto Layout constraint churn in cells</td>
+                <td>Eliminates Cassowary solver overhead</td>
+                <td>Medium</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="cell-prep">3. Cell Preparation Cost Reduction</h2>
+
+    <h3>Expensive Cell Configuration (Before)</h3>
+    <pre><code><span class="comment">// ❌ Expensive: doing too much work in cellForItemAt</span>
+<span class="keyword">func</span> <span class="func">collectionView</span>(
+    _ collectionView: <span class="type">UICollectionView</span>,
+    cellForItemAt indexPath: <span class="type">IndexPath</span>
+) -> <span class="type">UICollectionViewCell</span> {
+    <span class="keyword">let</span> cell = collectionView.<span class="func">dequeueReusableCell</span>(
+        withReuseIdentifier: <span class="string">"Cell"</span>, for: indexPath
+    ) <span class="keyword">as!</span> <span class="type">PostCell</span>
+
+    <span class="keyword">let</span> post = posts[indexPath.item]
+
+    <span class="comment">// ❌ Decoding full-resolution image on main thread</span>
+    cell.imageView.image = <span class="type">UIImage</span>(contentsOfFile: post.imagePath)
+
+    <span class="comment">// ❌ Creating attributed string every time</span>
+    <span class="keyword">let</span> attributed = <span class="type">NSAttributedString</span>(
+        string: post.caption,
+        attributes: [.font: <span class="type">UIFont</span>.systemFont(ofSize: <span class="number">14</span>)]
+    )
+    cell.captionLabel.attributedText = attributed
+
+    <span class="comment">// ❌ Date formatting every time</span>
+    <span class="keyword">let</span> formatter = <span class="type">DateFormatter</span>()
+    formatter.dateStyle = .medium
+    cell.dateLabel.text = formatter.<span class="func">string</span>(from: post.date)
+
+    <span class="comment">// ❌ Corner radius + masksToBounds on image</span>
+    cell.imageView.layer.cornerRadius = <span class="number">8</span>
+    cell.imageView.clipsToBounds = <span class="keyword">true</span>
+
+    <span class="keyword">return</span> cell
+}</code></pre>
+
+    <h3>Optimized Cell Configuration (After)</h3>
+    <pre><code><span class="comment">// ✅ Optimized: minimal work in cellForItemAt</span>
+
+<span class="comment">// Pre-computed view models with cached formatted strings</span>
+<span class="keyword">struct</span> <span class="type">PostViewModel</span> {
+    <span class="keyword">let</span> imageURL: <span class="type">URL</span>
+    <span class="keyword">let</span> caption: <span class="type">NSAttributedString</span>  <span class="comment">// Pre-computed</span>
+    <span class="keyword">let</span> dateString: <span class="type">String</span>            <span class="comment">// Pre-formatted</span>
+    <span class="keyword">let</span> cellHeight: <span class="type">CGFloat</span>           <span class="comment">// Pre-calculated</span>
+}
+
+<span class="keyword">class</span> <span class="type">OptimizedFeedController</span>: <span class="type">UICollectionViewController</span> {
+    <span class="keyword">private var</span> viewModels: [<span class="type">PostViewModel</span>] = []
+    <span class="keyword">private let</span> imagePipeline = <span class="type">ImagePipeline</span>.shared
+    <span class="keyword">private static let</span> dateFormatter: <span class="type">DateFormatter</span> = {
+        <span class="keyword">let</span> f = <span class="type">DateFormatter</span>()
+        f.dateStyle = .medium
+        <span class="keyword">return</span> f
+    }()
+
+    <span class="keyword">func</span> <span class="func">prepareViewModels</span>(from posts: [<span class="type">Post</span>]) {
+        <span class="type">DispatchQueue</span>.global(qos: .userInitiated).<span class="func">async</span> { [weak <span class="keyword">self</span>] <span class="keyword">in</span>
+            <span class="keyword">let</span> vms = posts.<span class="func">map</span> { post -> <span class="type">PostViewModel</span> <span class="keyword">in</span>
+                <span class="keyword">let</span> caption = <span class="type">NSAttributedString</span>(
+                    string: post.caption,
+                    attributes: [.font: <span class="type">UIFont</span>.systemFont(ofSize: <span class="number">14</span>)]
+                )
+                <span class="keyword">return</span> <span class="type">PostViewModel</span>(
+                    imageURL: post.imageURL,
+                    caption: caption,
+                    dateString: <span class="type">Self</span>.dateFormatter.<span class="func">string</span>(from: post.date),
+                    cellHeight: <span class="func">Self</span>.<span class="func">calculateHeight</span>(for: caption, width: <span class="number">375</span>)
+                )
+            }
+            <span class="type">DispatchQueue</span>.main.<span class="func">async</span> {
+                <span class="keyword">self</span>?.viewModels = vms
+                <span class="keyword">self</span>?.collectionView.<span class="func">reloadData</span>()
+            }
+        }
+    }
+
+    <span class="keyword">override func</span> <span class="func">collectionView</span>(
+        _ collectionView: <span class="type">UICollectionView</span>,
+        cellForItemAt indexPath: <span class="type">IndexPath</span>
+    ) -> <span class="type">UICollectionViewCell</span> {
+        <span class="keyword">let</span> cell = collectionView.<span class="func">dequeueReusableCell</span>(
+            withReuseIdentifier: <span class="string">"Cell"</span>, for: indexPath
+        ) <span class="keyword">as!</span> <span class="type">PostCell</span>
+
+        <span class="keyword">let</span> vm = viewModels[indexPath.item]
+
+        <span class="comment">// ✅ Pre-computed attributed string</span>
+        cell.captionLabel.attributedText = vm.caption
+        cell.dateLabel.text = vm.dateString
+
+        <span class="comment">// ✅ Async image loading with downsampling</span>
+        <span class="keyword">let</span> targetSize = cell.imageView.bounds.size
+        imagePipeline.<span class="func">loadImage</span>(url: vm.imageURL, targetSize: targetSize) { image <span class="keyword">in</span>
+            cell.imageView.image = image
+        }
+
+        <span class="keyword">return</span> cell
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="image-decoding">4. Image Decoding on Background Thread</h2>
+
+    <pre><code><span class="keyword">class</span> <span class="type">AsyncImageView</span>: <span class="type">UIImageView</span> {
+    <span class="keyword">private var</span> currentURL: <span class="type">URL</span>?
+    <span class="keyword">private static let</span> decodingQueue = <span class="type">DispatchQueue</span>(
+        label: <span class="string">"com.app.image.decoding"</span>,
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+
+    <span class="keyword">func</span> <span class="func">loadImage</span>(from url: <span class="type">URL</span>, targetSize: <span class="type">CGSize</span>) {
+        currentURL = url
+        image = <span class="keyword">nil</span>
+
+        <span class="type">Self</span>.decodingQueue.<span class="func">async</span> { [weak <span class="keyword">self</span>] <span class="keyword">in</span>
+            <span class="keyword">guard let</span> data = <span class="keyword">try</span>? <span class="type">Data</span>(contentsOf: url) <span class="keyword">else</span> { <span class="keyword">return</span> }
+
+            <span class="comment">// Downsample: only decode pixels we need</span>
+            <span class="keyword">let</span> options: [<span class="type">CFString</span>: <span class="type">Any</span>] = [
+                kCGImageSourceShouldCache: <span class="keyword">false</span>
+            ]
+            <span class="keyword">guard let</span> source = <span class="type">CGImageSourceCreateWithData</span>(
+                data <span class="keyword">as</span> <span class="type">CFData</span>, options <span class="keyword">as</span> <span class="type">CFDictionary</span>
+            ) <span class="keyword">else</span> { <span class="keyword">return</span> }
+
+            <span class="keyword">let</span> maxPixel = <span class="func">max</span>(targetSize.width, targetSize.height) *
+                           <span class="type">UIScreen</span>.main.scale
+            <span class="keyword">let</span> thumbOptions: [<span class="type">CFString</span>: <span class="type">Any</span>] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: <span class="keyword">true</span>,
+                kCGImageSourceShouldCacheImmediately: <span class="keyword">true</span>,
+                kCGImageSourceCreateThumbnailWithTransform: <span class="keyword">true</span>,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixel
+            ]
+
+            <span class="keyword">guard let</span> cgImage = <span class="type">CGImageSourceCreateThumbnailAtIndex</span>(
+                source, <span class="number">0</span>, thumbOptions <span class="keyword">as</span> <span class="type">CFDictionary</span>
+            ) <span class="keyword">else</span> { <span class="keyword">return</span> }
+
+            <span class="keyword">let</span> decoded = <span class="type">UIImage</span>(cgImage: cgImage)
+
+            <span class="type">DispatchQueue</span>.main.<span class="func">async</span> {
+                <span class="keyword">guard self</span>?.currentURL == url <span class="keyword">else</span> { <span class="keyword">return</span> }
+                <span class="keyword">self</span>?.image = decoded
+            }
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">cancelLoading</span>() {
+        currentURL = <span class="keyword">nil</span>
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="prefetching">5. Prefetching API</h2>
+
+    <pre><code><span class="keyword">class</span> <span class="type">FeedController</span>: <span class="type">UICollectionViewController</span>,
+                       <span class="type">UICollectionViewDataSourcePrefetching</span> {
+
+    <span class="keyword">private let</span> imagePipeline = <span class="type">ImagePipeline</span>.shared
+    <span class="keyword">private var</span> prefetchTasks: [<span class="type">IndexPath</span>: <span class="type">URLSessionDataTask</span>] = [:]
+
+    <span class="keyword">override func</span> <span class="func">viewDidLoad</span>() {
+        <span class="keyword">super</span>.<span class="func">viewDidLoad</span>()
+        collectionView.prefetchDataSource = <span class="keyword">self</span>
+    }
+
+    <span class="comment">// Called when cells are about to come into view</span>
+    <span class="keyword">func</span> <span class="func">collectionView</span>(
+        _ collectionView: <span class="type">UICollectionView</span>,
+        prefetchItemsAt indexPaths: [<span class="type">IndexPath</span>]
+    ) {
+        <span class="keyword">for</span> indexPath <span class="keyword">in</span> indexPaths {
+            <span class="keyword">let</span> post = posts[indexPath.item]
+            <span class="comment">// Start loading image before cell is visible</span>
+            imagePipeline.<span class="func">prefetch</span>(url: post.imageURL)
+        }
+    }
+
+    <span class="comment">// Called when prefetched cells are no longer needed</span>
+    <span class="keyword">func</span> <span class="func">collectionView</span>(
+        _ collectionView: <span class="type">UICollectionView</span>,
+        cancelPrefetchingForItemsAt indexPaths: [<span class="type">IndexPath</span>]
+    ) {
+        <span class="keyword">for</span> indexPath <span class="keyword">in</span> indexPaths {
+            <span class="keyword">let</span> post = posts[indexPath.item]
+            imagePipeline.<span class="func">cancelPrefetch</span>(url: post.imageURL)
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">How Prefetching Works Internally</div>
+        <p><code>UICollectionView</code> predicts which cells will become visible based on scroll velocity and direction. It calls <code>prefetchItemsAt</code> for cells that are ~1-2 screens away. If the user changes scroll direction, it calls <code>cancelPrefetchingForItemsAt</code> for cells that are no longer approaching the viewport. This gives you a window to start network requests and image decoding before the cell is needed.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="rasterize">6. shouldRasterize for Complex Cells</h2>
+
+    <pre><code><span class="keyword">class</span> <span class="type">ComplexCell</span>: <span class="type">UICollectionViewCell</span> {
+    <span class="keyword">override init</span>(frame: <span class="type">CGRect</span>) {
+        <span class="keyword">super</span>.<span class="keyword">init</span>(frame: frame)
+
+        <span class="comment">// For cells with many sublayers that don't change often:</span>
+        <span class="comment">// - Multiple labels, images, badges, separators</span>
+        <span class="comment">// - Shadow effects</span>
+        <span class="comment">// - Gradient backgrounds</span>
+        layer.shouldRasterize = <span class="keyword">true</span>
+        layer.rasterizationScale = <span class="type">UIScreen</span>.main.scale
+    }
+
+    <span class="keyword">override func</span> <span class="func">prepareForReuse</span>() {
+        <span class="keyword">super</span>.<span class="func">prepareForReuse</span>()
+        <span class="comment">// Temporarily disable rasterization during configuration</span>
+        <span class="comment">// to avoid rebuilding the cache for every property change</span>
+        layer.shouldRasterize = <span class="keyword">false</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">configure</span>(with viewModel: <span class="type">CellViewModel</span>) {
+        <span class="comment">// ... set all properties ...</span>
+
+        <span class="comment">// Re-enable after configuration is complete</span>
+        <span class="comment">// Cache will be built once on next render</span>
+        layer.shouldRasterize = <span class="keyword">true</span>
+    }
+
+    <span class="keyword">required init</span>?(coder: <span class="type">NSCoder</span>) {
+        <span class="func">fatalError</span>(<span class="string">"init(coder:) has not been implemented"</span>)
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">When shouldRasterize Hurts</div>
+        <p>If the cell content changes frequently (e.g., a progress bar, countdown timer, or live-updating content), <code>shouldRasterize</code> forces the cache to rebuild every frame — making performance <em>worse</em>. Use Instruments' "Color Hits Green and Misses Red" to verify: green means the cache is being reused (good), red means it's being rebuilt (bad).</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="blended">7. Blended Layers Detection</h2>
+
+    <p>Blended layers occur when the GPU must read the destination pixel and blend it with the source pixel (alpha compositing). This happens when a layer is not fully opaque.</p>
+
+    <div class="diagram">
+Opaque Layer (Fast):
+════════════════════
+Source pixel ──▶ Framebuffer (overwrite)
+GPU just writes the pixel. Done.
+
+Blended Layer (Slow):
+═════════════════════
+Source pixel ──┐
+               ├──▶ Blend equation ──▶ Framebuffer
+Dest pixel  ◀──┘    (read + compute + write)
+GPU must READ existing pixel, COMPUTE blend, WRITE result.
+    </div>
+
+    <pre><code><span class="comment">// ✅ Eliminate blending: set opaque backgrounds</span>
+label.backgroundColor = .systemBackground  <span class="comment">// Opaque</span>
+label.isOpaque = <span class="keyword">true</span>
+
+<span class="comment">// ❌ Causes blending: clear or transparent background</span>
+label.backgroundColor = .clear  <span class="comment">// Forces blending</span>
+
+<span class="comment">// ✅ For labels on colored backgrounds, match the background</span>
+<span class="keyword">let</span> cellBackground = <span class="type">UIColor</span>.systemBackground
+label.backgroundColor = cellBackground
+
+<span class="comment">// ✅ For UIImageView, set opaque if image has no transparency</span>
+imageView.isOpaque = <span class="keyword">true</span>
+imageView.backgroundColor = .systemBackground</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="misaligned">8. Misaligned Images</h2>
+
+    <p>Misaligned images occur when an image's pixel grid doesn't align with the screen's pixel grid. The GPU must perform anti-aliasing interpolation, which is expensive.</p>
+
+    <pre><code><span class="comment">// ❌ Misaligned: fractional point values</span>
+imageView.frame = <span class="type">CGRect</span>(x: <span class="number">10.3</span>, y: <span class="number">20.7</span>, width: <span class="number">50.5</span>, height: <span class="number">50.5</span>)
+
+<span class="comment">// ✅ Pixel-aligned: snap to pixel boundaries</span>
+<span class="keyword">extension</span> <span class="type">CGRect</span> {
+    <span class="keyword">var</span> pixelAligned: <span class="type">CGRect</span> {
+        <span class="keyword">let</span> scale = <span class="type">UIScreen</span>.main.scale
+        <span class="keyword">return</span> <span class="type">CGRect</span>(
+            x: <span class="func">round</span>(origin.x * scale) / scale,
+            y: <span class="func">round</span>(origin.y * scale) / scale,
+            width: <span class="func">round</span>(size.width * scale) / scale,
+            height: <span class="func">round</span>(size.height * scale) / scale
+        )
+    }
+}
+
+imageView.frame = <span class="type">CGRect</span>(x: <span class="number">10.3</span>, y: <span class="number">20.7</span>, width: <span class="number">50.5</span>, height: <span class="number">50.5</span>).pixelAligned
+
+<span class="comment">// ❌ Misaligned: image size doesn't match view size</span>
+<span class="comment">// A 200×200 image in a 100×100 @3x view = 200px image in 300px view</span>
+<span class="comment">// GPU must resample every frame</span>
+
+<span class="comment">// ✅ Downsample image to exact display pixel size</span>
+<span class="keyword">let</span> displayPixelSize = <span class="type">CGSize</span>(
+    width: imageView.bounds.width * <span class="type">UIScreen</span>.main.scale,
+    height: imageView.bounds.height * <span class="type">UIScreen</span>.main.scale
+)</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="compositing">9. Compositing Cost</h2>
+
+    <p>Every visible layer adds to the compositing cost. The GPU must process layers back-to-front, applying transforms, blending, and effects for each one.</p>
+
+    <table>
+        <thead>
+            <tr><th>Factor</th><th>Impact</th><th>Mitigation</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Layer count per cell</td>
+                <td>Linear — more layers = more GPU work</td>
+                <td>Flatten hierarchy; use <code>shouldRasterize</code></td>
+            </tr>
+            <tr>
+                <td>Layer size</td>
+                <td>Larger layers = more pixels to composite</td>
+                <td>Avoid oversized layers; clip to visible area</td>
+            </tr>
+            <tr>
+                <td>Transparency</td>
+                <td>Each transparent layer requires read-blend-write</td>
+                <td>Set <code>isOpaque = true</code>; use opaque backgrounds</td>
+            </tr>
+            <tr>
+                <td>Off-screen passes</td>
+                <td>Each pass requires context switch + temp buffer</td>
+                <td>Eliminate triggers; use <code>shadowPath</code></td>
+            </tr>
+            <tr>
+                <td>Overdraw</td>
+                <td>Overlapping opaque layers waste GPU cycles</td>
+                <td>Minimize overlapping views</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Measure layer count for a cell</span>
+<span class="keyword">func</span> <span class="func">countLayers</span>(in view: <span class="type">UIView</span>) -> <span class="type">Int</span> {
+    <span class="keyword">var</span> count = <span class="number">1</span>  <span class="comment">// This view's layer</span>
+    count += view.layer.sublayers?.count ?? <span class="number">0</span>
+    <span class="keyword">for</span> subview <span class="keyword">in</span> view.subviews {
+        count += <span class="func">countLayers</span>(in: subview)
+    }
+    <span class="keyword">return</span> count
+}
+
+<span class="comment">// Target: &lt; 50 layers per cell for smooth scrolling</span>
+<span class="comment">// Complex cells can easily reach 100+ layers</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="instruments">10. Instruments Core Animation Template</h2>
+
+    <h3>Debug Options Walkthrough</h3>
+    <table>
+        <thead>
+            <tr><th>Option</th><th>What to Look For</th><th>Fix</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Color Blended Layers</strong></td>
+                <td>Red areas = blended layers. Green = opaque.</td>
+                <td>Set opaque backgrounds on labels, image views</td>
+            </tr>
+            <tr>
+                <td><strong>Color Offscreen-Rendered Yellow</strong></td>
+                <td>Yellow areas = off-screen rendering</td>
+                <td>Add shadowPath, remove masksToBounds, etc.</td>
+            </tr>
+            <tr>
+                <td><strong>Color Misaligned Images</strong></td>
+                <td>Magenta = misaligned, yellow = stretched</td>
+                <td>Pixel-align frames, match image to display size</td>
+            </tr>
+            <tr>
+                <td><strong>Color Hits Green / Misses Red</strong></td>
+                <td>For shouldRasterize: green = cache hit, red = miss</td>
+                <td>Remove shouldRasterize if mostly red</td>
+            </tr>
+            <tr>
+                <td><strong>Color Compositing Fast-Path Blue</strong></td>
+                <td>Blue = hardware compositing fast path</td>
+                <td>Aim for maximum blue coverage</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Using os_signpost for Custom Measurements</h3>
+    <pre><code><span class="keyword">import</span> os
+
+<span class="keyword">class</span> <span class="type">InstrumentedFeedController</span>: <span class="type">UICollectionViewController</span> {
+    <span class="keyword">private static let</span> signpostLog = <span class="type">OSLog</span>(
+        subsystem: <span class="string">"com.app.feed"</span>,
+        category: .pointsOfInterest
+    )
+
+    <span class="keyword">override func</span> <span class="func">collectionView</span>(
+        _ collectionView: <span class="type">UICollectionView</span>,
+        cellForItemAt indexPath: <span class="type">IndexPath</span>
+    ) -> <span class="type">UICollectionViewCell</span> {
+        <span class="keyword">let</span> signpostID = <span class="type">OSSignpostID</span>(log: <span class="type">Self</span>.signpostLog)
+        os_signpost(.begin, log: <span class="type">Self</span>.signpostLog, name: <span class="string">"CellConfig"</span>,
+                    signpostID: signpostID, <span class="string">"row: %d"</span>, indexPath.item)
+
+        <span class="keyword">let</span> cell = collectionView.<span class="func">dequeueReusableCell</span>(
+            withReuseIdentifier: <span class="string">"Cell"</span>, for: indexPath
+        ) <span class="keyword">as!</span> <span class="type">PostCell</span>
+
+        <span class="comment">// ... configure cell ...</span>
+
+        os_signpost(.end, log: <span class="type">Self</span>.signpostLog, name: <span class="string">"CellConfig"</span>,
+                    signpostID: signpostID)
+
+        <span class="keyword">return</span> cell
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="systematic">11. Systematic Jank Diagnosis</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: Systematic Scroll Jank Diagnosis</div>
+        <p>At Staff level, you need a repeatable methodology for diagnosing and fixing scroll performance. Here's the systematic approach:</p>
+    </div>
+
+    <h3>Phase 1: Measure</h3>
+    <ol>
+        <li>Profile on the <strong>oldest supported device</strong> (not the latest iPhone Pro)</li>
+        <li>Use Instruments Core Animation template to measure baseline FPS</li>
+        <li>Record a 30-second scroll session through the problematic screen</li>
+        <li>Note frame drops: how many, how severe (1 frame vs 5 frames), and when they occur</li>
+    </ol>
+
+    <h3>Phase 2: Identify</h3>
+    <ol>
+        <li>Enable all Core Animation debug overlays one at a time</li>
+        <li>Use Time Profiler to identify CPU bottlenecks in <code>cellForItemAt</code></li>
+        <li>Check GPU utilization — if high, the problem is compositing; if low, it's CPU</li>
+        <li>Categorize issues: CPU-bound (cell configuration) vs GPU-bound (compositing)</li>
+    </ol>
+
+    <h3>Phase 3: Fix (Priority Order)</h3>
+    <table>
+        <thead>
+            <tr><th>Priority</th><th>Fix</th><th>Expected Impact</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>1</td>
+                <td>Move image decoding off main thread</td>
+                <td>Eliminates largest single hitch source</td>
+            </tr>
+            <tr>
+                <td>2</td>
+                <td>Downsample images to display size</td>
+                <td>Reduces decode time + memory pressure</td>
+            </tr>
+            <tr>
+                <td>3</td>
+                <td>Add shadowPath to all shadows</td>
+                <td>Eliminates expensive GPU outline tracing</td>
+            </tr>
+            <tr>
+                <td>4</td>
+                <td>Set opaque backgrounds</td>
+                <td>Eliminates blending cost</td>
+            </tr>
+            <tr>
+                <td>5</td>
+                <td>Pre-compute cell heights</td>
+                <td>Eliminates layout computation during scroll</td>
+            </tr>
+            <tr>
+                <td>6</td>
+                <td>Enable prefetching</td>
+                <td>Hides data loading latency</td>
+            </tr>
+            <tr>
+                <td>7</td>
+                <td>Consider shouldRasterize for complex cells</td>
+                <td>Reduces per-frame compositing cost</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Phase 4: Verify &amp; Prevent</h3>
+    <ol>
+        <li>Re-measure with Instruments to confirm improvement</li>
+        <li>Set up MetricKit monitoring for scroll hitch rate in production</li>
+        <li>Add performance assertions in debug builds</li>
+        <li>Document team guidelines for cell implementation</li>
+    </ol>
+
+    <pre><code><span class="comment">// Debug-only performance assertion for cell configuration time</span>
+<span class="keyword">#if</span> DEBUG
+<span class="keyword">func</span> <span class="func">assertCellConfigTime</span>(_ block: () -> <span class="type">Void</span>) {
+    <span class="keyword">let</span> start = <span class="type">CACurrentMediaTime</span>()
+    <span class="func">block</span>()
+    <span class="keyword">let</span> elapsed = (<span class="type">CACurrentMediaTime</span>() - start) * <span class="number">1000</span>
+    <span class="func">assert</span>(elapsed < <span class="number">4.0</span>,
+           <span class="string">"Cell configuration took \(elapsed)ms — exceeds 4ms budget"</span>)
+}
+<span class="keyword">#endif</span></code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice Summary</div>
+        <ul>
+            <li>Always profile on the oldest supported device — that's where users experience jank</li>
+            <li>Move all heavy work (image decode, text measurement, date formatting) off the main thread</li>
+            <li>Pre-compute everything possible: cell heights, attributed strings, formatted dates</li>
+            <li>Use prefetching to start loading data before cells become visible</li>
+            <li>Eliminate every off-screen rendering trigger in scroll view cells</li>
+            <li>Set opaque backgrounds on all cell subviews to eliminate blending</li>
+            <li>Monitor scroll hitch rate in production with MetricKit</li>
+            <li>Establish team coding standards for cell implementation performance</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="05-image-handling.html">← Image Handling</a>
+        <a href="07-interview-qa.html">Next: Interview Q&amp;A →</a>
+    </div>
+</div>
+</body>
+</html>

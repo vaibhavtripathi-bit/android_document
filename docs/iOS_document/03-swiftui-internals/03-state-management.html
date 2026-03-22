@@ -1,0 +1,1064 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>State Management Deep Dive — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">SwiftUI Internals</a><span class="sep">›</span>
+        State Management
+    </nav>
+
+    <h1>State Management Deep Dive — iOS L6 Interview Prep</h1>
+    <p class="subtitle">Heap-backed <code>@State</code>, projected <code>Binding</code>s, <code>ObservableObject</code> ownership traps, the Observation framework (<code>@Observable</code>, <code>ObservationRegistrar</code>, <code>withObservationTracking</code>), and how SwiftUI decides what to recompute — structured for L6/Staff iOS interviews.</p>
+    <p>
+        <span class="tag tag-l6">L6</span>
+        <span class="tag tag-senior">Senior+</span>
+        <span class="tag tag-architect">Architecture</span>
+    </p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#state">1. @State — Heap-backed, identity-scoped</a></li>
+            <li><a href="#state-dynamicproperty">1.6 DynamicProperty &amp; storage (interview depth)</a></li>
+            <li><a href="#state-heap-timeline">1.8 Heap allocation timeline</a></li>
+            <li><a href="#state-wrapper-spelling">1.9 wrappedValue / projectedValue / _count</a></li>
+            <li><a href="#binding">2. @Binding — Projected two-way links</a></li>
+            <li><a href="#binding-transforms">2.5 Binding transformations</a></li>
+            <li><a href="#stateobject-observed">3. @StateObject vs @ObservedObject</a></li>
+            <li><a href="#environment-object">4. @EnvironmentObject</a></li>
+            <li><a href="#observable-macro">5. @Observable (iOS 17+) — Macro expansion</a></li>
+            <li><a href="#observable-registrar-tracking">5.4 Registrar, access lists &amp; SwiftUI glue</a></li>
+            <li><a href="#bindable">6. @Bindable</a></li>
+            <li><a href="#observation-tracking">7. withObservationTracking</a></li>
+            <li><a href="#published-vs-observable">8. @Published vs per-property observation</a></li>
+            <li><a href="#comparison">9. Master comparison tables</a></li>
+            <li><a href="#comparison-choose">9.2 Choosing storage by problem shape</a></li>
+            <li><a href="#comparison-combine">9.3 Combine vs Observation</a></li>
+            <li><a href="#wrappers-ecosystem">9.4 Extended property-wrapper ecosystem</a></li>
+            <li><a href="#architect">10. Large-app state architecture</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="state">1. @State — Heap-backed, view-scoped storage</h2>
+
+    <p><code>@State</code> is the primitive for <em>private</em> mutable state that belongs to a <em>view subtree</em>, not to the Swift struct instance you type in source code. That distinction is the heart of almost every “why did my state reset?” question in SwiftUI.</p>
+
+    <h3>1.1 What @State compiles to (conceptual model)</h3>
+
+    <p>At compile time, <code>@State private var count: Int = 0</code> lowers to a property wrapper whose <code>wrappedValue</code> reads and writes through SwiftUI’s runtime. The actual <code>Int</code> (or whatever value type you store) lives in heap-allocated storage managed by the framework and keyed off the view’s <strong>identity</strong> in the attribute graph — not off the ephemeral struct value passed to <code>body</code>.</p>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│  Your source: struct CounterView: View { @State private var n }   │
+│                                                                 │
+│  Each body evaluation: NEW struct instance (value semantics)    │
+│       │                                                         │
+│       ▼                                                         │
+│  Attribute Graph node for this View identity                    │
+│       │                                                         │
+│       └──► Heap slot: StateBox holds actual storage for `n`     │
+│            Survives struct copies / body re-invocation          │
+└─────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Interview sound bite</div>
+        <p>SwiftUI views are structs; structs are recreated constantly. Persistent UI state cannot live “inside” the struct’s inline memory the way it would in a UIKit <code>UIView</code> subclass instance. <code>@State</code> relocates that state into runtime-owned storage associated with a stable graph identity.</p>
+    </div>
+
+    <h3>1.2 wrappedValue vs projectedValue (<code>$</code>)</h3>
+
+    <p>The property wrapper exposes two interfaces:</p>
+    <ul>
+        <li><strong><code>wrappedValue</code></strong> — the current value (<code>T</code>). Reading it during <code>body</code> establishes a dependency so the view invalidates when the value changes.</li>
+        <li><strong><code>projectedValue</code></strong> — a <code>Binding&lt;T&gt;</code> (spelled <code>$name</code>) that forwards reads and writes back into the same underlying storage without copying ownership of the object.</li>
+    </ul>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">CounterView</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private var</span> count: <span class="type">Int</span> = <span class="number">0</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span> {
+            <span class="type">Text</span>(<span class="string">"\(count)"</span>)           <span class="comment">// reads wrappedValue</span>
+            <span class="type">Stepper</span>(<span class="string">"Adjust"</span>, value: $count, <span class="keyword">in</span>: <span class="number">0</span>...<span class="number">100</span>)  <span class="comment">// Binding via $</span>
+        }
+    }
+}</code></pre>
+
+    <p>Here, <code>Stepper</code> mutates through the binding; SwiftUI writes the new integer into the same heap-backed slot and schedules a targeted invalidation for views that depended on <code>count</code>.</p>
+
+    <h3>1.3 Why @State should be <code>private</code></h3>
+
+    <p>Marking <code>@State</code> <code>private</code> is not a mere style guideline. If you expose mutable state as <code>internal</code> or <code>public</code>, other types can write to it <em>without</em> going through SwiftUI’s observation machinery in the intended way, and you encourage architectural leaks where parent views reach into children to flip bits. The framework also assumes state is encapsulated so dependency edges remain local and predictable.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Staff-level trap</div>
+        <p>Exposing <code>@State</code> breaks encapsulation and makes refactors painful. Interviewers often probe whether you understand that child state is not a substitute for a model object — it is UI-local transient state (selection, expansion, field draft text) with a narrow API surface.</p>
+    </div>
+
+    <h3>1.4 Struct recreation vs persistent state</h3>
+
+    <p>Every time SwiftUI calls <code>body</code>, it constructs a fresh <code>CounterView</code> value. If <code>count</code> lived only in that struct’s memory, it would reset to <code>0</code> constantly. Because the attribute graph associates storage with the view’s identity (type + position in the hierarchy + explicit <code>id</code> when used), the heap slot survives those re-instantiations.</p>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">LifecycleDemo</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private var</span> tick: <span class="type">Int</span> = <span class="number">0</span>
+    <span class="keyword">@State</span> <span class="keyword">private var</span> refreshToken: <span class="type">Int</span> = <span class="number">0</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span> {
+            <span class="type">Text</span>(<span class="string">"tick = \(tick)"</span>)
+            <span class="type">Button</span>(<span class="string">"Bump parent token"</span>) { refreshToken += <span class="number">1</span> }
+            <span class="type">ChildWithLocalState</span>(parentToken: refreshToken)
+        }
+        .<span class="func">onAppear</span> { tick += <span class="number">1</span> }  <span class="comment">// runs when inserted; state persists across parent redraws</span>
+    }
+}
+
+<span class="keyword">struct</span> <span class="type">ChildWithLocalState</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> parentToken: <span class="type">Int</span>
+    <span class="keyword">@State</span> <span class="keyword">private var</span> local: <span class="type">Int</span> = <span class="number">0</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">Button</span>(<span class="string">"local=\(local), token=\(parentToken)"</span>) { local += <span class="number">1</span> }
+    }
+}</code></pre>
+
+    <p>Changing <code>refreshToken</code> forces the parent to rebuild; <code>ChildWithLocalState</code> receives a new struct instance, but <code>local</code> remains tied to the child’s graph identity and does not reset unless the child is <em>removed</em> from the hierarchy or its identity changes (for example via <code>.id(...)</code>).</p>
+
+    <h3>1.5 When @State is the wrong tool</h3>
+
+    <p>Use <code>@State</code> for small value-semantic UI state owned by a single view. For reference-type models shared across screens, reach for <code>@StateObject</code>, <code>@Observable</code>, or dependency injection — not a growing pile of <code>@State</code> in the root view.</p>
+
+    <h3 id="state-dynamicproperty">1.6 <code>DynamicProperty</code>, container relationships, and why “the struct is not the view”</h3>
+
+    <p>Under the ABI surface, SwiftUI’s stateful property wrappers conform to protocols such as <code>DynamicProperty</code>. Before <code>body</code> runs, SwiftUI walks the view’s stored properties and calls into the wrapper so each one can <strong>update</strong> its connection to graph-backed storage. That is how a brand-new struct value still “finds” the same heap slot: the wrapper participates in a setup phase that binds the ephemeral value to a persistent graph location.</p>
+
+    <div class="diagram">
+  Ephemeral value semantics              Persistent graph semantics
+  --------------------------             ---------------------------
+  let v1 = CounterView()                 Attribute graph node ID: N
+  let v2 = CounterView()  // new struct   State storage keyed by N
+       |                                        ^
+       |  same logical view in hierarchy        |
+       +---- DynamicProperty update() -----------+---- resolves to same box
+    </div>
+
+    <p>Interviewers often expect you to articulate the consequence: <strong>you cannot rely on <code>self</code> identity in a <code>View</code> struct</strong> for persistence. Only framework-managed storage (<code>@State</code>, <code>@StateObject</code>, external models, environment) survives. This is also why capturing <code>self</code> incorrectly inside escaping closures can produce stale reads unless you capture the underlying value or use the binding.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Implementation note</div>
+        <p>Exact method names and call order are private to SwiftUI and change between OS releases. The durable mental model is: <em>wrappers reconcile value-type views with reference-type graph state</em>. Saying “@State is stored in the struct” is a red flag at staff level.</p>
+    </div>
+
+    <h3>1.7 Initialization rules and the single source of truth</h3>
+
+    <p><code>@State</code> initializers run when SwiftUI first allocates storage for that identity. Supplying <code>@State private var text = ""</code> sets the initial heap value once. Later, if you attempt to “re-initialize” by changing code and hot-reloading, or by reconstructing a view with a different generic parameter so its identity changes, you will see resets — not because <code>@State</code> is broken, but because <strong>identity changed</strong> or storage was recreated.</p>
+
+    <pre><code><span class="comment">// Initial value only matters on first creation of this view identity.</span>
+<span class="keyword">struct</span> <span class="type">KeyedEditor</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> recordID: <span class="type">UUID</span>
+    <span class="keyword">@State</span> <span class="keyword">private var</span> draft: <span class="type">String</span> = <span class="string">""</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">TextField</span>(<span class="string">"Draft"</span>, text: $draft)
+            .<span class="func">onChange</span>(of: recordID) { _, _ <span class="keyword">in</span>
+                draft = <span class="string">""</span>   <span class="comment">// explicit reset when logical record changes</span>
+            }
+    }
+}</code></pre>
+
+    <p>Staff-level apps almost always pair identity changes (<code>.id(recordID)</code>) with explicit model-driven resets, rather than expecting magic synchronization.</p>
+
+    <h3 id="state-heap-timeline">1.8 Heap allocation and the “first touch” timeline (mental model)</h3>
+
+    <p>SwiftUI does not document the private box type that backs <code>@State</code>, but the observable behavior implies a <strong>lazy, identity-keyed allocation</strong>: when a view node is first inserted into the live graph, the runtime reserves storage for each <code>DynamicProperty</code> field. Subsequent <code>body</code> evaluations run against new struct values, yet the wrapper’s update hook reattaches to the same box.</p>
+
+    <div class="diagram">
+  Timeline: @State private var n = 0
+  ---------------------------------
+  [Insert] View identity N appears in graph
+       |
+       +--> allocate State storage for `n` (initial value 0)
+       |
+  [Body #1] CounterView() value created on stack
+       |
+       +--> @State wrapper update: bind stack value -> heap box for N
+       |
+  [User taps] set n = 1 via Binding / direct write
+       |
+       +--> mark dependents dirty; schedule re-render
+       |
+  [Body #2] NEW CounterView() stack value
+       |
+       +--> @State wrapper update: SAME heap box, n still 1
+    </div>
+
+    <p>The interview-critical phrase: <strong>ownership of the value is transferred to the framework</strong> for the lifetime of that graph identity. You should not think “my struct holds an <code>Int</code>,” but “my struct holds a handle that reads through to graph storage.”</p>
+
+    <h3 id="state-wrapper-spelling">1.9 Property wrapper spelling: <code>wrappedValue</code>, <code>projectedValue</code>, and underscored access</h3>
+
+    <p>Under the hood, <code>@State var x</code> is lowered to a stored property of type <code>State&lt;T&gt;</code> (name illustrative). The compiler synthesizes accessors so that <code>x</code> reads <code>wrappedValue</code> and <code>$x</code> reads <code>projectedValue</code>. In advanced scenarios (custom initializers, property wrapper composition), you may see <code>_x</code> — the wrapper’s projected base — exactly as with any Swift property wrapper.</p>
+
+    <pre><code><span class="comment">// Conceptual de-sugaring (simplified)</span>
+<span class="keyword">struct</span> <span class="type">CounterView</span>: <span class="type">View</span> {
+    <span class="keyword">private var</span> _count = <span class="type">State</span>&lt;<span class="type">Int</span>&gt;(initialValue: <span class="number">0</span>)
+
+    <span class="keyword">private var</span> count: <span class="type">Int</span> {
+        <span class="func">get</span> { _count.wrappedValue }
+        <span class="keyword">nonmutating</span> <span class="func">set</span> { _count.wrappedValue = newValue }
+    }
+
+    <span class="comment">// $count == _count.projectedValue  (Binding&lt;Int&gt;)</span>
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Why interviewers probe this</div>
+        <p>Demonstrating that <code>@State</code> is a <em>property wrapper</em> with wrapper/projected values proves you understand Swift’s lowering — and explains why <code>$</code> is not “magic syntax” but <code>projectedValue</code> vending a <code>Binding</code>.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="binding">2. @Binding — Projected two-way connection</h2>
+
+    <p>A <code>Binding&lt;T&gt;</code> is a lightweight <strong>pair of closures</strong> (get + set) that describes how to read and write a piece of data <em>without</em> owning it. The projected value of <code>@State</code>, <code>@Bindable</code> wrappers, and many other sources produces such a binding.</p>
+
+    <h3>2.1 Binding as a struct</h3>
+
+    <p>Conceptually (simplified), <code>Binding</code> forwards to underlying storage:</p>
+
+    <pre><code><span class="comment">// Conceptual mental model — not exact ABI</span>
+<span class="keyword">struct</span> <span class="type">Binding</span>&lt;<span class="type">Value</span>&gt; {
+    <span class="keyword">var</span> get: () -> <span class="type">Value</span>
+    <span class="keyword">var</span> set: (<span class="type">Value</span>) -> <span class="type">Void</span>
+
+    <span class="keyword">var</span> wrappedValue: <span class="type">Value</span> {
+        <span class="func">get</span> { <span class="func">get</span>() }
+        <span class="keyword">nonmutating</span> <span class="func">set</span> { <span class="func">set</span>(newValue) }
+    }
+}</code></pre>
+
+    <p>Controls like <code>Toggle</code>, <code>TextField</code>, and <code>Sheet</code> modifiers accept <code>Binding</code> so they can both display and mutate source-of-truth state held elsewhere.</p>
+
+    <h3>2.2 Custom bindings with <code>Binding(get:set:)</code></h3>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">SettingsPanel</span>: <span class="type">View</span> {
+    <span class="keyword">@Binding</span> <span class="keyword">var</span> fontSize: <span class="type">CGFloat</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">Slider</span>(
+            value: <span class="type">Binding</span>(
+                <span class="func">get</span>: { fontSize },
+                <span class="func">set</span>: { fontSize = <span class="type">CGFloat</span>(<span class="func">round</span>($0)) }
+            ),
+            <span class="keyword">in</span>: <span class="number">12</span>...<span class="number">24</span>
+        )
+    }
+}</code></pre>
+
+    <p>Custom bindings are how you implement derived UI state, clamping, side effects on write, or bridging to non-SwiftUI APIs — while keeping a single authoritative store.</p>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Pattern</div>
+        <p>Prefer pushing <code>Binding</code> downward rather than callbacks for simple two-way sync; it composes with SwiftUI controls and keeps mutation sites uniform.</p>
+    </div>
+
+    <h3>2.3 <code>$state</code> ergonomics: projected value in practice</h3>
+
+    <p>For <code>@State</code>, <code>@FocusState</code>, and other wrappers that vend a <code>Binding</code>, the prefix <code>$</code> is pure sugar for the property wrapper’s <code>projectedValue</code>. It does not allocate a new model; it hands the control a capability to mutate the same storage SwiftUI already tracks.</p>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">FormDemo</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private var</span> username: <span class="type">String</span> = <span class="string">""</span>
+    <span class="keyword">@State</span> <span class="keyword">private var</span> accepted: <span class="type">Bool</span> = <span class="keyword">false</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span> {
+            <span class="type">TextField</span>(<span class="string">"Username"</span>, text: $username)   <span class="comment">// Binding&lt;String&gt;</span>
+            <span class="type">Toggle</span>(<span class="string">"Accept"</span>, isOn: $accepted)        <span class="comment">// Binding&lt;Bool&gt;</span>
+        }
+    }
+}</code></pre>
+
+    <h3>2.4 Constant and optional bindings</h3>
+
+    <p><code>.constant(true)</code> fixes a value for previews or disabled controls. <code>Binding</code> helpers unwrap optionals or supply defaults — useful when bridging legacy models into SwiftUI without rewriting everything at once.</p>
+
+    <h3 id="binding-transforms">2.5 Binding transformations: map, optional chaining, and transaction</h3>
+
+    <p><code>Binding</code> is a small value type; you can derive new bindings that apply forward/backward transforms. This is the SwiftUI analogue of lens-style updates in other reactive UI frameworks — keep the authoritative store untouched while presenting a control-friendly projection.</p>
+
+    <pre><code><span class="keyword">extension</span> <span class="type">Binding</span> {
+    <span class="keyword">func</span> <span class="func">map</span>&lt;<span class="type">T</span>&gt;(
+        <span class="func">get</span>: <span class="keyword">@escaping</span> (<span class="type">Value</span>) -> <span class="type">T</span>,
+        <span class="func">set</span>: <span class="keyword">@escaping</span> (<span class="type">T</span>, <span class="type">Value</span>) -> <span class="type">Value</span>
+    ) -> <span class="type">Binding</span>&lt;<span class="type">T</span>&gt; {
+        <span class="type">Binding</span>&lt;<span class="type">T</span>&gt;(
+            <span class="func">get</span>: { <span class="func">get</span>(<span class="keyword">self</span>.wrappedValue) },
+            <span class="func">set</span>: { <span class="keyword">self</span>.wrappedValue = <span class="func">set</span>($0, <span class="keyword">self</span>.wrappedValue) }
+        )
+    }
+}</code></pre>
+
+    <p>In application code, prefer standard library / SwiftUI helpers where available; in interviews, articulating that <code>Binding</code> is <strong>get/set closures</strong> proves you can implement validation, clamping, and reversible edits without duplicating source-of-truth fields.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="stateobject-observed">3. @StateObject vs @ObservedObject — Ownership and the classic bug</h2>
+
+    <p>Both wrappers subscribe to <code>ObservableObject</code>’s <code>objectWillChange</code> publisher (Combine) and invalidate dependent views. The <strong>critical</strong> difference is <em>who creates and owns</em> the object instance across view updates.</p>
+
+    <h3>3.1 @StateObject — SwiftUI owns the lifetime</h3>
+
+    <p>When you write <code>@StateObject private var model = MyModel()</code>, SwiftUI constructs (or retrieves) the object <strong>once per view identity</strong> and retains it for you. Subsequent <code>body</code> evaluations reuse that instance. This mirrors <code>@State</code> but for reference types conforming to <code>ObservableObject</code>.</p>
+
+    <h3>3.2 @ObservedObject — You own the lifetime</h3>
+
+    <p><code>@ObservedObject var model: MyModel</code> expects the <em>caller</em> to supply a stable object. SwiftUI does not promise to preserve whatever instance you passed in the initializer across arbitrary graph updates; the view’s struct is recreated, and if your initializer runs again and constructs a <em>new</em> <code>MyModel()</code>, you have a bug.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">The classic bug</div>
+        <p>Using <code>@ObservedObject</code> with a default value or inline construction in the child’s memberwise initializer causes a fresh model on every parent re-render — resetting UI, losing in-flight work, duplicating network requests, and confusing testers.</p>
+    </div>
+
+    <pre><code><span class="comment">// BUGGY: new ViewModel every time Parent redraws</span>
+<span class="keyword">struct</span> <span class="type">BrokenChild</span>: <span class="type">View</span> {
+    <span class="keyword">@ObservedObject</span> <span class="keyword">var</span> vm: <span class="type">ItemViewModel</span>
+
+    <span class="func">init</span>(itemID: <span class="type">UUID</span>) {
+        <span class="keyword">_vm</span> = <span class="type">ObservedObject</span>(wrappedValue: <span class="type">ItemViewModel</span>(id: itemID))
+    }
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> { <span class="type">Text</span>(vm.title) }
+}
+
+<span class="comment">// FIXED: parent owns creation; child observes</span>
+<span class="keyword">struct</span> <span class="type">Parent</span>: <span class="type">View</span> {
+    <span class="keyword">@StateObject</span> <span class="keyword">private var</span> vm = <span class="type">ItemViewModel</span>(id: <span class="type">UUID</span>())
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> { <span class="type">HealthyChild</span>(vm: vm) }
+}
+
+<span class="keyword">struct</span> <span class="type">HealthyChild</span>: <span class="type">View</span> {
+    <span class="keyword">@ObservedObject</span> <span class="keyword">var</span> vm: <span class="type">ItemViewModel</span>
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> { <span class="type">Text</span>(vm.title) }
+}</code></pre>
+
+    <h3>3.3 Memory and lifecycle</h3>
+
+    <ul>
+        <li><strong>@StateObject</strong> — retained by the view graph; released when the view is torn down (subject to navigation stack and hosting rules).</li>
+        <li><strong>@ObservedObject</strong> — SwiftUI holds a weak-ish conceptual relationship to “whatever you passed”; if you recreate models carelessly, ARC may deallocate old instances while subscribers still expect them — or you may leak if bindings keep cycles alive.</li>
+    </ul>
+
+    <p><strong>ARC angle:</strong> the observable object is a class; someone must keep it alive. <code>@StateObject</code> ensures the owning view subtree participates in that retention. <code>@ObservedObject</code> does not transfer ownership — if the parent stops retaining the model and nothing else holds it, the instance can deallocate even though a child view’s last <code>body</code> still referenced it. In practice, parent-created models are retained by the parent’s property list or environment; the wrapper only subscribes to changes.</p>
+
+    <p><strong>Re-creation angle:</strong> if a child incorrectly constructs <code>ItemViewModel()</code> inside <code>init</code> for <code>@ObservedObject</code>, every parent invalidation produces a new object graph: new Combine subscriptions, new network tasks, lost form state. <code>@StateObject</code>’s closure is evaluated once per view identity (with documented exceptions around explicit <code>id</code> changes), which is why Apple positions it as the fix for “created in the view.”</p>
+
+    <h3>3.4 <code>@StateObject(wrappedValue:)</code> vs injected instances — initializer recipes</h3>
+
+    <pre><code><span class="comment">// StateObject: pass factory OR value — still "owned" by view graph rules</span>
+<span class="keyword">struct</span> <span class="type">Screen</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> id: <span class="type">UUID</span>
+    <span class="keyword">@StateObject</span> <span class="keyword">private var</span> vm: <span class="type">ItemViewModel</span>
+
+    <span class="func">init</span>(id: <span class="type">UUID</span>) {
+        <span class="keyword">self</span>.id = id
+        <span class="keyword">_vm</span> = <span class="type">StateObject</span>(wrappedValue: <span class="type">ItemViewModel</span>(id: id))
+    }
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> { <span class="type">Text</span>(vm.title) }
+}
+
+<span class="comment">// ObservedObject: NEVER allocate here unless idempotently cached</span>
+<span class="keyword">struct</span> <span class="type">Row</span>: <span class="type">View</span> {
+    <span class="keyword">@ObservedObject</span> <span class="keyword">var</span> vm: <span class="type">RowViewModel</span>
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> { <span class="type">Text</span>(vm.title) }
+}</code></pre>
+
+    <h3>3.5 Decision flowchart (ASCII)</h3>
+
+    <div class="diagram">
+        Who creates the ObservableObject?
+              |
+              +--- The CHILD view creates it?
+              |         |
+              |         YES --> @StateObject (SwiftUI retains)
+              |         |
+              |         NO --> continue
+              |
+              +--- The PARENT (or DI container) creates it?
+                        |
+                        YES --> Pass in; child uses @ObservedObject
+                        |
+                        NO --> Rethink architecture (singleton? environment?)
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Navigation stacks</div>
+        <p>With <code>NavigationStack</code> and value-based navigation, view identity rules still apply. If you hoist a <code>@StateObject</code> at the wrong level, you can accidentally share one view model across destinations — or recreate it too often. Always tie object lifetime to the intended screen scope.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="environment-object">4. @EnvironmentObject — Type-keyed ambient state</h2>
+
+    <p><code>@EnvironmentObject</code> is a specialized path into SwiftUI’s <code>Environment</code>: at runtime, SwiftUI looks up a value by <strong>dynamic type</strong> (the concrete <code>ObservableObject</code> type) and injects it into <code>body</code> evaluation.</p>
+
+    <h3>4.1 Injection and lookup</h3>
+
+    <pre><code><span class="keyword">@main</span>
+<span class="keyword">struct</span> <span class="type">MyApp</span>: <span class="type">App</span> {
+    <span class="keyword">@StateObject</span> <span class="keyword">private var</span> session = <span class="type">SessionStore</span>()
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">Scene</span> {
+        <span class="type">WindowGroup</span> {
+            <span class="type">RootView</span>()
+                .<span class="func">environmentObject</span>(session)
+        }
+    }
+}
+
+<span class="keyword">struct</span> <span class="type">ProfileTab</span>: <span class="type">View</span> {
+    <span class="keyword">@EnvironmentObject</span> <span class="keyword">private var</span> session: <span class="type">SessionStore</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">Text</span>(session.userName)
+    }
+}</code></pre>
+
+    <p>If no ancestor called <code>.environmentObject(session)</code> (or equivalent), accessing <code>@EnvironmentObject</code> triggers a runtime failure — SwiftUI cannot synthesize a default.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Crash if missing</div>
+        <p>Unlike <code>@Environment</code> values with defaults, <code>@EnvironmentObject</code> is effectively required. Previews and tests must inject mocks explicitly.</p>
+    </div>
+
+    <h3>4.2 Scoping and overrides</h3>
+
+    <p>Environment propagates down the tree. A subtree can replace an object by applying another <code>.environmentObject</code> — useful for feature-local session overrides or A/B test buckets. The nearest ancestor wins, similar to CSS cascade (conceptually).</p>
+
+    <pre><code><span class="type">FeatureRoot</span>()
+    .<span class="func">environmentObject</span>(scopedStore)  <span class="comment">// shadows outer store for this subtree</span></code></pre>
+
+    <h3>4.3 When not to use environment objects</h3>
+
+    <p>Global ambient state hides dependencies (harder to test, harder to reason about data flow). Prefer explicit initializer parameters for shallow trees; reserve <code>EnvironmentObject</code> for truly cross-cutting concerns (session, theme, feature flags) with narrow protocols or concrete types per domain.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="observable-macro">5. @Observable macro (iOS 17+) — Under the hood</h2>
+
+    <p>Swift 5.9 introduced the Observation framework. The <code>@Observable</code> macro transforms a class at compile time so accesses to individual stored properties can be tracked with lower granularity than <code>objectWillChange.send()</code> blasting every subscriber.</p>
+
+    <h3>5.1 What the macro generates (illustrative)</h3>
+
+    <p>Exact synthesized code evolves with compiler versions; interview answers should describe <strong>behavior</strong> and <strong>registrar</strong> participation rather than memorizing every line. A faithful mental model:</p>
+
+    <pre><code><span class="comment">// You write:</span>
+<span class="keyword">import</span> Observation
+
+<span class="keyword">@Observable</span> <span class="keyword">final class</span> <span class="type">Cart</span> {
+    <span class="keyword">var</span> items: [<span class="type">Item</span>] = []
+    <span class="keyword">var</span> couponCode: <span class="type">String</span>?
+}
+
+<span class="comment">// Compiler conceptually expands toward (simplified pseudocode):</span>
+<span class="keyword">final class</span> <span class="type">Cart</span> {
+    <span class="keyword">private let</span> _$observationRegistrar = <span class="type">ObservationRegistrar</span>()
+
+    <span class="keyword">var</span> items: [<span class="type">Item</span>] {
+        <span class="func">get</span> {
+            _$observationRegistrar.<span class="func">access</span>(<span class="keyword">self</span>, keyPath: \.items)
+            <span class="keyword">return</span> _items
+        }
+        <span class="func">set</span> {
+            _$observationRegistrar.<span class="func">willSet</span>(<span class="keyword">self</span>, keyPath: \.items)
+            _items = newValue
+            _$observationRegistrar.<span class="func">didSet</span>(<span class="keyword">self</span>, keyPath: \.items)
+        }
+    }
+    <span class="keyword">private var</span> _items: [<span class="type">Item</span>] = []
+    <span class="comment">// ... similar for couponCode ...</span>
+}</code></pre>
+
+    <h3>5.2 ObservationRegistrar</h3>
+
+    <p>The registrar records which observers touched which properties during a tracking pass. On mutation, only observers that depended on the mutated key path are notified — enabling fine-grained invalidation when SwiftUI integrates with this machinery.</p>
+
+    <h3>5.3 Property-level vs object-level observation</h3>
+
+    <p><code>@Published</code> on an <code>ObservableObject</code> still ultimately funnels through <code>objectWillChange</code> before the concrete property change is visible — subscribers often broaden their invalidation. <code>@Observable</code> aims for <em>per-field</em> dependency lists in the observation system, which SwiftUI can use to narrow updates.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Integration point</div>
+        <p>SwiftUI’s runtime registers dependencies while reading <code>body</code>. When those reads touch <code>@Observable</code> properties, the framework links the view’s graph attributes to observation records. After a write, only affected views revisit dependent subtrees.</p>
+    </div>
+
+    <h3 id="observable-registrar-tracking">5.4 <code>ObservationRegistrar</code>, access lists, and how <code>withObservationTracking</code> fits</h3>
+
+    <p>The registrar maintains associations between an observable instance and the observers that have read particular storage. Conceptually, each tracked property access during a <code>withObservationTracking</code> <em>apply</em> pass appends the observer to an access list for the touched key paths. When the runtime executes a setter, it consults those lists to decide which observers need notification.</p>
+
+    <div class="diagram">
+  withObservationTracking { apply } onChange: { ... }
+        |
+        |-- apply() runs once immediately
+        |       |
+        |       +--> reads cart.items --> registrar notes: observer O depends on \.items
+        |
+        +-- later: cart.items = ... --> onChange fires for O
+                    |
+                    +--> IMPORTANT: tracking is NOT automatically re-armed
+                         SwiftUI re-establishes dependencies on next body evaluation
+                         Your manual code must recurse if you want continuous watching
+    </div>
+
+    <p>SwiftUI’s integration is analogous to “always recurse”: every time a view body is evaluated, dependency discovery runs again, so you inherit correct incremental behavior without writing the recursive harness yourself. That is the bridge between low-level Observation APIs and day-to-day declarative UI.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Do not confuse layers</div>
+        <p>In interviews, clearly separate: (1) the macro-generated accessors calling into <code>ObservationRegistrar</code>, (2) <code>withObservationTracking</code> for ad-hoc observation outside SwiftUI, and (3) SwiftUI’s own body-driven re-tracking. Mixing these levels signals confusion about ownership of the subscription lifecycle.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="bindable">6. @Bindable — Bindings for @Observable models</h2>
+
+    <p>Reference-type <code>@Observable</code> models are not property wrappers on the struct; you typically hold them as <code>let model: Cart</code> or <code>@State</code> / <code>@Bindable</code> depending on ownership. SwiftUI introduced <code>@Bindable</code> to opt into binding projection for observable objects without adopting the older <code>ObservableObject</code> + <code>@Published</code> pattern.</p>
+
+    <h3>6.1 Why @Bindable exists</h3>
+
+    <p>Controls want <code>Binding</code>. Your model is a class instance with mutable properties. <code>@Bindable</code> tells the compiler to synthesize accessors that produce <code>Binding</code>s to individual properties while preserving observation.</p>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">CartEditor</span>: <span class="type">View</span> {
+    <span class="keyword">@Bindable</span> <span class="keyword">var</span> cart: <span class="type">Cart</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">TextField</span>(<span class="string">"Coupon"</span>, text: <span class="type">Binding</span>(
+            <span class="func">get</span>: { cart.couponCode ?? <span class="string">""</span> },
+            <span class="func">set</span>: { cart.couponCode = $0.<span class="func">isEmpty</span> ? <span class="keyword">nil</span> : $0 }
+        ))
+    }
+}</code></pre>
+
+    <p>When properties are non-optional value types, <code>@Bindable</code> also enables the same <code>$model.property</code> spelling people associate with <code>@State</code>, but the backing mechanism is different: you are projecting into an observable object’s storage, not a dedicated per-view heap box.</p>
+
+    <pre><code><span class="keyword">@Observable</span> <span class="keyword">final class</span> <span class="type">UserDraft</span> {
+    <span class="keyword">var</span> displayName: <span class="type">String</span> = <span class="string">""</span>
+}
+
+<span class="keyword">struct</span> <span class="type">ProfileForm</span>: <span class="type">View</span> {
+    <span class="keyword">@Bindable</span> <span class="keyword">var</span> draft: <span class="type">UserDraft</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">TextField</span>(<span class="string">"Name"</span>, text: $draft.displayName)  <span class="comment">// Binding from @Bindable</span>
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Ownership nuance</div>
+        <p><code>@Bindable</code> enables projections at the <em>use site</em>; it does not answer “who retains this model?” If a parent recreates the observable instance on every outer state change, children still bind correctly to the <strong>current</strong> instance — but you may wipe in-flight edits or duplicate side effects. Pair <code>@Bindable</code> with deliberate scoping: feature roots own models; leaves receive stable references.</p>
+    </div>
+
+    <h3>6.2 Difference from @Binding</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Wrapper</th>
+                <th>What it wraps</th>
+                <th>Typical use</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>@Binding</code></td>
+                <td>An existing <code>Binding&lt;T&gt;</code> passed from parent</td>
+                <td>Child receives two-way linkage without owning storage</td>
+            </tr>
+            <tr>
+                <td><code>@Bindable</code></td>
+                <td>An <code>@Observable</code> (or bindable) object</td>
+                <td>Derive <code>$property</code> bindings from reference model fields</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="observation-tracking">7. Observation tracking — <code>withObservationTracking</code></h2>
+
+    <p>Lower-level APIs in the Observation framework let you run a closure and record which observable properties it read. SwiftUI uses analogous machinery internally when evaluating view bodies against <code>@Observable</code> types.</p>
+
+    <h3>7.1 Single-shot tracking</h3>
+
+    <p><code>withObservationTracking</code> runs the <code>apply</code> closure once to establish dependencies, and registers an <code>onChange</code> handler to fire when tracked properties mutate. After that callback runs, <strong>you must re-enter tracking</strong> if you want future notifications — tracking is not a persistent Combine-style subscription unless you re-arm it.</p>
+
+    <div class="diagram">
+  Timeline (manual Observation tracking)
+  --------------------------------------
+  t0: withObservationTracking { read A,B } onChange: handler
+        |
+        +--> dependencies {A,B} registered for this generation
+  t1: write to A only
+        |
+        +--> onChange(handler) fires ONCE
+        |
+        +--> unless handler calls withObservationTracking again,
+             further writes will NOT notify this observer
+    </div>
+
+    <pre><code><span class="keyword">import</span> Observation
+
+<span class="keyword">func</span> <span class="func">watchCart</span>(<span class="keyword">_</span> cart: <span class="type">Cart</span>, <span class="keyword">on</span> update: <span class="keyword">@escaping</span> () -> <span class="type">Void</span>) {
+    <span class="keyword">func</span> <span class="func">recurse</span>() {
+        <span class="func">withObservationTracking</span> {
+            _ = cart.items.count   <span class="comment">// establish dependency</span>
+        } onChange: {
+            update()
+            <span class="func">recurse</span>()          <span class="comment">// re-register for next generation</span>
+        }
+    }
+    <span class="func">recurse</span>()
+}</code></pre>
+
+    <h3>7.2 How SwiftUI re-registers</h3>
+
+    <p>Each time SwiftUI evaluates a view’s <code>body</code>, it effectively performs a fresh dependency discovery pass for observable models touched during that evaluation. That is why you do not manually call <code>withObservationTracking</code> in typical app code — the framework wraps your <code>body</code> evaluation.</p>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Mental model</div>
+        <p>Think “pull-based + cached incremental”: a body read pulls current model fields; the runtime remembers which fields participated so subsequent writes enqueue minimal recomputation.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="published-vs-observable">8. Why @Published tends to fan out invalidation</h2>
+
+    <p>Combine-driven <code>ObservableObject</code> publishes <code>objectWillChange</code> before mutations visible to observers. Many SwiftUI view bodies capture the whole object or re-read multiple properties; in practice, dependency tracking may be coarser than the ideal “only the label that changed.”</p>
+
+    <h3>8.1 ObservableObject + @Published: broadcast flavor</h3>
+
+    <div class="diagram">
+ ObservableObject root
+        |
+        |  objectWillChange.send()
+        |
+        v
+  +-----+-----+-----+
+  |     |     |     |
+ View  View  View  View   (may all re-evaluate body)
+        ...
+    </div>
+
+    <h3>8.2 @Observable: property-scoped flavor (conceptual)</h3>
+
+    <div class="diagram">
+ @Observable Cart
+   |-- items  .............. observers A, C
+   '-- couponCode .......... observer B
+
+ mutation to couponCode
+        |
+        v
+ only subtree B invalidated (idealized; implementation may vary slightly)
+    </div>
+
+    <h3>8.3 Performance narrative for interviews</h3>
+
+    <p>Benchmarks depend on view complexity, but the <strong>asymptotic story</strong> matters: coarse invalidation multiplies work with large <code>body</code> trees; granular observation reduces redundant layout and diffing. Modern SwiftUI prefers <code>@Observable</code> for new model code partly for this scalability win.</p>
+
+    <div class="diagram">
+ Same screen, two child views
+ ═══════════════════════════════
+
+ ObservableObject + @Published on "ProfileModel"
+ ─────────────────────────────────────────────
+ @Published var avatarURL
+ @Published var bio
+        │
+        │  changing bio triggers objectWillChange
+        v
+ Parent body + AvatarView + BioEditor may all reconsider work
+ (exact fan-out depends on what parent read)
+
+
+ @Observable Profile
+ ───────────────────
+ avatarURL  ◄── AvatarView body depends only on this
+ bio        ◄── BioEditor depends only on this
+
+ mutating bio
+      │
+      v
+ AvatarView ideally skips (no read dependency on bio)
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Nuance</div>
+        <p>Even with <code>@Observable</code>, if a view’s <code>body</code> reads ten properties, it still depends on all ten. The win is that a <em>different</em> view that only read <code>couponCode</code> will not churn when <code>items</code> alone changes.</p>
+    </div>
+
+    <h3>8.4 Reducing accidental “read the world” dependencies</h3>
+
+    <p>Staff-level discussions often turn to <strong>dependency minimization</strong>: pass only the sub-values a child needs (strings, IDs, lightweight structs) rather than the entire model, so <code>body</code> evaluation does not eagerly touch unrelated observable fields. With <code>@Observable</code>, splitting read surfaces is even more valuable because it maps directly to finer invalidation.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="comparison">9. Master comparison tables</h2>
+
+    <h3>9.1 Property wrappers at a glance</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Wrapper</th>
+                <th>Wrapped / held type</th>
+                <th>Ownership</th>
+                <th>Invalidation mechanism</th>
+                <th>Typical scope</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>@State</code></td>
+                <td>Value type <code>T</code></td>
+                <td>SwiftUI graph owns heap slot</td>
+                <td>Dependency on read during <code>body</code></td>
+                <td>Local UI state</td>
+            </tr>
+            <tr>
+                <td><code>@Binding</code></td>
+                <td><code>Binding&lt;T&gt;</code></td>
+                <td>None — forwards get/set</td>
+                <td>Mutations propagate to source</td>
+                <td>Child controls, sheets</td>
+            </tr>
+            <tr>
+                <td><code>@StateObject</code></td>
+                <td><code>ObservableObject</code></td>
+                <td>SwiftUI retains instance</td>
+                <td><code>objectWillChange</code></td>
+                <td>View-created view models</td>
+            </tr>
+            <tr>
+                <td><code>@ObservedObject</code></td>
+                <td><code>ObservableObject</code></td>
+                <td>Caller owns instance</td>
+                <td><code>objectWillChange</code></td>
+                <td>Injected / parent-owned models</td>
+            </tr>
+            <tr>
+                <td><code>@EnvironmentObject</code></td>
+                <td><code>ObservableObject</code></td>
+                <td>Owned elsewhere; found via environment</td>
+                <td><code>objectWillChange</code></td>
+                <td>Cross-cutting shared services</td>
+            </tr>
+            <tr>
+                <td><code>@Environment</code></td>
+                <td>Various (value or reference)</td>
+                <td>Injected; defaults possible</td>
+                <td>Depends on type / equatability</td>
+                <td>System values, custom tokens</td>
+            </tr>
+            <tr>
+                <td><code>@Observable</code> (macro)</td>
+                <td>Class definition</td>
+                <td>You manage instance lifetime</td>
+                <td>Observation registrar / per-field</td>
+                <td>Model layer (iOS 17+)</td>
+            </tr>
+            <tr>
+                <td><code>@Bindable</code></td>
+                <td>Observable model instance</td>
+                <td>Per usage site</td>
+                <td>Bridging to <code>Binding</code></td>
+                <td>Forms editing <code>@Observable</code> models</td>
+            </tr>
+            <tr>
+                <td><code>@FetchRequest</code></td>
+                <td>Core Data results</td>
+                <td>Framework-managed</td>
+                <td>Context change notifications</td>
+                <td>Lists backed by CD</td>
+            </tr>
+            <tr>
+                <td><code>@Query</code> (SwiftData)</td>
+                <td>Persistent models</td>
+                <td>Framework-managed</td>
+                <td>Model context updates</td>
+                <td>SwiftData screens</td>
+            </tr>
+            <tr>
+                <td><code>@FocusState</code></td>
+                <td>Focus value / <code>Bool</code></td>
+                <td>Graph-backed like <code>@State</code></td>
+                <td>Focus changes invalidate readers</td>
+                <td>Keyboard focus, programmatic focus moves</td>
+            </tr>
+            <tr>
+                <td><code>@GestureState</code></td>
+                <td>Transient gesture value</td>
+                <td>SwiftUI resets on gesture end</td>
+                <td>Gesture callbacks</td>
+                <td>Drag offsets, press highlights</td>
+            </tr>
+            <tr>
+                <td><code>@AppStorage</code></td>
+                <td>Property list / UserDefaults value</td>
+                <td>Persisted externally</td>
+                <td>UserDefaults change notifications</td>
+                <td>Lightweight settings flags</td>
+            </tr>
+            <tr>
+                <td><code>@SceneStorage</code></td>
+                <td>Per-scene persisted value</td>
+                <td>System-scoped storage</td>
+                <td>Scene state restoration hooks</td>
+                <td>Multi-window document UI</td>
+            </tr>
+            <tr>
+                <td><code>@ScaledMetric</code></td>
+                <td>Scaled number / font metric</td>
+                <td>Derived from environment</td>
+                <td>Dynamic Type / size class changes</td>
+                <td>Accessible spacing constants</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3 id="wrappers-ecosystem">9.4 Extended ecosystem — wrappers you still get asked about</h3>
+
+    <p>Beyond the core interview set, large apps routinely mix persistence, focus, scenes, and data stacks. This table situates those tools relative to the state primitives above.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Wrapper / API</th>
+                <th>What it stores</th>
+                <th>Ownership / lifetime</th>
+                <th>Invalidation / updates</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>@AppStorage</code></td>
+                <td><code>UserDefaults</code> keys (property list types)</td>
+                <td>Process-wide defaults; persisted</td>
+                <td>Change notifications from defaults</td>
+                <td>Great for lightweight flags; not a general database</td>
+            </tr>
+            <tr>
+                <td><code>@SceneStorage</code></td>
+                <td>Per-scene restoration state</td>
+                <td>Scene/session scoped</td>
+                <td>Scene lifecycle + system restoration</td>
+                <td>Document window state, sidebar selection (where appropriate)</td>
+            </tr>
+            <tr>
+                <td><code>@GestureState</code></td>
+                <td>Transient gesture values</td>
+                <td>Gesture lifetime</td>
+                <td>Gesture callbacks</td>
+                <td>Resets automatically; perfect for drag offsets</td>
+            </tr>
+            <tr>
+                <td><code>@FocusState</code></td>
+                <td>Focus graph state (enum/bool)</td>
+                <td>SwiftUI focus system</td>
+                <td>Focus changes</td>
+                <td>Forms, keyboard routing; not a replacement for model state</td>
+            </tr>
+            <tr>
+                <td><code>@ScaledMetric</code></td>
+                <td>Scaled CGFloats from layout metrics</td>
+                <td>Derived from Dynamic Type / environment</td>
+                <td>Environment metric changes</td>
+                <td>Typography/layout adaptation, not business logic</td>
+            </tr>
+            <tr>
+                <td><code>@NSApplicationDelegateAdaptor</code> / <code>@UIApplicationDelegateAdaptor</code></td>
+                <td>Bridge to app delegate</td>
+                <td>System owns delegate object</td>
+                <td>UIKit/AppKit callbacks</td>
+                <td>Interop, not general-purpose view state</td>
+            </tr>
+            <tr>
+                <td><code>Observable()</code> macro + <code>withMutation</code> (generated)</td>
+                <td>Mutation tracking hooks</td>
+                <td>Inside @Observable class</td>
+                <td>Pairs with registrar</td>
+                <td>You do not call these manually in typical UI code</td>
+            </tr>
+            <tr>
+                <td><code>@SectionedFetchRequest</code></td>
+                <td>Sectioned Core Data results</td>
+                <td>Framework-managed</td>
+                <td>Context saves / FRC updates</td>
+                <td>List screens with Core Data sections</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3 id="comparison-choose">9.2 Choosing storage by problem shape</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Scenario</th>
+                <th>Prefer</th>
+                <th>Avoid</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Toggle expanded/collapsed section</td>
+                <td><code>@State</code></td>
+                <td>Singleton on app delegate</td>
+            </tr>
+            <tr>
+                <td>Editable text field in child</td>
+                <td><code>Binding</code> or <code>@Bindable</code></td>
+                <td>Callback soup without shared truth</td>
+            </tr>
+            <tr>
+                <td>Screen-local view model created by view</td>
+                <td><code>@StateObject</code></td>
+                <td><code>@ObservedObject</code> + <code>init</code> allocation</td>
+            </tr>
+            <tr>
+                <td>Shared session across tabs</td>
+                <td><code>@EnvironmentObject</code> or explicit coordinator</td>
+                <td>Deep prop drilling through ten layers</td>
+            </tr>
+            <tr>
+                <td>Large model with many independent fields on screen</td>
+                <td><code>@Observable</code></td>
+                <td>Giant <code>ObservableObject</code> with dozens of <code>@Published</code> if it causes churn</td>
+            </tr>
+            <tr>
+                <td>One-off animation flag</td>
+                <td><code>@State</code></td>
+                <td>Core Data write per frame</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3 id="comparison-combine">9.3 Combine vs Observation (conceptual)</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>ObservableObject + Combine</th>
+                <th>@Observable + Observation</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Change signal</td>
+                <td>Publisher / <code>objectWillChange</code></td>
+                <td>Registrar + per-property access lists</td>
+            </tr>
+            <tr>
+                <td>SwiftUI property wrapper for models in views</td>
+                <td><code>@StateObject</code> / <code>@ObservedObject</code></td>
+                <td>Plain stored properties + <code>@Bindable</code> when needed</td>
+            </tr>
+            <tr>
+                <td>Interop</td>
+                <td>Mature in older tutorials</td>
+                <td>Preferred for new greenfield (Apple direction)</td>
+            </tr>
+            <tr>
+                <td>Testing</td>
+                <td>Inject mocks conforming to protocol + ObservableObject</td>
+                <td>Inject @Observable classes; spy on state reads if needed</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">10. State architecture for large SwiftUI apps</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect must-know: avoid the god object</div>
+        <p>At L6, interviewers probe whether you can scale SwiftUI beyond demo apps. A single <code>AppState</code> with one hundred <code>@Published</code> properties becomes a change amplifier: any mutation risks fan-out, merge conflicts in a large team, and untestable entanglement. Split state into <strong>focused domains</strong> — authentication, navigation, feature modules — with explicit composition at the root.</p>
+        <ul>
+            <li><strong>Domain stores</strong>: one observable object or <code>@Observable</code> class per bounded context (e.g., <code>CartStore</code>, <code>InboxStore</code>).</li>
+            <li><strong>Routing state</strong>: keep navigation models separate from business entities; use value types where possible.</li>
+            <li><strong>Environment vs injection</strong>: reserve environment for truly global services; pass explicit dependencies into feature roots for clarity.</li>
+            <li><strong>Feature modules</strong>: expose narrow protocols to siblings; never reach through the graph to “the one true singleton.”</li>
+        </ul>
+        <p>For 50+ screens, adopt a pattern the team can repeat: a feature root <code>View</code> owns a <code>@StateObject</code> coordinator, children use <code>@ObservedObject</code> or bindings, and cross-feature events flow through an app-level event bus or coordinator — not ad-hoc environment writes from deep leaves.</p>
+    </div>
+
+    <h3>10.1 Layered diagram (ASCII)</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│ App entry: composes domains, installs environment objects   │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+        ┌───────────────────┼───────────────────┐
+        ▼                   ▼                   ▼
+  SessionDomain      NavigationCoordinator   SettingsDomain
+  (@Observable)      (@State / router model)  (ObservableObject)
+        │                   │                   │
+        └─────────┬─────────┴─────────┬─────────┘
+                  ▼                   ▼
+           Feature A root        Feature B root
+           @StateObject VM       @StateObject VM
+                  │                   │
+              child views         child views
+           @Binding / @Observed   @Binding / @Bindable
+    </div>
+
+    <h3>10.2 Migration strategy (ObservableObject → @Observable)</h3>
+
+    <p>Migrate leaf models first where win is clearest; keep adapters at module boundaries until Combine-based SDKs disappear. Run both styles temporarily behind protocols if you must share code with extensions or widgets.</p>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Closing framing</div>
+        <p>Staff engineers explain state as a <em>graph problem</em>: identities own storage, bindings are projections, objects have lifetimes, and observation determines work. Master those four axes and SwiftUI’s property wrappers become predictable rather than magical.</p>
+    </div>
+
+    <h3>10.3 Quick reference — interview questions</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Question</th>
+                <th>Answer kernel</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Why doesn’t my struct reset lose <code>@State</code>?</td>
+                <td>State is keyed by view identity in the attribute graph, not by struct instance address.</td>
+            </tr>
+            <tr>
+                <td>When must I use <code>@StateObject</code>?</td>
+                <td>When the view introduces the observable object instance that must survive parent redraws.</td>
+            </tr>
+            <tr>
+                <td>What does <code>$foo</code> mean?</td>
+                <td>Projected <code>Binding</code> (or bindable projection) for two-way UI linkage.</td>
+            </tr>
+            <tr>
+                <td>How does <code>@Observable</code> differ from <code>@Published</code>?</td>
+                <td>Field-level access tracking vs object-broadcast <code>objectWillChange</code> semantics.</td>
+            </tr>
+            <tr>
+                <td>Why did my preview crash?</td>
+                <td>Missing <code>.environmentObject</code> / required environment value.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="nav-footer">
+        <a href="02-view-identity-diffing.html">← View Identity</a>
+        <a href="04-layout-system.html">Next: Layout System →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Notifications &amp; Push — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">System Frameworks</a><span class="sep">›</span>
+        Notifications &amp; Push
+    </nav>
+
+    <div class="series-header">
+        <p style="margin-bottom: 12px;">
+            <span class="tag tag-l6">L6</span>
+            <span class="tag tag-architect">Architect</span>
+            <span class="tag tag-senior">Staff+</span>
+        </p>
+        <h1>Notifications &amp; Push</h1>
+        <p class="subtitle">Apple Push Notification service (APNs), <code>UserNotifications</code>, extensions, silent and background delivery, provider authentication, and the reliability tradeoffs you must own at Staff level. This chapter connects transport mechanics to product behavior: what users see, what the OS guarantees, and what your backend must infer from absence of acknowledgments.</p>
+    </div>
+
+    <div class="toc">
+        <h3>On This Page</h3>
+        <ul>
+            <li><a href="#apns-architecture">APNs Architecture</a></li>
+            <li><a href="#device-token">Device Token Lifecycle</a></li>
+            <li><a href="#unusernotificationcenter">UNUserNotificationCenter</a></li>
+            <li><a href="#service-extension">Notification Service Extension</a></li>
+            <li><a href="#content-extension">Notification Content Extension</a></li>
+            <li><a href="#silent-push">Silent Push (<code>content-available</code>)</a></li>
+            <li><a href="#background-push">Background Push &amp; <code>apns-push-type</code></a></li>
+            <li><a href="#reliability">Delivery Reliability &amp; Failure Modes</a></li>
+            <li><a href="#auth">JWT vs Certificate-Based Auth</a></li>
+            <li><a href="#rich">Rich Notifications &amp; Attachments</a></li>
+            <li><a href="#categories">Categories &amp; Actions</a></li>
+            <li><a href="#architect-scale">Architect: Push at Scale</a></li>
+        </ul>
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive</div>
+        <p>Staff interviews probe <strong>end-to-end causality</strong>: a 410 from APNs implies a token is dead, but a 200 does not prove the user ever saw an alert. Battery budgets, Low Power Mode, Focus filters, and per-notification settings all sit between your JSON payload and a human. The winning narrative separates <em>acceptance by APNs</em>, <em>delivery to device</em>, and <em>presentation in UI</em>.</p>
+    </div>
+
+    <h2 id="apns-architecture">APNs Architecture</h2>
+
+    <p>APNs is Apple&rsquo;s managed pub/sub edge for iOS, iPadOS, watchOS, tvOS, and macOS. Your <strong>provider</strong> (first-party backend or B2B partner) opens TLS connections to Apple&rsquo;s APNs HTTP/2 endpoint and POSTs notification requests. APNs authenticates the provider, validates the payload and topic, routes to the correct device, and hands off to userland services that wake or launch the appropriate app or extension.</p>
+
+    <div class="diagram">┌─────────────────┐     TLS / HTTP/2      ┌──────────────────────────────┐
+│  Your Provider  │ ───────────────────▶  │  APNs (Apple data centers)   │
+│  (server fleet) │ ◀───────────────────  │  - AuthN / rate / validation │
+└────────┬────────┘   JSON + headers       └──────────────┬───────────────┘
+         │                                                  │
+         │  Device token + topic + headers                  │ cellular / Wi‑Fi
+         │                                                  ▼
+         │                                       ┌──────────────────────┐
+         │                                       │  Device (persistent   │
+         │                                       │  connection to APNs) │
+         │                                       └──────────┬───────────┘
+         │                                                  │
+         │                                                  ▼
+         │                                       ┌──────────────────────┐
+         └──────────────────────────────────────▶│  SpringBoard /       │
+              (indirect: user taps notification)│  UserNotifications   │
+                                                └──────────────────────┘</div>
+
+    <h3>Full push flow (conceptual)</h3>
+    <ol>
+        <li><strong>Registration:</strong> App requests remote notification permission; system obtains or refreshes an APNs device token bound to <em>app + device + environment</em>.</li>
+        <li><strong>Upload:</strong> Client sends the opaque token string to your backend; you store it keyed by user/account and environment.</li>
+        <li><strong>Send:</strong> Provider builds an APNs request: <code>:path /3/device/{token}</code>, JSON payload, and required HTTP/2 headers (<code>apns-topic</code>, <code>apns-push-type</code>, <code>apns-priority</code>, etc.).</li>
+        <li><strong>Route:</strong> APNs maps token to a device connection and enqueues for delivery when reachable.</li>
+        <li><strong>Present or wake:</strong> If the notification is user-visible, the system may show a banner; if it is a background update, the runtime may launch the app briefly or deliver to an extension first (for <code>mutable-content</code>).</li>
+    </ol>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice</div>
+        <p>Treat APNs as a <strong>best-effort datagram service with strong auth</strong>, not a message queue with consumer acks. Design features so missing pushes degrade gracefully: periodic fetches, on-launch reconciliation, and server-side &ldquo;last known state&rdquo; that does not assume every device applied every silent update.</p>
+    </div>
+
+    <h3>HTTP/2 provider API</h3>
+    <p>Legacy binary protocol and the Feedback Service are obsolete for new work. The modern contract is HTTP/2: multiplexed streams, per-notification responses, and structured error bodies. Typical success is <code>200</code> with an empty body—meaning APNs accepted the message for delivery, not that the phone displayed it.</p>
+
+    <h3>Feedback Service vs HTTP/2 status codes</h3>
+    <p>The legacy Feedback Service polled for tokens that had permanently failed. With HTTP/2 APNs, <strong>unregistered devices</strong> surface as immediate errors on send—commonly <code>410 Gone</code> with a JSON reason such as <code>Unregistered</code> or <code>BadDeviceToken</code> when environment or topic mismatches occur. Operational playbooks should <strong>delete or quarantine</strong> tokens on 410 and backoff on 429.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall</div>
+        <p>Do not conflate &ldquo;HTTP 200 from APNs&rdquo; with &ldquo;push arrived.&rdquo; The device may be off-network for hours, the user may have disabled alerts for your app, or the system may defer low-priority work. Product metrics that count &ldquo;sends&rdquo; as &ldquo;impressions&rdquo; will lie.</p>
+    </div>
+
+    <h3>Environments and endpoints</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Environment</th>
+                <th>APNs hostname</th>
+                <th>When used</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Development (sandbox)</td>
+                <td><code>api.sandbox.push.apple.com</code></td>
+                <td>Debug builds, TestFlight in sandbox mode, Xcode-installed apps</td>
+            </tr>
+            <tr>
+                <td>Production</td>
+                <td><code>api.push.apple.com</code></td>
+                <td>App Store, Ad Hoc, enterprise signed for production APNs</td>
+            </tr>
+        </tbody>
+    </table>
+    <p>A <strong>topic mismatch</strong> (wrong bundle id / wrong entitlements) or sending a sandbox token to production yields hard failures. Staff-level systems keep <code>apns_env</code> per token and route sends through the correct endpoint and credential.</p>
+
+    <h2 id="device-token">Device Token Lifecycle</h2>
+
+    <p>The device token is an opaque identifier that lets APNs locate your app installation on a specific device. It is unique per <strong>application</strong>, <strong>device</strong>, and <strong>APNs environment</strong>. It is not a stable user id, not a hardware id, and not suitable as a long-lived primary key without pairing to your account model.</p>
+
+    <h3>Registration flow</h3>
+    <p>Calling <code>UIApplication.shared.registerForRemoteNotifications()</code> (or the equivalent on other platforms) tells the system you want a token. Actual issuance is asynchronous and may wait on network, parental controls, MDM restrictions, or user authorization for alerts—though note that token registration and alert permission are related but not identical in all OS versions and configurations.</p>
+
+    <pre><code><span class="comment">// AppDelegate or @main App conforming to UIApplicationDelegate</span>
+<span class="keyword">import</span> UIKit
+<span class="keyword">import</span> UserNotifications
+
+<span class="keyword">final</span> <span class="keyword">class</span> <span class="type">AppDelegate</span>: <span class="type">UIResponder</span>, <span class="type">UIApplicationDelegate</span> {
+
+    <span class="keyword">func</span> <span class="func">application</span>(
+        _ application: <span class="type">UIApplication</span>,
+        didFinishLaunchingWithOptions launchOptions: [<span class="type">UIApplication</span>.<span class="type">LaunchOptionsKey</span>: <span class="type">Any</span>]? = <span class="keyword">nil</span>
+    ) -&gt; <span class="type">Bool</span> {
+        <span class="type">UNUserNotificationCenter</span>.<span class="func">current</span>().<span class="func">delegate</span> = <span class="keyword">self</span>
+        application.<span class="func">registerForRemoteNotifications</span>()
+        <span class="keyword">return</span> <span class="keyword">true</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">application</span>(
+        _ application: <span class="type">UIApplication</span>,
+        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: <span class="type">Data</span>
+    ) {
+        <span class="keyword">let</span> hex = deviceToken.<span class="func">map</span> { <span class="type">String</span>(<span class="func">format</span>: <span class="string">"%02x"</span>, $0) }.<span class="func">joined</span>()
+        <span class="comment">// Upload `hex` to your backend with environment + app build metadata.</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">application</span>(
+        _ application: <span class="type">UIApplication</span>,
+        didFailToRegisterForRemoteNotificationsWithError error: <span class="type">Error</span>
+    ) {
+        <span class="comment">// Simulator without push, missing capability, MDM, user restrictions, etc.</span>
+    }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive</div>
+        <p>Historically tokens were often shown as 64-character hex (32 bytes). Apple has documented that <strong>format and length may change</strong>; always transmit the token as an opaque blob (hex or base64 consistently on your wire format) and never parse it for app logic. Your server should store the exact string you will place in the APNs URL path.</p>
+    </div>
+
+    <h3>When tokens refresh</h3>
+    <ul>
+        <li><strong>OS upgrade or restore</strong> can change the mapping between installation and token.</li>
+        <li><strong>Reinstall</strong> produces a new installation surface; treat as a new endpoint.</li>
+        <li><strong>Provisioning / signing changes</strong> in rare cases interact with how the system registers the app.</li>
+    </ul>
+    <p>Because refresh is possible <strong>without a reinstall</strong>, Apple recommends posting the token to your server <strong>on every launch</strong> (or whenever <code>didRegisterForRemoteNotificationsWithDeviceToken</code> fires), not only after login. Idempotent upsert by <code>(user_id, device_id, app_install_id)</code> avoids duplicates.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall</div>
+        <p>Storing one token per user globally loses multi-device reality. Model <strong>endpoints</strong>: user → many devices, each with token, locale, OS version, last_seen, and apns_environment.</p>
+    </div>
+
+    <h2 id="unusernotificationcenter">UNUserNotificationCenter API</h2>
+
+    <p><code>UserNotifications.framework</code> unifies local and remote notifications behind a single pipeline: authorization, settings, categories, presentation hooks, and action handling. Remote payloads still originate from APNs, but scheduling, foreground behavior, and action routing are client-side concerns.</p>
+
+    <h3>Authorization</h3>
+    <pre><code><span class="keyword">import</span> UserNotifications
+
+<span class="keyword">func</span> <span class="func">requestNotificationAuthorization</span>() {
+    <span class="keyword">let</span> center = <span class="type">UNUserNotificationCenter</span>.<span class="func">current</span>()
+    center.<span class="func">requestAuthorization</span>(options: [.alert, .badge, .sound, .provisional]) { granted, error <span class="keyword">in</span>
+        <span class="type">DispatchQueue</span>.main.<span class="func">async</span> {
+            <span class="type">UIApplication</span>.shared.<span class="func">registerForRemoteNotifications</span>()
+        }
+    }
+}</code></pre>
+    <p><code>provisional</code> authorization delivers quietly to Notification Center without a modal prompt—useful for onboarding flows when product policy allows. Respect <strong>Focus</strong>, per-thread settings, and the Settings deep link; query <code>getNotificationSettings</code> before assuming you can show UI.</p>
+
+    <h3>Local notification content and triggers</h3>
+    <pre><code><span class="keyword">func</span> <span class="func">scheduleLocalReminder</span>() {
+    <span class="keyword">let</span> content = <span class="type">UNMutableNotificationContent</span>()
+    content.title = <span class="string">"Staff interview"</span>
+    content.body = <span class="string">"Review APNs failure modes"</span>
+    content.sound = .default
+
+    <span class="keyword">let</span> trigger = <span class="type">UNTimeIntervalNotificationTrigger</span>(timeInterval: <span class="number">60</span>, repeats: <span class="keyword">false</span>)
+    <span class="keyword">let</span> request = <span class="type">UNNotificationRequest</span>(identifier: <span class="string">"reminder-1"</span>, content: content, trigger: trigger)
+    <span class="type">UNUserNotificationCenter</span>.<span class="func">current</span>().<span class="func">add</span>(request)
+}</code></pre>
+    <p>Triggers include <code>UNCalendarNotificationTrigger</code>, <code>UNLocationNotificationTrigger</code>, and for push, the trigger is implicit when APNs delivers. Use <code>UNUserNotificationCenter</code> to inspect <strong>pending</strong> (scheduled) and <strong>delivered</strong> notifications where APIs allow.</p>
+
+    <h3>Foreground presentation</h3>
+    <pre><code><span class="keyword">extension</span> <span class="type">AppDelegate</span>: <span class="type">UNUserNotificationCenterDelegate</span> {
+    <span class="keyword">func</span> <span class="func">userNotificationCenter</span>(
+        _ center: <span class="type">UNUserNotificationCenter</span>,
+        willPresent notification: <span class="type">UNNotification</span>,
+        withCompletionHandler completionHandler: @escaping (<span class="type">UNNotificationPresentationOptions</span>) -&gt; <span class="type">Void</span>
+    ) {
+        completionHandler([.banner, .sound, .badge])
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice</div>
+        <p>Centralize notification handling in a small type injected from the app entry point: parse userInfo once, map to domain events, and avoid scattering <code>userInfo</code> key string literals across modules. At Staff scale, consider code generation or shared constants between server and client for payload contracts.</p>
+    </div>
+
+    <h2 id="service-extension">Notification Service Extension</h2>
+
+    <p>The <strong>Notification Service Extension</strong> (NSE) runs when a remote notification arrives with <code>mutable-content: 1</code>. It executes <em>before</em> the user sees the banner (subject to timeouts), letting you decrypt fields, rewrite title/body, attach media, or drop sensitive plaintext from the initial wire payload.</p>
+
+    <div class="diagram">APNs delivers payload (mutable-content: 1)
+        │
+        ▼
+┌───────────────────────────────┐
+│ Notification Service Ext.     │  &lt;── ~30s budget, ~24MB memory
+│ didReceive(_:withContent...)   │
+└───────────────┬───────────────┘
+                │ contentHandler(modified) OR
+                │ serviceExtensionTimeWillExpire()
+                ▼
+┌───────────────────────────────┐
+│ System presents notification  │
+│ (banner / sound / badge)      │
+└───────────────────────────────┘
+                │
+                ▼ (user long-presses)
+┌───────────────────────────────┐
+│ Content Extension (optional)  │
+└───────────────────────────────┘</div>
+
+    <pre><code><span class="keyword">import</span> UserNotifications
+
+<span class="keyword">class</span> <span class="type">NotificationService</span>: <span class="type">UNNotificationServiceExtension</span> {
+
+    <span class="keyword">var</span> contentHandler: ((<span class="type">UNNotificationContent</span>) -&gt; <span class="type">Void</span>)?
+    <span class="keyword">var</span> bestAttemptContent: <span class="type">UNMutableNotificationContent</span>?
+
+    <span class="keyword">override</span> <span class="keyword">func</span> <span class="func">didReceive</span>(
+        _ request: <span class="type">UNNotificationRequest</span>,
+        withContentHandler contentHandler: @escaping (<span class="type">UNNotificationContent</span>) -&gt; <span class="type">Void</span>
+    ) {
+        <span class="keyword">self</span>.contentHandler = contentHandler
+        bestAttemptContent = (request.content.<span class="func">mutableCopy</span>() <span class="keyword">as</span>? <span class="type">UNMutableNotificationContent</span>)
+
+        <span class="keyword">guard</span> <span class="keyword">let</span> bestAttemptContent <span class="keyword">else</span> {
+            contentHandler(request.content)
+            <span class="keyword">return</span>
+        }
+
+        <span class="comment">// Example: download attachment, decrypt title from userInfo, etc.</span>
+        bestAttemptContent.title = <span class="string">"Updated title"</span>
+
+        <span class="keyword">if</span> <span class="keyword">let</span> urlString = bestAttemptContent.userInfo[<span class="string">"media"</span>] <span class="keyword">as</span>? <span class="type">String</span>,
+           <span class="keyword">let</span> url = <span class="type">URL</span>(string: urlString) {
+            <span class="func">downloadAttachment</span>(url: url) { attachment <span class="keyword">in</span>
+                <span class="keyword">if</span> <span class="keyword">let</span> attachment { bestAttemptContent.attachments = [attachment] }
+                contentHandler(bestAttemptContent)
+            }
+            <span class="keyword">return</span>
+        }
+
+        contentHandler(bestAttemptContent)
+    }
+
+    <span class="keyword">override</span> <span class="keyword">func</span> <span class="func">serviceExtensionTimeWillExpire</span>() {
+        <span class="keyword">if</span> <span class="keyword">let</span> contentHandler, <span class="keyword">let</span> bestAttemptContent {
+            contentHandler(bestAttemptContent)
+        }
+    }
+
+    <span class="keyword">private</span> <span class="keyword">func</span> <span class="func">downloadAttachment</span>(url: <span class="type">URL</span>, completion: @escaping (<span class="type">UNNotificationAttachment</span>?) -&gt; <span class="type">Void</span>) {
+        <span class="comment">// Move file into a temp directory with correct extension for UTType.</span>
+        completion(<span class="keyword">nil</span>)
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall</div>
+        <p>The NSE runs in a separate process with a tight memory ceiling (commonly cited around <strong>24MB</strong>—treat this as an order-of-magnitude contract, not something to flirt with). Large media downloads, complex decryption, or leaking caches cause Jetsam kills and fallback content. You <strong>cannot</strong> read arbitrary files from the host app container; use <strong>App Groups</strong> or encrypted attachments with keys shared via the group container or Keychain Access Group.</p>
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive</div>
+        <p>End-to-end encrypted notifications often send ciphertext and a key id in <code>userInfo</code>. The NSE pulls keys from the group Keychain, decrypts, and sets human-readable title/body so they never appear in plaintext on the APNs wire—reducing exposure to provider logs and third-party push middleboxes.</p>
+    </div>
+
+    <h2 id="content-extension">Notification Content Extension</h2>
+
+    <p>A <strong>Notification Content Extension</strong> provides a custom interface when the user expands the notification (long press / 3D Touch historically). It implements <code>UNNotificationContentExtension</code> in a view controller embedded by the system.</p>
+
+    <pre><code><span class="keyword">import</span> UIKit
+<span class="keyword">import</span> UserNotifications
+<span class="keyword">import</span> UserNotificationsUI
+
+<span class="keyword">class</span> <span class="type">NotificationViewController</span>: <span class="type">UIViewController</span>, <span class="type">UNNotificationContentExtension</span> {
+
+    <span class="keyword">func</span> <span class="func">didReceive</span>(_ notification: <span class="type">UNNotification</span>) {
+        <span class="keyword">let</span> userInfo = notification.request.content.userInfo
+        <span class="comment">// Bind models to UI — keep layout within system size constraints.</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">didReceive</span>(_ response: <span class="type">UNNotificationResponse</span>, completionHandler completion: @escaping () -&gt; <span class="type">Void</span>) {
+        <span class="comment">// Handle inline custom actions if configured.</span>
+        <span class="func">completion</span>()
+    }
+}</code></pre>
+
+    <p>Extensions can support limited media playback. Constraints matter: scrolling is restricted, height is bounded, and memory/time budgets are not as generous as your main app. Prefer lightweight views and defer heavy work to the main app via URLs or deep links.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall</div>
+        <p>Assuming the content extension can replicate full app navigation creates fragile UX. Design for <strong>glanceable</strong> summaries and a single primary CTA that opens the host app.</p>
+    </div>
+
+    <h2 id="silent-push">Silent Push (<code>content-available</code>)</h2>
+
+    <p>Silent pushes carry <code>"content-available": 1</code> in the root JSON object (and typically omit alert/sound/badge). They are meant to <strong>nudge</strong> the app to download fresh data in the background. iOS delivers them by waking your process and calling:</p>
+    <ul>
+        <li><code>application(_:didReceiveRemoteNotification:fetchCompletionHandler:)</code> on <code>UIApplicationDelegate</code>, and/or</li>
+        <li>the background URL session / BGAppRefresh patterns you combine with push triggers where appropriate.</li>
+    </ul>
+
+    <pre><code><span class="keyword">func</span> <span class="func">application</span>(
+    _ application: <span class="type">UIApplication</span>,
+    didReceiveRemoteNotification userInfo: [<span class="type">AnyHashable</span>: <span class="type">Any</span>],
+    fetchCompletionHandler completionHandler: @escaping (<span class="type">UIBackgroundFetchResult</span>) -&gt; <span class="type">Void</span>
+) {
+    <span class="comment">// Perform short network + disk work; call completionHandler exactly once.</span>
+    <span class="func">syncInbox</span> { result <span class="keyword">in</span>
+        completionHandler(result)
+    }
+}</code></pre>
+
+    <p>System policy: roughly <strong>30 seconds</strong> of background execution, aggressive <strong>rate limiting</strong> if you abuse wakes, and no user-visible banner. Failing to call the completion handler or calling it twice corrupts scheduling heuristics for your app.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall</div>
+        <p>Silent push is <strong>not a cron substitute</strong>. Low battery, Data Saver expectations, and user behavior can starve delivery for long periods. Never implement financial correctness solely on silent push.</p>
+    </div>
+
+    <h2 id="background-push">Background Push &amp; <code>apns-push-type</code></h2>
+
+    <p>On the provider side, Apple distinguishes push types via the <code>apns-push-type</code> header. For background/throttled updates, you send <code>apns-push-type: background</code> together with <code>apns-priority: 5</code> (power-aware). Contrast with alert pushes that use <code>apns-push-type: alert</code> (and typically priority 10).</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive</div>
+        <p><strong>Background pushes are budgeted.</strong> The OS learns your app&rsquo;s pattern: completion handler results (<code>newData</code>, <code>noData</code>, <code>failed</code>) influence future delivery enthusiasm. Chronic failures or no-ops teach the system to deprioritize your wakes—an operational detail SRE and mobile leads must monitor together.</p>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Silent / background update</th>
+                <th>User-visible alert push</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Typical <code>apns-push-type</code></td>
+                <td><code>background</code></td>
+                <td><code>alert</code></td>
+            </tr>
+            <tr>
+                <td>Typical priority</td>
+                <td><code>5</code></td>
+                <td><code>10</code></td>
+            </tr>
+            <tr>
+                <td>User visibility</td>
+                <td>None</td>
+                <td>Banner / sound / badge</td>
+            </tr>
+            <tr>
+                <td>Delivery guarantees</td>
+                <td>Best effort, deferred</td>
+                <td>Best effort; still not guaranteed</td>
+            </tr>
+            <tr>
+                <td>Primary risk</td>
+                <td>Throttling &amp; battery policy</td>
+                <td>User settings &amp; Focus</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice</div>
+        <p>Coalesce server-side: one silent push should unlock a batch fetch, not a per-row ping storm. On the client, exit quickly with accurate <code>UIBackgroundFetchResult</code> to preserve your push budget.</p>
+    </div>
+
+    <h2 id="reliability">Push Delivery Reliability &amp; Failure Modes</h2>
+
+    <p>Staff-level answers enumerate concrete loss points and what telemetry can observe:</p>
+    <ul>
+        <li><strong>Device offline:</strong> APNs holds messages for a limited time window for many notification types, but not indefinitely; expired notifications are dropped.</li>
+        <li><strong>Invalid token:</strong> Returns 410 from HTTP/2 API—purge endpoint.</li>
+        <li><strong>Payload size:</strong> Maximum payload currently <strong>4096 bytes</strong>; exceed and APNs rejects before routing.</li>
+        <li><strong>Throttling:</strong> Too many connections or sends → 429; per-app background wake throttling on device.</li>
+        <li><strong>Low priority:</strong> Priority 5 pushes may be deferred heavily under load and power constraints.</li>
+        <li><strong>Power management:</strong> Low Power Mode, thermal limits, and user habits.</li>
+        <li><strong>User-controlled filters:</strong> Notification off, Deliver Quietly, Focus modes, Scheduled Summary.</li>
+    </ul>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive</div>
+        <p>Monitoring <strong>delivery rate</strong> as &ldquo;APNs 200 / attempted sends&rdquo; is only the first layer. Add client analytics for <code>didReceiveRemoteNotification</code> and extension entry (privacy reviewed), correlate with app sessions, and track 410 rates by OS version. For campaigns, measure influenced opens vs control—not raw send counts.</p>
+    </div>
+
+    <h2 id="auth">Token-Based Auth (JWT) vs Certificate-Based</h2>
+
+    <p>APNs authenticates providers with either a traditional TLS client certificate (often distributed as <code>.p12</code>) or <strong>token-based authentication</strong> using a private key (<code>.p8</code>) and signed JWTs.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Dimension</th>
+                <th>Certificate (.p12)</th>
+                <th>Token (.p8 / JWT)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Rotation</td>
+                <td>Yearly renewal per certificate</td>
+                <td>Key rotation on your policy; JWTs are short-lived</td>
+            </tr>
+            <tr>
+                <td>Scope</td>
+                <td>Tied to explicit App ID / cert chain</td>
+                <td>Team-scoped key; topics still enforced per push</td>
+            </tr>
+            <tr>
+                <td>Operational burden</td>
+                <td>Export, store, rotate secrets per app/env</td>
+                <td>One key can sign for many topics (still least privilege in practice)</td>
+            </tr>
+            <tr>
+                <td>Protocol header</td>
+                <td>TLS mutual auth with cert</td>
+                <td><code>authorization: bearer {signed JWT}</code></td>
+            </tr>
+            <tr>
+                <td>Migration</td>
+                <td>Legacy stacks</td>
+                <td>Preferred for new services and multi-app fleets</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <p><strong>JWT structure (conceptual):</strong> header (algorithm <code>ES256</code>, key id <code>kid</code>), claims (<code>iss</code> team id, <code>iat</code> issued at), signed with your <code>.p8</code> private key. Providers cache signed tokens for up to an hour in typical implementations to reduce CPU load, regenerating before expiry.</p>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice</div>
+        <p>Store signing keys in a managed secret backend (HSM/KMS where policy requires), never commit <code>.p8</code> to git, and automate rotation with dual-key overlap. Separate staging and production keys to prevent cross-environment catastrophes.</p>
+    </div>
+
+    <h2 id="rich">Rich Notifications &amp; Attachments</h2>
+
+    <p>Rich notifications attach media shown inline or as thumbnails. For remote notifications, you usually set <code>mutable-content: 1</code> and let the NSE download assets, constructing <code>UNNotificationAttachment</code> instances saved as files on disk (correct file extension and UTType matter).</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Media</th>
+                <th>Typical use</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Image (<code>jpg</code>, <code>png</code>, <code>gif</code>)</td>
+                <td>Marketing, social previews</td>
+                <td>Watch attachment limits stricter than phone</td>
+            </tr>
+            <tr>
+                <td>Audio / video</td>
+                <td>Podcasts, clips</td>
+                <td>Large files risk NSE timeout—use CDN close to edge</td>
+            </tr>
+            <tr>
+                <td>Custom thumbnails</td>
+                <td>Branded collapsed state</td>
+                <td>Configure options on attachment where supported</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall</div>
+        <p>Download failures in the NSE should degrade to text-only quickly; do not block until timeout every time or users experience delayed banners.</p>
+    </div>
+
+    <h2 id="categories">Notification Categories &amp; Actions</h2>
+
+    <p>Categories map notification types to up to ten actions (system limits apply). Declare them at runtime with <code>UNNotificationCategory</code> and reference the category identifier from the push payload (<code>category</code> in the <code>aps</code> dictionary).</p>
+
+    <pre><code><span class="keyword">func</span> <span class="func">registerCategories</span>() {
+    <span class="keyword">let</span> reply = <span class="type">UNTextInputNotificationAction</span>(
+        identifier: <span class="string">"MESSAGE_REPLY"</span>,
+        title: <span class="string">"Reply"</span>,
+        options: [],
+        textInputButtonTitle: <span class="string">"Send"</span>,
+        textInputPlaceholder: <span class="string">"Message…"</span>
+    )
+    <span class="keyword">let</span> archive = <span class="type">UNNotificationAction</span>(
+        identifier: <span class="string">"ARCHIVE"</span>,
+        title: <span class="string">"Archive"</span>,
+        options: [.authenticationRequired]
+    )
+    <span class="keyword">let</span> destructive = <span class="type">UNNotificationAction</span>(
+        identifier: <span class="string">"DELETE"</span>,
+        title: <span class="string">"Delete"</span>,
+        options: [.destructive, .foreground]
+    )
+
+    <span class="keyword">let</span> category = <span class="type">UNNotificationCategory</span>(
+        identifier: <span class="string">"MAIL_THREAD"</span>,
+        actions: [reply, archive, destructive],
+        intentIdentifiers: [],
+        options: [.customDismissAction]
+    )
+
+    <span class="type">UNUserNotificationCenter</span>.<span class="func">current</span>().<span class="func">setNotificationCategories</span>([category])
+}</code></pre>
+
+    <pre><code><span class="keyword">extension</span> <span class="type">AppDelegate</span>: <span class="type">UNUserNotificationCenterDelegate</span> {
+    <span class="keyword">func</span> <span class="func">userNotificationCenter</span>(
+        _ center: <span class="type">UNUserNotificationCenter</span>,
+        didReceive response: <span class="type">UNNotificationResponse</span>,
+        withCompletionHandler completionHandler: @escaping () -&gt; <span class="type">Void</span>
+    ) {
+        <span class="keyword">switch</span> response.actionIdentifier {
+        <span class="keyword">case</span> <span class="type">UNNotificationDefaultActionIdentifier</span>, <span class="type">UNNotificationDismissActionIdentifier</span>:
+            <span class="keyword">break</span>
+        <span class="keyword">default</span>:
+            <span class="keyword">break</span>
+        }
+        completionHandler()
+    }
+}</code></pre>
+
+    <p>Action options change behavior: <code>.foreground</code> launches the app to handle the action; <code>.authenticationRequired</code> demands device unlock; destructive styling warns on destructive actions. Foreground vs background activation affects whether your scene delegate sees a full UI transition—plan state restoration accordingly.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Comparison</th>
+                <th>Local</th>
+                <th>Remote</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Origin</td>
+                <td>Scheduled on-device</td>
+                <td>Issued by your provider via APNs</td>
+            </tr>
+            <tr>
+                <td>Payload mutability</td>
+                <td>Full control before schedule</td>
+                <td>Limited by 4KB; NSE can mutate if enabled</td>
+            </tr>
+            <tr>
+                <td>Ideal for</td>
+                <td>Timers, alarms, local reminders</td>
+                <td>Cross-device sync, marketing, messaging</td>
+            </tr>
+            <tr>
+                <td>Failure modes</td>
+                <td>App uninstalled, permissions revoked</td>
+                <td>Token invalid, throttling, network, user settings</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h2 id="architect-scale">Architect: Reliable Push Infrastructure at Scale</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must Know</div>
+        <p>At global scale, push is a <strong>distributed systems problem wearing a mobile API</strong>. You need: (1) <strong>token lifecycle</strong>—idempotent registration, environment separation, 410 tombstoning; (2) <strong>send pipeline</strong>—HTTP/2 connection pooling to APNs, exponential backoff on 429, circuit breakers per topic; (3) <strong>payload governance</strong>—versioned schemas, feature flags, size budgets; (4) <strong>extension strategy</strong>—NSE for secrets and media, content extensions only where ROI is clear; (5) <strong>observability</strong>—APNs status histograms, device-side sampling (with privacy review), synthetic devices in QA; (6) <strong>fallbacks</strong>—pull on open, WebSocket/chat sync for messaging, email/SMS for critical paths where policy allows.</p>
+        <p>Silent push reliability disputes should be resolved with <strong>explicit SLIs</strong>: time-to-sync percentiles after server-side state changes, not &ldquo;did we get 200 from Apple?&rdquo; Educate PMs that background delivery is a hint. For marketing pushes, prefer frequency caps and relevance to avoid notification fatigue that nukes opt-in rates—an architecture concern because it changes permission state and invalidates growth models.</p>
+    </div>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice</div>
+        <p>Run <strong>staging APNs</strong> with sandbox tokens only; never mix credentials on one connection pool. Load-test providers with realistic batch sizes and measure TLS handshake reuse. Document incident runbooks for mass 410 spikes (bad deploy swapping bundle id) versus 403 mis-signing (clock skew, wrong <code>kid</code>).</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="03-swift-runtime.html">← Swift Runtime</a>
+        <a href="05-inter-process-communication.html">Inter-Process Communication →</a>
+    </div>
+</div>
+</body>
+</html>

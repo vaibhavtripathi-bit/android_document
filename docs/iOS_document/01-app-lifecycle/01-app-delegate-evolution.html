@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AppDelegate Evolution — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">App Lifecycle</a><span class="sep">›</span>
+        AppDelegate Evolution
+    </nav>
+
+    <h1>AppDelegate Evolution</h1>
+    <p class="subtitle">From UIApplicationDelegate in iOS 2 to SwiftUI's @main — the complete history of how iOS apps bootstrap, and the pre-main internals every Staff engineer must understand.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#pre-main">1. The Pre-main Boot Sequence</a></li>
+            <li><a href="#uiapplicationmain">2. UIApplicationMain &amp; the @main Attribute</a></li>
+            <li><a href="#responder-chain">3. UIApplicationDelegate as UIResponder Subclass</a></li>
+            <li><a href="#will-vs-did">4. willFinishLaunching vs didFinishLaunching</a></li>
+            <li><a href="#evolution">5. Evolution: iOS 2 → iOS 13 → iOS 14+</a></li>
+            <li><a href="#swiftui-app">6. SwiftUI App Protocol &amp; @main</a></li>
+            <li><a href="#full-boot">7. Full Boot Sequence: Icon Tap to First Frame</a></li>
+            <li><a href="#architect">8. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="pre-main">1. The Pre-main Boot Sequence</h2>
+
+    <p>Before your Swift code ever executes, the operating system performs a complex series of steps to prepare your process. Understanding this is critical for optimizing app launch time — a key metric at scale.</p>
+
+    <h3>1.1 dyld4 — The Dynamic Linker</h3>
+
+    <p>When the kernel creates a process for your app, it maps the Mach-O binary into memory and hands control to <code>dyld</code> (the dynamic linker). Since iOS 15 / macOS 12, Apple uses <strong>dyld4</strong>, which introduced significant performance improvements over dyld3.</p>
+
+    <div class="diagram">
+Kernel: fork + exec
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│                    dyld4                         │
+│                                                  │
+│  1. Load shared cache (pre-linked system libs)   │
+│  2. Parse Mach-O load commands                   │
+│  3. Map dependent dylibs into memory             │
+│  4. Perform rebasing (ASLR slide)                │
+│  5. Perform binding (resolve external symbols)   │
+│  6. Run initializers:                            │
+│     a. C++ static constructors                   │
+│     b. ObjC +load methods                        │
+│     c. __attribute__((constructor)) functions    │
+│  7. Jump to main()                               │
+└─────────────────────────────────────────────────┘
+    </div>
+
+    <h4>dyld Shared Cache</h4>
+    <p>Apple pre-links all system frameworks (UIKit, Foundation, CoreGraphics, etc.) into a single shared cache file. This is a massive optimization — your app doesn't need to individually load and link hundreds of system dylibs. The shared cache is mapped into every process at the same address, enabling efficient sharing of read-only pages across all running apps.</p>
+
+    <h4>ASLR and Rebasing</h4>
+    <p>Address Space Layout Randomization (ASLR) loads your binary at a random base address for security. Since the Mach-O was compiled with a preferred base address, all internal pointers must be adjusted by the ASLR slide. This is <strong>rebasing</strong>. dyld4 uses "closures" — pre-computed data about how to load your app — cached to disk after the first launch, making subsequent launches faster.</p>
+
+    <h3>1.2 +load vs +initialize</h3>
+
+    <p>Two Objective-C class methods run during startup, but at very different times and with very different implications:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th><code>+load</code></th>
+                <th><code>+initialize</code></th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>When called</td>
+                <td>During dyld initialization, before <code>main()</code></td>
+                <td>Lazily, before first message to the class</td>
+            </tr>
+            <tr>
+                <td>Thread safety</td>
+                <td>Called with the runtime lock held (serial)</td>
+                <td>Thread-safe via dispatch_once-like mechanism</td>
+            </tr>
+            <tr>
+                <td>Inheritance</td>
+                <td>Not inherited — each class's own +load runs</td>
+                <td>Inherited — subclass may trigger super's</td>
+            </tr>
+            <tr>
+                <td>Category behavior</td>
+                <td>Category +load runs separately after class +load</td>
+                <td>Category +initialize replaces class implementation</td>
+            </tr>
+            <tr>
+                <td>Impact on launch</td>
+                <td><strong>Directly adds to pre-main time</strong></td>
+                <td>Deferred — no launch impact</td>
+            </tr>
+            <tr>
+                <td>Use case</td>
+                <td>Method swizzling (only valid place)</td>
+                <td>Lazy one-time setup</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall</div>
+        <p>Every <code>+load</code> method adds directly to your pre-main time. At scale, third-party SDKs often sneak in +load methods. Audit with: <code>otool -oV YourApp | grep -A1 "load"</code>. A Staff engineer should know that eliminating unnecessary +load calls is one of the highest-ROI launch optimizations.</p>
+    </div>
+
+    <h3>1.3 Static Initializers</h3>
+
+    <p>C++ static constructors and <code>__attribute__((constructor))</code> functions also run before <code>main()</code>. In Swift, global variables with complex initializers can trigger these. The key insight: <strong>Swift global lets are lazily initialized</strong> (via <code>dispatch_once</code>), but <strong>ObjC/C++ globals are not</strong>.</p>
+
+    <pre><code><span class="comment">// Swift: This is lazy — initialized on first access (safe)</span>
+<span class="keyword">let</span> sharedManager = <span class="type">NetworkManager</span>()
+
+<span class="comment">// C++: This runs BEFORE main() — adds to pre-main time</span>
+<span class="comment">// static std::string kDefaultEndpoint = "https://api.example.com";</span>
+
+<span class="comment">// ObjC: +load runs before main()</span>
+<span class="comment">// + (void)load { /* swizzle something */ }</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Measuring Pre-main Time</div>
+        <p>Set the environment variable <code>DYLD_PRINT_STATISTICS=1</code> in your Xcode scheme to see a breakdown of pre-main time:</p>
+        <pre><code>Total pre-main time: 347.42 ms
+  dylib loading time: 182.34 ms
+  rebase/binding time:  23.18 ms
+  ObjC setup time:      41.67 ms
+  initializer time:    100.23 ms</code></pre>
+        <p>For iOS 15+, use <code>DYLD_PRINT_STATISTICS_DETAILS=1</code> for even more granularity. In production, use <code>MetricKit</code>'s <code>MXAppLaunchMetric</code> to track launch time across your user base.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="uiapplicationmain">2. UIApplicationMain &amp; the @main Attribute</h2>
+
+    <h3>2.1 The Traditional Entry Point</h3>
+
+    <p>In Objective-C, every iOS app had an explicit <code>main.m</code> file:</p>
+
+    <pre><code><span class="comment">// main.m — the traditional entry point</span>
+<span class="keyword">int</span> <span class="func">main</span>(<span class="keyword">int</span> argc, <span class="keyword">char</span> *argv[]) {
+    <span class="keyword">@autoreleasepool</span> {
+        <span class="keyword">return</span> <span class="func">UIApplicationMain</span>(argc, argv, <span class="keyword">nil</span>, 
+            <span class="func">NSStringFromClass</span>([<span class="type">AppDelegate</span> <span class="keyword">class</span>]));
+    }
+}</code></pre>
+
+    <p><code>UIApplicationMain</code> does the following, in order:</p>
+    <ol>
+        <li>Creates the <code>UIApplication</code> singleton (or a custom subclass if the 3rd parameter is non-nil)</li>
+        <li>Creates an instance of the delegate class (4th parameter)</li>
+        <li>Sets the delegate on the UIApplication singleton</li>
+        <li>Starts the main run loop (<code>CFRunLoopRun</code>)</li>
+        <li><strong>Never returns</strong> — the function signature returns <code>Int</code> but it runs the run loop forever</li>
+    </ol>
+
+    <h3>2.2 Swift's @UIApplicationMain</h3>
+
+    <p>Swift eliminated the explicit <code>main.swift</code> file with the <code>@UIApplicationMain</code> attribute (later renamed to <code>@main</code>):</p>
+
+    <pre><code><span class="comment">// Pre-iOS 14: @UIApplicationMain</span>
+<span class="keyword">@UIApplicationMain</span>
+<span class="keyword">class</span> <span class="type">AppDelegate</span>: <span class="type">UIResponder</span>, <span class="type">UIApplicationDelegate</span> {
+    <span class="keyword">var</span> window: <span class="type">UIWindow</span>?
+    
+    <span class="keyword">func</span> <span class="func">application</span>(
+        <span class="keyword">_</span> application: <span class="type">UIApplication</span>,
+        didFinishLaunchingWithOptions launchOptions: [<span class="type">UIApplication</span>.<span class="type">LaunchOptionsKey</span>: <span class="type">Any</span>]?
+    ) -> <span class="type">Bool</span> {
+        <span class="keyword">return</span> <span class="keyword">true</span>
+    }
+}</code></pre>
+
+    <h3>2.3 The @main Attribute (Swift 5.3+)</h3>
+
+    <p>Swift 5.3 introduced the generalized <code>@main</code> attribute. Any type with a static <code>main()</code> method can be the entry point. UIKit's <code>UIApplicationDelegate</code> protocol extension provides this automatically:</p>
+
+    <pre><code><span class="comment">// iOS 14+: @main replaces @UIApplicationMain</span>
+<span class="keyword">@main</span>
+<span class="keyword">class</span> <span class="type">AppDelegate</span>: <span class="type">UIResponder</span>, <span class="type">UIApplicationDelegate</span> {
+    <span class="comment">// The compiler synthesizes:</span>
+    <span class="comment">// static func main() {</span>
+    <span class="comment">//     UIApplicationMain(</span>
+    <span class="comment">//         CommandLine.argc,</span>
+    <span class="comment">//         CommandLine.unsafeArgv,</span>
+    <span class="comment">//         nil,</span>
+    <span class="comment">//         NSStringFromClass(Self.self)</span>
+    <span class="comment">//     )</span>
+    <span class="comment">// }</span>
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Why @main is More Than Syntactic Sugar</div>
+        <p>The <code>@main</code> attribute works with <strong>any</strong> type that has a static <code>main()</code>. This is how SwiftUI's <code>App</code> protocol works — it provides a default <code>main()</code> implementation that bootstraps the SwiftUI runtime instead of calling <code>UIApplicationMain</code>. This decouples the entry point from UIKit entirely.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="responder-chain">3. UIApplicationDelegate as UIResponder Subclass</h2>
+
+    <p>A frequently overlooked detail: <code>AppDelegate</code> inherits from <code>UIResponder</code>, not <code>NSObject</code>. This is intentional and architecturally significant.</p>
+
+    <h3>3.1 The Responder Chain Integration</h3>
+
+    <div class="diagram">
+Touch/Event Responder Chain:
+
+UIView (first responder)
+   │
+   ▼
+UIViewController
+   │
+   ▼
+UIWindow
+   │
+   ▼
+UIWindowScene (iOS 13+)
+   │
+   ▼
+UIApplication ◀── singleton, also a UIResponder
+   │
+   ▼
+AppDelegate ◀── LAST in the responder chain
+    </div>
+
+    <p>Because <code>AppDelegate</code> is a <code>UIResponder</code>, it sits at the <strong>end of the responder chain</strong>. Any event that isn't handled by views, view controllers, windows, or the application itself will bubble up to the app delegate. This enables:</p>
+
+    <ul>
+        <li><strong>Remote notification handling</strong> — <code>UIResponder</code> methods like <code>remoteControlReceived(with:)</code></li>
+        <li><strong>Motion events</strong> — shake gestures that no view handles</li>
+        <li><strong>Key commands</strong> — hardware keyboard shortcuts via <code>keyCommands</code></li>
+        <li><strong>Undo/redo</strong> — application-wide undo manager</li>
+        <li><strong>Menu actions</strong> — unhandled menu bar actions (Catalyst/iPad)</li>
+    </ul>
+
+    <pre><code><span class="keyword">class</span> <span class="type">AppDelegate</span>: <span class="type">UIResponder</span>, <span class="type">UIApplicationDelegate</span> {
+    
+    <span class="comment">// AppDelegate can handle events that bubble up the entire chain</span>
+    <span class="keyword">override</span> <span class="keyword">var</span> canBecomeFirstResponder: <span class="type">Bool</span> { <span class="keyword">true</span> }
+    
+    <span class="comment">// Handle hardware keyboard shortcuts at the app level</span>
+    <span class="keyword">override</span> <span class="keyword">var</span> keyCommands: [<span class="type">UIKeyCommand</span>]? {
+        [
+            <span class="type">UIKeyCommand</span>(
+                title: <span class="string">"New Document"</span>,
+                action: <span class="keyword">#selector</span>(newDocument),
+                input: <span class="string">"n"</span>,
+                modifierFlags: .command
+            )
+        ]
+    }
+    
+    <span class="keyword">@objc</span> <span class="keyword">func</span> <span class="func">newDocument</span>() {
+        <span class="comment">// Handle Cmd+N at the application level</span>
+    }
+    
+    <span class="comment">// Handle remote control events (audio playback controls)</span>
+    <span class="keyword">override</span> <span class="keyword">func</span> <span class="func">remoteControlReceived</span>(with event: <span class="type">UIEvent</span>?) {
+        <span class="keyword">guard let</span> event = event <span class="keyword">else</span> { <span class="keyword">return</span> }
+        <span class="keyword">switch</span> event.subtype {
+        <span class="keyword">case</span> .remoteControlPlay:
+            <span class="type">AudioPlayer</span>.shared.<span class="func">play</span>()
+        <span class="keyword">case</span> .remoteControlPause:
+            <span class="type">AudioPlayer</span>.shared.<span class="func">pause</span>()
+        <span class="keyword">default</span>: <span class="keyword">break</span>
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>In scene-based apps (iOS 13+), the responder chain was extended: <code>UIView → UIViewController → UIWindow → UIWindowScene → UIApplication → AppDelegate</code>. The <code>UIWindowScene</code> is now in the chain, which means scene delegates can also participate in event handling. This is critical for multi-window apps where different scenes might handle the same key command differently.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="will-vs-did">4. willFinishLaunching vs didFinishLaunching</h2>
+
+    <h3>4.1 Ordering and Purpose</h3>
+
+    <pre><code><span class="keyword">func</span> <span class="func">application</span>(
+    <span class="keyword">_</span> application: <span class="type">UIApplication</span>,
+    willFinishLaunchingWithOptions launchOptions: [<span class="type">UIApplication</span>.<span class="type">LaunchOptionsKey</span>: <span class="type">Any</span>]?
+) -> <span class="type">Bool</span> {
+    <span class="comment">// FIRST callback. App state: .inactive</span>
+    <span class="comment">// State restoration happens BETWEEN will and did</span>
+    <span class="comment">// Use for: essential setup that state restoration depends on</span>
+    <span class="keyword">return</span> <span class="keyword">true</span>
+}
+
+<span class="keyword">func</span> <span class="func">application</span>(
+    <span class="keyword">_</span> application: <span class="type">UIApplication</span>,
+    didFinishLaunchingWithOptions launchOptions: [<span class="type">UIApplication</span>.<span class="type">LaunchOptionsKey</span>: <span class="type">Any</span>]?
+) -> <span class="type">Bool</span> {
+    <span class="comment">// SECOND callback. State restoration is complete.</span>
+    <span class="comment">// Use for: final setup, analytics, feature flags, UI customization</span>
+    <span class="keyword">return</span> <span class="keyword">true</span>
+}</code></pre>
+
+    <div class="diagram">
+UIApplicationMain called
+         │
+         ▼
+willFinishLaunchingWithOptions ◀── App state: .inactive
+         │
+         ▼
+   State Restoration          ◀── NSCoder-based restoration happens here
+         │
+         ▼
+didFinishLaunchingWithOptions  ◀── App state: still .inactive
+         │
+         ▼
+  Scene Connection (iOS 13+)   ◀── scene(_:willConnectTo:options:)
+         │
+         ▼
+applicationDidBecomeActive     ◀── App state: .active (pre-iOS 13)
+    ─── OR ───
+sceneDidBecomeActive           ◀── Scene state: .foregroundActive (iOS 13+)
+    </div>
+
+    <h3>4.2 What to Do in Each</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Task</th>
+                <th>willFinish</th>
+                <th>didFinish</th>
+                <th>Why</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Core Data stack setup</td>
+                <td>Yes</td>
+                <td></td>
+                <td>State restoration may need the persistent store</td>
+            </tr>
+            <tr>
+                <td>Register for remote notifications</td>
+                <td></td>
+                <td>Yes</td>
+                <td>Needs app to be fully initialized</td>
+            </tr>
+            <tr>
+                <td>Analytics SDK init</td>
+                <td></td>
+                <td>Yes</td>
+                <td>Non-essential; keep willFinish fast</td>
+            </tr>
+            <tr>
+                <td>Feature flag fetch</td>
+                <td></td>
+                <td>Yes</td>
+                <td>Network-dependent, non-blocking</td>
+            </tr>
+            <tr>
+                <td>Appearance customization</td>
+                <td></td>
+                <td>Yes</td>
+                <td>After restoration so it doesn't conflict</td>
+            </tr>
+            <tr>
+                <td>Dependency injection container</td>
+                <td>Yes</td>
+                <td></td>
+                <td>Other setup code depends on it</td>
+            </tr>
+            <tr>
+                <td>URL/notification handling check</td>
+                <td></td>
+                <td>Yes</td>
+                <td>Check launchOptions for pending URLs/notifications</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: Return Value</div>
+        <p>Returning <code>false</code> from <code>willFinishLaunchingWithOptions</code> tells the system your app cannot handle the launch URL. The system will <strong>not</strong> call <code>application(_:open:options:)</code>. However, returning <code>false</code> does <strong>not</strong> prevent the app from launching — it only affects URL handling. Many developers confuse this with "abort launch."</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="evolution">5. Evolution: iOS 2 → iOS 13 → iOS 14+</h2>
+
+    <h3>5.1 Era 1: iOS 2–12 — AppDelegate Owns Everything</h3>
+
+    <pre><code><span class="comment">// The "classic" AppDelegate — one window, one lifecycle</span>
+<span class="keyword">@UIApplicationMain</span>
+<span class="keyword">class</span> <span class="type">AppDelegate</span>: <span class="type">UIResponder</span>, <span class="type">UIApplicationDelegate</span> {
+    <span class="keyword">var</span> window: <span class="type">UIWindow</span>?
+    
+    <span class="keyword">func</span> <span class="func">application</span>(<span class="keyword">_</span> app: <span class="type">UIApplication</span>,
+        didFinishLaunchingWithOptions opts: [<span class="type">UIApplication</span>.<span class="type">LaunchOptionsKey</span>: <span class="type">Any</span>]?) -> <span class="type">Bool</span> {
+        window = <span class="type">UIWindow</span>(frame: <span class="type">UIScreen</span>.main.bounds)
+        window?.rootViewController = <span class="type">MainViewController</span>()
+        window?.makeKeyAndVisible()
+        <span class="keyword">return</span> <span class="keyword">true</span>
+    }
+    
+    <span class="comment">// Lifecycle was app-level, not scene-level</span>
+    <span class="keyword">func</span> <span class="func">applicationDidBecomeActive</span>(<span class="keyword">_</span> app: <span class="type">UIApplication</span>) { }
+    <span class="keyword">func</span> <span class="func">applicationWillResignActive</span>(<span class="keyword">_</span> app: <span class="type">UIApplication</span>) { }
+    <span class="keyword">func</span> <span class="func">applicationDidEnterBackground</span>(<span class="keyword">_</span> app: <span class="type">UIApplication</span>) { }
+    <span class="keyword">func</span> <span class="func">applicationWillEnterForeground</span>(<span class="keyword">_</span> app: <span class="type">UIApplication</span>) { }
+}</code></pre>
+
+    <p>In this era, the AppDelegate was responsible for:</p>
+    <ul>
+        <li>Creating and owning the single <code>UIWindow</code></li>
+        <li>All lifecycle transitions (active, inactive, background, foreground)</li>
+        <li>State restoration</li>
+        <li>URL handling</li>
+        <li>Remote notification registration and handling</li>
+        <li>Background fetch</li>
+    </ul>
+
+    <h3>5.2 Era 2: iOS 13 — Scene-Based Lifecycle</h3>
+
+    <p>iOS 13 introduced <code>UIScene</code> to support multi-window on iPad. This was the biggest architectural shift in UIKit's history:</p>
+
+    <pre><code><span class="comment">// iOS 13+: AppDelegate loses lifecycle duties to SceneDelegate</span>
+<span class="keyword">@main</span>
+<span class="keyword">class</span> <span class="type">AppDelegate</span>: <span class="type">UIResponder</span>, <span class="type">UIApplicationDelegate</span> {
+    <span class="comment">// NO more window property</span>
+    <span class="comment">// NO more lifecycle methods (they're ignored if scenes are adopted)</span>
+    
+    <span class="keyword">func</span> <span class="func">application</span>(<span class="keyword">_</span> app: <span class="type">UIApplication</span>,
+        didFinishLaunchingWithOptions opts: [<span class="type">UIApplication</span>.<span class="type">LaunchOptionsKey</span>: <span class="type">Any</span>]?) -> <span class="type">Bool</span> {
+        <span class="comment">// Process-level setup only</span>
+        <span class="keyword">return</span> <span class="keyword">true</span>
+    }
+    
+    <span class="comment">// NEW: Scene configuration</span>
+    <span class="keyword">func</span> <span class="func">application</span>(<span class="keyword">_</span> app: <span class="type">UIApplication</span>,
+        configurationForConnecting session: <span class="type">UISceneSession</span>,
+        options: <span class="type">UIScene</span>.<span class="type">ConnectionOptions</span>) -> <span class="type">UISceneConfiguration</span> {
+        <span class="keyword">return</span> <span class="type">UISceneConfiguration</span>(
+            name: <span class="string">"Default"</span>,
+            sessionRole: session.role
+        )
+    }
+    
+    <span class="comment">// NEW: Scene disconnection</span>
+    <span class="keyword">func</span> <span class="func">application</span>(<span class="keyword">_</span> app: <span class="type">UIApplication</span>,
+        didDiscardSceneSessions sessions: <span class="type">Set</span>&lt;<span class="type">UISceneSession</span>&gt;) {
+        <span class="comment">// Clean up resources for discarded scenes</span>
+    }
+}
+
+<span class="keyword">class</span> <span class="type">SceneDelegate</span>: <span class="type">UIResponder</span>, <span class="type">UIWindowSceneDelegate</span> {
+    <span class="keyword">var</span> window: <span class="type">UIWindow</span>?
+    
+    <span class="keyword">func</span> <span class="func">scene</span>(<span class="keyword">_</span> scene: <span class="type">UIScene</span>,
+        willConnectTo session: <span class="type">UISceneSession</span>,
+        options: <span class="type">UIScene</span>.<span class="type">ConnectionOptions</span>) {
+        <span class="keyword">guard let</span> windowScene = scene <span class="keyword">as?</span> <span class="type">UIWindowScene</span> <span class="keyword">else</span> { <span class="keyword">return</span> }
+        window = <span class="type">UIWindow</span>(windowScene: windowScene)
+        window?.rootViewController = <span class="type">MainViewController</span>()
+        window?.makeKeyAndVisible()
+    }
+    
+    <span class="comment">// Lifecycle is now per-scene</span>
+    <span class="keyword">func</span> <span class="func">sceneDidBecomeActive</span>(<span class="keyword">_</span> scene: <span class="type">UIScene</span>) { }
+    <span class="keyword">func</span> <span class="func">sceneWillResignActive</span>(<span class="keyword">_</span> scene: <span class="type">UIScene</span>) { }
+    <span class="keyword">func</span> <span class="func">sceneDidEnterBackground</span>(<span class="keyword">_</span> scene: <span class="type">UIScene</span>) { }
+    <span class="keyword">func</span> <span class="func">sceneWillEnterForeground</span>(<span class="keyword">_</span> scene: <span class="type">UIScene</span>) { }
+}</code></pre>
+
+    <h3>5.3 Responsibility Split</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Responsibility</th>
+                <th>Pre-iOS 13 (AppDelegate)</th>
+                <th>iOS 13+ (Split)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Process launch</td>
+                <td>AppDelegate</td>
+                <td>AppDelegate</td>
+            </tr>
+            <tr>
+                <td>Window creation</td>
+                <td>AppDelegate</td>
+                <td><strong>SceneDelegate</strong></td>
+            </tr>
+            <tr>
+                <td>Lifecycle (active/background)</td>
+                <td>AppDelegate</td>
+                <td><strong>SceneDelegate</strong></td>
+            </tr>
+            <tr>
+                <td>State restoration</td>
+                <td>AppDelegate</td>
+                <td><strong>SceneDelegate</strong></td>
+            </tr>
+            <tr>
+                <td>URL handling</td>
+                <td>AppDelegate</td>
+                <td><strong>SceneDelegate</strong> (via ConnectionOptions)</td>
+            </tr>
+            <tr>
+                <td>Remote notification registration</td>
+                <td>AppDelegate</td>
+                <td>AppDelegate (unchanged)</td>
+            </tr>
+            <tr>
+                <td>Scene configuration</td>
+                <td>N/A</td>
+                <td>AppDelegate</td>
+            </tr>
+            <tr>
+                <td>Scene cleanup</td>
+                <td>N/A</td>
+                <td>AppDelegate</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>5.4 Era 3: iOS 14+ — SwiftUI App Protocol</h3>
+
+    <p>SwiftUI introduced the <code>App</code> protocol, which can entirely replace both AppDelegate and SceneDelegate:</p>
+
+    <pre><code><span class="keyword">@main</span>
+<span class="keyword">struct</span> <span class="type">MyApp</span>: <span class="type">App</span> {
+    <span class="comment">// @UIApplicationDelegateAdaptor bridges to UIKit when needed</span>
+    <span class="keyword">@UIApplicationDelegateAdaptor</span>(<span class="type">AppDelegate</span>.<span class="keyword">self</span>) <span class="keyword">var</span> appDelegate
+    
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">Scene</span> {
+        <span class="type">WindowGroup</span> {
+            <span class="type">ContentView</span>()
+        }
+    }
+}
+
+<span class="comment">// Still need AppDelegate for push notifications, etc.</span>
+<span class="keyword">class</span> <span class="type">AppDelegate</span>: <span class="type">NSObject</span>, <span class="type">UIApplicationDelegate</span> {
+    <span class="keyword">func</span> <span class="func">application</span>(<span class="keyword">_</span> app: <span class="type">UIApplication</span>,
+        didRegisterForRemoteNotificationsWithDeviceToken token: <span class="type">Data</span>) {
+        <span class="comment">// Handle push token</span>
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="swiftui-app">6. SwiftUI App Protocol &amp; @main</h2>
+
+    <h3>6.1 How SwiftUI Bootstraps</h3>
+
+    <p>When you use <code>@main</code> on a SwiftUI <code>App</code> struct, the compiler generates a <code>static func main()</code> that does <strong>not</strong> call <code>UIApplicationMain</code>. Instead, it:</p>
+
+    <ol>
+        <li>Creates a <code>UIApplication</code> instance (still needed for system integration)</li>
+        <li>Creates the SwiftUI app struct</li>
+        <li>Evaluates the <code>body</code> to get <code>Scene</code> declarations</li>
+        <li>Maps SwiftUI <code>Scene</code> types to UIKit <code>UIScene</code> configurations</li>
+        <li>Starts the main run loop</li>
+    </ol>
+
+    <h3>6.2 Scene Types in SwiftUI</h3>
+
+    <pre><code><span class="keyword">@main</span>
+<span class="keyword">struct</span> <span class="type">MyApp</span>: <span class="type">App</span> {
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">Scene</span> {
+        <span class="comment">// WindowGroup: multi-instance windows (maps to UIWindowScene)</span>
+        <span class="type">WindowGroup</span> {
+            <span class="type">ContentView</span>()
+        }
+        
+        <span class="comment">// DocumentGroup: document-based apps</span>
+        <span class="type">DocumentGroup</span>(newDocument: <span class="type">MyDocument</span>()) { file <span class="keyword">in</span>
+            <span class="type">DocumentEditor</span>(document: file.$document)
+        }
+        
+        <span class="comment">// Settings: macOS/Catalyst preferences window</span>
+        <span class="keyword">#if</span> os(macOS)
+        <span class="type">Settings</span> {
+            <span class="type">PreferencesView</span>()
+        }
+        <span class="keyword">#endif</span>
+    }
+}</code></pre>
+
+    <h3>6.3 @UIApplicationDelegateAdaptor Limitations</h3>
+
+    <p>The adaptor bridges UIKit delegate methods to SwiftUI, but not all methods are forwarded. Notably:</p>
+    <ul>
+        <li><code>application(_:configurationForConnecting:options:)</code> — <strong>NOT forwarded</strong>; SwiftUI manages scene configuration</li>
+        <li><code>application(_:didDiscardSceneSessions:)</code> — <strong>NOT forwarded</strong></li>
+        <li>Push notification methods — forwarded</li>
+        <li><code>application(_:didFinishLaunchingWithOptions:)</code> — forwarded</li>
+        <li>Background URL session methods — forwarded</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2 id="full-boot">7. Full Boot Sequence: Icon Tap to First Frame</h2>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│                    FULL iOS APP BOOT SEQUENCE                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ① KERNEL (XNU)                                                  │
+│     fork() → exec() → load Mach-O → map pages → start dyld      │
+│                                                                  │
+│  ② DYLD4 (Pre-main)                                    ~100ms   │
+│     Load shared cache → map dylibs → rebase → bind               │
+│     → ObjC class registration → +load methods                    │
+│     → C++ static constructors → jump to main()                   │
+│                                                                  │
+│  ③ UIApplicationMain                                    ~10ms    │
+│     Create UIApplication singleton                                │
+│     Create AppDelegate instance                                   │
+│     Set delegate on UIApplication                                 │
+│     Start main RunLoop                                            │
+│                                                                  │
+│  ④ WILL FINISH LAUNCHING                                ~5ms     │
+│     application(_:willFinishLaunchingWithOptions:)                │
+│     → Core Data stack, DI container, essential setup              │
+│                                                                  │
+│  ⑤ STATE RESTORATION (if applicable)                    ~20ms    │
+│     Decode saved state → recreate view controller hierarchy       │
+│                                                                  │
+│  ⑥ DID FINISH LAUNCHING                                ~50ms    │
+│     application(_:didFinishLaunchingWithOptions:)                 │
+│     → Analytics, feature flags, push registration                 │
+│                                                                  │
+│  ⑦ SCENE CONNECTION (iOS 13+)                           ~10ms    │
+│     scene(_:willConnectTo:options:)                               │
+│     → Create UIWindow, set rootViewController                     │
+│     → makeKeyAndVisible()                                         │
+│                                                                  │
+│  ⑧ LAYOUT PASS                                          ~20ms    │
+│     layoutSubviews() cascade                                      │
+│     Auto Layout constraint solving                                │
+│                                                                  │
+│  ⑨ FIRST RENDER                                         ~16ms    │
+│     CATransaction commit → render server → GPU → display          │
+│     Launch storyboard dismissed → first app frame visible         │
+│                                                                  │
+│  ⑩ ACTIVE                                                        │
+│     sceneDidBecomeActive / applicationDidBecomeActive             │
+│                                                                  │
+│  Total: ~200-400ms (target: <400ms warm, <1s cold)               │
+└─────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Launch Time Budget</div>
+        <p>Apple's guidelines: cold launch should complete in under 400ms. The system watchdog will kill your app if launch takes more than 20 seconds. At Google scale, target p95 cold launch under 1 second. Key optimizations:</p>
+        <ul>
+            <li>Eliminate <code>+load</code> methods (move to <code>+initialize</code> or lazy init)</li>
+            <li>Reduce dylib count (merge frameworks, use static linking)</li>
+            <li>Defer non-essential work past first frame</li>
+            <li>Use <code>os_signpost</code> to instrument each phase</li>
+            <li>Profile with Instruments App Launch template</li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">8. Architect Considerations</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: Scene-Based Lifecycle Broke Singleton Patterns</div>
+        <p>The transition to scene-based lifecycle in iOS 13 was the most significant architectural disruption in UIKit's history. Here's why:</p>
+        <p><strong>The Problem:</strong> Pre-iOS 13, apps had one window, one lifecycle. Singletons like <code>AppState.shared</code> mapped naturally to this model. With multi-window, you now have multiple scenes, each with its own lifecycle, potentially showing different content.</p>
+        <p><strong>What Broke:</strong></p>
+        <ul>
+            <li><code>UIScreen.main</code> — which screen? Multiple scenes can be on different screens</li>
+            <li><code>UIApplication.shared.keyWindow</code> — deprecated; there's no single "key" window</li>
+            <li>Singleton state managers that assumed one active view hierarchy</li>
+            <li>Deep link handlers that push onto "the" navigation stack</li>
+            <li>Alert presenters that use <code>topViewController</code> heuristics</li>
+        </ul>
+        <p><strong>The Architectural Solution:</strong></p>
+        <ul>
+            <li>Separate <strong>process-scoped</strong> state (user session, auth tokens, caches) from <strong>scene-scoped</strong> state (navigation, UI state, selected tab)</li>
+            <li>Use dependency injection to provide scene-specific context rather than singletons</li>
+            <li>Design navigation routers that accept a scene/window parameter</li>
+            <li>Use <code>UIScene.session.persistentIdentifier</code> to key scene-specific data</li>
+        </ul>
+    </div>
+
+    <h3>8.1 Process-Scoped vs Scene-Scoped State</h3>
+
+    <pre><code><span class="comment">// Process-scoped: shared across all scenes (singleton OK)</span>
+<span class="keyword">final class</span> <span class="type">AuthManager</span> {
+    <span class="keyword">static let</span> shared = <span class="type">AuthManager</span>()
+    <span class="keyword">var</span> currentUser: <span class="type">User</span>?
+    <span class="keyword">var</span> accessToken: <span class="type">String</span>?
+}
+
+<span class="comment">// Scene-scoped: unique per scene instance</span>
+<span class="keyword">final class</span> <span class="type">SceneState</span>: <span class="type">ObservableObject</span> {
+    <span class="keyword">let</span> sceneIdentifier: <span class="type">String</span>
+    <span class="keyword">@Published</span> <span class="keyword">var</span> selectedTab: <span class="type">Tab</span> = .home
+    <span class="keyword">@Published</span> <span class="keyword">var</span> navigationPath: [<span class="type">Route</span>] = []
+    
+    <span class="keyword">init</span>(session: <span class="type">UISceneSession</span>) {
+        <span class="keyword">self</span>.sceneIdentifier = session.persistentIdentifier
+    }
+}
+
+<span class="comment">// Scene state registry: maps scene IDs to their state</span>
+<span class="keyword">final class</span> <span class="type">SceneStateRegistry</span> {
+    <span class="keyword">static let</span> shared = <span class="type">SceneStateRegistry</span>()
+    <span class="keyword">private var</span> states: [<span class="type">String</span>: <span class="type">SceneState</span>] = [:]
+    
+    <span class="keyword">func</span> <span class="func">state</span>(for session: <span class="type">UISceneSession</span>) -> <span class="type">SceneState</span> {
+        <span class="keyword">if let</span> existing = states[session.persistentIdentifier] {
+            <span class="keyword">return</span> existing
+        }
+        <span class="keyword">let</span> newState = <span class="type">SceneState</span>(session: session)
+        states[session.persistentIdentifier] = newState
+        <span class="keyword">return</span> newState
+    }
+    
+    <span class="keyword">func</span> <span class="func">removeState</span>(for session: <span class="type">UISceneSession</span>) {
+        states.removeValue(forKey: session.persistentIdentifier)
+    }
+}</code></pre>
+
+    <h3>8.2 Launch Time Architecture at Scale</h3>
+
+    <pre><code><span class="comment">// Phased launch: defer work past first frame</span>
+<span class="keyword">final class</span> <span class="type">LaunchCoordinator</span> {
+    <span class="keyword">enum</span> <span class="type">Phase</span> {
+        <span class="keyword">case</span> critical    <span class="comment">// Before first frame: DI, Core Data, auth check</span>
+        <span class="keyword">case</span> important   <span class="comment">// First idle: analytics, feature flags, prefetch</span>
+        <span class="keyword">case</span> deferred    <span class="comment">// After 2s: non-essential SDKs, prewarming</span>
+    }
+    
+    <span class="keyword">private var</span> tasks: [<span class="type">Phase</span>: [() -> <span class="type">Void</span>]] = [:]
+    
+    <span class="keyword">func</span> <span class="func">register</span>(phase: <span class="type">Phase</span>, task: <span class="keyword">@escaping</span> () -> <span class="type">Void</span>) {
+        tasks[phase, <span class="keyword">default</span>: []].<span class="func">append</span>(task)
+    }
+    
+    <span class="keyword">func</span> <span class="func">executeCritical</span>() {
+        tasks[.critical]?.<span class="func">forEach</span> { $0() }
+    }
+    
+    <span class="keyword">func</span> <span class="func">schedulePostLaunch</span>() {
+        <span class="type">DispatchQueue</span>.main.<span class="func">async</span> { [<span class="keyword">self</span>] <span class="keyword">in</span>
+            tasks[.important]?.<span class="func">forEach</span> { $0() }
+        }
+        <span class="type">DispatchQueue</span>.main.<span class="func">asyncAfter</span>(deadline: .now() + <span class="number">2.0</span>) { [<span class="keyword">self</span>] <span class="keyword">in</span>
+            tasks[.deferred]?.<span class="func">forEach</span> { $0() }
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Startup Instrumentation</div>
+        <p>Instrument every phase of your launch with <code>os_signpost</code>:</p>
+        <pre><code><span class="keyword">import</span> os
+
+<span class="keyword">let</span> launchLog = <span class="type">OSLog</span>(subsystem: <span class="string">"com.app.launch"</span>, category: .pointsOfInterest)
+
+<span class="keyword">func</span> <span class="func">application</span>(<span class="keyword">_</span> app: <span class="type">UIApplication</span>,
+    didFinishLaunchingWithOptions opts: [<span class="type">UIApplication</span>.<span class="type">LaunchOptionsKey</span>: <span class="type">Any</span>]?) -> <span class="type">Bool</span> {
+    <span class="func">os_signpost</span>(.begin, log: launchLog, name: <span class="string">"didFinishLaunching"</span>)
+    <span class="comment">// ... setup ...</span>
+    <span class="func">os_signpost</span>(.end, log: launchLog, name: <span class="string">"didFinishLaunching"</span>)
+    <span class="keyword">return</span> <span class="keyword">true</span>
+}</code></pre>
+    </div>
+
+    <div class="nav-footer">
+        <a href="index.html">← Series Index</a>
+        <a href="02-scene-lifecycle.html">Next: Scene Lifecycle →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rendering Pipeline — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">UIKit View System</a><span class="sep">›</span>
+        Rendering Pipeline
+    </nav>
+
+    <h1>Rendering Pipeline</h1>
+    <p class="subtitle">Core Animation commit transactions, the render server (backboardd), GPU compositing, off-screen rendering triggers, CADisplayLink, and achieving 120fps on ProMotion displays.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#pipeline-overview">1. Pipeline Overview</a></li>
+            <li><a href="#catransaction">2. CATransaction: Implicit vs Explicit</a></li>
+            <li><a href="#layer-display">3. CALayer Display Cycle</a></li>
+            <li><a href="#offscreen-rendering">4. Off-Screen Rendering Triggers</a></li>
+            <li><a href="#compositing">5. Compositing</a></li>
+            <li><a href="#metal-backing">6. Metal Backing</a></li>
+            <li><a href="#cadisplaylink">7. CADisplayLink &amp; ProMotion</a></li>
+            <li><a href="#architect-120fps">8. Architect: Achieving 120fps</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="pipeline-overview">1. Pipeline Overview</h2>
+    <!-- ============================================================ -->
+
+    <p>The Core Animation rendering pipeline is a <strong>two-process architecture</strong>. Your app prepares the layer tree, then hands it off to a separate system process (the render server) that does the actual GPU compositing. This split is fundamental to understanding iOS rendering performance.</p>
+
+    <div class="diagram">
+THE CORE ANIMATION RENDERING PIPELINE
+═══════════════════════════════════════════════════════════════════
+
+  APP PROCESS                          RENDER SERVER (backboardd)
+  ═══════════════                      ═══════════════════════════
+
+  ┌─────────────────┐
+  │  1. HANDLE EVENT │  ← RunLoop processes touch/timer/etc.
+  │     (your code)  │
+  └────────┬────────┘
+           ▼
+  ┌─────────────────┐
+  │  2. COMMIT       │  ← End of RunLoop iteration
+  │  TRANSACTION     │
+  │                  │
+  │  a. Layout pass  │  ← layoutSubviews() called
+  │  b. Display pass │  ← draw(_:) called (if needed)
+  │  c. Prepare      │  ← Image decoding, format conversion
+  │  d. Serialize    │  ← Layer tree encoded for IPC
+  │                  │
+  └────────┬────────┘
+           │
+           │  Mach IPC (serialized layer tree)
+           │
+           ▼
+                                       ┌─────────────────────┐
+                                       │  3. RENDER SERVER     │
+                                       │     (backboardd)      │
+                                       │                       │
+                                       │  a. Deserialize tree  │
+                                       │  b. Build render tree  │
+                                       │  c. Submit to GPU     │
+                                       └───────────┬───────────┘
+                                                   │
+                                                   ▼
+                                       ┌─────────────────────┐
+                                       │  4. GPU COMPOSITING   │
+                                       │                       │
+                                       │  a. Vertex shaders    │
+                                       │  b. Fragment shaders  │
+                                       │  c. Compositing       │
+                                       │  d. Write to frame    │
+                                       │     buffer            │
+                                       └───────────┬───────────┘
+                                                   │
+                                                   ▼
+                                       ┌─────────────────────┐
+                                       │  5. DISPLAY           │
+                                       │     Frame buffer →    │
+                                       │     Screen refresh    │
+                                       └─────────────────────┘
+
+  TIMING (at 60fps, 16.67ms per frame):
+  ┌──────────┬──────────┬──────────┬──────────┐
+  │ Frame N  │          │          │          │
+  │ App:     │ Render:  │ GPU:     │ Display: │
+  │ Commit   │ Process  │ Compose  │ Show     │
+  │ ~8ms     │ ~4ms     │ ~4ms     │ VSync    │
+  └──────────┴──────────┴──────────┴──────────┘
+  │◄──────── Total pipeline latency: ~3 frames ────────►│
+    </div>
+
+    <h3>Why Two Processes?</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Benefit</th>
+                <th>Explanation</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Crash isolation</strong></td>
+                <td>If your app crashes, the render server keeps the last frame on screen (no black flash)</td>
+            </tr>
+            <tr>
+                <td><strong>Animation continuity</strong></td>
+                <td>Core Animation animations run in the render server — they continue even if your app's main thread is blocked</td>
+            </tr>
+            <tr>
+                <td><strong>Security</strong></td>
+                <td>Apps can't directly access the GPU or frame buffer — the render server mediates all access</td>
+            </tr>
+            <tr>
+                <td><strong>Efficiency</strong></td>
+                <td>The render server batches work from multiple apps into a single GPU submission</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="catransaction">2. CATransaction: Implicit vs Explicit</h2>
+    <!-- ============================================================ -->
+
+    <p>Every change to a <code>CALayer</code> property happens within a <code>CATransaction</code>. Transactions batch changes and commit them together at the end of the RunLoop iteration.</p>
+
+    <h3>Implicit Transactions</h3>
+
+    <pre><code><span class="comment">// Every RunLoop iteration has an implicit transaction</span>
+<span class="comment">// Any layer property change is automatically captured</span>
+
+layer.opacity = <span class="number">0.5</span>          <span class="comment">// Captured in implicit transaction</span>
+layer.position = newPosition  <span class="comment">// Also captured</span>
+layer.backgroundColor = <span class="type">UIColor</span>.red.cgColor  <span class="comment">// Also captured</span>
+
+<span class="comment">// At the end of the RunLoop iteration:</span>
+<span class="comment">// 1. Implicit transaction commits</span>
+<span class="comment">// 2. All changes are batched and sent to render server</span>
+<span class="comment">// 3. Default animation duration: 0.25s for standalone layers</span>
+<span class="comment">//    (UIView-backed layers suppress implicit animations by default)</span></code></pre>
+
+    <h3>Explicit Transactions</h3>
+
+    <pre><code><span class="comment">// Explicit transactions give you control over commit timing and animation</span>
+
+<span class="type">CATransaction</span>.<span class="func">begin</span>()
+
+<span class="comment">// Disable implicit animations (important for performance)</span>
+<span class="type">CATransaction</span>.<span class="func">setDisableActions</span>(<span class="keyword">true</span>)
+
+<span class="comment">// Set animation duration for this transaction</span>
+<span class="type">CATransaction</span>.<span class="func">setAnimationDuration</span>(<span class="number">0.5</span>)
+
+<span class="comment">// Set completion handler</span>
+<span class="type">CATransaction</span>.<span class="func">setCompletionBlock</span> {
+    <span class="func">print</span>(<span class="string">"Animation complete"</span>)
+}
+
+<span class="comment">// Batch multiple layer changes</span>
+layer1.opacity = <span class="number">0</span>
+layer2.position = newPosition
+layer3.transform = <span class="type">CATransform3DMakeScale</span>(<span class="number">2</span>, <span class="number">2</span>, <span class="number">1</span>)
+
+<span class="type">CATransaction</span>.<span class="func">commit</span>()
+
+<span class="comment">// Nested transactions</span>
+<span class="type">CATransaction</span>.<span class="func">begin</span>()
+<span class="type">CATransaction</span>.<span class="func">setAnimationDuration</span>(<span class="number">1.0</span>)
+
+layer1.opacity = <span class="number">0.5</span>  <span class="comment">// 1.0s animation</span>
+
+<span class="type">CATransaction</span>.<span class="func">begin</span>()
+<span class="type">CATransaction</span>.<span class="func">setAnimationDuration</span>(<span class="number">0.3</span>)
+layer2.opacity = <span class="number">0.5</span>  <span class="comment">// 0.3s animation (inner transaction)</span>
+<span class="type">CATransaction</span>.<span class="func">commit</span>()
+
+<span class="type">CATransaction</span>.<span class="func">commit</span>()</code></pre>
+
+    <h3>Why UIView Suppresses Implicit Animations</h3>
+
+    <pre><code><span class="comment">// UIView-backed layers suppress implicit animations by default.</span>
+<span class="comment">// This is because UIView has its own animation system (UIView.animate).</span>
+
+<span class="comment">// The mechanism: UIView implements the CALayerDelegate method</span>
+<span class="comment">// action(for:forKey:) and returns NSNull() for most properties,</span>
+<span class="comment">// which tells Core Animation "no animation."</span>
+
+<span class="comment">// Inside a UIView.animate block, UIView temporarily returns</span>
+<span class="comment">// actual CAAction objects instead of NSNull(), enabling animations.</span>
+
+<span class="comment">// This is why this doesn't animate:</span>
+view.layer.opacity = <span class="number">0.5</span>  <span class="comment">// No animation — UIView suppresses it</span>
+
+<span class="comment">// But this does:</span>
+<span class="type">UIView</span>.<span class="func">animate</span>(withDuration: <span class="number">0.3</span>) {
+    view.layer.opacity = <span class="number">0.5</span>  <span class="comment">// Animates — UIView provides CAAction</span>
+}
+
+<span class="comment">// And standalone layers always animate implicitly:</span>
+<span class="keyword">let</span> standaloneLayer = <span class="type">CALayer</span>()
+view.layer.<span class="func">addSublayer</span>(standaloneLayer)
+standaloneLayer.opacity = <span class="number">0.5</span>  <span class="comment">// Animates with 0.25s default duration</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="layer-display">3. CALayer Display Cycle</h2>
+    <!-- ============================================================ -->
+
+    <pre><code><span class="comment">// The layer display cycle determines how content is rendered</span>
+
+<span class="comment">// Option 1: Direct contents assignment (most efficient)</span>
+layer.contents = image.cgImage  <span class="comment">// No drawing — just compositing</span>
+
+<span class="comment">// Option 2: Layer delegate drawing</span>
+<span class="keyword">class</span> <span class="type">MyView</span>: <span class="type">UIView</span> {
+    <span class="keyword">override func</span> <span class="func">draw</span>(_ rect: <span class="type">CGRect</span>) {
+        <span class="comment">// Called when layer needs to redraw its contents</span>
+        <span class="comment">// UIKit creates a CGContext, calls this method,</span>
+        <span class="comment">// then assigns the resulting bitmap to layer.contents</span>
+
+        <span class="keyword">let</span> context = <span class="type">UIGraphicsGetCurrentContext</span>()!
+        context.<span class="func">setFillColor</span>(<span class="type">UIColor</span>.blue.cgColor)
+        context.<span class="func">fill</span>(rect)
+    }
+}
+
+<span class="comment">// The display cycle:</span>
+<span class="comment">// 1. Something calls setNeedsDisplay() (or a property change triggers it)</span>
+<span class="comment">// 2. At commit time, CALayer.display() is called</span>
+<span class="comment">// 3. display() checks if delegate implements display(_:)</span>
+<span class="comment">//    → If yes: delegate.display(layer) — delegate provides contents directly</span>
+<span class="comment">//    → If no: layer creates a CGContext and calls delegate.draw(_:in:)</span>
+<span class="comment">// 4. For UIView: draw(_:) is called with the CGContext</span>
+<span class="comment">// 5. The resulting bitmap is assigned to layer.contents</span>
+
+<span class="comment">// IMPORTANT: draw(_:) creates a backing store (bitmap in memory)</span>
+<span class="comment">// A 375×812 @3x view = 1125×2436 pixels × 4 bytes = ~10.4 MB!</span>
+<span class="comment">// Only override draw(_:) when you actually need custom drawing.</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall</div>
+        <p><strong>Overriding <code>draw(_:)</code> allocates a backing store bitmap.</strong> A plain <code>UIView</code> with just <code>backgroundColor</code> set does NOT have a backing store — the color is composited directly by the GPU. The moment you override <code>draw(_:)</code>, UIKit allocates a bitmap the size of the view (× screen scale). For a full-screen view on iPhone 15 Pro Max at 3x, that's ~10 MB. Don't override <code>draw(_:)</code> just to set a background color.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="offscreen-rendering">4. Off-Screen Rendering Triggers</h2>
+    <!-- ============================================================ -->
+
+    <p>Off-screen rendering occurs when the GPU can't composite a layer in a single pass and needs to render to a temporary buffer first. This is expensive because it requires a context switch on the GPU.</p>
+
+    <div class="diagram">
+Normal Rendering (single pass):
+  Layer → GPU → Frame Buffer → Screen
+  (fast — single pass compositing)
+
+Off-Screen Rendering (multi-pass):
+  Layer → GPU → Off-Screen Buffer → GPU → Frame Buffer → Screen
+  (slow — extra render target, context switch, memory allocation)
+
+Cost of off-screen rendering:
+  • GPU context switch (~0.1ms per layer)
+  • Temporary buffer allocation (layer size × scale × 4 bytes)
+  • Extra compositing pass
+  • At 60fps with 20 off-screen layers: ~2ms wasted (12% of frame budget)
+    </div>
+
+    <h3>What Triggers Off-Screen Rendering</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Trigger</th>
+                <th>Why</th>
+                <th>Mitigation</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>cornerRadius</code> + <code>masksToBounds</code></td>
+                <td>GPU must clip content to rounded rect</td>
+                <td>Use <code>layer.cornerRadius</code> without <code>masksToBounds</code> if possible; or pre-render rounded images</td>
+            </tr>
+            <tr>
+                <td><code>shadow</code> without <code>shadowPath</code></td>
+                <td>GPU must trace the layer's alpha channel to compute shadow shape</td>
+                <td>Always set <code>shadowPath</code> explicitly</td>
+            </tr>
+            <tr>
+                <td><code>mask</code> (CALayer mask)</td>
+                <td>Requires compositing the mask with the layer content</td>
+                <td>Use <code>cornerRadius</code> instead of mask for simple shapes</td>
+            </tr>
+            <tr>
+                <td><code>shouldRasterize = true</code></td>
+                <td>Intentionally renders to off-screen buffer (cached)</td>
+                <td>Use when the layer content is static and complex</td>
+            </tr>
+            <tr>
+                <td>Group opacity (<code>allowsGroupOpacity</code>)</td>
+                <td>Must composite sublayers together before applying opacity</td>
+                <td>Set <code>layer.allowsGroupOpacity = false</code> if not needed</td>
+            </tr>
+            <tr>
+                <td><code>CALayer.mask</code></td>
+                <td>Arbitrary mask shape requires off-screen compositing</td>
+                <td>Avoid when possible; use <code>cornerRadius</code> for simple cases</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// BAD: Off-screen rendering for rounded corners</span>
+imageView.layer.cornerRadius = <span class="number">20</span>
+imageView.layer.masksToBounds = <span class="keyword">true</span>  <span class="comment">// Triggers off-screen render!</span>
+
+<span class="comment">// GOOD: cornerRadius without masksToBounds (iOS 13+)</span>
+imageView.layer.cornerRadius = <span class="number">20</span>
+imageView.layer.cornerCurve = .continuous  <span class="comment">// Smooth Apple-style corners</span>
+<span class="comment">// No masksToBounds — background rounds but content doesn't clip</span>
+<span class="comment">// Works for solid-color views but not for images that need clipping</span>
+
+<span class="comment">// GOOD: Pre-render rounded image on background thread</span>
+<span class="keyword">func</span> <span class="func">roundedImage</span>(_ image: <span class="type">UIImage</span>, radius: <span class="type">CGFloat</span>) -> <span class="type">UIImage</span> {
+    <span class="keyword">let</span> renderer = <span class="type">UIGraphicsImageRenderer</span>(size: image.size)
+    <span class="keyword">return</span> renderer.<span class="func">image</span> { context <span class="keyword">in</span>
+        <span class="keyword">let</span> rect = <span class="type">CGRect</span>(origin: .zero, size: image.size)
+        <span class="type">UIBezierPath</span>(roundedRect: rect, cornerRadius: radius).<span class="func">addClip</span>()
+        image.<span class="func">draw</span>(in: rect)
+    }
+}
+
+<span class="comment">// BAD: Shadow without path</span>
+view.layer.shadowColor = <span class="type">UIColor</span>.black.cgColor
+view.layer.shadowOffset = <span class="type">CGSize</span>(width: <span class="number">0</span>, height: <span class="number">2</span>)
+view.layer.shadowRadius = <span class="number">4</span>
+view.layer.shadowOpacity = <span class="number">0.3</span>
+<span class="comment">// GPU must trace alpha channel every frame!</span>
+
+<span class="comment">// GOOD: Shadow with explicit path</span>
+view.layer.shadowPath = <span class="type">UIBezierPath</span>(
+    roundedRect: view.bounds,
+    cornerRadius: view.layer.cornerRadius
+).cgPath
+<span class="comment">// GPU knows the shadow shape — no off-screen render needed</span>
+<span class="comment">// IMPORTANT: Update shadowPath in layoutSubviews() when bounds change</span></code></pre>
+
+    <h3>shouldRasterize — Intentional Caching</h3>
+
+    <pre><code><span class="comment">// shouldRasterize renders the layer tree to an off-screen bitmap</span>
+<span class="comment">// and caches it. Subsequent frames reuse the cached bitmap.</span>
+
+cell.layer.shouldRasterize = <span class="keyword">true</span>
+cell.layer.rasterizationScale = <span class="type">UIScreen</span>.main.scale  <span class="comment">// MUST set this!</span>
+
+<span class="comment">// When to use shouldRasterize:</span>
+<span class="comment">// ✓ Complex static layer trees (many sublayers, effects)</span>
+<span class="comment">// ✓ Layers that don't change content frequently</span>
+<span class="comment">// ✓ During scroll animations (cache cell appearance)</span>
+
+<span class="comment">// When NOT to use:</span>
+<span class="comment">// ✗ Layers that change every frame (animation, video)</span>
+<span class="comment">// ✗ Very large layers (cache bitmap is expensive in memory)</span>
+<span class="comment">// ✗ Layers with frequently changing content</span>
+
+<span class="comment">// The cache is invalidated when:</span>
+<span class="comment">// • Any sublayer property changes</span>
+<span class="comment">// • The layer's bounds change</span>
+<span class="comment">// • The cache hasn't been used for 100ms (auto-eviction)</span>
+
+<span class="comment">// Debugging: Enable "Color Off-screen Rendered" in Instruments</span>
+<span class="comment">// Yellow highlight = off-screen rendered layers</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="compositing">5. Compositing</h2>
+    <!-- ============================================================ -->
+
+    <p>Compositing is the process of combining multiple layer bitmaps into a single frame buffer image. The GPU does this using the painter's algorithm (back to front).</p>
+
+    <pre><code><span class="comment">// Compositing properties that affect performance:</span>
+
+<span class="comment">// 1. Opaque layers are faster to composite</span>
+view.isOpaque = <span class="keyword">true</span>  <span class="comment">// Tells compositor: no need to blend with layers behind</span>
+view.backgroundColor = .white  <span class="comment">// Fully opaque background</span>
+
+<span class="comment">// 2. Blending is expensive — minimize transparent layers</span>
+<span class="comment">// Instruments → "Color Blended Layers" shows blending in red</span>
+
+<span class="comment">// 3. Misaligned layers cause extra work</span>
+<span class="comment">// If a layer's position doesn't align to pixel boundaries,</span>
+<span class="comment">// the GPU must anti-alias the edges</span>
+view.frame = <span class="type">CGRect</span>(x: <span class="number">10.5</span>, y: <span class="number">20.3</span>, width: <span class="number">100</span>, height: <span class="number">50</span>)  <span class="comment">// BAD</span>
+view.frame = <span class="type">CGRect</span>(x: <span class="number">10</span>, y: <span class="number">20</span>, width: <span class="number">100</span>, height: <span class="number">50</span>)      <span class="comment">// GOOD</span>
+
+<span class="comment">// 4. Layer count matters — each layer is a separate GPU draw call</span>
+<span class="comment">// Flatten complex static content into a single layer when possible</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="metal-backing">6. Metal Backing</h2>
+    <!-- ============================================================ -->
+
+    <p>Since iOS 12, Core Animation uses Metal as its GPU backend (replacing OpenGL ES). This is transparent to most developers but has implications for advanced rendering.</p>
+
+    <pre><code><span class="comment">// CAMetalLayer — direct Metal rendering in a layer</span>
+<span class="keyword">class</span> <span class="type">MetalView</span>: <span class="type">UIView</span> {
+    <span class="keyword">override class var</span> layerClass: <span class="type">AnyClass</span> {
+        <span class="keyword">return</span> <span class="type">CAMetalLayer</span>.<span class="keyword">self</span>
+    }
+
+    <span class="keyword">var</span> metalLayer: <span class="type">CAMetalLayer</span> {
+        <span class="keyword">return</span> layer <span class="keyword">as</span>! <span class="type">CAMetalLayer</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">configure</span>() {
+        metalLayer.device = <span class="type">MTLCreateSystemDefaultDevice</span>()
+        metalLayer.pixelFormat = .bgra8Unorm
+        metalLayer.framebufferOnly = <span class="keyword">true</span>
+        metalLayer.contentsScale = <span class="type">UIScreen</span>.main.scale
+    }
+
+    <span class="keyword">func</span> <span class="func">render</span>() {
+        <span class="keyword">guard let</span> drawable = metalLayer.<span class="func">nextDrawable</span>() <span class="keyword">else</span> { <span class="keyword">return</span> }
+        <span class="comment">// Create command buffer, encode render commands, present drawable</span>
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="cadisplaylink">7. CADisplayLink &amp; ProMotion</h2>
+    <!-- ============================================================ -->
+
+    <pre><code><span class="comment">// CADisplayLink synchronizes drawing with the display refresh rate</span>
+<span class="keyword">class</span> <span class="type">AnimationController</span> {
+    <span class="keyword">private var</span> displayLink: <span class="type">CADisplayLink</span>?
+
+    <span class="keyword">func</span> <span class="func">startAnimation</span>() {
+        displayLink = <span class="type">CADisplayLink</span>(target: <span class="keyword">self</span>, selector: #<span class="func">selector</span>(tick))
+
+        <span class="comment">// ProMotion (120Hz) support — iOS 15+</span>
+        <span class="keyword">if</span> #available(iOS <span class="number">15.0</span>, *) {
+            <span class="comment">// Request specific frame rates</span>
+            displayLink?.preferredFrameRateRange = <span class="type">CAFrameRateRange</span>(
+                minimum: <span class="number">60</span>,      <span class="comment">// Don't go below 60fps</span>
+                maximum: <span class="number">120</span>,     <span class="comment">// Up to 120fps on ProMotion</span>
+                preferred: <span class="number">120</span>    <span class="comment">// Prefer 120fps</span>
+            )
+        }
+
+        displayLink?.<span class="func">add</span>(to: .main, forMode: .common)
+    }
+
+    @objc <span class="keyword">func</span> <span class="func">tick</span>(_ link: <span class="type">CADisplayLink</span>) {
+        <span class="keyword">let</span> timestamp = link.timestamp           <span class="comment">// When this frame started</span>
+        <span class="keyword">let</span> targetTimestamp = link.targetTimestamp <span class="comment">// When next frame should display</span>
+        <span class="keyword">let</span> duration = link.duration              <span class="comment">// Time between frames</span>
+
+        <span class="comment">// Calculate animation progress based on timestamps</span>
+        <span class="keyword">let</span> dt = targetTimestamp - timestamp
+        <span class="func">updateAnimation</span>(deltaTime: dt)
+    }
+
+    <span class="keyword">func</span> <span class="func">stopAnimation</span>() {
+        displayLink?.<span class="func">invalidate</span>()
+        displayLink = <span class="keyword">nil</span>
+    }
+}
+
+<span class="comment">// Frame pacing on ProMotion displays:</span>
+<span class="comment">// The display can run at: 120Hz, 80Hz, 60Hz, 48Hz, 40Hz, 30Hz, 24Hz, 20Hz</span>
+<span class="comment">// (divisors of 120)</span>
+<span class="comment">//</span>
+<span class="comment">// If your frame takes 9ms → 120fps (8.33ms budget)</span>
+<span class="comment">// If your frame takes 12ms → 80fps (12.5ms budget)</span>
+<span class="comment">// If your frame takes 17ms → 60fps (16.67ms budget)</span>
+<span class="comment">//</span>
+<span class="comment">// The system dynamically adjusts refresh rate based on content</span>
+<span class="comment">// Static content → 24Hz or lower (saves battery)</span>
+<span class="comment">// Scrolling → 120Hz</span>
+<span class="comment">// Animation → matches animation frame rate</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive</div>
+        <p><strong>ProMotion adaptive refresh rate:</strong> On ProMotion displays (iPhone 13 Pro+, iPad Pro), the system dynamically adjusts the refresh rate. When nothing is animating, it drops to 24Hz or even 10Hz to save battery. When scrolling or animating, it ramps up to 120Hz. Your app doesn't need to do anything special — Core Animation handles this automatically. However, if you use <code>CADisplayLink</code> for custom animations, set <code>preferredFrameRateRange</code> to hint at your desired frame rate.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architect-120fps">8. Architect: Achieving Consistent 120fps</h2>
+    <!-- ============================================================ -->
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p><strong>Achieving consistent 120fps on ProMotion displays requires understanding the full pipeline:</strong></p>
+        <ul>
+            <li><strong>Frame budget at 120fps: 8.33ms</strong> — This is half the 60fps budget. Every millisecond counts.</li>
+            <li><strong>Commit phase must be fast</strong> — Layout + display + prepare must complete in ~4ms to leave room for the render server and GPU.</li>
+            <li><strong>Eliminate off-screen rendering</strong> — Each off-screen layer costs ~0.1ms on the GPU. With 20 visible cells, that's 2ms — 24% of your frame budget.</li>
+            <li><strong>Pre-decode images</strong> — Image decoding on the main thread during scroll is the #1 cause of 120fps drops. Decode on a background queue and cache the decoded bitmap.</li>
+            <li><strong>Minimize layer count</strong> — Each layer is a separate GPU draw call. Flatten static content into fewer layers.</li>
+        </ul>
+    </div>
+
+    <pre><code><span class="comment">// 120fps optimization checklist:</span>
+
+<span class="comment">// 1. Pre-decode images on background thread</span>
+<span class="keyword">func</span> <span class="func">preDecodeImage</span>(_ image: <span class="type">UIImage</span>) -> <span class="type">UIImage</span> {
+    <span class="keyword">let</span> renderer = <span class="type">UIGraphicsImageRenderer</span>(size: image.size)
+    <span class="keyword">return</span> renderer.<span class="func">image</span> { context <span class="keyword">in</span>
+        image.<span class="func">draw</span>(at: .zero)
+    }
+}
+
+<span class="comment">// 2. Set shadowPath for all shadows</span>
+<span class="keyword">override func</span> <span class="func">layoutSubviews</span>() {
+    <span class="keyword">super</span>.<span class="func">layoutSubviews</span>()
+    layer.shadowPath = <span class="type">UIBezierPath</span>(
+        roundedRect: bounds,
+        cornerRadius: layer.cornerRadius
+    ).cgPath
+}
+
+<span class="comment">// 3. Mark opaque views</span>
+view.isOpaque = <span class="keyword">true</span>
+view.backgroundColor = .systemBackground
+
+<span class="comment">// 4. Align frames to pixel boundaries</span>
+<span class="keyword">extension</span> <span class="type">CGRect</span> {
+    <span class="keyword">var</span> pixelAligned: <span class="type">CGRect</span> {
+        <span class="keyword">let</span> scale = <span class="type">UIScreen</span>.main.scale
+        <span class="keyword">return</span> <span class="type">CGRect</span>(
+            x: (<span class="func">origin</span>.x * scale).<span class="func">rounded</span>() / scale,
+            y: (<span class="func">origin</span>.y * scale).<span class="func">rounded</span>() / scale,
+            width: (size.width * scale).<span class="func">rounded</span>() / scale,
+            height: (size.height * scale).<span class="func">rounded</span>() / scale
+        )
+    }
+}
+
+<span class="comment">// 5. Use Instruments to identify bottlenecks</span>
+<span class="comment">// Core Animation instrument → "Color Off-screen Rendered" (yellow)</span>
+<span class="comment">// Core Animation instrument → "Color Blended Layers" (red)</span>
+<span class="comment">// Core Animation instrument → "Color Misaligned Images" (magenta)</span>
+<span class="comment">// Time Profiler → look for main thread work during scroll</span></code></pre>
+
+    <div class="nav-footer">
+        <a href="03-layout-system.html">← Layout System</a>
+        <a href="05-drawing-core-graphics.html">Drawing &amp; Core Graphics →</a>
+    </div>
+</div>
+</body>
+</html>

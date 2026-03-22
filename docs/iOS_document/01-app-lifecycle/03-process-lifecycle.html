@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Process Lifecycle — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">App Lifecycle</a><span class="sep">›</span>
+        Process Lifecycle
+    </nav>
+
+    <h1>Process Lifecycle</h1>
+    <p class="subtitle">Background execution, Jetsam, BGTaskScheduler, and the reality of process death on iOS — the Staff-level understanding of what happens when your app isn't in the foreground.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#background-model">1. Background Execution Model</a></li>
+            <li><a href="#background-task">2. beginBackgroundTask — The Critical API</a></li>
+            <li><a href="#background-modes">3. Background Modes</a></li>
+            <li><a href="#bgtaskscheduler">4. BGTaskScheduler</a></li>
+            <li><a href="#jetsam">5. Jetsam — The iOS OOM Killer</a></li>
+            <li><a href="#suspension-termination">6. Suspension vs Termination</a></li>
+            <li><a href="#architect">7. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="background-model">1. Background Execution Model</h2>
+
+    <p>iOS is fundamentally different from desktop operating systems in how it handles background processes. The core philosophy: <strong>apps don't run in the background unless they have a specific, system-sanctioned reason</strong>. This is driven by battery life, thermal constraints, and memory pressure on mobile devices.</p>
+
+    <div class="diagram">
+┌────────────────────────────────────────────────────────────┐
+│              iOS BACKGROUND EXECUTION TIMELINE              │
+├────────────────────────────────────────────────────────────┤
+│                                                             │
+│  User leaves app                                            │
+│  ─────────────────────────────────────────────────────────  │
+│  │                                                          │
+│  │  sceneWillResignActive                                   │
+│  │  sceneDidEnterBackground                                 │
+│  │                                                          │
+│  │  ┌──────────────────────────┐                            │
+│  │  │ ~5 seconds of execution  │  Default background time   │
+│  │  └──────────────────────────┘                            │
+│  │                                                          │
+│  │  ┌──────────────────────────────────────────┐            │
+│  │  │ beginBackgroundTask: up to ~30 seconds   │  Extended  │
+│  │  │ (was 180s pre-iOS 13, now ~30s)          │            │
+│  │  └──────────────────────────────────────────┘            │
+│  │                                                          │
+│  │  ┌──────────────────────────────────────────┐            │
+│  │  │ Background modes: varies by mode         │  Ongoing   │
+│  │  │ Audio: unlimited while playing           │            │
+│  │  │ Location: unlimited with active session  │            │
+│  │  │ VoIP: push-based wakeup                  │            │
+│  │  └──────────────────────────────────────────┘            │
+│  │                                                          │
+│  ▼  SUSPENDED (in memory, not executing)                    │
+│  │                                                          │
+│  ▼  JETSAM (killed, no callback)                            │
+│                                                             │
+└────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>1.1 The Background Execution Budget</h3>
+
+    <p>When your app moves to the background, the system gives you a limited window to finish work:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Mechanism</th>
+                <th>Time Budget</th>
+                <th>iOS Version</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Default (no API call)</td>
+                <td>~5 seconds</td>
+                <td>All</td>
+                <td>After sceneDidEnterBackground</td>
+            </tr>
+            <tr>
+                <td><code>beginBackgroundTask</code></td>
+                <td>~30 seconds</td>
+                <td>iOS 13+</td>
+                <td>Was ~180s pre-iOS 13</td>
+            </tr>
+            <tr>
+                <td>Background URL session</td>
+                <td>System-managed</td>
+                <td>iOS 7+</td>
+                <td>Transfers continue after suspension</td>
+            </tr>
+            <tr>
+                <td><code>BGAppRefreshTask</code></td>
+                <td>~30 seconds</td>
+                <td>iOS 13+</td>
+                <td>System-scheduled, not guaranteed</td>
+            </tr>
+            <tr>
+                <td><code>BGProcessingTask</code></td>
+                <td>Minutes</td>
+                <td>iOS 13+</td>
+                <td>Requires charging + Wi-Fi (optional)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: Background Time Reduction</div>
+        <p>In iOS 13, Apple silently reduced <code>beginBackgroundTask</code> time from ~180 seconds to ~30 seconds. Many apps that relied on the longer window broke silently. The system doesn't guarantee any specific duration — <code>UIApplication.shared.backgroundTimeRemaining</code> is an estimate, not a contract. Design your background work to complete as quickly as possible.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="background-task">2. beginBackgroundTask — The Critical API</h2>
+
+    <h3>2.1 Correct Usage</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">DataSyncManager</span> {
+    <span class="keyword">private var</span> backgroundTaskID: <span class="type">UIBackgroundTaskIdentifier</span> = .invalid
+    
+    <span class="keyword">func</span> <span class="func">syncBeforeBackground</span>() {
+        <span class="comment">// Start background task BEFORE the work begins</span>
+        backgroundTaskID = <span class="type">UIApplication</span>.shared.<span class="func">beginBackgroundTask</span>(
+            withName: <span class="string">"DataSync"</span>
+        ) { [<span class="keyword">weak self</span>] <span class="keyword">in</span>
+            <span class="comment">// Expiration handler: MUST call endBackgroundTask</span>
+            <span class="comment">// System is about to suspend — clean up NOW</span>
+            <span class="keyword">self</span>?.<span class="func">cancelSync</span>()
+            <span class="keyword">self</span>?.<span class="func">endTask</span>()
+        }
+        
+        <span class="comment">// Guard against failure to begin</span>
+        <span class="keyword">guard</span> backgroundTaskID != .invalid <span class="keyword">else</span> { <span class="keyword">return</span> }
+        
+        <span class="comment">// Perform the actual work</span>
+        <span class="func">performSync</span> { [<span class="keyword">weak self</span>] <span class="keyword">in</span>
+            <span class="keyword">self</span>?.<span class="func">endTask</span>()
+        }
+    }
+    
+    <span class="keyword">private func</span> <span class="func">endTask</span>() {
+        <span class="keyword">guard</span> backgroundTaskID != .invalid <span class="keyword">else</span> { <span class="keyword">return</span> }
+        <span class="type">UIApplication</span>.shared.<span class="func">endBackgroundTask</span>(backgroundTaskID)
+        backgroundTaskID = .invalid
+    }
+}</code></pre>
+
+    <h3>2.2 The Critical Mistake</h3>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Critical Bug: Not Calling endBackgroundTask</div>
+        <p>If you call <code>beginBackgroundTask</code> but never call <code>endBackgroundTask</code>, the system will:</p>
+        <ol>
+            <li>Call your expiration handler when time runs out</li>
+            <li>If you <strong>still</strong> don't call <code>endBackgroundTask</code> in the expiration handler, the system <strong>kills your app immediately</strong></li>
+            <li>This appears as a crash in your crash logs (SIGKILL with <code>0x8badf00d</code> — "ate bad food")</li>
+        </ol>
+        <p>This is one of the most common causes of mysterious crashes in production iOS apps. Always pair <code>begin</code> with <code>end</code>, and always call <code>end</code> in the expiration handler.</p>
+    </div>
+
+    <pre><code><span class="comment">// THE BUG: forgetting to end the task</span>
+<span class="keyword">func</span> <span class="func">buggySync</span>() {
+    <span class="keyword">let</span> taskID = <span class="type">UIApplication</span>.shared.<span class="func">beginBackgroundTask</span> {
+        <span class="comment">// ❌ Expiration handler does nothing</span>
+        <span class="comment">// System will KILL the app</span>
+    }
+    
+    <span class="func">performSync</span> {
+        <span class="comment">// ❌ If this closure never fires (error, timeout),</span>
+        <span class="comment">// endBackgroundTask is never called</span>
+        <span class="type">UIApplication</span>.shared.<span class="func">endBackgroundTask</span>(taskID)
+    }
+}
+
+<span class="comment">// THE FIX: defensive pattern</span>
+<span class="keyword">func</span> <span class="func">safeSync</span>() {
+    <span class="keyword">var</span> taskID: <span class="type">UIBackgroundTaskIdentifier</span> = .invalid
+    
+    taskID = <span class="type">UIApplication</span>.shared.<span class="func">beginBackgroundTask</span> {
+        <span class="comment">// ✅ Always end in expiration handler</span>
+        <span class="type">UIApplication</span>.shared.<span class="func">endBackgroundTask</span>(taskID)
+        taskID = .invalid
+    }
+    
+    <span class="keyword">guard</span> taskID != .invalid <span class="keyword">else</span> { <span class="keyword">return</span> }
+    
+    <span class="func">performSync</span> { result <span class="keyword">in</span>
+        <span class="comment">// ✅ End on completion (success or failure)</span>
+        <span class="keyword">defer</span> {
+            <span class="type">UIApplication</span>.shared.<span class="func">endBackgroundTask</span>(taskID)
+            taskID = .invalid
+        }
+        <span class="comment">// Process result...</span>
+    }
+}</code></pre>
+
+    <h3>2.3 Multiple Background Tasks</h3>
+
+    <p>You can have multiple active background tasks simultaneously. Each gets its own identifier and must be ended independently. The system keeps the app running until <strong>all</strong> tasks are ended or expired:</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">BackgroundTaskManager</span> {
+    <span class="keyword">private var</span> activeTasks: [<span class="type">String</span>: <span class="type">UIBackgroundTaskIdentifier</span>] = [:]
+    <span class="keyword">private let</span> lock = <span class="type">NSLock</span>()
+    
+    <span class="keyword">func</span> <span class="func">begin</span>(name: <span class="type">String</span>, work: <span class="keyword">@escaping</span> (<span class="keyword">@escaping</span> () -> <span class="type">Void</span>) -> <span class="type">Void</span>) {
+        <span class="keyword">var</span> taskID: <span class="type">UIBackgroundTaskIdentifier</span> = .invalid
+        
+        taskID = <span class="type">UIApplication</span>.shared.<span class="func">beginBackgroundTask</span>(withName: name) { [<span class="keyword">weak self</span>] <span class="keyword">in</span>
+            <span class="keyword">self</span>?.<span class="func">end</span>(name: name)
+        }
+        
+        <span class="keyword">guard</span> taskID != .invalid <span class="keyword">else</span> { <span class="keyword">return</span> }
+        
+        lock.<span class="func">lock</span>()
+        activeTasks[name] = taskID
+        lock.<span class="func">unlock</span>()
+        
+        <span class="func">work</span> { [<span class="keyword">weak self</span>] <span class="keyword">in</span>
+            <span class="keyword">self</span>?.<span class="func">end</span>(name: name)
+        }
+    }
+    
+    <span class="keyword">private func</span> <span class="func">end</span>(name: <span class="type">String</span>) {
+        lock.<span class="func">lock</span>()
+        <span class="keyword">guard let</span> taskID = activeTasks.removeValue(forKey: name) <span class="keyword">else</span> {
+            lock.<span class="func">unlock</span>()
+            <span class="keyword">return</span>
+        }
+        lock.<span class="func">unlock</span>()
+        <span class="type">UIApplication</span>.shared.<span class="func">endBackgroundTask</span>(taskID)
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="background-modes">3. Background Modes</h2>
+
+    <p>Background modes are declared in Info.plist under <code>UIBackgroundModes</code> and grant specific background execution privileges:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Mode</th>
+                <th>Key</th>
+                <th>Execution Model</th>
+                <th>Review Scrutiny</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Audio</td>
+                <td><code>audio</code></td>
+                <td>Continuous while playing/recording</td>
+                <td>Must actually play audio</td>
+            </tr>
+            <tr>
+                <td>Location</td>
+                <td><code>location</code></td>
+                <td>Continuous with active CLLocationManager</td>
+                <td>Must justify always-on location</td>
+            </tr>
+            <tr>
+                <td>VoIP</td>
+                <td><code>voip</code></td>
+                <td>Push-based wakeup via PushKit</td>
+                <td>Must use CallKit; heavily scrutinized</td>
+            </tr>
+            <tr>
+                <td>Background Fetch</td>
+                <td><code>fetch</code></td>
+                <td>System-scheduled, ~30s per wake</td>
+                <td>Deprecated in iOS 13 (use BGTaskScheduler)</td>
+            </tr>
+            <tr>
+                <td>Remote Notification</td>
+                <td><code>remote-notification</code></td>
+                <td>Wakes app on silent push, ~30s</td>
+                <td>Must process notification content</td>
+            </tr>
+            <tr>
+                <td>Background Processing</td>
+                <td><code>processing</code></td>
+                <td>BGProcessingTask, minutes of execution</td>
+                <td>iOS 13+; requires BGTaskScheduler</td>
+            </tr>
+            <tr>
+                <td>Bluetooth</td>
+                <td><code>bluetooth-central</code> / <code>bluetooth-peripheral</code></td>
+                <td>BLE scanning/advertising continues</td>
+                <td>Must actively use BLE</td>
+            </tr>
+            <tr>
+                <td>External Accessory</td>
+                <td><code>external-accessory</code></td>
+                <td>Communication with MFi accessories</td>
+                <td>Must have MFi accessory</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Silent Push Notifications</div>
+        <p>Silent pushes (<code>content-available: 1</code>) wake your app in the background for ~30 seconds. However, the system applies <strong>rate limiting</strong> — if your app uses too much energy or CPU during these wakeups, the system will throttle or stop delivering them. The system also won't wake your app if it was force-quit by the user. This is a common source of "my background sync stopped working" bugs.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="bgtaskscheduler">4. BGTaskScheduler</h2>
+
+    <p>Introduced in iOS 13, <code>BGTaskScheduler</code> replaced the old <code>performFetchWithCompletionHandler</code> and <code>setMinimumBackgroundFetchInterval</code> APIs with a more powerful and predictable system.</p>
+
+    <h3>4.1 Task Types</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Type</th>
+                <th>Duration</th>
+                <th>Constraints</th>
+                <th>Use Case</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>BGAppRefreshTask</code></td>
+                <td>~30 seconds</td>
+                <td>Network optional</td>
+                <td>Fetch new content, sync small data</td>
+            </tr>
+            <tr>
+                <td><code>BGProcessingTask</code></td>
+                <td>Several minutes</td>
+                <td>Can require charging, network</td>
+                <td>ML training, database maintenance, large sync</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>4.2 Registration and Scheduling</h3>
+
+    <pre><code><span class="comment">// Step 1: Register task identifiers in Info.plist</span>
+<span class="comment">// BGTaskSchedulerPermittedIdentifiers: ["com.app.refresh", "com.app.dbCleanup"]</span>
+
+<span class="comment">// Step 2: Register handlers at launch (before end of didFinishLaunching)</span>
+<span class="keyword">func</span> <span class="func">application</span>(<span class="keyword">_</span> app: <span class="type">UIApplication</span>,
+    didFinishLaunchingWithOptions opts: [<span class="type">UIApplication</span>.<span class="type">LaunchOptionsKey</span>: <span class="type">Any</span>]?) -> <span class="type">Bool</span> {
+    
+    <span class="type">BGTaskScheduler</span>.shared.<span class="func">register</span>(
+        forTaskWithIdentifier: <span class="string">"com.app.refresh"</span>,
+        using: <span class="keyword">nil</span>  <span class="comment">// nil = main queue</span>
+    ) { task <span class="keyword">in</span>
+        <span class="keyword">self</span>.<span class="func">handleAppRefresh</span>(task: task <span class="keyword">as!</span> <span class="type">BGAppRefreshTask</span>)
+    }
+    
+    <span class="type">BGTaskScheduler</span>.shared.<span class="func">register</span>(
+        forTaskWithIdentifier: <span class="string">"com.app.dbCleanup"</span>,
+        using: <span class="keyword">nil</span>
+    ) { task <span class="keyword">in</span>
+        <span class="keyword">self</span>.<span class="func">handleDatabaseCleanup</span>(task: task <span class="keyword">as!</span> <span class="type">BGProcessingTask</span>)
+    }
+    
+    <span class="keyword">return</span> <span class="keyword">true</span>
+}
+
+<span class="comment">// Step 3: Schedule tasks (typically when entering background)</span>
+<span class="keyword">func</span> <span class="func">scheduleAppRefresh</span>() {
+    <span class="keyword">let</span> request = <span class="type">BGAppRefreshTaskRequest</span>(identifier: <span class="string">"com.app.refresh"</span>)
+    request.earliestBeginDate = <span class="type">Date</span>(timeIntervalSinceNow: <span class="number">15</span> * <span class="number">60</span>) <span class="comment">// 15 min minimum</span>
+    
+    <span class="keyword">do</span> {
+        <span class="keyword">try</span> <span class="type">BGTaskScheduler</span>.shared.<span class="func">submit</span>(request)
+    } <span class="keyword">catch</span> {
+        <span class="func">print</span>(<span class="string">"Failed to schedule: \(error)"</span>)
+    }
+}
+
+<span class="keyword">func</span> <span class="func">scheduleDatabaseCleanup</span>() {
+    <span class="keyword">let</span> request = <span class="type">BGProcessingTaskRequest</span>(identifier: <span class="string">"com.app.dbCleanup"</span>)
+    request.requiresNetworkConnectivity = <span class="keyword">false</span>
+    request.requiresExternalPower = <span class="keyword">true</span>  <span class="comment">// Only when charging</span>
+    request.earliestBeginDate = <span class="type">Date</span>(timeIntervalSinceNow: <span class="number">60</span> * <span class="number">60</span>) <span class="comment">// 1 hour</span>
+    
+    <span class="keyword">do</span> {
+        <span class="keyword">try</span> <span class="type">BGTaskScheduler</span>.shared.<span class="func">submit</span>(request)
+    } <span class="keyword">catch</span> {
+        <span class="func">print</span>(<span class="string">"Failed to schedule: \(error)"</span>)
+    }
+}
+
+<span class="comment">// Step 4: Handle the task</span>
+<span class="keyword">func</span> <span class="func">handleAppRefresh</span>(task: <span class="type">BGAppRefreshTask</span>) {
+    <span class="comment">// Schedule the next refresh</span>
+    <span class="func">scheduleAppRefresh</span>()
+    
+    <span class="keyword">let</span> operation = <span class="type">RefreshOperation</span>()
+    
+    <span class="comment">// Handle expiration</span>
+    task.expirationHandler = {
+        operation.<span class="func">cancel</span>()
+    }
+    
+    operation.completionBlock = {
+        task.<span class="func">setTaskCompleted</span>(success: !operation.isCancelled)
+    }
+    
+    <span class="type">OperationQueue</span>().<span class="func">addOperation</span>(operation)
+}</code></pre>
+
+    <h3>4.3 Debugging BGTaskScheduler</h3>
+
+    <pre><code><span class="comment">// Simulate task launch from Xcode debugger:</span>
+<span class="comment">// (lldb) e -l objc -- (void)[[BGTaskScheduler sharedScheduler] _simulateLaunchForTaskWithIdentifier:@"com.app.refresh"]</span>
+
+<span class="comment">// Force early execution (debug only):</span>
+<span class="comment">// (lldb) e -l objc -- (void)[[BGTaskScheduler sharedScheduler] _simulateExpirationForTaskWithIdentifier:@"com.app.refresh"]</span></code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: BGTaskScheduler Patterns</div>
+        <ul>
+            <li>Always re-schedule the next task inside the handler (tasks are one-shot)</li>
+            <li>Always set an <code>expirationHandler</code> that cancels in-flight work</li>
+            <li>Always call <code>setTaskCompleted(success:)</code> — failure to do so is treated like the <code>endBackgroundTask</code> bug</li>
+            <li>Use <code>BGProcessingTask</code> with <code>requiresExternalPower = true</code> for heavy work — the system is much more generous with time when the device is charging</li>
+            <li>Register handlers in <code>didFinishLaunching</code>, <strong>not</strong> later — the system may launch your app directly into a background task</li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="jetsam">5. Jetsam — The iOS OOM Killer</h2>
+
+    <p>Jetsam is iOS's memory management daemon, analogous to Linux's OOM killer but more aggressive and with different heuristics. Understanding Jetsam is critical for Staff-level iOS engineers.</p>
+
+    <h3>5.1 How Jetsam Works</h3>
+
+    <div class="diagram">
+┌──────────────────────────────────────────────────────────┐
+│                    JETSAM PRIORITY BANDS                   │
+├──────────────────────────────────────────────────────────┤
+│                                                           │
+│  Band 0-10: Idle / Background (KILLED FIRST)             │
+│  ├── Suspended apps (no execution)                        │
+│  ├── Background apps (limited execution)                  │
+│  └── Killed in LRU order (least recently used first)      │
+│                                                           │
+│  Band 10-20: Low Priority                                 │
+│  ├── Apps performing background tasks                     │
+│  └── Extensions                                           │
+│                                                           │
+│  Band 20-30: Default                                      │
+│  ├── Foreground inactive apps                             │
+│  └── Apps transitioning states                            │
+│                                                           │
+│  Band 30-40: High Priority                                │
+│  ├── Foreground active app                                │
+│  └── System UI (SpringBoard)                              │
+│                                                           │
+│  Band 40+: Critical (KILLED LAST)                         │
+│  ├── Kernel tasks                                         │
+│  └── Core system daemons                                  │
+│                                                           │
+│  Memory Limit (foreground): ~1-2GB (device dependent)     │
+│  Memory Limit (background): ~50-80MB                      │
+│  Memory Limit (extensions): ~40-120MB                     │
+│                                                           │
+└──────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>5.2 Jetsam Kills vs Crashes</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Jetsam Kill</th>
+                <th>App Crash</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Signal</td>
+                <td>SIGKILL (unblockable)</td>
+                <td>Various (SIGSEGV, SIGABRT, etc.)</td>
+            </tr>
+            <tr>
+                <td>Callback</td>
+                <td><strong>None</strong></td>
+                <td>Signal handler possible</td>
+            </tr>
+            <tr>
+                <td>didReceiveMemoryWarning</td>
+                <td>May or may not fire first</td>
+                <td>N/A</td>
+            </tr>
+            <tr>
+                <td>applicationWillTerminate</td>
+                <td><strong>Not called</strong></td>
+                <td>Not called</td>
+            </tr>
+            <tr>
+                <td>Crash report</td>
+                <td>Jetsam event report (different format)</td>
+                <td>Standard crash report</td>
+            </tr>
+            <tr>
+                <td>Prevention</td>
+                <td>Reduce memory footprint</td>
+                <td>Fix the bug</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>5.3 Memory Monitoring</h3>
+
+    <pre><code><span class="keyword">import</span> os
+
+<span class="keyword">func</span> <span class="func">checkMemoryPressure</span>() {
+    <span class="comment">// Available memory (iOS 13+)</span>
+    <span class="keyword">let</span> available = <span class="func">os_proc_available_memory</span>()
+    <span class="func">print</span>(<span class="string">"Available memory: \(available / 1024 / 1024) MB"</span>)
+    
+    <span class="comment">// Current footprint</span>
+    <span class="keyword">var</span> info = <span class="type">mach_task_basic_info</span>()
+    <span class="keyword">var</span> count = <span class="type">mach_msg_type_number_t</span>(
+        <span class="type">MemoryLayout</span>&lt;<span class="type">mach_task_basic_info</span>&gt;.size / <span class="type">MemoryLayout</span>&lt;<span class="type">natural_t</span>&gt;.size
+    )
+    <span class="keyword">let</span> result = <span class="func">withUnsafeMutablePointer</span>(to: &amp;info) {
+        $0.<span class="func">withMemoryRebound</span>(to: <span class="type">integer_t</span>.<span class="keyword">self</span>, capacity: <span class="type">Int</span>(count)) {
+            <span class="func">task_info</span>(mach_task_self_, <span class="type">task_flavor_t</span>(MACH_TASK_BASIC_INFO), $0, &amp;count)
+        }
+    }
+    <span class="keyword">if</span> result == KERN_SUCCESS {
+        <span class="func">print</span>(<span class="string">"Resident memory: \(info.resident_size / 1024 / 1024) MB"</span>)
+    }
+}
+
+<span class="comment">// Subscribe to memory pressure notifications</span>
+<span class="keyword">let</span> source = <span class="type">DispatchSource</span>.<span class="func">makeMemoryPressureSource</span>(
+    eventMask: [.warning, .critical],
+    queue: .main
+)
+source.setEventHandler {
+    <span class="keyword">let</span> event = source.data
+    <span class="keyword">if</span> event.contains(.warning) {
+        <span class="comment">// Purge caches, release non-essential resources</span>
+        <span class="type">ImageCache</span>.shared.<span class="func">purge</span>()
+    }
+    <span class="keyword">if</span> event.contains(.critical) {
+        <span class="comment">// Aggressive cleanup — Jetsam is imminent</span>
+        <span class="type">ImageCache</span>.shared.<span class="func">purgeAll</span>()
+        <span class="type">DataCache</span>.shared.<span class="func">purgeAll</span>()
+    }
+}
+source.<span class="func">resume</span>()</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: didReceiveMemoryWarning is Unreliable</div>
+        <p><code>didReceiveMemoryWarning</code> is <strong>not guaranteed</strong> to fire before Jetsam kills your app. On devices under extreme memory pressure, Jetsam may kill your app without any warning. Additionally, this callback runs on the main thread — if your main thread is blocked (e.g., during a large layout pass), the warning can't be delivered. Never rely on this as your only defense against OOM kills.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="suspension-termination">6. Suspension vs Termination</h2>
+
+    <div class="diagram">
+┌──────────────────────────────────────────────────────────┐
+│          WHAT SURVIVES EACH STATE TRANSITION              │
+├──────────────────────────────────────────────────────────┤
+│                                                           │
+│  SUSPENDED (in memory, not executing)                     │
+│  ✅ All memory intact                                     │
+│  ✅ File handles open                                     │
+│  ✅ Network connections (may timeout)                     │
+│  ✅ Core Data contexts                                    │
+│  ✅ View hierarchy                                        │
+│  ❌ Timers paused                                         │
+│  ❌ GCD/OperationQueue work paused                        │
+│  ❌ RunLoop not running                                   │
+│                                                           │
+│  TERMINATED (process killed)                              │
+│  ❌ All memory freed                                      │
+│  ❌ File handles closed                                   │
+│  ❌ Network connections dropped                           │
+│  ❌ Core Data contexts gone                               │
+│  ❌ View hierarchy destroyed                              │
+│  ✅ UserDefaults (if synchronized)                        │
+│  ✅ Files on disk                                         │
+│  ✅ Keychain items                                        │
+│  ✅ Core Data persistent store (SQLite file)              │
+│  ✅ UISceneSession (persisted by system)                  │
+│  ✅ NSUserActivity (if saved to session)                  │
+│                                                           │
+└──────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>6.1 applicationWillTerminate</h3>
+
+    <pre><code><span class="keyword">func</span> <span class="func">applicationWillTerminate</span>(<span class="keyword">_</span> application: <span class="type">UIApplication</span>) {
+    <span class="comment">// Called ONLY when:</span>
+    <span class="comment">// 1. App is in foreground and system needs to terminate</span>
+    <span class="comment">// 2. App has opted out of scene lifecycle (legacy apps)</span>
+    <span class="comment">//</span>
+    <span class="comment">// NOT called when:</span>
+    <span class="comment">// 1. Jetsam kills a suspended app (most common case)</span>
+    <span class="comment">// 2. User force-quits from app switcher</span>
+    <span class="comment">// 3. Device reboots</span>
+    <span class="comment">//</span>
+    <span class="comment">// You have ~5 seconds to save state.</span>
+    <span class="comment">// For scene-based apps, save state in sceneDidEnterBackground instead.</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">7. Architect Considerations</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: Designing Reliable Background Work Systems</div>
+        <p>At Staff level, you're expected to design systems that are resilient to process death. The fundamental principle: <strong>assume your app can be killed at any time with no callback</strong>. Every operation must be either idempotent and resumable, or transactional with rollback.</p>
+    </div>
+
+    <h3>7.1 Reliable Background Sync Architecture</h3>
+
+    <pre><code><span class="comment">// Design principle: every sync operation is a state machine</span>
+<span class="comment">// persisted to disk, resumable after process death</span>
+
+<span class="keyword">enum</span> <span class="type">SyncState</span>: <span class="type">Codable</span> {
+    <span class="keyword">case</span> pending
+    <span class="keyword">case</span> uploading(progress: <span class="type">Double</span>)
+    <span class="keyword">case</span> confirming(serverID: <span class="type">String</span>)
+    <span class="keyword">case</span> completed
+    <span class="keyword">case</span> failed(retryCount: <span class="type">Int</span>)
+}
+
+<span class="keyword">struct</span> <span class="type">SyncOperation</span>: <span class="type">Codable</span> {
+    <span class="keyword">let</span> id: <span class="type">UUID</span>
+    <span class="keyword">let</span> entityID: <span class="type">String</span>
+    <span class="keyword">let</span> entityType: <span class="type">String</span>
+    <span class="keyword">var</span> state: <span class="type">SyncState</span>
+    <span class="keyword">let</span> createdAt: <span class="type">Date</span>
+    <span class="keyword">var</span> lastAttempt: <span class="type">Date</span>?
+}
+
+<span class="keyword">final class</span> <span class="type">SyncEngine</span> {
+    <span class="keyword">private let</span> store: <span class="type">SyncOperationStore</span>  <span class="comment">// Persisted to disk</span>
+    
+    <span class="comment">// On app launch: resume any incomplete operations</span>
+    <span class="keyword">func</span> <span class="func">resumePendingOperations</span>() {
+        <span class="keyword">let</span> pending = store.<span class="func">operations</span>(in: [.pending, .uploading, .confirming])
+        <span class="keyword">for</span> op <span class="keyword">in</span> pending {
+            <span class="func">execute</span>(op)
+        }
+    }
+    
+    <span class="comment">// Use background URL session for large transfers</span>
+    <span class="comment">// These survive process death</span>
+    <span class="keyword">private lazy var</span> backgroundSession: <span class="type">URLSession</span> = {
+        <span class="keyword">let</span> config = <span class="type">URLSessionConfiguration</span>.<span class="func">background</span>(
+            withIdentifier: <span class="string">"com.app.sync"</span>
+        )
+        config.isDiscretionary = <span class="keyword">false</span>
+        config.sessionSendsLaunchEvents = <span class="keyword">true</span>
+        <span class="keyword">return</span> <span class="type">URLSession</span>(configuration: config, delegate: <span class="keyword">self</span>, delegateQueue: <span class="keyword">nil</span>)
+    }()
+}</code></pre>
+
+    <h3>7.2 Handling Jetsam Gracefully</h3>
+
+    <pre><code><span class="comment">// Strategy: save state continuously, not just in callbacks</span>
+
+<span class="keyword">final class</span> <span class="type">AutoSaveManager</span> {
+    <span class="keyword">private var</span> saveTimer: <span class="type">Timer</span>?
+    <span class="keyword">private let</span> interval: <span class="type">TimeInterval</span> = <span class="number">5.0</span>
+    
+    <span class="keyword">func</span> <span class="func">startAutoSaving</span>() {
+        saveTimer = <span class="type">Timer</span>.<span class="func">scheduledTimer</span>(
+            withTimeInterval: interval,
+            repeats: <span class="keyword">true</span>
+        ) { [<span class="keyword">weak self</span>] _ <span class="keyword">in</span>
+            <span class="keyword">self</span>?.<span class="func">saveState</span>()
+        }
+    }
+    
+    <span class="keyword">private func</span> <span class="func">saveState</span>() {
+        <span class="comment">// Write to disk atomically</span>
+        <span class="keyword">let</span> state = <span class="func">captureCurrentState</span>()
+        <span class="keyword">let</span> data = <span class="keyword">try</span>? <span class="type">JSONEncoder</span>().<span class="func">encode</span>(state)
+        <span class="keyword">let</span> url = <span class="func">stateFileURL</span>()
+        <span class="keyword">try</span>? data?.<span class="func">write</span>(to: url, options: .atomic)
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Background Work Decision Tree</div>
+        <p>Choose the right mechanism based on your needs:</p>
+        <ul>
+            <li><strong>Finish in-flight request</strong> → <code>beginBackgroundTask</code> (~30s)</li>
+            <li><strong>Large file upload/download</strong> → Background <code>URLSession</code> (survives process death)</li>
+            <li><strong>Periodic content refresh</strong> → <code>BGAppRefreshTask</code> (~30s, system-scheduled)</li>
+            <li><strong>Heavy processing (ML, DB)</strong> → <code>BGProcessingTask</code> (minutes, while charging)</li>
+            <li><strong>Real-time updates</strong> → Silent push notifications (rate-limited)</li>
+            <li><strong>Continuous audio/location</strong> → Background modes (must justify to App Review)</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="02-scene-lifecycle.html">← Scene Lifecycle</a>
+        <a href="04-state-restoration.html">Next: State Restoration →</a>
+    </div>
+</div>
+</body>
+</html>

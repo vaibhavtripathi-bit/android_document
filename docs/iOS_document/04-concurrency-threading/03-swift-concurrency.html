@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Swift Concurrency — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Concurrency &amp; Threading</a><span class="sep">›</span>
+        Swift Concurrency
+    </nav>
+
+    <h1>Swift Concurrency</h1>
+    <p class="subtitle">How async/await works under the hood — from continuations and suspension points to structured concurrency with TaskGroup, the critical Task vs Task.detached distinction, cooperative cancellation, priority escalation, TaskLocal values, and the Sendable protocol.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#async-await">1. async/await Under the Hood</a></li>
+            <li><a href="#continuations">2. Continuations &amp; Suspension Points</a></li>
+            <li><a href="#structured">3. Structured Concurrency: TaskGroup</a></li>
+            <li><a href="#task-vs-detached">4. Task vs Task.detached</a></li>
+            <li><a href="#cancellation">5. Task Cancellation (Cooperative Model)</a></li>
+            <li><a href="#priority">6. Task Priority &amp; Priority Escalation</a></li>
+            <li><a href="#tasklocal">7. TaskLocal Values</a></li>
+            <li><a href="#sendable">8. Sendable Protocol &amp; @Sendable Closures</a></li>
+            <li><a href="#architect">9. Architect: Migrating from GCD to Structured Concurrency</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="async-await">1. async/await Under the Hood</h2>
+
+    <p>Swift concurrency (introduced in Swift 5.5 / iOS 15) fundamentally changes how concurrent code executes. Instead of blocking threads, async functions <strong>suspend</strong> at <code>await</code> points, freeing the thread to do other work. The runtime uses a <strong>cooperative thread pool</strong> limited to the number of CPU cores.</p>
+
+    <h3>1.1 The Cooperative Thread Pool</h3>
+
+    <div class="diagram">
+GCD Thread Model (old):                    Swift Concurrency Thread Model (new):
+
+┌─────────────────────────┐               ┌─────────────────────────┐
+│ Thread 1: Task A (blocked on I/O)│      │ Core 1: Task A → suspend │
+│ Thread 2: Task B (blocked on I/O)│      │         → Task C runs    │
+│ Thread 3: Task C (running)       │      │         → Task A resumes │
+│ Thread 4: Task D (blocked on I/O)│      │ Core 2: Task B → suspend │
+│ Thread 5: Task E (blocked on I/O)│      │         → Task D runs    │
+│ ...                              │      │         → Task B resumes │
+│ Thread 64: Task ZZ (blocked)     │      │ Core 3: Task E (running) │
+│ ⚠️ Thread explosion!            │      │ ...                      │
+└─────────────────────────┘               │ Core 6: Task F (running) │
+                                          │ ✅ Only 6 threads total! │
+64+ threads, most blocked                 └─────────────────────────┘
+512KB × 64 = 32MB stack memory            6 threads, tasks suspend/resume
+Massive context switching                  Minimal context switching
+    </div>
+
+    <h3>1.2 How an async Function Compiles</h3>
+
+    <p>The Swift compiler transforms async functions into a <strong>state machine</strong>. Each <code>await</code> point becomes a state transition. The function's local variables are stored in a heap-allocated <strong>async frame</strong> (not on the stack), so they survive suspension.</p>
+
+    <pre><code><span class="comment">// What you write:</span>
+<span class="keyword">func</span> <span class="func">fetchUserProfile</span>(id: <span class="type">String</span>) <span class="keyword">async throws</span> -> <span class="type">UserProfile</span> {
+    <span class="keyword">let</span> userData = <span class="keyword">try await</span> api.<span class="func">fetchUser</span>(id: id)       <span class="comment">// Suspension point 1</span>
+    <span class="keyword">let</span> avatar = <span class="keyword">try await</span> api.<span class="func">fetchAvatar</span>(url: userData.avatarURL) <span class="comment">// Suspension point 2</span>
+    <span class="keyword">return</span> <span class="type">UserProfile</span>(user: userData, avatar: avatar)
+}
+
+<span class="comment">// What the compiler generates (conceptually):</span>
+<span class="comment">// A state machine with states: .entry, .afterFetchUser, .afterFetchAvatar</span>
+<span class="comment">//</span>
+<span class="comment">// State .entry:</span>
+<span class="comment">//   Call api.fetchUser(id:) with continuation → suspend</span>
+<span class="comment">//   Thread is freed to run other tasks</span>
+<span class="comment">//</span>
+<span class="comment">// State .afterFetchUser (resumed by continuation):</span>
+<span class="comment">//   Store userData in async frame</span>
+<span class="comment">//   Call api.fetchAvatar(url:) with continuation → suspend</span>
+<span class="comment">//   Thread is freed again</span>
+<span class="comment">//</span>
+<span class="comment">// State .afterFetchAvatar (resumed by continuation):</span>
+<span class="comment">//   Create UserProfile, return to caller's continuation</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Async Frames vs Stack Frames</div>
+        <p>Traditional function calls use stack frames — allocated on the thread's stack, automatically freed when the function returns. Async functions use <strong>async frames</strong> — heap-allocated structures that hold the function's local state across suspension points. This is why async functions can suspend without holding a thread: their state lives on the heap, not on any thread's stack. The tradeoff is heap allocation overhead, but this is amortized by the massive reduction in thread count.</p>
+    </div>
+
+    <h3>1.3 The Runtime: Executor and Jobs</h3>
+
+    <div class="diagram">
+Swift Concurrency Runtime Architecture:
+
+┌─────────────────────────────────────────────────────────────┐
+│                     Your async Code                          │
+│   Task { await fetchUser() }                                 │
+└──────────────────────┬───────────────────────────────────────┘
+                       │ Creates a Job
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Executor Layer                             │
+│                                                              │
+│  ┌─────────────────┐  ┌──────────────────────────────────┐  │
+│  │  MainActor      │  │  Default Concurrent Executor     │  │
+│  │  Executor       │  │  (cooperative thread pool)       │  │
+│  │  (main thread)  │  │  Width = # CPU cores             │  │
+│  └────────┬────────┘  └──────────────┬───────────────────┘  │
+│           │                          │                       │
+└───────────┼──────────────────────────┼───────────────────────┘
+            │                          │
+            ▼                          ▼
+┌──────────────────┐    ┌──────────────────────────────────┐
+│  Main Thread     │    │  Worker Threads (one per core)   │
+│  (RunLoop-based) │    │  Thread 1 │ Thread 2 │ Thread 3 │
+└──────────────────┘    └──────────────────────────────────┘
+                                       │
+                                       ▼
+                        ┌──────────────────────────────────┐
+                        │  libdispatch (underlying)        │
+                        │  dispatch_workloop_t              │
+                        └──────────────────────────────────┘
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="continuations">2. Continuations &amp; Suspension Points</h2>
+
+    <p>Continuations are the mechanism that bridges callback-based APIs to async/await. They represent "the rest of the computation" after a suspension point.</p>
+
+    <h3>2.1 withCheckedContinuation</h3>
+
+    <pre><code><span class="comment">// Bridging a callback-based API to async/await</span>
+<span class="keyword">func</span> <span class="func">fetchImage</span>(url: <span class="type">URL</span>) <span class="keyword">async throws</span> -> <span class="type">UIImage</span> {
+    <span class="keyword">try await</span> <span class="func">withCheckedThrowingContinuation</span> { continuation <span class="keyword">in</span>
+        <span class="type">URLSession</span>.shared.<span class="func">dataTask</span>(with: url) { data, response, error <span class="keyword">in</span>
+            <span class="keyword">if let</span> error = error {
+                continuation.<span class="func">resume</span>(throwing: error)
+                <span class="keyword">return</span>
+            }
+            <span class="keyword">guard let</span> data = data, <span class="keyword">let</span> image = <span class="type">UIImage</span>(data: data) <span class="keyword">else</span> {
+                continuation.<span class="func">resume</span>(throwing: <span class="type">ImageError</span>.decodingFailed)
+                <span class="keyword">return</span>
+            }
+            continuation.<span class="func">resume</span>(returning: image)
+        }.<span class="func">resume</span>()
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: Continuation Must Be Resumed Exactly Once</div>
+        <p>A continuation must be resumed <strong>exactly once</strong>. Resuming zero times leaks the task (it hangs forever). Resuming more than once is undefined behavior — with <code>withCheckedContinuation</code>, it triggers a runtime crash; with <code>withUnsafeContinuation</code>, it's a memory corruption bug. Always ensure every code path through your callback resumes the continuation.</p>
+        <pre><code><span class="comment">// ❌ BUG: Missing resume on error path</span>
+<span class="keyword">func</span> <span class="func">broken</span>() <span class="keyword">async</span> -> <span class="type">Data</span>? {
+    <span class="keyword">await</span> <span class="func">withCheckedContinuation</span> { continuation <span class="keyword">in</span>
+        <span class="func">fetchData</span> { result <span class="keyword">in</span>
+            <span class="keyword">switch</span> result {
+            <span class="keyword">case</span> .success(<span class="keyword">let</span> data):
+                continuation.<span class="func">resume</span>(returning: data)
+            <span class="keyword">case</span> .failure:
+                <span class="comment">// 💀 Forgot to resume! Task hangs forever.</span>
+                <span class="keyword">break</span>
+            }
+        }
+    }
+}</code></pre>
+    </div>
+
+    <h3>2.2 Checked vs Unsafe Continuations</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th><code>withCheckedContinuation</code></th>
+                <th><code>withUnsafeContinuation</code></th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Double-resume</td>
+                <td>Runtime crash (detectable)</td>
+                <td>Undefined behavior (memory corruption)</td>
+            </tr>
+            <tr>
+                <td>Never-resume</td>
+                <td>Runtime warning in debug</td>
+                <td>Silent hang</td>
+            </tr>
+            <tr>
+                <td>Performance</td>
+                <td>Slight overhead for checking</td>
+                <td>Zero overhead</td>
+            </tr>
+            <tr>
+                <td>Use case</td>
+                <td>Development, most production code</td>
+                <td>Hot paths where overhead matters</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="structured">3. Structured Concurrency: TaskGroup</h2>
+
+    <p>Structured concurrency means that concurrent tasks form a <strong>tree</strong> — child tasks are scoped to their parent, and the parent doesn't complete until all children complete (or are cancelled). This eliminates an entire class of resource leak bugs.</p>
+
+    <h3>3.1 withTaskGroup</h3>
+
+    <pre><code><span class="comment">// Parallel fan-out: fetch multiple images concurrently</span>
+<span class="keyword">func</span> <span class="func">fetchAllImages</span>(urls: [<span class="type">URL</span>]) <span class="keyword">async throws</span> -> [<span class="type">UIImage</span>] {
+    <span class="keyword">try await</span> <span class="func">withThrowingTaskGroup</span>(of: (<span class="type">Int</span>, <span class="type">UIImage</span>).<span class="keyword">self</span>) { group <span class="keyword">in</span>
+        <span class="keyword">for</span> (index, url) <span class="keyword">in</span> urls.<span class="func">enumerated</span>() {
+            group.<span class="func">addTask</span> {
+                <span class="keyword">let</span> (data, _) = <span class="keyword">try await</span> <span class="type">URLSession</span>.shared.<span class="func">data</span>(from: url)
+                <span class="keyword">guard let</span> image = <span class="type">UIImage</span>(data: data) <span class="keyword">else</span> {
+                    <span class="keyword">throw</span> <span class="type">ImageError</span>.decodingFailed
+                }
+                <span class="keyword">return</span> (index, image)
+            }
+        }
+
+        <span class="comment">// Collect results, maintaining original order</span>
+        <span class="keyword">var</span> images = [<span class="type">UIImage</span>?](<span class="func">repeating</span>: <span class="keyword">nil</span>, count: urls.count)
+        <span class="keyword">for try await</span> (index, image) <span class="keyword">in</span> group {
+            images[index] = image
+        }
+        <span class="keyword">return</span> images.<span class="func">compactMap</span> { $0 }
+    }
+}</code></pre>
+
+    <h3>3.2 TaskGroup Properties</h3>
+
+    <div class="diagram">
+Structured Concurrency Tree:
+
+        Parent Task
+       ┌────┼────┐
+       │    │    │
+    Child  Child  Child
+    Task1  Task2  Task3
+              │
+           ┌──┼──┐
+         Grand Grand
+         child child
+
+Rules:
+1. Parent waits for ALL children before completing
+2. If parent is cancelled → all children are cancelled
+3. If a child throws → other children are cancelled (ThrowingTaskGroup)
+4. Children inherit parent's priority and task-local values
+5. Children cannot outlive their parent scope
+    </div>
+
+    <h3>3.3 Limiting Concurrency in TaskGroup</h3>
+
+    <pre><code><span class="comment">// Process 1000 items with max 10 concurrent tasks</span>
+<span class="keyword">func</span> <span class="func">processWithLimit</span>(items: [<span class="type">Item</span>]) <span class="keyword">async</span> -> [<span class="type">Result</span>] {
+    <span class="keyword">await</span> <span class="func">withTaskGroup</span>(of: <span class="type">Result</span>.<span class="keyword">self</span>) { group <span class="keyword">in</span>
+        <span class="keyword">var</span> results: [<span class="type">Result</span>] = []
+        <span class="keyword">var</span> iterator = items.<span class="func">makeIterator</span>()
+
+        <span class="comment">// Seed with initial batch</span>
+        <span class="keyword">for</span> _ <span class="keyword">in</span> <span class="number">0</span>..&lt;<span class="func">min</span>(<span class="number">10</span>, items.count) {
+            <span class="keyword">if let</span> item = iterator.<span class="func">next</span>() {
+                group.<span class="func">addTask</span> { <span class="keyword">await</span> <span class="func">process</span>(item) }
+            }
+        }
+
+        <span class="comment">// As each completes, add the next</span>
+        <span class="keyword">for await</span> result <span class="keyword">in</span> group {
+            results.<span class="func">append</span>(result)
+            <span class="keyword">if let</span> item = iterator.<span class="func">next</span>() {
+                group.<span class="func">addTask</span> { <span class="keyword">await</span> <span class="func">process</span>(item) }
+            }
+        }
+
+        <span class="keyword">return</span> results
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="task-vs-detached">4. Task vs Task.detached</h2>
+
+    <p>This is one of the most critical distinctions in Swift concurrency. Getting it wrong leads to subtle bugs with actor isolation, priority, and cancellation.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th><code>Task { }</code></th>
+                <th><code>Task.detached { }</code></th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Actor context</td>
+                <td><strong>Inherits</strong> — runs on same actor</td>
+                <td><strong>Does not inherit</strong> — runs on default executor</td>
+            </tr>
+            <tr>
+                <td>Priority</td>
+                <td>Inherits from creating context</td>
+                <td>Must specify explicitly (or .medium)</td>
+            </tr>
+            <tr>
+                <td>Task-local values</td>
+                <td>Inherits from parent</td>
+                <td>Does not inherit</td>
+            </tr>
+            <tr>
+                <td>Cancellation</td>
+                <td>Not automatically cancelled with parent</td>
+                <td>Not automatically cancelled with parent</td>
+            </tr>
+            <tr>
+                <td>Structured?</td>
+                <td>No (unstructured)</td>
+                <td>No (unstructured)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="keyword">@MainActor</span>
+<span class="keyword">class</span> <span class="type">ViewModel</span>: <span class="type">ObservableObject</span> {
+    <span class="keyword">@Published var</span> data: [<span class="type">Item</span>] = []
+
+    <span class="keyword">func</span> <span class="func">loadData</span>() {
+        <span class="comment">// Task inherits @MainActor context</span>
+        <span class="type">Task</span> {
+            <span class="comment">// This closure runs on MainActor</span>
+            <span class="keyword">let</span> items = <span class="keyword">try await</span> api.<span class="func">fetchItems</span>()
+            data = items  <span class="comment">// ✅ Safe: we're on MainActor</span>
+        }
+
+        <span class="comment">// Task.detached does NOT inherit @MainActor</span>
+        <span class="type">Task</span>.<span class="func">detached</span> {
+            <span class="keyword">let</span> items = <span class="keyword">try await</span> <span class="keyword">self</span>.api.<span class="func">fetchItems</span>()
+            <span class="keyword">await</span> <span class="type">MainActor</span>.<span class="func">run</span> {
+                <span class="keyword">self</span>.data = items  <span class="comment">// Must explicitly hop to MainActor</span>
+            }
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: Task { } is NOT Structured</div>
+        <p>Despite being called "Task," <code>Task { }</code> and <code>Task.detached { }</code> are both <strong>unstructured</strong> concurrency. They create top-level tasks that are not children of any parent. Only tasks created inside <code>withTaskGroup</code> or <code>withThrowingTaskGroup</code> are truly structured. Unstructured tasks can outlive their creating scope, which means they can leak if you don't store and cancel the <code>Task</code> handle.</p>
+    </div>
+
+    <pre><code><span class="comment">// Storing task handles for cancellation</span>
+<span class="keyword">class</span> <span class="type">SearchViewModel</span> {
+    <span class="keyword">private var</span> searchTask: <span class="type">Task</span>&lt;<span class="type">Void</span>, <span class="type">Never</span>&gt;?
+
+    <span class="keyword">func</span> <span class="func">search</span>(query: <span class="type">String</span>) {
+        <span class="comment">// Cancel previous search</span>
+        searchTask?.<span class="func">cancel</span>()
+
+        searchTask = <span class="type">Task</span> {
+            <span class="keyword">try</span>? <span class="keyword">await</span> <span class="type">Task</span>.<span class="func">sleep</span>(for: .<span class="func">milliseconds</span>(<span class="number">300</span>))  <span class="comment">// Debounce</span>
+            <span class="keyword">guard</span> !<span class="type">Task</span>.isCancelled <span class="keyword">else</span> { <span class="keyword">return</span> }
+            <span class="keyword">let</span> results = <span class="keyword">try</span>? <span class="keyword">await</span> api.<span class="func">search</span>(query)
+            <span class="keyword">guard</span> !<span class="type">Task</span>.isCancelled <span class="keyword">else</span> { <span class="keyword">return</span> }
+            <span class="keyword">await</span> <span class="func">updateResults</span>(results ?? [])
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">cleanup</span>() {
+        searchTask?.<span class="func">cancel</span>()
+        searchTask = <span class="keyword">nil</span>
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="cancellation">5. Task Cancellation (Cooperative Model)</h2>
+
+    <p>Like Operation, Swift concurrency uses <strong>cooperative cancellation</strong>. Calling <code>task.cancel()</code> sets a flag; the task must check it and respond.</p>
+
+    <h3>5.1 Cancellation Checking Patterns</h3>
+
+    <pre><code><span class="keyword">func</span> <span class="func">processLargeDataset</span>(items: [<span class="type">Item</span>]) <span class="keyword">async throws</span> -> [<span class="type">Result</span>] {
+    <span class="keyword">var</span> results: [<span class="type">Result</span>] = []
+
+    <span class="keyword">for</span> item <span class="keyword">in</span> items {
+        <span class="comment">// Method 1: Check and throw</span>
+        <span class="keyword">try</span> <span class="type">Task</span>.<span class="func">checkCancellation</span>()  <span class="comment">// Throws CancellationError</span>
+
+        <span class="comment">// Method 2: Check and handle gracefully</span>
+        <span class="keyword">guard</span> !<span class="type">Task</span>.isCancelled <span class="keyword">else</span> {
+            <span class="keyword">return</span> results  <span class="comment">// Return partial results</span>
+        }
+
+        <span class="keyword">let</span> result = <span class="keyword">await</span> <span class="func">process</span>(item)
+        results.<span class="func">append</span>(result)
+    }
+
+    <span class="keyword">return</span> results
+}
+
+<span class="comment">// Cancellation-aware sleep</span>
+<span class="keyword">func</span> <span class="func">pollWithBackoff</span>() <span class="keyword">async throws</span> {
+    <span class="keyword">var</span> delay: <span class="type">Duration</span> = .<span class="func">seconds</span>(<span class="number">1</span>)
+
+    <span class="keyword">while</span> <span class="keyword">true</span> {
+        <span class="keyword">let</span> status = <span class="keyword">try await</span> <span class="func">checkStatus</span>()
+        <span class="keyword">if</span> status == .complete { <span class="keyword">return</span> }
+
+        <span class="comment">// Task.sleep throws CancellationError if task is cancelled</span>
+        <span class="keyword">try await</span> <span class="type">Task</span>.<span class="func">sleep</span>(for: delay)
+        delay = <span class="func">min</span>(delay * <span class="number">2</span>, .<span class="func">seconds</span>(<span class="number">60</span>))
+    }
+}</code></pre>
+
+    <h3>5.2 Cancellation Propagation in TaskGroup</h3>
+
+    <pre><code><span class="comment">// In ThrowingTaskGroup: one child throws → others cancelled</span>
+<span class="keyword">func</span> <span class="func">fetchAllOrFail</span>(urls: [<span class="type">URL</span>]) <span class="keyword">async throws</span> -> [<span class="type">Data</span>] {
+    <span class="keyword">try await</span> <span class="func">withThrowingTaskGroup</span>(of: <span class="type">Data</span>.<span class="keyword">self</span>) { group <span class="keyword">in</span>
+        <span class="keyword">for</span> url <span class="keyword">in</span> urls {
+            group.<span class="func">addTask</span> {
+                <span class="keyword">let</span> (data, _) = <span class="keyword">try await</span> <span class="type">URLSession</span>.shared.<span class="func">data</span>(from: url)
+                <span class="keyword">return</span> data
+            }
+        }
+
+        <span class="keyword">var</span> results: [<span class="type">Data</span>] = []
+        <span class="keyword">for try await</span> data <span class="keyword">in</span> group {
+            results.<span class="func">append</span>(data)
+        }
+        <span class="keyword">return</span> results
+        <span class="comment">// If ANY child throws, the group cancels remaining children</span>
+        <span class="comment">// and rethrows the error</span>
+    }
+}
+
+<span class="comment">// In non-throwing TaskGroup: cancellation must be manual</span>
+<span class="keyword">func</span> <span class="func">fetchFirstSuccess</span>(urls: [<span class="type">URL</span>]) <span class="keyword">async</span> -> <span class="type">Data</span>? {
+    <span class="keyword">await</span> <span class="func">withTaskGroup</span>(of: <span class="type">Data</span>?.<span class="keyword">self</span>) { group <span class="keyword">in</span>
+        <span class="keyword">for</span> url <span class="keyword">in</span> urls {
+            group.<span class="func">addTask</span> {
+                <span class="keyword">try</span>? <span class="keyword">await</span> <span class="type">URLSession</span>.shared.<span class="func">data</span>(from: url).<span class="number">0</span>
+            }
+        }
+
+        <span class="keyword">for await</span> result <span class="keyword">in</span> group {
+            <span class="keyword">if let</span> data = result {
+                group.<span class="func">cancelAll</span>()  <span class="comment">// Cancel remaining tasks</span>
+                <span class="keyword">return</span> data
+            }
+        }
+        <span class="keyword">return</span> <span class="keyword">nil</span>
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="priority">6. Task Priority &amp; Priority Escalation</h2>
+
+    <p>Tasks have priorities that map to GCD QoS classes. The runtime supports <strong>priority escalation</strong> — if a high-priority task awaits a low-priority task, the low-priority task's priority is boosted.</p>
+
+    <pre><code><span class="comment">// Task priorities</span>
+<span class="type">Task</span>(priority: .high) { ... }       <span class="comment">// Maps to .userInitiated</span>
+<span class="type">Task</span>(priority: .medium) { ... }     <span class="comment">// Maps to .default</span>
+<span class="type">Task</span>(priority: .low) { ... }        <span class="comment">// Maps to .utility</span>
+<span class="type">Task</span>(priority: .background) { ... } <span class="comment">// Maps to .background</span>
+<span class="type">Task</span>(priority: .userInitiated) { ... }
+
+<span class="comment">// Priority escalation example</span>
+<span class="keyword">let</span> lowPriorityTask = <span class="type">Task</span>(priority: .background) {
+    <span class="keyword">await</span> <span class="func">heavyComputation</span>()  <span class="comment">// Running at .background</span>
+}
+
+<span class="comment">// High-priority task awaits the low-priority one</span>
+<span class="type">Task</span>(priority: .userInitiated) {
+    <span class="keyword">let</span> result = <span class="keyword">await</span> lowPriorityTask.value
+    <span class="comment">// Runtime detects: .userInitiated waiting on .background</span>
+    <span class="comment">// → Escalates lowPriorityTask to .userInitiated</span>
+    <span class="func">updateUI</span>(result)
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Priority Escalation Mechanics</div>
+        <p>Priority escalation in Swift concurrency works through the executor. When a high-priority task calls <code>await</code> on a lower-priority task's <code>value</code>, the runtime walks the dependency chain and boosts the priority of all tasks in the chain. For actors, this means the actor's executor will schedule the boosted job ahead of other same-priority jobs. This is similar to GCD's priority inheritance but works at the task level rather than the thread level.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="tasklocal">7. TaskLocal Values</h2>
+
+    <p><code>TaskLocal</code> values are the Swift concurrency equivalent of thread-local storage. They propagate automatically through the task hierarchy — child tasks inherit their parent's task-local values.</p>
+
+    <pre><code><span class="keyword">enum</span> <span class="type">RequestContext</span> {
+    <span class="keyword">@TaskLocal static var</span> requestID: <span class="type">String</span>?
+    <span class="keyword">@TaskLocal static var</span> userID: <span class="type">String</span>?
+    <span class="keyword">@TaskLocal static var</span> traceID: <span class="type">String</span>?
+}
+
+<span class="comment">// Setting task-local values</span>
+<span class="keyword">func</span> <span class="func">handleRequest</span>(_ request: <span class="type">Request</span>) <span class="keyword">async</span> {
+    <span class="keyword">await</span> <span class="type">RequestContext</span>.$requestID.<span class="func">withValue</span>(request.id) {
+        <span class="keyword">await</span> <span class="type">RequestContext</span>.$traceID.<span class="func">withValue</span>(<span class="type">UUID</span>().uuidString) {
+            <span class="comment">// All code in this scope (and child tasks) sees these values</span>
+            <span class="keyword">await</span> <span class="func">processRequest</span>(request)
+        }
+    }
+}
+
+<span class="keyword">func</span> <span class="func">processRequest</span>(_ request: <span class="type">Request</span>) <span class="keyword">async</span> {
+    <span class="comment">// Task-local values are available here</span>
+    <span class="func">log</span>(<span class="string">"Processing request \(RequestContext.requestID ?? "unknown")"</span>)
+
+    <span class="keyword">await</span> <span class="func">withTaskGroup</span>(of: <span class="type">Void</span>.<span class="keyword">self</span>) { group <span class="keyword">in</span>
+        group.<span class="func">addTask</span> {
+            <span class="comment">// Child tasks inherit task-local values</span>
+            <span class="func">log</span>(<span class="string">"Child task sees: \(RequestContext.requestID ?? "none")"</span>)
+        }
+    }
+}
+
+<span class="comment">// Task.detached does NOT inherit task-local values</span>
+<span class="type">Task</span>.<span class="func">detached</span> {
+    <span class="func">log</span>(<span class="string">"Detached: \(RequestContext.requestID ?? "none")"</span>)  <span class="comment">// "none"</span>
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: TaskLocal for Distributed Tracing</div>
+        <p>TaskLocal values are ideal for propagating request context through a call chain — request IDs, trace IDs, user context, feature flags. They replace the thread-local storage pattern that was common with GCD. The key advantage: they propagate through async boundaries automatically, which thread-local storage cannot do (since async code can resume on any thread).</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="sendable">8. Sendable Protocol &amp; @Sendable Closures</h2>
+
+    <p><code>Sendable</code> is a marker protocol that indicates a type is safe to share across concurrency domains (actors, tasks). It's the foundation of Swift's compile-time data race safety.</p>
+
+    <h3>8.1 What Is Sendable?</h3>
+
+    <pre><code><span class="comment">// Types that are implicitly Sendable:</span>
+<span class="comment">// - Value types (struct, enum) where all stored properties are Sendable</span>
+<span class="comment">// - Actor types (isolated by definition)</span>
+<span class="comment">// - Final classes with only let properties that are Sendable</span>
+<span class="comment">// - Tuples of Sendable types</span>
+<span class="comment">// - Metatypes (String.self)</span>
+
+<span class="keyword">struct</span> <span class="type">UserData</span>: <span class="type">Sendable</span> {  <span class="comment">// ✅ All properties are Sendable</span>
+    <span class="keyword">let</span> name: <span class="type">String</span>
+    <span class="keyword">let</span> age: <span class="type">Int</span>
+}
+
+<span class="keyword">final class</span> <span class="type">ImmutableConfig</span>: <span class="type">Sendable</span> {  <span class="comment">// ✅ Final + all let + Sendable</span>
+    <span class="keyword">let</span> apiKey: <span class="type">String</span>
+    <span class="keyword">let</span> timeout: <span class="type">TimeInterval</span>
+}
+
+<span class="keyword">class</span> <span class="type">MutableState</span>: <span class="type">Sendable</span> {  <span class="comment">// ❌ Compiler error: has mutable state</span>
+    <span class="keyword">var</span> count = <span class="number">0</span>  <span class="comment">// Not safe to share across tasks</span>
+}
+
+<span class="comment">// @unchecked Sendable: "trust me, I handle synchronization"</span>
+<span class="keyword">final class</span> <span class="type">ThreadSafeCounter</span>: <span class="keyword">@unchecked</span> <span class="type">Sendable</span> {
+    <span class="keyword">private var</span> _count = <span class="number">0</span>
+    <span class="keyword">private let</span> lock = <span class="type">NSLock</span>()
+
+    <span class="keyword">var</span> count: <span class="type">Int</span> {
+        lock.<span class="func">lock</span>()
+        <span class="keyword">defer</span> { lock.<span class="func">unlock</span>() }
+        <span class="keyword">return</span> _count
+    }
+
+    <span class="keyword">func</span> <span class="func">increment</span>() {
+        lock.<span class="func">lock</span>()
+        _count += <span class="number">1</span>
+        lock.<span class="func">unlock</span>()
+    }
+}</code></pre>
+
+    <h3>8.2 @Sendable Closures</h3>
+
+    <pre><code><span class="comment">// @Sendable closures cannot capture mutable state</span>
+<span class="keyword">var</span> counter = <span class="number">0</span>
+
+<span class="type">Task</span> { <span class="keyword">@Sendable in</span>
+    counter += <span class="number">1</span>  <span class="comment">// ❌ Error: mutation of captured var in @Sendable closure</span>
+}
+
+<span class="comment">// Correct: capture immutable value</span>
+<span class="keyword">let</span> currentCount = counter
+<span class="type">Task</span> {
+    <span class="func">print</span>(currentCount)  <span class="comment">// ✅ Captures a let binding</span>
+}
+
+<span class="comment">// @Sendable function types</span>
+<span class="keyword">func</span> <span class="func">runInBackground</span>(_ work: <span class="keyword">@Sendable @escaping</span> () <span class="keyword">async</span> -> <span class="type">Void</span>) {
+    <span class="type">Task</span>.<span class="func">detached</span>(operation: work)
+}</code></pre>
+
+    <h3>8.3 Sendable Checking Levels</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Swift Version</th>
+                <th>Checking Level</th>
+                <th>Behavior</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Swift 5.5-5.9</td>
+                <td>Minimal</td>
+                <td>Warnings only for explicit Sendable violations</td>
+            </tr>
+            <tr>
+                <td>Swift 5.10</td>
+                <td>Complete (opt-in)</td>
+                <td><code>-strict-concurrency=complete</code> flag for full checking</td>
+            </tr>
+            <tr>
+                <td>Swift 6.0</td>
+                <td>Strict (default)</td>
+                <td>All Sendable violations are errors by default</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">9. Architect: Migrating from GCD to Structured Concurrency</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>Migrating a large codebase from GCD to async/await is a multi-quarter effort that requires careful planning. Here's a battle-tested strategy used by teams at scale.</p>
+    </div>
+
+    <h3>9.1 Migration Strategy: Bottom-Up</h3>
+
+    <div class="diagram">
+Migration Order (Bottom → Top):
+
+Phase 1: Leaf functions (no dependencies)
+┌──────────────────────────────────────────────┐
+│  Network layer: URLSession → async/await      │
+│  File I/O: Data(contentsOf:) → async          │
+│  Database: Core Data perform → async           │
+└──────────────────────────────────────────────┘
+                    │
+Phase 2: Service layer
+┌──────────────────────────────────────────────┐
+│  Repositories: callback → async               │
+│  Use cases: DispatchGroup → TaskGroup          │
+│  Caches: serial queue → actor                  │
+└──────────────────────────────────────────────┘
+                    │
+Phase 3: Presentation layer
+┌──────────────────────────────────────────────┐
+│  ViewModels: Combine → @MainActor + async     │
+│  Coordinators: callback → async               │
+│  UI bindings: @Published → @Observable         │
+└──────────────────────────────────────────────┘
+    </div>
+
+    <h3>9.2 Bridge Patterns</h3>
+
+    <pre><code><span class="comment">// Pattern 1: Wrap callback API in async</span>
+<span class="keyword">extension</span> <span class="type">LegacyNetworkClient</span> {
+    <span class="keyword">func</span> <span class="func">fetch</span>(url: <span class="type">URL</span>) <span class="keyword">async throws</span> -> <span class="type">Data</span> {
+        <span class="keyword">try await</span> <span class="func">withCheckedThrowingContinuation</span> { continuation <span class="keyword">in</span>
+            <span class="keyword">self</span>.<span class="func">fetch</span>(url: url) { result <span class="keyword">in</span>
+                continuation.<span class="func">resume</span>(with: result)
+            }
+        }
+    }
+}
+
+<span class="comment">// Pattern 2: Expose async API with callback wrapper for legacy callers</span>
+<span class="keyword">class</span> <span class="type">ModernService</span> {
+    <span class="keyword">func</span> <span class="func">fetchData</span>() <span class="keyword">async throws</span> -> <span class="type">Data</span> {
+        <span class="comment">// Modern implementation</span>
+    }
+
+    <span class="comment">// Legacy bridge for callers not yet migrated</span>
+    <span class="keyword">func</span> <span class="func">fetchData</span>(completion: <span class="keyword">@escaping</span> (<span class="type">Result</span>&lt;<span class="type">Data</span>, <span class="type">Error</span>&gt;) -> <span class="type">Void</span>) {
+        <span class="type">Task</span> {
+            <span class="keyword">do</span> {
+                <span class="keyword">let</span> data = <span class="keyword">try await</span> <span class="func">fetchData</span>()
+                completion(.<span class="func">success</span>(data))
+            } <span class="keyword">catch</span> {
+                completion(.<span class="func">failure</span>(error))
+            }
+        }
+    }
+}
+
+<span class="comment">// Pattern 3: Replace serial queue with actor</span>
+<span class="comment">// Before:</span>
+<span class="keyword">class</span> <span class="type">CacheManager</span> {
+    <span class="keyword">private var</span> cache: [<span class="type">String</span>: <span class="type">Data</span>] = [:]
+    <span class="keyword">private let</span> queue = <span class="type">DispatchQueue</span>(label: <span class="string">"cache"</span>)
+
+    <span class="keyword">func</span> <span class="func">get</span>(_ key: <span class="type">String</span>) -> <span class="type">Data</span>? {
+        queue.<span class="func">sync</span> { cache[key] }
+    }
+}
+
+<span class="comment">// After:</span>
+<span class="keyword">actor</span> <span class="type">CacheManager</span> {
+    <span class="keyword">private var</span> cache: [<span class="type">String</span>: <span class="type">Data</span>] = [:]
+
+    <span class="keyword">func</span> <span class="func">get</span>(_ key: <span class="type">String</span>) -> <span class="type">Data</span>? {
+        cache[key]
+    }
+}</code></pre>
+
+    <h3>9.3 Migration Checklist</h3>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Migration Checklist</div>
+        <ul>
+            <li><strong>Enable strict concurrency warnings</strong> first (<code>-strict-concurrency=complete</code>) to see the scope of changes needed</li>
+            <li><strong>Migrate bottom-up</strong>: leaf functions first, then services, then presentation</li>
+            <li><strong>Use withCheckedContinuation</strong> to bridge callback APIs — don't rewrite everything at once</li>
+            <li><strong>Replace serial queues with actors</strong> — but beware of reentrancy (see next document)</li>
+            <li><strong>Replace DispatchGroup with TaskGroup</strong> — structured concurrency handles cancellation automatically</li>
+            <li><strong>Mark types as Sendable</strong> progressively — use <code>@unchecked Sendable</code> as a temporary bridge</li>
+            <li><strong>Test thoroughly</strong>: async code has different timing characteristics than GCD code</li>
+            <li><strong>Keep both APIs during transition</strong>: provide async + callback versions until all callers migrate</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="02-operation-queues.html">← Operation Queues</a>
+        <a href="04-actors-isolation.html">Next: Actors &amp; Isolation →</a>
+    </div>
+</div>
+</body>
+</html>

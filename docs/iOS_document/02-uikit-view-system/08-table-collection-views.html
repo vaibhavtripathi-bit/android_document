@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Table &amp; Collection Views — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">UIKit View System</a><span class="sep">›</span>
+        Table &amp; Collection Views
+    </nav>
+
+    <h1>Table &amp; Collection Views</h1>
+    <p class="subtitle">Cell reuse internals, UICollectionViewCompositionalLayout, DiffableDataSource, CellRegistration, prefetching, self-sizing cells, and building generic list infrastructure at scale.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#internals">1. UITableView / UICollectionView Internals</a></li>
+            <li><a href="#cell-reuse">2. Cell Reuse Queue Mechanism</a></li>
+            <li><a href="#compositional-layout">3. UICollectionViewCompositionalLayout</a></li>
+            <li><a href="#diffable">4. DiffableDataSource &amp; Snapshots</a></li>
+            <li><a href="#cell-registration">5. CellRegistration API</a></li>
+            <li><a href="#prefetching">6. Prefetching</a></li>
+            <li><a href="#self-sizing">7. Self-Sizing Cells</a></li>
+            <li><a href="#advanced-compositional">8. Advanced Compositional Layout</a></li>
+            <li><a href="#list-cell">9. UICollectionViewListCell</a></li>
+            <li><a href="#architect-infrastructure">10. Architect: Generic List Infrastructure</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="internals">1. UITableView / UICollectionView Internals</h2>
+    <!-- ============================================================ -->
+
+    <p>Both <code>UITableView</code> and <code>UICollectionView</code> are subclasses of <code>UIScrollView</code>. They implement a <strong>virtualization</strong> pattern: only cells visible on screen (plus a small buffer) exist in memory. As the user scrolls, cells leaving the screen are recycled and reused for new content.</p>
+
+    <div class="diagram">
+Cell Virtualization:
+
+  Visible Area (screen)
+  ┌─────────────────────────┐
+  │  Cell A (index 5)        │  ← Visible, in view hierarchy
+  │  Cell B (index 6)        │
+  │  Cell C (index 7)        │
+  │  Cell D (index 8)        │
+  │  Cell E (index 9)        │
+  └─────────────────────────┘
+                ▲
+  Buffer Zone   │  (prefetch area)
+  ┌─────────────────────────┐
+  │  Cell F (index 10)       │  ← Prepared but not yet visible
+  │  Cell G (index 11)       │
+  └─────────────────────────┘
+
+  Reuse Queue (off-screen pool)
+  ┌─────────────────────────┐
+  │  Cell X (was index 2)    │  ← Removed from hierarchy
+  │  Cell Y (was index 3)    │     Available for dequeue
+  │  Cell Z (was index 4)    │
+  └─────────────────────────┘
+
+  Total data: 10,000 items
+  Cells in memory: ~7-10 (visible + buffer)
+  Memory savings: ~99.9%
+    </div>
+
+    <h3>Architecture Comparison</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Feature</th>
+                <th>UITableView</th>
+                <th>UICollectionView</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Layout</td>
+                <td>Single column, rows only</td>
+                <td>Arbitrary layout via UICollectionViewLayout</td>
+            </tr>
+            <tr>
+                <td>Sections</td>
+                <td>Headers/footers per section</td>
+                <td>Supplementary views (any kind)</td>
+            </tr>
+            <tr>
+                <td>Decoration</td>
+                <td>None</td>
+                <td>Decoration views (backgrounds, etc.)</td>
+            </tr>
+            <tr>
+                <td>Cell sizing</td>
+                <td>rowHeight or automaticDimension</td>
+                <td>Layout-driven (estimatedItemSize)</td>
+            </tr>
+            <tr>
+                <td>Editing</td>
+                <td>Built-in swipe actions, reorder</td>
+                <td>Manual (or use UICollectionViewListCell)</td>
+            </tr>
+            <tr>
+                <td>Modern recommendation</td>
+                <td>Use for simple lists</td>
+                <td>Use for everything (with CompositionalLayout)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="cell-reuse">2. Cell Reuse Queue Mechanism</h2>
+    <!-- ============================================================ -->
+
+    <pre><code><span class="comment">// The reuse queue is a dictionary of [String: [UICollectionViewCell]]</span>
+<span class="comment">// Key = reuse identifier, Value = array of available cells</span>
+
+<span class="comment">// Registration (tells the collection view how to create cells)</span>
+collectionView.<span class="func">register</span>(
+    <span class="type">MyCell</span>.<span class="keyword">self</span>,
+    forCellWithReuseIdentifier: <span class="string">"myCell"</span>
+)
+
+<span class="comment">// Dequeue (gets a cell from the reuse queue or creates a new one)</span>
+<span class="keyword">let</span> cell = collectionView.<span class="func">dequeueReusableCell</span>(
+    withReuseIdentifier: <span class="string">"myCell"</span>,
+    for: indexPath
+) <span class="keyword">as</span>! <span class="type">MyCell</span>
+
+<span class="comment">// What happens internally during dequeue:</span>
+<span class="comment">// 1. Check reuse queue for a cell with matching identifier</span>
+<span class="comment">// 2. If found: remove from queue, call prepareForReuse()</span>
+<span class="comment">// 3. If not found: instantiate a new cell (init or nib)</span>
+<span class="comment">// 4. Return the cell</span>
+
+<span class="comment">// What happens when a cell scrolls off screen:</span>
+<span class="comment">// 1. Cell is removed from the collection view's visible cells</span>
+<span class="comment">// 2. Cell is added to the reuse queue</span>
+<span class="comment">// 3. Cell remains in memory but is NOT in the view hierarchy</span>
+
+<span class="keyword">class</span> <span class="type">MyCell</span>: <span class="type">UICollectionViewCell</span> {
+    <span class="keyword">override func</span> <span class="func">prepareForReuse</span>() {
+        <span class="keyword">super</span>.<span class="func">prepareForReuse</span>()
+        <span class="comment">// Reset cell to default state</span>
+        <span class="comment">// Cancel any pending image loads</span>
+        imageView.image = <span class="keyword">nil</span>
+        imageLoadTask?.<span class="func">cancel</span>()
+        titleLabel.text = <span class="keyword">nil</span>
+        <span class="comment">// DON'T reset constraints here — they should be set once in init</span>
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall</div>
+        <p><strong>Forgetting to reset state in <code>prepareForReuse()</code>.</strong> Since cells are recycled, any state from the previous use persists. If you set an image asynchronously and don't clear it in <code>prepareForReuse()</code>, a recycled cell will briefly show the wrong image before the new one loads. Always cancel pending async work and reset visual state.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="compositional-layout">3. UICollectionViewCompositionalLayout</h2>
+    <!-- ============================================================ -->
+
+    <p>Introduced in iOS 13, <code>UICollectionViewCompositionalLayout</code> replaces <code>UICollectionViewFlowLayout</code> for most use cases. It uses a hierarchical structure: <strong>Item → Group → Section → Layout</strong>.</p>
+
+    <div class="diagram">
+Compositional Layout Hierarchy:
+
+  Layout
+  └── Section 0
+  │     └── Group (horizontal)
+  │           ├── Item (fractionalWidth: 0.5)
+  │           └── Item (fractionalWidth: 0.5)
+  └── Section 1
+  │     └── Group (horizontal)
+  │           ├── Item (fractionalWidth: 0.3)
+  │           ├── Item (fractionalWidth: 0.3)
+  │           └── Item (fractionalWidth: 0.3)
+  └── Section 2
+        └── Group (horizontal, orthogonal scrolling)
+              ├── Item (absolute: 200pt)
+              ├── Item (absolute: 200pt)
+              └── Item (absolute: 200pt)
+    </div>
+
+    <pre><code><span class="comment">// Basic grid layout</span>
+<span class="keyword">func</span> <span class="func">createGridLayout</span>() -> <span class="type">UICollectionViewCompositionalLayout</span> {
+    <span class="comment">// Item: each cell takes half the group width</span>
+    <span class="keyword">let</span> itemSize = <span class="type">NSCollectionLayoutSize</span>(
+        widthDimension: .fractionalWidth(<span class="number">0.5</span>),
+        heightDimension: .fractionalHeight(<span class="number">1.0</span>)
+    )
+    <span class="keyword">let</span> item = <span class="type">NSCollectionLayoutItem</span>(layoutSize: itemSize)
+    item.contentInsets = <span class="type">NSDirectionalEdgeInsets</span>(
+        top: <span class="number">4</span>, leading: <span class="number">4</span>, bottom: <span class="number">4</span>, trailing: <span class="number">4</span>
+    )
+
+    <span class="comment">// Group: horizontal, 2 items per row, estimated height</span>
+    <span class="keyword">let</span> groupSize = <span class="type">NSCollectionLayoutSize</span>(
+        widthDimension: .fractionalWidth(<span class="number">1.0</span>),
+        heightDimension: .estimated(<span class="number">200</span>)
+    )
+    <span class="keyword">let</span> group = <span class="type">NSCollectionLayoutGroup</span>.<span class="func">horizontal</span>(
+        layoutSize: groupSize,
+        subitems: [item]
+    )
+
+    <span class="comment">// Section</span>
+    <span class="keyword">let</span> section = <span class="type">NSCollectionLayoutSection</span>(group: group)
+    section.contentInsets = <span class="type">NSDirectionalEdgeInsets</span>(
+        top: <span class="number">16</span>, leading: <span class="number">16</span>, bottom: <span class="number">16</span>, trailing: <span class="number">16</span>
+    )
+
+    <span class="comment">// Section header</span>
+    <span class="keyword">let</span> headerSize = <span class="type">NSCollectionLayoutSize</span>(
+        widthDimension: .fractionalWidth(<span class="number">1.0</span>),
+        heightDimension: .estimated(<span class="number">44</span>)
+    )
+    <span class="keyword">let</span> header = <span class="type">NSCollectionLayoutBoundarySupplementaryItem</span>(
+        layoutSize: headerSize,
+        elementKind: <span class="type">UICollectionView</span>.elementKindSectionHeader,
+        alignment: .top
+    )
+    header.pinToVisibleBounds = <span class="keyword">true</span>  <span class="comment">// Sticky header</span>
+    section.boundarySupplementaryItems = [header]
+
+    <span class="keyword">return</span> <span class="type">UICollectionViewCompositionalLayout</span>(section: section)
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="diffable">4. DiffableDataSource &amp; Snapshots</h2>
+    <!-- ============================================================ -->
+
+    <pre><code><span class="comment">// DiffableDataSource replaces UICollectionViewDataSource</span>
+<span class="comment">// It uses snapshots for declarative data management</span>
+
+<span class="keyword">enum</span> <span class="type">Section</span>: <span class="type">Hashable</span> {
+    <span class="keyword">case</span> featured, recent, categories
+}
+
+<span class="keyword">struct</span> <span class="type">Item</span>: <span class="type">Hashable</span> {
+    <span class="keyword">let</span> id: <span class="type">UUID</span>
+    <span class="keyword">let</span> title: <span class="type">String</span>
+    <span class="keyword">let</span> imageURL: <span class="type">URL</span>?
+
+    <span class="keyword">func</span> <span class="func">hash</span>(into hasher: <span class="keyword">inout</span> <span class="type">Hasher</span>) {
+        hasher.<span class="func">combine</span>(id)  <span class="comment">// Hash only by identity, not content</span>
+    }
+
+    <span class="keyword">static func</span> == (lhs: <span class="type">Item</span>, rhs: <span class="type">Item</span>) -> <span class="type">Bool</span> {
+        lhs.id == rhs.id  <span class="comment">// Equality by identity</span>
+    }
+}
+
+<span class="comment">// Create data source</span>
+<span class="keyword">var</span> dataSource: <span class="type">UICollectionViewDiffableDataSource</span>&lt;<span class="type">Section</span>, <span class="type">Item</span>&gt;!
+
+dataSource = <span class="type">UICollectionViewDiffableDataSource</span>(
+    collectionView: collectionView
+) { collectionView, indexPath, item <span class="keyword">in</span>
+    <span class="keyword">let</span> cell = collectionView.<span class="func">dequeueReusableCell</span>(
+        withReuseIdentifier: <span class="string">"cell"</span>,
+        for: indexPath
+    ) <span class="keyword">as</span>! <span class="type">ItemCell</span>
+    cell.<span class="func">configure</span>(with: item)
+    <span class="keyword">return</span> cell
+}
+
+<span class="comment">// Apply a snapshot</span>
+<span class="keyword">var</span> snapshot = <span class="type">NSDiffableDataSourceSnapshot</span>&lt;<span class="type">Section</span>, <span class="type">Item</span>&gt;()
+snapshot.<span class="func">appendSections</span>([.featured, .recent, .categories])
+snapshot.<span class="func">appendItems</span>(featuredItems, toSection: .featured)
+snapshot.<span class="func">appendItems</span>(recentItems, toSection: .recent)
+snapshot.<span class="func">appendItems</span>(categoryItems, toSection: .categories)
+
+<span class="comment">// Apply with animation</span>
+dataSource.<span class="func">apply</span>(snapshot, animatingDifferences: <span class="keyword">true</span>)
+
+<span class="comment">// Update existing items (iOS 15+)</span>
+<span class="keyword">var</span> snapshot = dataSource.<span class="func">snapshot</span>()
+snapshot.<span class="func">reconfigureItems</span>([updatedItem])  <span class="comment">// Reconfigure without reload</span>
+dataSource.<span class="func">apply</span>(snapshot)
+
+<span class="comment">// Difference between reloadItems and reconfigureItems:</span>
+<span class="comment">// reloadItems: dequeues a NEW cell and configures it (expensive)</span>
+<span class="comment">// reconfigureItems: updates the EXISTING cell in place (cheap, iOS 15+)</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive</div>
+        <p><strong>How diffing works internally:</strong> When you call <code>apply(snapshot)</code>, the data source computes the difference between the current and new snapshots using a diffing algorithm (based on the <code>Hashable</code> conformance of your section and item types). It then generates the minimal set of insert, delete, move, and reload operations needed to transform the current state into the new state. This is why your items must be <code>Hashable</code> — the diff algorithm uses hash values to identify items across snapshots.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="cell-registration">5. CellRegistration API</h2>
+    <!-- ============================================================ -->
+
+    <pre><code><span class="comment">// CellRegistration (iOS 14+) — type-safe cell configuration</span>
+<span class="comment">// Replaces register() + dequeueReusableCell() pattern</span>
+
+<span class="keyword">let</span> cellRegistration = <span class="type">UICollectionView</span>.<span class="type">CellRegistration</span>&lt;<span class="type">UICollectionViewListCell</span>, <span class="type">Item</span>&gt; {
+    cell, indexPath, item <span class="keyword">in</span>
+
+    <span class="keyword">var</span> content = cell.<span class="func">defaultContentConfiguration</span>()
+    content.text = item.title
+    content.secondaryText = item.subtitle
+    content.image = <span class="type">UIImage</span>(systemName: item.iconName)
+    cell.contentConfiguration = content
+
+    <span class="comment">// Accessories</span>
+    cell.accessories = [
+        .disclosureIndicator(),
+        .label(text: item.badge)
+    ]
+}
+
+<span class="comment">// Use in data source</span>
+dataSource = <span class="type">UICollectionViewDiffableDataSource</span>(
+    collectionView: collectionView
+) { collectionView, indexPath, item <span class="keyword">in</span>
+    collectionView.<span class="func">dequeueConfiguredReusableCell</span>(
+        using: cellRegistration,
+        for: indexPath,
+        item: item
+    )
+}
+
+<span class="comment">// Benefits over the old pattern:</span>
+<span class="comment">// 1. Type-safe — no force casting</span>
+<span class="comment">// 2. No string identifiers — no runtime crashes from typos</span>
+<span class="comment">// 3. Registration and configuration in one place</span>
+<span class="comment">// 4. Works with UIContentConfiguration for modern cell setup</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="prefetching">6. Prefetching</h2>
+    <!-- ============================================================ -->
+
+    <pre><code><span class="comment">// UICollectionViewDataSourcePrefetching</span>
+<span class="comment">// Tells you which cells are about to become visible</span>
+<span class="comment">// Use to start async data loading ahead of time</span>
+
+<span class="keyword">class</span> <span class="type">FeedViewController</span>: <span class="type">UICollectionViewController</span>,
+    <span class="type">UICollectionViewDataSourcePrefetching</span> {
+
+    <span class="keyword">private var</span> prefetchTasks: [<span class="type">IndexPath</span>: <span class="type">Task</span>&lt;<span class="type">Void</span>, <span class="type">Never</span>&gt;] = [:]
+
+    <span class="keyword">override func</span> <span class="func">viewDidLoad</span>() {
+        <span class="keyword">super</span>.<span class="func">viewDidLoad</span>()
+        collectionView.prefetchDataSource = <span class="keyword">self</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">collectionView</span>(
+        _ collectionView: <span class="type">UICollectionView</span>,
+        prefetchItemsAt indexPaths: [<span class="type">IndexPath</span>]
+    ) {
+        <span class="keyword">for</span> indexPath <span class="keyword">in</span> indexPaths {
+            <span class="keyword">let</span> item = items[indexPath.item]
+            <span class="keyword">guard</span> imageCache[item.imageURL] == <span class="keyword">nil</span> <span class="keyword">else</span> { <span class="keyword">continue</span> }
+
+            prefetchTasks[indexPath] = <span class="type">Task</span> {
+                <span class="keyword">let</span> image = <span class="keyword">try</span>? <span class="keyword">await</span> imageLoader.<span class="func">load</span>(item.imageURL)
+                imageCache[item.imageURL] = image
+            }
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">collectionView</span>(
+        _ collectionView: <span class="type">UICollectionView</span>,
+        cancelPrefetchingForItemsAt indexPaths: [<span class="type">IndexPath</span>]
+    ) {
+        <span class="keyword">for</span> indexPath <span class="keyword">in</span> indexPaths {
+            prefetchTasks[indexPath]?.<span class="func">cancel</span>()
+            prefetchTasks.<span class="func">removeValue</span>(forKey: indexPath)
+        }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="self-sizing">7. Self-Sizing Cells</h2>
+    <!-- ============================================================ -->
+
+    <pre><code><span class="comment">// Self-sizing with Auto Layout (most common)</span>
+<span class="keyword">let</span> layout = <span class="func">createLayout</span>()
+<span class="comment">// Use .estimated() for dimensions that should self-size</span>
+<span class="keyword">let</span> itemSize = <span class="type">NSCollectionLayoutSize</span>(
+    widthDimension: .fractionalWidth(<span class="number">1.0</span>),
+    heightDimension: .estimated(<span class="number">100</span>)  <span class="comment">// Self-sizing height</span>
+)
+
+<span class="comment">// The cell's contentView must have constraints that define its height</span>
+<span class="keyword">class</span> <span class="type">SelfSizingCell</span>: <span class="type">UICollectionViewCell</span> {
+    <span class="keyword">private let</span> titleLabel = <span class="type">UILabel</span>()
+    <span class="keyword">private let</span> bodyLabel = <span class="type">UILabel</span>()
+
+    <span class="keyword">override init</span>(frame: <span class="type">CGRect</span>) {
+        <span class="keyword">super</span>.<span class="keyword">init</span>(frame: frame)
+
+        titleLabel.numberOfLines = <span class="number">0</span>
+        bodyLabel.numberOfLines = <span class="number">0</span>
+
+        <span class="keyword">let</span> stack = <span class="type">UIStackView</span>(arrangedSubviews: [titleLabel, bodyLabel])
+        stack.axis = .vertical
+        stack.spacing = <span class="number">8</span>
+        stack.translatesAutoresizingMaskIntoConstraints = <span class="keyword">false</span>
+        contentView.<span class="func">addSubview</span>(stack)
+
+        <span class="type">NSLayoutConstraint</span>.<span class="func">activate</span>([
+            stack.topAnchor.<span class="func">constraint</span>(equalTo: contentView.topAnchor, constant: <span class="number">16</span>),
+            stack.leadingAnchor.<span class="func">constraint</span>(equalTo: contentView.leadingAnchor, constant: <span class="number">16</span>),
+            stack.trailingAnchor.<span class="func">constraint</span>(equalTo: contentView.trailingAnchor, constant: -<span class="number">16</span>),
+            stack.bottomAnchor.<span class="func">constraint</span>(equalTo: contentView.bottomAnchor, constant: -<span class="number">16</span>)
+        ])
+    }
+
+    <span class="keyword">required init</span>?(coder: <span class="type">NSCoder</span>) { <span class="func">fatalError</span>() }
+}
+
+<span class="comment">// Self-sizing with preferredLayoutAttributesFitting (manual)</span>
+<span class="keyword">class</span> <span class="type">ManualSizingCell</span>: <span class="type">UICollectionViewCell</span> {
+    <span class="keyword">override func</span> <span class="func">preferredLayoutAttributesFitting</span>(
+        _ layoutAttributes: <span class="type">UICollectionViewLayoutAttributes</span>
+    ) -> <span class="type">UICollectionViewLayoutAttributes</span> {
+        <span class="keyword">let</span> attributes = <span class="keyword">super</span>.<span class="func">preferredLayoutAttributesFitting</span>(layoutAttributes)
+
+        <span class="keyword">let</span> targetSize = <span class="type">CGSize</span>(
+            width: layoutAttributes.frame.width,
+            height: <span class="number">0</span>
+        )
+        <span class="keyword">let</span> size = contentView.<span class="func">systemLayoutSizeFitting</span>(
+            targetSize,
+            withHorizontalFittingPriority: .required,
+            verticalFittingPriority: .fittingSizeLevel
+        )
+        attributes.frame.size.height = <span class="func">ceil</span>(size.height)
+        <span class="keyword">return</span> attributes
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="advanced-compositional">8. Advanced Compositional Layout</h2>
+    <!-- ============================================================ -->
+
+    <pre><code><span class="comment">// Section provider — different layout per section</span>
+<span class="keyword">let</span> layout = <span class="type">UICollectionViewCompositionalLayout</span> { sectionIndex, environment <span class="keyword">in</span>
+    <span class="keyword">switch</span> sectionIndex {
+    <span class="keyword">case</span> <span class="number">0</span>:
+        <span class="keyword">return</span> <span class="func">createFeaturedSection</span>()    <span class="comment">// Full-width cards</span>
+    <span class="keyword">case</span> <span class="number">1</span>:
+        <span class="keyword">return</span> <span class="func">createHorizontalSection</span>()  <span class="comment">// Horizontal scroll</span>
+    <span class="keyword">default</span>:
+        <span class="keyword">return</span> <span class="func">createGridSection</span>(environment: environment)
+    }
+}
+
+<span class="comment">// Orthogonal scrolling section (horizontal scroll within vertical list)</span>
+<span class="keyword">func</span> <span class="func">createHorizontalSection</span>() -> <span class="type">NSCollectionLayoutSection</span> {
+    <span class="keyword">let</span> itemSize = <span class="type">NSCollectionLayoutSize</span>(
+        widthDimension: .fractionalWidth(<span class="number">1.0</span>),
+        heightDimension: .fractionalHeight(<span class="number">1.0</span>)
+    )
+    <span class="keyword">let</span> item = <span class="type">NSCollectionLayoutItem</span>(layoutSize: itemSize)
+
+    <span class="keyword">let</span> groupSize = <span class="type">NSCollectionLayoutSize</span>(
+        widthDimension: .absolute(<span class="number">200</span>),
+        heightDimension: .absolute(<span class="number">250</span>)
+    )
+    <span class="keyword">let</span> group = <span class="type">NSCollectionLayoutGroup</span>.<span class="func">horizontal</span>(
+        layoutSize: groupSize,
+        subitems: [item]
+    )
+
+    <span class="keyword">let</span> section = <span class="type">NSCollectionLayoutSection</span>(group: group)
+    section.interGroupSpacing = <span class="number">12</span>
+    section.contentInsets = <span class="type">NSDirectionalEdgeInsets</span>(
+        top: <span class="number">0</span>, leading: <span class="number">16</span>, bottom: <span class="number">0</span>, trailing: <span class="number">16</span>
+    )
+
+    <span class="comment">// Enable horizontal scrolling for this section</span>
+    section.orthogonalScrollingBehavior = .continuousGroupLeadingBoundary
+
+    <span class="comment">// Orthogonal scrolling options:</span>
+    <span class="comment">// .none                           — no orthogonal scroll</span>
+    <span class="comment">// .continuous                     — free scrolling</span>
+    <span class="comment">// .continuousGroupLeadingBoundary — snaps to group leading edge</span>
+    <span class="comment">// .paging                         — page-based scrolling</span>
+    <span class="comment">// .groupPaging                    — snaps to group boundaries</span>
+    <span class="comment">// .groupPagingCentered            — centers each group</span>
+
+    <span class="keyword">return</span> section
+}
+
+<span class="comment">// Decoration views (section backgrounds)</span>
+<span class="keyword">func</span> <span class="func">createSectionWithBackground</span>() -> <span class="type">NSCollectionLayoutSection</span> {
+    <span class="comment">// ... item and group setup ...</span>
+    <span class="keyword">let</span> section = <span class="type">NSCollectionLayoutSection</span>(group: group)
+
+    <span class="keyword">let</span> background = <span class="type">NSCollectionLayoutDecorationItem</span>.<span class="func">background</span>(
+        elementKind: <span class="string">"sectionBackground"</span>
+    )
+    background.contentInsets = <span class="type">NSDirectionalEdgeInsets</span>(
+        top: <span class="number">8</span>, leading: <span class="number">8</span>, bottom: <span class="number">8</span>, trailing: <span class="number">8</span>
+    )
+    section.decorationItems = [background]
+
+    <span class="keyword">return</span> section
+}
+
+<span class="comment">// Register decoration view</span>
+layout.<span class="func">register</span>(
+    <span class="type">SectionBackgroundView</span>.<span class="keyword">self</span>,
+    forDecorationViewOfKind: <span class="string">"sectionBackground"</span>
+)</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="list-cell">9. UICollectionViewListCell</h2>
+    <!-- ============================================================ -->
+
+    <pre><code><span class="comment">// UICollectionViewListCell (iOS 14+) — UITableViewCell-like cells in collection view</span>
+
+<span class="comment">// List configuration — creates a UITableView-like layout</span>
+<span class="keyword">var</span> config = <span class="type">UICollectionLayoutListConfiguration</span>(appearance: .insetGrouped)
+config.headerMode = .supplementary
+config.trailingSwipeActionsConfigurationProvider = { indexPath <span class="keyword">in</span>
+    <span class="keyword">let</span> deleteAction = <span class="type">UIContextualAction</span>(
+        style: .destructive,
+        title: <span class="string">"Delete"</span>
+    ) { action, view, completion <span class="keyword">in</span>
+        <span class="comment">// Handle delete</span>
+        completion(<span class="keyword">true</span>)
+    }
+    <span class="keyword">return</span> <span class="type">UISwipeActionsConfiguration</span>(actions: [deleteAction])
+}
+
+<span class="keyword">let</span> layout = <span class="type">UICollectionViewCompositionalLayout</span>.<span class="func">list</span>(using: config)
+
+<span class="comment">// UIContentConfiguration — modern cell configuration</span>
+<span class="keyword">let</span> registration = <span class="type">UICollectionView</span>.<span class="type">CellRegistration</span>&lt;<span class="type">UICollectionViewListCell</span>, <span class="type">Item</span>&gt; {
+    cell, indexPath, item <span class="keyword">in</span>
+
+    <span class="keyword">var</span> content = cell.<span class="func">defaultContentConfiguration</span>()
+    content.text = item.title
+    content.secondaryText = item.subtitle
+    content.image = <span class="type">UIImage</span>(systemName: <span class="string">"star"</span>)
+    content.imageProperties.tintColor = .systemYellow
+    cell.contentConfiguration = content
+
+    <span class="comment">// Accessories</span>
+    cell.accessories = [
+        .disclosureIndicator(displayed: .always),
+        .delete(displayed: .whenEditing, actionHandler: {
+            <span class="comment">// Handle delete</span>
+        })
+    ]
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect-infrastructure">10. Architect: Generic List Infrastructure</h2>
+    <!-- ============================================================ -->
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p><strong>Building a generic, performant list infrastructure for 100+ screen types:</strong></p>
+        <p>At scale, you need a reusable collection view infrastructure that handles heterogeneous content, multiple layout types, and consistent performance. Key architectural decisions:</p>
+        <ul>
+            <li><strong>Protocol-based cell configuration</strong> — Define a protocol that all cell types conform to. Use <code>UIContentConfiguration</code> (iOS 14+) as the standard.</li>
+            <li><strong>Section-based layout composition</strong> — Each section defines its own layout via <code>NSCollectionLayoutSection</code>. A section provider maps section types to layouts.</li>
+            <li><strong>Diffable data source with type erasure</strong> — Use <code>AnyHashable</code> for item types to support heterogeneous content in a single data source.</li>
+            <li><strong>Prefetching pipeline</strong> — Centralize image loading and data prefetching. Cancel on reuse.</li>
+            <li><strong>Height caching</strong> — For self-sizing cells, cache computed heights keyed by content hash to avoid redundant layout passes.</li>
+        </ul>
+    </div>
+
+    <pre><code><span class="comment">// Generic section-based collection view controller</span>
+<span class="keyword">protocol</span> <span class="type">SectionType</span>: <span class="type">Hashable</span> {
+    <span class="keyword">var</span> layoutSection: <span class="type">NSCollectionLayoutSection</span> { <span class="keyword">get</span> }
+}
+
+<span class="keyword">protocol</span> <span class="type">CellConfigurable</span>: <span class="type">Hashable</span> {
+    <span class="keyword">associatedtype</span> <span class="type">CellType</span>: <span class="type">UICollectionViewCell</span>
+    <span class="keyword">func</span> <span class="func">configure</span>(_ cell: <span class="type">CellType</span>)
+}
+
+<span class="keyword">class</span> <span class="type">GenericListViewController</span>&lt;<span class="type">S</span>: <span class="type">SectionType</span>&gt;: <span class="type">UIViewController</span> {
+    <span class="keyword">private(set) lazy var</span> collectionView: <span class="type">UICollectionView</span> = {
+        <span class="keyword">let</span> layout = <span class="type">UICollectionViewCompositionalLayout</span> {
+            [<span class="keyword">weak self</span>] sectionIndex, environment <span class="keyword">in</span>
+            <span class="keyword">guard let self</span>,
+                  <span class="keyword">let</span> section = <span class="keyword">self</span>.dataSource.<span class="func">sectionIdentifier</span>(
+                      for: sectionIndex
+                  ) <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+            <span class="keyword">return</span> section.layoutSection
+        }
+        <span class="keyword">return</span> <span class="type">UICollectionView</span>(frame: .zero, collectionViewLayout: layout)
+    }()
+
+    <span class="keyword">private(set) var</span> dataSource: <span class="type">UICollectionViewDiffableDataSource</span>&lt;<span class="type">S</span>, <span class="type">AnyHashable</span>&gt;!
+
+    <span class="keyword">func</span> <span class="func">applySnapshot</span>(_ builder: (<span class="keyword">inout</span> <span class="type">NSDiffableDataSourceSnapshot</span>&lt;<span class="type">S</span>, <span class="type">AnyHashable</span>&gt;) -> <span class="type">Void</span>) {
+        <span class="keyword">var</span> snapshot = <span class="type">NSDiffableDataSourceSnapshot</span>&lt;<span class="type">S</span>, <span class="type">AnyHashable</span>&gt;()
+        <span class="func">builder</span>(&amp;snapshot)
+        dataSource.<span class="func">apply</span>(snapshot, animatingDifferences: <span class="keyword">true</span>)
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice</div>
+        <p><strong>Modern UIKit collection view stack (iOS 16+):</strong> Use <code>UICollectionViewCompositionalLayout</code> for layout, <code>UICollectionViewDiffableDataSource</code> for data, <code>CellRegistration</code> for type-safe cell dequeue, <code>UIContentConfiguration</code> for cell content, and <code>UICollectionViewDataSourcePrefetching</code> for async data loading. This combination gives you the best performance, type safety, and maintainability.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="07-animations.html">← Animations</a>
+        <a href="09-interview-qa.html">Interview Q&amp;A →</a>
+    </div>
+</div>
+</body>
+</html>

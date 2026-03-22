@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Off-Screen Rendering — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Rendering &amp; Graphics</a><span class="sep">›</span>
+        Off-Screen Rendering
+    </nav>
+
+    <h1>Off-Screen Rendering</h1>
+    <p class="subtitle">Understanding what triggers off-screen rendering passes in the GPU, how to measure their cost, and systematic approaches to eliminating every trigger for smooth 60fps performance.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#what-is">1. What Is Off-Screen Rendering?</a></li>
+            <li><a href="#triggers">2. All Off-Screen Rendering Triggers</a></li>
+            <li><a href="#corner-radius">3. cornerRadius + masksToBounds</a></li>
+            <li><a href="#shadows">4. Shadows Without shadowPath</a></li>
+            <li><a href="#masks">5. Mask Layers</a></li>
+            <li><a href="#rasterize">6. shouldRasterize</a></li>
+            <li><a href="#group-opacity">7. Group Opacity</a></li>
+            <li><a href="#blur-effects">8. Visual Effects &amp; Blur</a></li>
+            <li><a href="#measurement">9. Measuring Off-Screen Rendering Cost</a></li>
+            <li><a href="#avoidance">10. Avoidance Strategies for Each Trigger</a></li>
+            <li><a href="#audit">11. Auditing an Entire App</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="what-is">1. What Is Off-Screen Rendering?</h2>
+
+    <p>Off-screen rendering occurs when the GPU cannot composite a layer in a single pass directly to the framebuffer. Instead, it must allocate a <strong>temporary off-screen buffer</strong>, render into it, then composite that buffer back into the framebuffer. This is expensive because:</p>
+
+    <ul>
+        <li><strong>Context switching</strong> — the GPU must switch rendering targets (from framebuffer to off-screen buffer and back)</li>
+        <li><strong>Memory allocation</strong> — temporary buffers consume GPU memory</li>
+        <li><strong>Extra draw passes</strong> — the content is effectively rendered twice</li>
+        <li><strong>Cache thrashing</strong> — switching render targets invalidates GPU tile caches</li>
+    </ul>
+
+    <div class="diagram">
+Normal Rendering (Single Pass):
+═══════════════════════════════
+Layer content ──▶ Framebuffer ──▶ Display
+                  (one pass)
+
+Off-Screen Rendering (Multi-Pass):
+══════════════════════════════════
+                  ┌─────────────────┐
+Layer content ──▶ │ Off-screen      │
+                  │ buffer (temp)   │──▶ Framebuffer ──▶ Display
+                  └─────────────────┘    (second pass)
+                  (first pass)
+
+Context switch penalty: ~2-3ms per off-screen pass on older devices
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>Off-screen rendering is the <strong>#1 cause of scroll jank</strong> in production iOS apps. At Staff level, you need to be able to audit an entire app's layer tree, identify every off-screen rendering trigger, and provide alternatives. The cost compounds: a table view with 10 visible cells, each with 2 off-screen triggers, means <strong>20 extra GPU passes per frame</strong>.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="triggers">2. All Off-Screen Rendering Triggers</h2>
+
+    <table>
+        <thead>
+            <tr><th>Trigger</th><th>Why Off-Screen?</th><th>Avoidable?</th><th>Cost</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>cornerRadius</code> + <code>masksToBounds</code></td>
+                <td>GPU must clip all sublayer content to rounded rect</td>
+                <td>Yes — use pre-rendered corners or <code>CAShapeLayer</code></td>
+                <td>Medium</td>
+            </tr>
+            <tr>
+                <td><code>shadow</code> without <code>shadowPath</code></td>
+                <td>GPU must compute layer outline from alpha channel</td>
+                <td>Yes — always provide <code>shadowPath</code></td>
+                <td>High</td>
+            </tr>
+            <tr>
+                <td><code>mask</code> layer</td>
+                <td>GPU must render mask, then composite with content</td>
+                <td>Sometimes — use pre-masked images</td>
+                <td>High</td>
+            </tr>
+            <tr>
+                <td><code>shouldRasterize = true</code></td>
+                <td>Intentional off-screen render to cache result</td>
+                <td>N/A — this is a deliberate optimization</td>
+                <td>One-time high, then cached</td>
+            </tr>
+            <tr>
+                <td><code>allowsGroupOpacity</code></td>
+                <td>Must composite sublayers first, then apply opacity</td>
+                <td>Yes — set <code>allowsGroupOpacity = false</code></td>
+                <td>Medium</td>
+            </tr>
+            <tr>
+                <td><code>UIVisualEffectView</code></td>
+                <td>Blur requires reading and processing background pixels</td>
+                <td>No — inherent to blur</td>
+                <td>Very High</td>
+            </tr>
+            <tr>
+                <td>Edge antialiasing</td>
+                <td><code>edgeAntialiasingMask</code> on rotated layers</td>
+                <td>Yes — avoid or use <code>allowsEdgeAntialiasing</code></td>
+                <td>Low</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="corner-radius">3. cornerRadius + masksToBounds</h2>
+
+    <p>The most common off-screen rendering trigger. Setting <code>cornerRadius</code> alone does NOT cause off-screen rendering — it only rounds the layer's background and border. The problem arises when combined with <code>masksToBounds = true</code> (or <code>clipsToBounds = true</code> on UIView), because the GPU must clip <em>all sublayer content</em> to the rounded rect.</p>
+
+    <h3>When It Triggers</h3>
+    <pre><code><span class="comment">// ❌ TRIGGERS off-screen rendering</span>
+imageView.layer.cornerRadius = <span class="number">20</span>
+imageView.layer.masksToBounds = <span class="keyword">true</span>  <span class="comment">// or imageView.clipsToBounds = true</span>
+
+<span class="comment">// ✅ Does NOT trigger off-screen rendering (iOS 13+)</span>
+<span class="comment">// If the layer has only backgroundColor and/or contents (no sublayers),</span>
+<span class="comment">// iOS 13+ optimizes this to avoid off-screen rendering</span>
+imageView.layer.cornerRadius = <span class="number">20</span>
+imageView.layer.masksToBounds = <span class="keyword">true</span>
+<span class="comment">// Only works if NO sublayers need clipping</span>
+
+<span class="comment">// ❌ Still triggers: sublayers present that need clipping</span>
+containerView.layer.cornerRadius = <span class="number">20</span>
+containerView.layer.masksToBounds = <span class="keyword">true</span>
+containerView.<span class="func">addSubview</span>(labelInsideContainer)  <span class="comment">// sublayer forces off-screen</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">iOS 13+ Optimization</div>
+        <p>Starting with iOS 13, Apple optimized the common case: a single layer with <code>cornerRadius</code> + <code>masksToBounds</code> that has <code>contents</code> (an image) but <strong>no sublayers that extend beyond the corner radius</strong> no longer triggers off-screen rendering. The GPU handles this with a specialized shader. However, if you have sublayers that need clipping, off-screen rendering still occurs.</p>
+    </div>
+
+    <h3>Avoidance Strategies</h3>
+    <pre><code><span class="comment">// Strategy 1: Pre-round images on a background thread</span>
+<span class="keyword">func</span> <span class="func">roundImage</span>(_ image: <span class="type">UIImage</span>, radius: <span class="type">CGFloat</span>) -> <span class="type">UIImage</span> {
+    <span class="keyword">let</span> renderer = <span class="type">UIGraphicsImageRenderer</span>(size: image.size)
+    <span class="keyword">return</span> renderer.<span class="func">image</span> { ctx <span class="keyword">in</span>
+        <span class="keyword">let</span> rect = <span class="type">CGRect</span>(origin: .zero, size: image.size)
+        <span class="type">UIBezierPath</span>(roundedRect: rect, cornerRadius: radius).addClip()
+        image.<span class="func">draw</span>(in: rect)
+    }
+}
+
+<span class="comment">// Strategy 2: Use CAShapeLayer as mask (still off-screen, but cacheable)</span>
+<span class="keyword">let</span> maskLayer = <span class="type">CAShapeLayer</span>()
+maskLayer.path = <span class="type">UIBezierPath</span>(
+    roundedRect: view.bounds,
+    cornerRadius: <span class="number">20</span>
+).cgPath
+view.layer.mask = maskLayer
+
+<span class="comment">// Strategy 3: Overlay with a "hole" image</span>
+<span class="comment">// Pre-render an image with transparent rounded rect hole</span>
+<span class="comment">// and opaque corners matching the background color</span>
+<span class="keyword">let</span> overlayView = <span class="type">UIImageView</span>(image: cornerMaskImage)
+overlayView.frame = containerView.bounds
+containerView.<span class="func">addSubview</span>(overlayView)
+
+<span class="comment">// Strategy 4: Use continuous corners (iOS 13+)</span>
+view.layer.cornerRadius = <span class="number">20</span>
+view.layer.cornerCurve = .continuous  <span class="comment">// Smooth Apple-style corners</span>
+<span class="comment">// Still needs masksToBounds for clipping, but looks better</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="shadows">4. Shadows Without shadowPath</h2>
+
+    <p>When you set shadow properties without providing a <code>shadowPath</code>, the GPU must compute the shadow outline by examining the layer's alpha channel pixel by pixel. This is extremely expensive.</p>
+
+    <pre><code><span class="comment">// ❌ VERY expensive: GPU must trace the layer outline</span>
+view.layer.shadowColor = <span class="type">UIColor</span>.black.cgColor
+view.layer.shadowOffset = <span class="type">CGSize</span>(width: <span class="number">0</span>, height: <span class="number">2</span>)
+view.layer.shadowRadius = <span class="number">4</span>
+view.layer.shadowOpacity = <span class="number">0.3</span>
+<span class="comment">// No shadowPath → GPU traces alpha channel every frame!</span>
+
+<span class="comment">// ✅ FAST: provide explicit shadow path</span>
+view.layer.shadowColor = <span class="type">UIColor</span>.black.cgColor
+view.layer.shadowOffset = <span class="type">CGSize</span>(width: <span class="number">0</span>, height: <span class="number">2</span>)
+view.layer.shadowRadius = <span class="number">4</span>
+view.layer.shadowOpacity = <span class="number">0.3</span>
+view.layer.shadowPath = <span class="type">UIBezierPath</span>(
+    roundedRect: view.bounds,
+    cornerRadius: view.layer.cornerRadius
+).cgPath  <span class="comment">// GPU uses this path directly — no tracing needed</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Shadow Path Invalidation</div>
+        <p>The <code>shadowPath</code> is <strong>not automatically updated</strong> when the layer's bounds change. You must update it manually in <code>layoutSubviews()</code> or use a <code>CAAction</code> to animate the path change. Forgetting this causes the shadow to appear misaligned after layout changes.</p>
+    </div>
+
+    <pre><code><span class="keyword">class</span> <span class="type">ShadowedView</span>: <span class="type">UIView</span> {
+    <span class="keyword">override func</span> <span class="func">layoutSubviews</span>() {
+        <span class="keyword">super</span>.<span class="func">layoutSubviews</span>()
+        <span class="comment">// Update shadow path whenever bounds change</span>
+        layer.shadowPath = <span class="type">UIBezierPath</span>(
+            roundedRect: bounds,
+            cornerRadius: layer.cornerRadius
+        ).cgPath
+    }
+
+    <span class="keyword">override init</span>(frame: <span class="type">CGRect</span>) {
+        <span class="keyword">super</span>.<span class="keyword">init</span>(frame: frame)
+        layer.shadowColor = <span class="type">UIColor</span>.black.cgColor
+        layer.shadowOffset = <span class="type">CGSize</span>(width: <span class="number">0</span>, height: <span class="number">2</span>)
+        layer.shadowRadius = <span class="number">8</span>
+        layer.shadowOpacity = <span class="number">0.15</span>
+    }
+
+    <span class="keyword">required init</span>?(coder: <span class="type">NSCoder</span>) {
+        <span class="func">fatalError</span>(<span class="string">"init(coder:) has not been implemented"</span>)
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="masks">5. Mask Layers</h2>
+
+    <p>Setting <code>layer.mask</code> always triggers off-screen rendering. The GPU must render the mask layer into a temporary buffer, render the content layer into another buffer, then composite them using the mask's alpha channel.</p>
+
+    <div class="diagram">
+Mask Compositing (3-pass operation):
+════════════════════════════════════
+
+Pass 1: Render mask layer ──▶ ┌─────────────┐
+                               │ Mask Buffer │
+Pass 2: Render content    ──▶ │             │──▶ Composite
+        layer                  │ Content Buf │    to framebuffer
+                               └─────────────┘
+Pass 3: Composite using mask alpha
+    </div>
+
+    <pre><code><span class="comment">// ❌ Off-screen rendering: mask layer</span>
+<span class="keyword">let</span> maskLayer = <span class="type">CAShapeLayer</span>()
+maskLayer.path = complexPath.cgPath
+view.layer.mask = maskLayer
+
+<span class="comment">// ✅ Alternative: pre-mask the image content</span>
+<span class="keyword">func</span> <span class="func">maskedImage</span>(_ image: <span class="type">UIImage</span>, mask: <span class="type">UIBezierPath</span>) -> <span class="type">UIImage</span> {
+    <span class="keyword">let</span> renderer = <span class="type">UIGraphicsImageRenderer</span>(size: image.size)
+    <span class="keyword">return</span> renderer.<span class="func">image</span> { ctx <span class="keyword">in</span>
+        mask.<span class="func">addClip</span>()
+        image.<span class="func">draw</span>(at: .zero)
+    }
+}
+
+<span class="comment">// ✅ Alternative: use CAShapeLayer with fillColor instead of mask</span>
+<span class="keyword">let</span> shapeLayer = <span class="type">CAShapeLayer</span>()
+shapeLayer.path = starPath.cgPath
+shapeLayer.fillColor = <span class="type">UIColor</span>.systemBlue.cgColor
+view.layer.<span class="func">addSublayer</span>(shapeLayer)</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="rasterize">6. shouldRasterize</h2>
+
+    <p><code>shouldRasterize</code> is a <strong>deliberate</strong> off-screen rendering trigger used as an optimization. It renders the layer and all its sublayers into a single cached bitmap. Subsequent frames reuse the cache instead of re-compositing the subtree.</p>
+
+    <pre><code><span class="comment">// Rasterize a complex cell for scroll performance</span>
+cell.layer.shouldRasterize = <span class="keyword">true</span>
+cell.layer.rasterizationScale = <span class="type">UIScreen</span>.main.scale
+
+<span class="comment">// The cache is invalidated when:</span>
+<span class="comment">// - Any sublayer property changes</span>
+<span class="comment">// - The layer's bounds change</span>
+<span class="comment">// - The cache exceeds 2.5x the layer's bounds (screen size limit)</span>
+<span class="comment">// - The cache hasn't been used for ~100ms</span></code></pre>
+
+    <table>
+        <thead>
+            <tr><th>Aspect</th><th>shouldRasterize = true</th><th>shouldRasterize = false</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>First frame</td>
+                <td>Expensive (renders to off-screen buffer)</td>
+                <td>Normal compositing</td>
+            </tr>
+            <tr>
+                <td>Subsequent frames</td>
+                <td>Fast (uses cached bitmap)</td>
+                <td>Re-composites every frame</td>
+            </tr>
+            <tr>
+                <td>Memory</td>
+                <td>Extra GPU memory for cache</td>
+                <td>No extra memory</td>
+            </tr>
+            <tr>
+                <td>Good for</td>
+                <td>Complex static cells, shadows, many sublayers</td>
+                <td>Simple layers, frequently changing content</td>
+            </tr>
+            <tr>
+                <td>Bad for</td>
+                <td>Frequently changing content (cache thrashing)</td>
+                <td>Complex static content (re-composites every frame)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">shouldRasterize Pitfalls</div>
+        <ul>
+            <li><strong>Forgetting rasterizationScale</strong>: defaults to 1.0, causing blurry content on Retina displays. Always set to <code>UIScreen.main.scale</code>.</li>
+            <li><strong>Cache thrashing</strong>: if the layer content changes every frame, you pay the off-screen cost every frame <em>plus</em> the cache overhead. Worse than not rasterizing.</li>
+            <li><strong>Cache size limit</strong>: the rasterized cache can't exceed ~2.5x the screen size. Oversized layers won't benefit.</li>
+            <li><strong>Instruments detection</strong>: "Color Hits Green and Misses Red" shows whether the cache is being hit (green) or rebuilt (red). If you see red, rasterization is hurting, not helping.</li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="group-opacity">7. Group Opacity</h2>
+
+    <p>When <code>allowsGroupOpacity</code> is <code>true</code> (the default for UIView-backed layers) and the layer's opacity is less than 1.0, the GPU must composite all sublayers into a temporary buffer first, then apply the opacity to the entire group. Without this, each sublayer would have opacity applied individually, causing visual artifacts where sublayers overlap.</p>
+
+    <div class="diagram">
+Without Group Opacity (incorrect visual):
+══════════════════════════════════════════
+Parent (opacity 0.5)
+  ├─ Child A (opacity applied: 0.5)
+  └─ Child B (opacity applied: 0.5)
+     Overlap region: 0.5 × 0.5 = 0.25 opacity ← WRONG!
+
+With Group Opacity (correct visual, off-screen):
+═════════════════════════════════════════════════
+1. Render children at full opacity into temp buffer
+2. Apply 0.5 opacity to entire buffer
+   Overlap region: 0.5 opacity ← CORRECT
+    </div>
+
+    <pre><code><span class="comment">// ❌ Group opacity causes off-screen rendering when opacity &lt; 1.0</span>
+containerView.alpha = <span class="number">0.8</span>  <span class="comment">// Triggers off-screen for all sublayers</span>
+
+<span class="comment">// ✅ Disable group opacity if visual artifacts are acceptable</span>
+containerView.layer.allowsGroupOpacity = <span class="keyword">false</span>
+
+<span class="comment">// ✅ Better: set opacity on individual elements instead</span>
+containerView.alpha = <span class="number">1.0</span>
+childLabel.alpha = <span class="number">0.8</span>
+childImage.alpha = <span class="number">0.8</span>
+
+<span class="comment">// ✅ Or use shouldRasterize to cache the group</span>
+containerView.layer.shouldRasterize = <span class="keyword">true</span>
+containerView.layer.rasterizationScale = <span class="type">UIScreen</span>.main.scale
+containerView.alpha = <span class="number">0.8</span>  <span class="comment">// Off-screen, but cached</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="blur-effects">8. Visual Effects &amp; Blur</h2>
+
+    <p><code>UIVisualEffectView</code> with blur is inherently expensive. The GPU must read the background pixels, apply a Gaussian blur kernel, and composite the result. This cannot be avoided — it's the nature of real-time blur.</p>
+
+    <pre><code><span class="comment">// Blur is always expensive — minimize usage in scroll views</span>
+<span class="keyword">let</span> blurEffect = <span class="type">UIBlurEffect</span>(style: .systemMaterial)
+<span class="keyword">let</span> blurView = <span class="type">UIVisualEffectView</span>(effect: blurEffect)
+
+<span class="comment">// Optimization: reduce blur view size</span>
+<span class="comment">// A full-screen blur is much more expensive than a small one</span>
+blurView.frame = <span class="type">CGRect</span>(x: <span class="number">0</span>, y: <span class="number">0</span>, width: <span class="number">200</span>, height: <span class="number">44</span>)
+
+<span class="comment">// Optimization: use .prominent only when needed</span>
+<span class="comment">// .systemUltraThinMaterial is cheaper than .systemThickMaterial</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="measurement">9. Measuring Off-Screen Rendering Cost</h2>
+
+    <h3>Instruments Core Animation Template</h3>
+    <p>The primary tool for detecting off-screen rendering:</p>
+
+    <table>
+        <thead>
+            <tr><th>Debug Option</th><th>What It Shows</th><th>Color</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Color Offscreen-Rendered Yellow</td>
+                <td>Layers requiring off-screen passes</td>
+                <td>Yellow overlay</td>
+            </tr>
+            <tr>
+                <td>Color Hits Green and Misses Red</td>
+                <td>shouldRasterize cache effectiveness</td>
+                <td>Green = hit, Red = miss</td>
+            </tr>
+            <tr>
+                <td>Color Blended Layers</td>
+                <td>Layers requiring alpha blending</td>
+                <td>Red = blended, Green = opaque</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Programmatic Detection</h3>
+    <pre><code><span class="comment">// Debug helper: recursively check for off-screen rendering triggers</span>
+<span class="keyword">func</span> <span class="func">auditOffScreenRendering</span>(view: <span class="type">UIView</span>, depth: <span class="type">Int</span> = <span class="number">0</span>) {
+    <span class="keyword">let</span> indent = <span class="type">String</span>(repeating: <span class="string">"  "</span>, count: depth)
+    <span class="keyword">let</span> layer = view.layer
+    <span class="keyword">var</span> triggers: [<span class="type">String</span>] = []
+
+    <span class="keyword">if</span> layer.cornerRadius > <span class="number">0</span> && layer.masksToBounds {
+        triggers.<span class="func">append</span>(<span class="string">"cornerRadius + masksToBounds"</span>)
+    }
+    <span class="keyword">if</span> layer.shadowOpacity > <span class="number">0</span> && layer.shadowPath == <span class="keyword">nil</span> {
+        triggers.<span class="func">append</span>(<span class="string">"shadow without shadowPath"</span>)
+    }
+    <span class="keyword">if</span> layer.mask != <span class="keyword">nil</span> {
+        triggers.<span class="func">append</span>(<span class="string">"mask layer"</span>)
+    }
+    <span class="keyword">if</span> layer.allowsGroupOpacity && view.alpha < <span class="number">1.0</span> {
+        triggers.<span class="func">append</span>(<span class="string">"group opacity (alpha: \(view.alpha))"</span>)
+    }
+    <span class="keyword">if</span> layer.shouldRasterize {
+        triggers.<span class="func">append</span>(<span class="string">"shouldRasterize (intentional)"</span>)
+    }
+
+    <span class="keyword">if</span> !triggers.isEmpty {
+        <span class="func">print</span>(<span class="string">"\(indent)⚠️ \(type(of: view)): \(triggers.joined(separator: ", "))"</span>)
+    }
+
+    <span class="keyword">for</span> subview <span class="keyword">in</span> view.subviews {
+        <span class="func">auditOffScreenRendering</span>(view: subview, depth: depth + <span class="number">1</span>)
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="avoidance">10. Avoidance Strategies for Each Trigger</h2>
+
+    <table>
+        <thead>
+            <tr><th>Trigger</th><th>Avoidance Strategy</th><th>Trade-off</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>cornerRadius</code> + <code>masksToBounds</code></td>
+                <td>Pre-round images on background thread; use overlay mask image; rely on iOS 13+ optimization for simple cases</td>
+                <td>Extra image processing; more complex code</td>
+            </tr>
+            <tr>
+                <td>Shadow without <code>shadowPath</code></td>
+                <td>Always provide <code>shadowPath</code>; update in <code>layoutSubviews()</code></td>
+                <td>Must maintain path manually</td>
+            </tr>
+            <tr>
+                <td>Mask layer</td>
+                <td>Pre-mask images; use <code>CAShapeLayer</code> with fill instead; use overlay images</td>
+                <td>Less dynamic; more assets</td>
+            </tr>
+            <tr>
+                <td>Group opacity</td>
+                <td>Set <code>allowsGroupOpacity = false</code>; apply opacity to individual elements</td>
+                <td>Visual difference in overlapping areas</td>
+            </tr>
+            <tr>
+                <td>Blur</td>
+                <td>Minimize blur view size; use static blur snapshots; reduce blur radius</td>
+                <td>Less dynamic; stale content</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Complete Optimized Cell Example</h3>
+    <pre><code><span class="keyword">class</span> <span class="type">OptimizedCell</span>: <span class="type">UICollectionViewCell</span> {
+    <span class="keyword">private let</span> avatarImageView = <span class="type">UIImageView</span>()
+    <span class="keyword">private let</span> shadowContainer = <span class="type">UIView</span>()
+
+    <span class="keyword">override init</span>(frame: <span class="type">CGRect</span>) {
+        <span class="keyword">super</span>.<span class="keyword">init</span>(frame: frame)
+
+        <span class="comment">// Shadow: always use shadowPath</span>
+        shadowContainer.layer.shadowColor = <span class="type">UIColor</span>.black.cgColor
+        shadowContainer.layer.shadowOffset = <span class="type">CGSize</span>(width: <span class="number">0</span>, height: <span class="number">2</span>)
+        shadowContainer.layer.shadowRadius = <span class="number">8</span>
+        shadowContainer.layer.shadowOpacity = <span class="number">0.1</span>
+
+        <span class="comment">// Corner radius: rely on iOS 13+ optimization</span>
+        <span class="comment">// (no sublayers extending beyond corners)</span>
+        contentView.layer.cornerRadius = <span class="number">12</span>
+        contentView.layer.masksToBounds = <span class="keyword">true</span>
+        contentView.backgroundColor = .systemBackground
+
+        <span class="comment">// Avatar: pre-round on background thread, no masksToBounds needed</span>
+        avatarImageView.contentMode = .scaleAspectFill
+
+        <span class="comment">// Opaque backgrounds to avoid blending</span>
+        contentView.isOpaque = <span class="keyword">true</span>
+    }
+
+    <span class="keyword">override func</span> <span class="func">layoutSubviews</span>() {
+        <span class="keyword">super</span>.<span class="func">layoutSubviews</span>()
+        <span class="comment">// Update shadow path on layout</span>
+        shadowContainer.layer.shadowPath = <span class="type">UIBezierPath</span>(
+            roundedRect: contentView.bounds,
+            cornerRadius: <span class="number">12</span>
+        ).cgPath
+    }
+
+    <span class="keyword">func</span> <span class="func">configure</span>(with avatar: <span class="type">UIImage</span>) {
+        <span class="comment">// Pre-round avatar on background thread</span>
+        <span class="type">DispatchQueue</span>.global(qos: .userInitiated).<span class="func">async</span> {
+            <span class="keyword">let</span> rounded = <span class="keyword">self</span>.<span class="func">roundImage</span>(avatar, radius: <span class="number">24</span>)
+            <span class="type">DispatchQueue</span>.main.<span class="func">async</span> {
+                <span class="keyword">self</span>.avatarImageView.image = rounded
+            }
+        }
+    }
+
+    <span class="keyword">private func</span> <span class="func">roundImage</span>(_ image: <span class="type">UIImage</span>, radius: <span class="type">CGFloat</span>) -> <span class="type">UIImage</span> {
+        <span class="keyword">let</span> renderer = <span class="type">UIGraphicsImageRenderer</span>(size: <span class="type">CGSize</span>(width: <span class="number">48</span>, height: <span class="number">48</span>))
+        <span class="keyword">return</span> renderer.<span class="func">image</span> { ctx <span class="keyword">in</span>
+            <span class="type">UIBezierPath</span>(
+                roundedRect: <span class="type">CGRect</span>(x: <span class="number">0</span>, y: <span class="number">0</span>, width: <span class="number">48</span>, height: <span class="number">48</span>),
+                cornerRadius: radius
+            ).<span class="func">addClip</span>()
+            image.<span class="func">draw</span>(in: <span class="type">CGRect</span>(x: <span class="number">0</span>, y: <span class="number">0</span>, width: <span class="number">48</span>, height: <span class="number">48</span>))
+        }
+    }
+
+    <span class="keyword">required init</span>?(coder: <span class="type">NSCoder</span>) {
+        <span class="func">fatalError</span>(<span class="string">"init(coder:) has not been implemented"</span>)
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="audit">11. Auditing an Entire App</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: Systematic Off-Screen Rendering Audit</div>
+        <p>At Staff level, you should be able to audit an entire app for off-screen rendering issues. Here's the systematic approach:</p>
+        <ol>
+            <li><strong>Instrument first</strong>: Run the Core Animation template with "Color Offscreen-Rendered Yellow" enabled. Scroll through every screen.</li>
+            <li><strong>Prioritize by frequency</strong>: Focus on views that appear in scroll views or are animated. A single off-screen trigger in a static header is less impactful than one in a table view cell.</li>
+            <li><strong>Categorize triggers</strong>: Group findings by trigger type (shadow, corner radius, mask, etc.) to apply batch fixes.</li>
+            <li><strong>Measure before/after</strong>: Use Instruments to measure FPS improvement after each fix. Some fixes may not be worth the code complexity.</li>
+            <li><strong>Establish team guidelines</strong>: Create a "rendering performance" section in your team's coding standards. Require <code>shadowPath</code> in code review. Provide utility classes for common patterns.</li>
+            <li><strong>CI integration</strong>: Consider automated UI tests that check for off-screen rendering in critical scroll views using the audit function above.</li>
+        </ol>
+    </div>
+
+    <h3>Audit Checklist</h3>
+    <table>
+        <thead>
+            <tr><th>Check</th><th>Tool</th><th>Action</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Off-screen rendered layers</td>
+                <td>Instruments → Color Offscreen-Rendered Yellow</td>
+                <td>Eliminate or cache with shouldRasterize</td>
+            </tr>
+            <tr>
+                <td>Blended layers</td>
+                <td>Instruments → Color Blended Layers</td>
+                <td>Set opaque backgrounds, use <code>isOpaque = true</code></td>
+            </tr>
+            <tr>
+                <td>Misaligned images</td>
+                <td>Instruments → Color Misaligned Images</td>
+                <td>Ensure pixel-aligned frames, correct image sizes</td>
+            </tr>
+            <tr>
+                <td>shouldRasterize effectiveness</td>
+                <td>Instruments → Color Hits Green and Misses Red</td>
+                <td>Remove shouldRasterize if mostly red (cache misses)</td>
+            </tr>
+            <tr>
+                <td>Shadow paths</td>
+                <td>Code review / grep</td>
+                <td>Every <code>shadowOpacity > 0</code> must have <code>shadowPath</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice Summary</div>
+        <ul>
+            <li>Always provide <code>shadowPath</code> when using shadows — no exceptions</li>
+            <li>Rely on iOS 13+ <code>cornerRadius</code> optimization for simple layers; pre-round images for complex cases</li>
+            <li>Use <code>shouldRasterize</code> for complex static cells, but verify cache hits with Instruments</li>
+            <li>Avoid <code>layer.mask</code> in scroll views — use pre-masked images instead</li>
+            <li>Set <code>isOpaque = true</code> and opaque backgrounds to eliminate blending</li>
+            <li>Profile on the oldest supported device — that's where users will notice jank</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="01-core-animation-pipeline.html">← Core Animation Pipeline</a>
+        <a href="03-metal-gpu.html">Next: Metal &amp; GPU →</a>
+    </div>
+</div>
+</body>
+</html>

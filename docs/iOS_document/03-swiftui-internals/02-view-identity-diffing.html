@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>View Identity &amp; Diffing — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">SwiftUI Internals</a><span class="sep">›</span>
+        View Identity &amp; Diffing
+    </nav>
+    <!-- content -->
+
+    <h1>View Identity &amp; Diffing</h1>
+    <p class="subtitle">How SwiftUI decides whether a view is “the same” instance across updates — structural identity, <code>@ViewBuilder</code> lowering, <code>ForEach</code> keys, <code>AnyView</code> costs, and the Staff-level patterns that keep large UIs fast and state-stable.</p>
+    <p>
+        <span class="tag tag-l6">L6</span>
+        <span class="tag tag-senior">Senior+</span>
+        <span class="tag tag-architect">Architecture</span>
+    </p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#structural-identity">1. Structural Identity — Position in <code>@ViewBuilder</code></a></li>
+            <li><a href="#id-modifier">2. The <code>.id()</code> Modifier and Its Implications</a></li>
+            <li><a href="#foreach-identity">3. <code>ForEach</code> Identity Requirements</a></li>
+            <li><a href="#anyview-cost">4. <code>AnyView</code> Type Erasure Cost</a></li>
+            <li><a href="#viewbuilder-internals">5. <code>@ViewBuilder</code> Result Builder Internals</a></li>
+            <li><a href="#conditional-pitfalls">6. Conditional View Identity Pitfalls</a></li>
+            <li><a href="#architect-patterns">7. Identity Stability Patterns for Complex UIs</a></li>
+            <li><a href="#interview-qa">8. Staff / L6 Interview Q&amp;A</a></li>
+        </ul>
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">How this page fits the stack</div>
+        <p>Identity is the hinge between <strong>ephemeral <code>View</code> values</strong> (structs you return from <code>body</code>) and <strong>long-lived runtime state</strong> (AttributeGraph nodes, animations, focus, accessibility, <code>UIViewRepresentable</code> hosts). Diffing without identity would be blind replacement every frame; with identity, SwiftUI incrementally updates the smallest plausible subtree. The sections below map compiler-generated types to what you observe in production.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="structural-identity">1. Structural Identity — Position in <code>@ViewBuilder</code></h2>
+
+    <p>SwiftUI’s rendering pipeline is often described as a <em>declarative diff</em>: you describe what the UI <em>should</em> be, and the framework reconciles that description with what is already on screen. The reconciliation algorithm needs a stable notion of <strong>identity</strong> so it can update the right backing storage (<code>@State</code>, preferences, animations, focus, accessibility elements) instead of tearing everything down.</p>
+
+    <p>When you do not supply an explicit identity (via <code>.id(_:)</code> or keyed collections like <code>ForEach</code>), SwiftUI falls back to <strong>structural identity</strong>: the <em>type</em> and <em>ordinal position</em> of a child inside its parent’s view list. Two updates produce “the same” child if they occupy the same slot in the statically-known structure and have compatible types for that slot.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Interview Framing</div>
+        <p>At Staff level, interviewers rarely want a perfect reproduction of private AttributeGraph APIs. They want you to connect <strong>compiler-generated view types</strong> (tuples, conditionals, optionals) to <strong>runtime update behavior</strong>: why state resets, why animations behave oddly, and how to design APIs that preserve identity under dynamic content.</p>
+    </div>
+
+    <h3>1.1 How position becomes identity</h3>
+
+    <p>Conceptually, each parent stores an ordered list of child “nodes.” On an update, SwiftUI walks the new description in parallel with the old one. Matching proceeds slot-by-slot: child 0 matches child 0, child 1 matches child 1, and so on. If a slot’s <em>static structure</em> changes — for example, an <code>if/else</code> flips which generic branch is active — the framework must reconcile <code>TrueBranch</code> vs <code>FalseBranch</code>. That is not the same operation as mutating properties of a single persistent subtree.</p>
+
+    <div class="diagram">
+Root: VStack
+ │
+ ├─[0] Text("Title")          ← slot 0: stable if Text stays in slot 0
+ ├─[1] TextField(...)         ← slot 1
+ └─[2] HStack
+      ├─[0] Image(systemName:)
+      └─[1] Button(...)
+    </div>
+
+    <p>The diagram above is a simplified <strong>structural tree</strong>. Identity is not the string <code>"Title"</code>; it is “the <code>Text</code> at index 0 under this <code>VStack</code>.” If you insert a new view above it, the old <code>Text</code> may become index 1 — and whatever now sits at index 0 is a <em>different</em> structural child, even if it is also a <code>Text</code>.</p>
+
+    <h3>1.2 Structural path vs semantic content</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>What engineers assume</th>
+                <th>What SwiftUI keys on (default)</th>
+                <th>Typical failure mode</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>“It is still a <code>TextField</code>”</td>
+                <td>Slot index under the parent</td>
+                <td>Insertion above steals slot 0; field state appears on wrong field</td>
+            </tr>
+            <tr>
+                <td>“Same closure, same view”</td>
+                <td>Lowered type + position + branch</td>
+                <td>Changing branch type swaps identity even with identical labels</td>
+            </tr>
+            <tr>
+                <td>“Same string binding target”</td>
+                <td>Not automatically tracked as identity</td>
+                <td>Multiple fields bound to related state still differ by path</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>1.3 What <code>@ViewBuilder</code> actually builds</h3>
+
+    <p><code>@ViewBuilder</code> is a Swift result builder. It rewrites your function body into nested generic types that preserve the exact shape of the view hierarchy at compile time. That shape is what enables fast, mostly static diffing: the type system encodes “there are two children” vs “there is an optional child” vs “there is a conditional with two branches.”</p>
+
+    <p>Common lowering patterns (names are representative; Apple’s internal symbol names can differ by SDK):</p>
+
+    <ul>
+        <li><strong>Multiple statements / tuple-like groups</strong> become <code>TupleView&lt;(Child0, Child1, …)&gt;</code>, which carries a fixed number of statically typed children.</li>
+        <li><strong>Optional sections</strong> (<code>if let</code>, <code>if</code> without <code>else</code>) become optional child wrappers that represent “0 or 1 child” at a position.</li>
+        <li><strong><code>if/else</code></strong> becomes <code>_ConditionalContent&lt;TrueBranch, FalseBranch&gt;</code> (or an equivalent conditional wrapper), a single slot whose <em>discriminant</em> chooses which concrete subtree is active.</li>
+    </ul>
+
+    <div class="diagram">
+Lowered tree: TupleView + _ConditionalContent
+
+TupleView&lt;(
+  Text,                              [slot 0]
+  _ConditionalContent&lt;Text, Text&gt;,   [slot 1]  ← ONE slot, TWO possible types
+  Text                               [slot 2]
+)&gt;
+        │
+        └── slot 1 when flag == true:
+              └── active: TrueBranch (Text "B")
+        └── slot 1 when flag == false:
+              └── active: FalseBranch (Text "C")
+
+Flipping flag switches which branch subtree is mounted at slot 1.
+    </div>
+
+    <pre><code><span class="comment">// What you write (conceptually)</span>
+<span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+    <span class="type">Text</span>(<span class="string">"A"</span>)
+    <span class="keyword">if</span> flag {
+        <span class="type">Text</span>(<span class="string">"B"</span>)
+    } <span class="keyword">else</span> {
+        <span class="type">Text</span>(<span class="string">"C"</span>)
+    }
+    <span class="type">Text</span>(<span class="string">"D"</span>)
+}</code></pre>
+
+    <pre><code><span class="comment">// Conceptual lowered shape (illustrative)</span>
+<span class="type">TupleView</span>&lt;(
+    <span class="type">Text</span>,                                              <span class="comment">// slot 0</span>
+    <span class="type">_ConditionalContent</span>&lt;<span class="type">Text</span>, <span class="type">Text</span>&gt;,                     <span class="comment">// slot 1</span>
+    <span class="type">Text</span>                                               <span class="comment">// slot 2</span>
+)&gt;</code></pre>
+
+    <h3>1.4 Why <code>if/else</code> is a single slot — and why that still destroys state</h3>
+
+    <p>The conditional occupies <strong>one</strong> structural position (slot 1 in the example). That fact sometimes confuses engineers: “Isn’t it still one child?” Yes — but the active branch is a <em>different concrete subtree</em> when the discriminant flips. SwiftUI’s runtime must reconcile <code>TrueBranch</code> vs <code>FalseBranch</code>. In practice, when the conditional switches, the framework treats the inactive branch’s stored state and platform representations as no longer applicable; the newly active branch is initialized fresh.</p>
+
+    <p>So: <strong>different branches of <code>if/else</code> are not two persistent identities you can toggle between</strong> while preserving per-branch <code>@State</code> in the way you might expect from UIKit view controllers. Each side can have its own <code>@State</code>, but flipping the condition typically <em>discards</em> the other side’s state because that subtree is not “the same view” across the change — it is an alternate member of a conditional sum type.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">State Loss: <code>if/else</code> vs hiding</div>
+        <p>Interviewers love this because it separates “I memorized APIs” from “I understand identity.” Prefer keeping <strong>one</strong> structurally stable child and changing visibility/layout over swapping distinct type branches when you need persistent local state.</p>
+    </div>
+
+    <h3>1.5 Code: state loss with <code>if/else</code> vs <code>opacity</code> / <code>hidden</code></h3>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">FragileToggle</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> showA = <span class="keyword">true</span>
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> textA = <span class="string">""</span>
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> textB = <span class="string">""</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span> {
+            <span class="type">Toggle</span>(<span class="string">"Show A"</span>, isOn: $showA)
+            <span class="keyword">if</span> showA {
+                <span class="type">TextField</span>(<span class="string">"A"</span>, text: $textA)
+            } <span class="keyword">else</span> {
+                <span class="type">TextField</span>(<span class="string">"B"</span>, text: $textB)
+            }
+        }
+    }
+}</code></pre>
+
+    <p>When <code>showA</code> flips, the conditional switches branches. The <code>TextField</code> that disappears was bound to a particular structural path; the newly appearing <code>TextField</code> is not “the same” identity as the opposite branch’s field. Users observe lost text, reset focus, and sometimes odd animation.</p>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">StableToggle</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> showA = <span class="keyword">true</span>
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> textA = <span class="string">""</span>
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> textB = <span class="string">""</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span> {
+            <span class="type">Toggle</span>(<span class="string">"Show A"</span>, isOn: $showA)
+            <span class="type">ZStack</span> {
+                <span class="type">TextField</span>(<span class="string">"A"</span>, text: $textA)
+                    .opacity(showA ? <span class="number">1</span> : <span class="number">0</span>)
+                    .disabled(!showA)
+                    .allowsHitTesting(showA)
+                <span class="type">TextField</span>(<span class="string">"B"</span>, text: $textB)
+                    .opacity(showA ? <span class="number">0</span> : <span class="number">1</span>)
+                    .disabled(showA)
+                    .allowsHitTesting(!showA)
+            }
+        }
+    }
+}</code></pre>
+
+    <p>Here, both fields always exist in the hierarchy (modulo layout choices). Each <code>TextField</code> keeps a stable structural path, so <code>@State</code> for <code>textA</code> and <code>textB</code> persists across toggles. Tradeoffs: accessibility and hit-testing need care — prefer explicit <code>allowsHitTesting</code>, consider <code>accessibilityHidden</code>, and validate VoiceOver order in QA.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Technique</th>
+                <th>Structural slots</th>
+                <th>Typical state persistence</th>
+                <th>Tradeoff</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>if/else</code> two different views</td>
+                <td>One conditional slot; branches alternate</td>
+                <td>Branch-local state resets on flip</td>
+                <td>Clean code, dangerous for persistent subtree state</td>
+            </tr>
+            <tr>
+                <td><code>opacity</code> / layout hiding</td>
+                <td>Both children remain</td>
+                <td>State usually stable</td>
+                <td>Must manage interaction, a11y, and sometimes layout cost</td>
+            </tr>
+            <tr>
+                <td><code>.id</code> override</td>
+                <td>Explicit identity decoupled from structure</td>
+                <td>Forces recreation when id changes</td>
+                <td>Powerful; easy to misuse and thrash expensive views</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="id-modifier">2. The <code>.id()</code> Modifier and Its Implications</h2>
+
+    <p><code>id(_:)</code> attaches an explicit identity value to a subtree. When that value changes, SwiftUI interprets the subtree as <strong>new</strong>: state scoped to the old identity is discarded, transitions can run as insert/remove, and platform objects (like <code>UIViewRepresentable</code> wrappers) may be rebuilt.</p>
+
+    <h3>2.1 Overriding structural identity</h3>
+
+    <p>Structural identity answers: “Which child is this in the parent list?” <code>.id</code> answers: “Treat this subtree as the instance keyed by <em>this value</em>.” It is especially useful when the <em>position</em> is unstable — for example, when you reorder rows — but you still want to preserve semantic identity for animations or state keyed to a model id.</p>
+
+    <pre><code><span class="type">ArticleRow</span>(article: article)
+    .<span class="func">id</span>(article.<span class="type">stableId</span>)</code></pre>
+
+    <p>The <code>id</code> parameter conforms to <code>Hashable</code>. In practice you use <code>UUID</code>, <code>String</code> primary keys, or small equatable structs. Avoid computing ids from values that change every render unless you intentionally want recreation.</p>
+
+    <h3>2.2 Forcing recreation (intentional thrash)</h3>
+
+    <p>Sometimes you <em>want</em> a fresh subtree: resetting scroll position, rebuilding a representable with buggy external state, or reloading a web view. Changing <code>.id</code> is the idiomatic hammer.</p>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">ResettableEditor</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> documentId: <span class="type">UUID</span>
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> revision = <span class="number">0</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">EditorView</span>(documentId: documentId)
+            .<span class="func">id</span>(<span class="string">"\(documentId.uuidString)-\(revision)"</span>)
+            .toolbar {
+                <span class="type">Button</span>(<span class="string">"Reset"</span>) { revision += <span class="number">1</span> }
+            }
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Pattern</div>
+        <p><code>.id(item.version)</code> (or a revision counter) is a controlled way to express “this model instance changed so dramatically that incremental updates are wrong — rebuild.” Use it sparingly inside large lists where full recreation is <span class="type">O(n)</span> expensive.</p>
+    </div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Anti-pattern</div>
+        <p><code>.id(UUID())</code> in <code>body</code> without memoization forces a brand-new identity every evaluation — essentially permanent thrash. If you see this in code review, replace with a stable key or move randomness to <code>onAppear</code> once.</p>
+    </div>
+
+    <h3>2.3 <code>.id</code> and animations</h3>
+
+    <p>Because identity transitions present as removal + insertion, <code>withAnimation</code> may animate the outgoing and incoming identities as separate operations. Pair <code>.id</code> changes with <code>transition</code> on the view for predictable effects; otherwise, you may see pops or default fades depending on container and animation context.</p>
+
+    <pre><code><span class="type">Color</span>.<span class="func">red</span>
+    .<span class="func">id</span>(theme.<span class="type">rawValue</span>)
+    .transition(.opacity.combined(with: .scale))</code></pre>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Scenario</th>
+                <th>Structural identity alone</th>
+                <th>With explicit <code>.id</code></th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Reorder rows in a <code>List</code></td>
+                <td>Cells may reuse by position; subtle state bugs possible</td>
+                <td>Keyed by model id aligns reuse with domain identity</td>
+            </tr>
+            <tr>
+                <td>Swap between two large subtrees</td>
+                <td>Depends on conditional lowering; easy to reset state unexpectedly</td>
+                <td>Stable ids preserve each subtree’s state across parent changes</td>
+            </tr>
+            <tr>
+                <td>Force reload</td>
+                <td>Hard to guarantee without conditional hacks</td>
+                <td>Increment id → deterministic recreation</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="foreach-identity">3. <code>ForEach</code> Identity Requirements</h2>
+
+    <p><code>ForEach</code> expands a collection into a dynamic number of children. Unlike tuple slots, the count can change. SwiftUI needs a key for each element so inserts, deletes, and moves diff like keyed collections rather than “whatever ended up at index <code>i</code>.”</p>
+
+    <h3>3.1 <code>Identifiable</code> vs explicit <code>id:</code></h3>
+
+    <pre><code><span class="comment">// Identifiable elements — id inferred from .id</span>
+<span class="type">ForEach</span>(models) { model <span class="keyword">in</span>
+    <span class="type">Row</span>(model: model)
+}
+
+<span class="comment">// Explicit key path</span>
+<span class="type">ForEach</span>(models, id: \.<span class="type">stableId</span>) { model <span class="keyword">in</span>
+    <span class="type">Row</span>(model: model)
+}</code></pre>
+
+    <p>The identifier must be stable across updates for the <em>same domain object</em>. If you change ids when content changes, SwiftUI will tear down and recreate rows — sometimes desirable, often catastrophic for scroll performance and focus.</p>
+
+    <h3>3.2 Why array index as <code>id</code> is dangerous</h3>
+
+    <p>Using <code>indices</code> or enumerated positions keys rows by <strong>position</strong>, not by <strong>entity</strong>. Any insertion before row <code>i</code> shifts identities: the item at index 3 becomes index 4, but its <code>id</code> changed from 3 to 4, so SwiftUI thinks “old 3 removed, new 4 inserted” — state and animations attach to the wrong logical rows.</p>
+
+    <pre><code><span class="comment">// ❌ Fragile: identity tracks position, not item</span>
+<span class="type">ForEach</span>(items.<span class="func">indices</span>, id: \.<span class="keyword">self</span>) { idx <span class="keyword">in</span>
+    <span class="type">Row</span>(item: items[idx])
+}
+
+<span class="comment">// ✅ Prefer stable domain keys</span>
+<span class="type">ForEach</span>(items, id: \.<span class="type">id</span>) { item <span class="keyword">in</span>
+    <span class="type">Row</span>(item: item)
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Staff Signal</div>
+        <p>When candidates say “I used indices because the model wasn’t <code>Identifiable</code>,” the follow-up should be: <strong>what is the true primary key?</strong> Derive <code>id:</code> from that, or wrap items in a lightweight struct with stable identity.</p>
+    </div>
+
+    <h3>3.3 Cell reuse, animations, and list performance</h3>
+
+    <p>Identity drives diff quality. Good keys yield minimal updates; bad keys produce churn that looks like “the list flickers” or “expanded rows collapse.” For animations, SwiftUI matches inserted/removed/moved identities to build transition graphs; index keys scramble those operations.</p>
+
+    <h3>3.4 Nested <code>ForEach</code> and composite keys</h3>
+
+    <p>In outline or sectioned UIs, outer and inner collections each need stable keys. Collisions across sections (same inner id in two sections) can confuse diffing if you flatten poorly. Prefer <code>Section</code> models with their own ids, or encode composite keys in the inner id when you must flatten.</p>
+
+    <pre><code><span class="type">ForEach</span>(sections, id: \.<span class="type">id</span>) { section <span class="keyword">in</span>
+    <span class="type">Section</span>(header: <span class="type">Text</span>(section.title)) {
+        <span class="type">ForEach</span>(section.rows, id: \.<span class="type">id</span>) { row <span class="keyword">in</span>
+            <span class="type">RowView</span>(row: row)
+        }
+    }
+}</code></pre>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Keying strategy</th>
+                <th>Insert at head</th>
+                <th>Reorder</th>
+                <th>Duplicate values</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Index <code>id: \.self</code> on indices</td>
+                <td>Shifts all identities — mass recreate</td>
+                <td>Misattributes state to wrong rows</td>
+                <td>N/A (indices unique)</td>
+            </tr>
+            <tr>
+                <td>Stable UUID from server</td>
+                <td>Minimal churn for existing rows</td>
+                <td>Correct move detection</td>
+                <td>Must be unique per row</td>
+            </tr>
+            <tr>
+                <td>Hash of content</td>
+                <td>Can recreate on any edit changing hash</td>
+                <td>OK if hash tracks entity + version thoughtfully</td>
+                <td>Collisions possible if poorly chosen</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="anyview-cost">4. <code>AnyView</code> Type Erasure Cost</h2>
+
+    <p><code>AnyView</code> wraps an arbitrary <code>View</code> in a type-erased container. It exists because sometimes the <em>static type</em> of a view cannot be expressed without exposing implementation details — but it has profound implications for diffing.</p>
+
+    <h3>4.1 Why erasure disrupts the attribute graph</h3>
+
+    <p>SwiftUI’s high-performance path relies on knowing concrete view types at compile time so the attribute graph (AG) can store typed fields and apply specialized update rules. <code>AnyView</code> replaces that compile-time structure with a dynamic box: the concrete child type is not visible in the parent’s generic signature, so much information must be discovered at runtime.</p>
+
+    <div class="diagram">
+WITHOUT AnyView (conceptual AG fan-out)
+┌─────────────────────────────────────┐
+│ HStack&lt;TupleView&lt;(Text, Image)&gt;&gt;     │
+└─────────────────┬───────────────────┘
+                  │
+        ┌─────────┴─────────┐
+        ▼                   ▼
+   [Text node]        [Image node]
+   typed update        typed update
+   fast path           fast path
+    </div>
+
+    <div class="diagram">
+WITH AnyView (conceptual boxing)
+┌──────────────────────────────────────┐
+│ HStack&lt;TupleView&lt;(AnyView, AnyView)&gt;&gt; │
+└─────────────────┬────────────────────┘
+                  │
+        ┌─────────┴─────────┐
+        ▼                   ▼
+   ┌─────────┐        ┌─────────┐
+   │ AnyView │        │ AnyView │
+   │  box    │        │  box    │
+   └───┬─────┘        └───┬─────┘
+       │ runtime          │ runtime
+       │ type dispatch    │ type dispatch
+       ▼                  ▼
+   concrete?          concrete?
+   (opaque)           (opaque)
+    </div>
+
+    <h3>4.2 Dynamic dispatch vs static diffing</h3>
+
+    <p>With concrete generics, the compiler can specialize <code>body</code> builders and produce compact, predictable machine code. <code>AnyView</code> forces indirect calls through witnesses and runtime type descriptors. In hot update paths (60/120 Hz scrolling, large forms), those costs accumulate — especially when <code>AnyView</code> appears inside every row.</p>
+
+    <h3>4.3 Performance comparison: <code>AnyView</code> vs <code>@ViewBuilder</code></h3>
+
+    <p>Microbenchmarks vary by device and SDK, but the qualitative Staff answer is stable: <strong>prefer opaque <code>some View</code> + generics over erasure</strong>. Use <code>AnyView</code> at boundaries where type identity must be collapsed — and isolate that boundary so it does not infect inner loops.</p>
+
+    <pre><code><span class="comment">// ❌ Hot path erasure — every row boxes views</span>
+<span class="keyword">struct</span> <span class="type">SlowRows</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> items: [<span class="type">Item</span>]
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span> {
+            <span class="keyword">ForEach</span>(items, id: \.<span class="type">id</span>) { item <span class="keyword">in</span>
+                <span class="func">AnyView</span>(<span class="type">Row</span>(item: item))   <span class="comment">// unnecessary boxing</span>
+            }
+        }
+    }
+}
+
+<span class="comment">// ✅ Preserve concrete row type</span>
+<span class="keyword">struct</span> <span class="type">FastRows</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> items: [<span class="type">Item</span>]
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span> {
+            <span class="keyword">ForEach</span>(items, id: \.<span class="type">id</span>) { item <span class="keyword">in</span>
+                <span class="type">Row</span>(item: item)
+            }
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">When <code>AnyView</code> is acceptable</div>
+        <p>Rare cases: heterogeneous collections where you must store views in data structures, legacy bridging, or a narrow factory that returns different concrete types to a non-generic consumer. Even then, confine erasure — do not let <code>AnyView</code> leak into every child of a <code>List</code>.</p>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Approach</th>
+                <th>Type information at compile time</th>
+                <th>Typical cost profile</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>some View</code> + generics</td>
+                <td>Maximal — concrete per specialization</td>
+                <td>Best for large hierarchies and scrolling</td>
+            </tr>
+            <tr>
+                <td><code>@ViewBuilder</code> parameters</td>
+                <td>High — builder rewrites preserve branches</td>
+                <td>Excellent for flexible container APIs</td>
+            </tr>
+            <tr>
+                <td><code>AnyView</code></td>
+                <td>Erased at boundary</td>
+                <td>Convenient but heavy if pervasive</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="viewbuilder-internals">5. <code>@ViewBuilder</code> Result Builder Internals</h2>
+
+    <p>Result builders are compile-time syntactic sugar that desugar to nested generic types. Understanding the three families — <code>buildBlock</code>, <code>buildEither</code>, <code>buildOptional</code> — explains most SwiftUI identity surprises. Newer Swift versions add <code>buildPartialBlock</code> to chunk long sequences; SwiftUI’s arity limits still reflect finite tuple representations in the ABI.</p>
+
+    <h3>5.1 <code>buildBlock</code> — sequencing statements</h3>
+
+    <p>Multiple child statements in a builder become a single value representing a group. For SwiftUI, that grouping is typically a <code>TupleView</code> (conceptually): a heterogenous tuple of children encoded in the generic parameters.</p>
+
+    <h3>5.2 <code>buildEither</code> — <code>if/else</code></h3>
+
+    <p>The builder emits a conditional wrapper that stores either the true or false branch. Both branches exist as types in the signature, even if only one is active at runtime. This is why toggling branches is not the same as updating a single persistent view.</p>
+
+    <h3>5.3 <code>buildOptional</code> — optional sections</h3>
+
+    <p>An <code>if</code> without <code>else</code> introduces an optional child: zero or one view at a structural position. Switching between “nil” and “some” still changes the subtree materially; local state attached to the optional content may reset when content appears/disappears depending on transition and storage rules.</p>
+
+    <h3>5.4 The ten-view limit (tuple arity)</h3>
+
+    <p><code>TupleView</code> is not variadic in the unlimited sense; the library provides overloads up to a fixed arity (commonly ten children). Beyond that, you must introduce explicit grouping (<code>Group</code>, nested containers) that nests another tuple level. This is not an arbitrary aesthetic limit — it is a consequence of modeling tuples as finite generic parameter lists in the SwiftUI ABI.</p>
+
+    <pre><code><span class="comment">// Conceptual builder methods (simplified)</span>
+<span class="keyword">enum</span> <span class="type">ViewBuilder</span> {
+    <span class="keyword">static</span> <span class="keyword">func</span> <span class="func">buildBlock</span>&lt;<span class="type">C0</span>, <span class="type">C1</span>&gt;(<span class="keyword">_</span> c0: <span class="type">C0</span>, <span class="keyword">_</span> c1: <span class="type">C1</span>) -> <span class="type">TupleView</span>&lt;(<span class="type">C0</span>, <span class="type">C1</span>)&gt;
+
+    <span class="keyword">static</span> <span class="keyword">func</span> <span class="func">buildEither</span>&lt;<span class="type">T</span>, <span class="type">F</span>&gt;(<span class="keyword">first</span>: <span class="type">T</span>) -> <span class="type">_ConditionalContent</span>&lt;<span class="type">T</span>, <span class="type">F</span>&gt;
+
+    <span class="keyword">static</span> <span class="keyword">func</span> <span class="func">buildEither</span>&lt;<span class="type">T</span>, <span class="type">F</span>&gt;(<span class="keyword">second</span>: <span class="type">F</span>) -> <span class="type">_ConditionalContent</span>&lt;<span class="type">T</span>, <span class="type">F</span>&gt;
+
+    <span class="keyword">static</span> <span class="keyword">func</span> <span class="func">buildOptional</span>&lt;<span class="type">V</span>&gt;(<span class="keyword">_</span> value: <span class="type">V</span>?) -> <span class="type">V</span>?   <span class="comment">// optional child</span>
+}</code></pre>
+
+    <h3>5.5 What the compiler generates (multi-branch sketch)</h3>
+
+    <p>Nested <code>if</code> chains produce nested <code>_ConditionalContent</code> types — exponential growth of generic structure in the worst case, which is one reason deeply nested builder conditionals slow type-checking. Extract subviews with explicit <code>some View</code> return types to help the compiler.</p>
+
+    <pre><code><span class="comment">// Nested conditionals → nested _ConditionalContent (illustrative)</span>
+<span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+    <span class="keyword">if</span> a {
+        <span class="type">Text</span>(<span class="string">"A"</span>)
+    } <span class="keyword">else</span> <span class="keyword">if</span> b {
+        <span class="type">Text</span>(<span class="string">"B"</span>)
+    } <span class="keyword">else</span> {
+        <span class="type">Text</span>(<span class="string">"C"</span>)
+    }
+}
+<span class="comment">// Conceptually similar to nested Either types in the lowered View type</span></code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Interview Sound Bite</div>
+        <p>“<code>@ViewBuilder</code> lowers control flow into sum and product types — tuples for sequencing, <code>_ConditionalContent</code> for <code>if/else</code>, optionals for conditional absence. Identity follows that lowered shape.” That sentence alone signals Staff-level mental modeling.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="conditional-pitfalls">6. Conditional View Identity Pitfalls</h2>
+
+    <p>This section consolidates edge cases that trip up experienced engineers: not because the APIs are obscure, but because identity is implicit.</p>
+
+    <h3>6.1 <code>if/else</code> and local <code>@State</code></h3>
+
+    <p>The general rule: <strong>branch switching is not a view update — it is a subtree exchange.</strong> For form fields, media players, and map views, keep stable containers.</p>
+
+    <h3>6.2 Alternatives: <code>opacity</code>, <code>hidden</code>, overlays</h3>
+
+    <ul>
+        <li><code>opacity(0)</code> + <code>allowsHitTesting(false)</code> preserves layout; good when you want space reservation.</li>
+        <li><code>hidden()</code> hides visually; combine with layout modifiers intentionally — hidden views may still affect layout depending on container.</li>
+        <li><code>overlay</code> / <code>background</code> can stack alternatives without conditional removal.</li>
+    </ul>
+
+    <pre><code><span class="type">TextField</span>(<span class="string">"Email"</span>, text: $email)
+    .opacity(showEmailField ? <span class="number">1</span> : <span class="number">0</span>)
+    .allowsHitTesting(showEmailField)
+    .accessibilityHidden(!showEmailField)</code></pre>
+
+    <h3>6.3 <code>switch</code> statement identity</h3>
+
+    <p><code>switch</code> in a builder lowers to nested conditionals or a chain of <code>if/else</code>-like structures depending on Swift version and builder support. Each case path is a distinct structural type; jumping cases resets subtree state similarly to <code>if/else</code>. Mitigations: stable outer container + inner <code>switch</code> only for content that should reset, or drive changes through models and bindings instead of swapping entire platform-heavy views.</p>
+
+    <pre><code><span class="keyword">enum</span> <span class="type">Pane</span> { <span class="keyword">case</span> home, settings }
+
+<span class="keyword">struct</span> <span class="type">Root</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> pane: <span class="type">Pane</span> = .home
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="keyword">switch</span> pane {
+        <span class="keyword">case</span> .home:     <span class="type">HomeView</span>()
+        <span class="keyword">case</span> .settings: <span class="type">SettingsView</span>()
+        }
+    }
+}
+<span class="comment">// Changing pane replaces entire subtree at this position — expected if each pane owns fresh state.</span></code></pre>
+
+    <h3>6.4 <code>Group</code> vs concrete containers</h3>
+
+    <p><code>Group</code> is often transparent for layout — it does not inherently introduce a layout container like <code>VStack</code> — but it still structures the type tree. Do not assume <code>Group</code> magically merges children into a parent’s tuple; it wraps them. Whether that affects identity depends on surrounding builder context. When debugging identity, replace <code>Group</code> with explicit stacks to make slot indices obvious.</p>
+
+    <pre><code><span class="comment">// Debugging trick: make slots explicit</span>
+<span class="type">VStack</span> {
+    slot0
+    slot1
+}</code></pre>
+
+    <h3>6.5 <code>EquatableView</code> / <code>equatable()</code>: not a substitute for identity</h3>
+
+    <p>Short-circuiting body evaluation when inputs are equal reduces work, but it does not fix wrong <code>ForEach</code> keys or branch swaps. Use equality as an optimization layer on top of a correct identity story — measure with Instruments if you rely on it in hot paths.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Pitfall</th>
+                <th>Symptom</th>
+                <th>Mitigation</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Flipping <code>if/else</code> around a <code>TextField</code></td>
+                <td>Text clears, focus drops</td>
+                <td>Single field with bound model; toggle label/validation only</td>
+            </tr>
+            <tr>
+                <td>Index-keyed <code>ForEach</code></td>
+                <td>Wrong row animates; state jumps</td>
+                <td>Stable model ids; hashable ids carefully</td>
+            </tr>
+            <tr>
+                <td>Random <code>.id(UUID())</code></td>
+                <td>Constant recreation; CPU spikes</td>
+                <td>Key only by changing model version, not per render</td>
+            </tr>
+            <tr>
+                <td>Pervasive <code>AnyView</code></td>
+                <td>Janky scrolling; high memory</td>
+                <td>Generics, <code>some View</code>, <code>@ViewBuilder</code> APIs</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="architect-patterns">7. Identity Stability Patterns for Complex UIs</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect / Staff Bar</div>
+        <p>Large SwiftUI apps fail in two related ways: <strong>state attached to the wrong graph node</strong> (bugs), and <strong>unnecessary node churn</strong> (performance). The fix is not memorizing modifiers — it is designing <em>stable identity hierarchies</em> that align with your domain model and diff-friendly containers.</p>
+    </div>
+
+    <h3>7.1 Designing stable identity hierarchies</h3>
+
+    <ol>
+        <li><strong>Key by domain ids at dynamic boundaries.</strong> Any <code>ForEach</code>, grid, or carousel should use primary keys from your server or persistence layer — not positions.</li>
+        <li><strong>Isolate expensive subtrees.</strong> Representables, maps, and web views go inside views with carefully chosen <code>.id</code> tied to model versions to avoid accidental recreation from unrelated parent state.</li>
+        <li><strong>Minimize conditional swapping of heavy views.</strong> Prefer lightweight facades whose identity is stable while inner content loads asynchronously.</li>
+    </ol>
+
+    <h3>7.2 Avoiding unnecessary recreation</h3>
+
+    <ul>
+        <li>Split read-only chrome from volatile content so parent re-renders do not reconstruct static sections.</li>
+        <li>Use <code>EquatableView</code> or custom <code>equatable()</code> wrappers where appropriate to short-circuit deep comparisons — but do not mask identity problems; measure first.</li>
+        <li>Be cautious with <code>some View</code> returning different concrete types from a single function without a disciplined state machine — type changes can imply wholesale replacement.</li>
+    </ul>
+
+    <h3>7.3 Dynamic content with stable identity</h3>
+
+    <p>Feed and messaging UIs mix stable entities (threads, users) with volatile attributes (unread counts). The pattern: outer list keyed by thread id; inner badges keyed by a composite id (<code>threadId + notificationEpoch</code>) only when you intentionally want a fresh animation.</p>
+
+    <div class="diagram">
+Stable hierarchy sketch
+Screen (root)
+ └─ NavigationStack
+     └─ List (sectioned)
+         ├─ Section(header: "Pinned")
+         │   └─ ForEach(pinnedThreads, id: \.id) { ThreadRow($0) }
+         └─ Section(header: "Recent")
+             └─ ForEach(recentThreads, id: \.id) { ThreadRow($0) }
+
+ThreadRow
+ └─ HStack
+     ├─ Avatar (id: user.id)        ← stable image pipeline
+     ├─ VStack { title, subtitle }
+     └─ Badge (id: "\(thread.id)-\(thread.badgeVersion)")
+    </div>
+
+    <p>Notice how <code>Badge</code> uses a version suffix: you can animate badge replacements without re-keying the entire row unless the thread itself changes identity.</p>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architecture Review Checklist</div>
+        <ul style="margin-bottom: 0;">
+            <li>Does every <code>ForEach</code> have a domain-stable <code>id</code>?</li>
+            <li>Do heavy representables have explicit <code>.id</code> tied to model version, not parent noise?</li>
+            <li>Are conditionals used for layout toggles where state must persist?</li>
+            <li>Is <code>AnyView</code> confined to narrow factories, not list rows?</li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="interview-qa">8. Staff / L6 Interview Q&amp;A</h2>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Closing Mental Model</div>
+        <p>SwiftUI identity is the bridge between <strong>value-type view descriptions</strong> and <strong>long-lived framework state</strong>. Structural identity encodes “where” in the lowered builder tree; <code>.id</code> and <code>ForEach</code> keys encode “which logical thing.” Staff engineers design APIs so those two stories agree — minimizing surprises in diffing, animation, and performance.</p>
+    </div>
+
+    <h3>Q: Why did my <code>@State</code> reset when I toggled a boolean?</h3>
+    <p><strong>A:</strong> Likely the view holding that state lived inside a conditional branch that swapped out for another type. The graph node for the old branch was torn down. Fix by stabilizing structure (<code>ZStack</code>, opacity, single child) or lifting state above the conditional.</p>
+
+    <h3>Q: How is this different from UIKit reuse?</h3>
+    <p><strong>A:</strong> UIKit often reuses <em>cells</em> by class; SwiftUI diffs <em>descriptions</em> and keys dynamic lists. Wrong keys look like “reuse bugs” but originate from identity, not dequeuing.</p>
+
+    <h3>Q: When should I use <code>.id</code> on a <code>List</code> row?</h3>
+    <p><strong>A:</strong> When domain identity and structural position diverge (reordering, async refresh) or when you must force a clean subtree. Do not use unstable ids; prefer model primary keys.</p>
+
+    <h3>Q: Is <code>Group { a; b; c }</code> free?</h3>
+    <p><strong>A:</strong> It is cheap at runtime relative to representables, but it shapes types. For debugging, prefer explicit stacks to read slot indices; for APIs, use <code>Group</code> when you need builder flexibility without layout semantics.</p>
+
+    <div class="nav-footer">
+        <a href="01-swiftui-runtime.html">← SwiftUI Runtime</a>
+        <a href="03-state-management.html">Next: State Management →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Async Sequences — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Concurrency &amp; Threading</a><span class="sep">›</span>
+        Async Sequences
+    </nav>
+
+    <h1>Async Sequences</h1>
+    <p class="subtitle">AsyncSequence, AsyncStream, and AsyncThrowingStream — the async iteration protocol, backpressure handling, bridging from Combine, withCheckedContinuation patterns, and building custom async sequences for real-world streaming data.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#async-sequence">1. AsyncSequence Protocol</a></li>
+            <li><a href="#for-await">2. for-await Pattern</a></li>
+            <li><a href="#async-stream">3. AsyncStream &amp; AsyncThrowingStream</a></li>
+            <li><a href="#backpressure">4. Backpressure Handling</a></li>
+            <li><a href="#bridging">5. Bridging Combine → AsyncSequence</a></li>
+            <li><a href="#continuations">6. withCheckedContinuation Patterns</a></li>
+            <li><a href="#custom">7. Building Custom Async Sequences</a></li>
+            <li><a href="#operators">8. AsyncSequence Operators</a></li>
+            <li><a href="#architect">9. Architect: Choosing Between Combine, AsyncSequence, and Observation</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="async-sequence">1. AsyncSequence Protocol</h2>
+
+    <p><code>AsyncSequence</code> is the async counterpart of <code>Sequence</code>. Where <code>Sequence</code> provides elements synchronously, <code>AsyncSequence</code> provides elements that may arrive over time, with each element potentially requiring an <code>await</code>.</p>
+
+    <pre><code><span class="comment">// The AsyncSequence protocol</span>
+<span class="keyword">protocol</span> <span class="type">AsyncSequence</span> {
+    <span class="keyword">associatedtype</span> <span class="type">Element</span>
+    <span class="keyword">associatedtype</span> <span class="type">AsyncIterator</span>: <span class="type">AsyncIteratorProtocol</span>
+    <span class="keyword">func</span> <span class="func">makeAsyncIterator</span>() -> <span class="type">AsyncIterator</span>
+}
+
+<span class="keyword">protocol</span> <span class="type">AsyncIteratorProtocol</span> {
+    <span class="keyword">associatedtype</span> <span class="type">Element</span>
+    <span class="keyword">mutating func</span> <span class="func">next</span>() <span class="keyword">async throws</span> -> <span class="type">Element</span>?
+    <span class="comment">// Returns nil when the sequence is finished</span>
+}</code></pre>
+
+    <div class="diagram">
+Sequence vs AsyncSequence:
+
+Sequence (synchronous):
+┌───┐ ┌───┐ ┌───┐ ┌───┐ ┌─────┐
+│ 1 │→│ 2 │→│ 3 │→│ 4 │→│ nil │  All available immediately
+└───┘ └───┘ └───┘ └───┘ └─────┘
+
+AsyncSequence (asynchronous):
+┌───┐    ┌───┐         ┌───┐  ┌───┐       ┌─────┐
+│ 1 │→···│ 2 │→·········│ 3 │→·│ 4 │→······│ nil │
+└───┘    └───┘         └───┘  └───┘       └─────┘
+  t=0     t=100ms       t=500ms t=510ms    t=2s
+
+Elements arrive over time. Consumer awaits each one.
+    </div>
+
+    <h3>1.1 Built-in AsyncSequences</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Type</th>
+                <th>Source</th>
+                <th>Use Case</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>URL.resourceBytes</code></td>
+                <td>Foundation</td>
+                <td>Streaming download bytes</td>
+            </tr>
+            <tr>
+                <td><code>URLSession.bytes(from:)</code></td>
+                <td>Foundation</td>
+                <td>HTTP response streaming</td>
+            </tr>
+            <tr>
+                <td><code>FileHandle.bytes</code></td>
+                <td>Foundation</td>
+                <td>Reading file bytes</td>
+            </tr>
+            <tr>
+                <td><code>NotificationCenter.notifications</code></td>
+                <td>Foundation</td>
+                <td>Observing notifications</td>
+            </tr>
+            <tr>
+                <td><code>AsyncStream</code></td>
+                <td>Swift stdlib</td>
+                <td>Custom async sequences</td>
+            </tr>
+            <tr>
+                <td><code>AsyncThrowingStream</code></td>
+                <td>Swift stdlib</td>
+                <td>Custom async sequences with errors</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="for-await">2. for-await Pattern</h2>
+
+    <pre><code><span class="comment">// Basic for-await iteration</span>
+<span class="keyword">func</span> <span class="func">processNotifications</span>() <span class="keyword">async</span> {
+    <span class="keyword">let</span> notifications = <span class="type">NotificationCenter</span>.default.<span class="func">notifications</span>(
+        named: .didReceiveData
+    )
+
+    <span class="keyword">for await</span> notification <span class="keyword">in</span> notifications {
+        <span class="keyword">guard let</span> data = notification.userInfo?[<span class="string">"data"</span>] <span class="keyword">as</span>? <span class="type">Data</span> <span class="keyword">else</span> { <span class="keyword">continue</span> }
+        <span class="keyword">await</span> <span class="func">processData</span>(data)
+    }
+    <span class="comment">// This line is reached when the sequence finishes (iterator returns nil)</span>
+    <span class="comment">// or when the task is cancelled</span>
+}
+
+<span class="comment">// Streaming bytes from a URL</span>
+<span class="keyword">func</span> <span class="func">downloadWithProgress</span>(url: <span class="type">URL</span>) <span class="keyword">async throws</span> {
+    <span class="keyword">let</span> (bytes, response) = <span class="keyword">try await</span> <span class="type">URLSession</span>.shared.<span class="func">bytes</span>(from: url)
+    <span class="keyword">let</span> totalBytes = response.expectedContentLength
+
+    <span class="keyword">var</span> receivedBytes: <span class="type">Int64</span> = <span class="number">0</span>
+    <span class="keyword">var</span> buffer = <span class="type">Data</span>()
+
+    <span class="keyword">for try await</span> byte <span class="keyword">in</span> bytes {
+        buffer.<span class="func">append</span>(byte)
+        receivedBytes += <span class="number">1</span>
+
+        <span class="keyword">if</span> receivedBytes % <span class="number">1024</span> == <span class="number">0</span> {
+            <span class="keyword">let</span> progress = <span class="type">Double</span>(receivedBytes) / <span class="type">Double</span>(totalBytes)
+            <span class="keyword">await</span> <span class="func">updateProgress</span>(progress)
+        }
+    }
+}
+
+<span class="comment">// Reading lines from a file</span>
+<span class="keyword">func</span> <span class="func">processLogFile</span>(url: <span class="type">URL</span>) <span class="keyword">async throws</span> {
+    <span class="keyword">for try await</span> line <span class="keyword">in</span> url.lines {
+        <span class="keyword">if</span> line.<span class="func">contains</span>(<span class="string">"ERROR"</span>) {
+            <span class="keyword">await</span> <span class="func">reportError</span>(line)
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: How for-await Compiles</div>
+        <p>The compiler transforms <code>for await x in sequence</code> into a while loop that calls <code>next()</code> on the iterator. Each <code>next()</code> call is an await point — the task suspends until the next element is available. When <code>next()</code> returns <code>nil</code>, the loop exits. If the task is cancelled, the next <code>await</code> point will check cancellation (if the sequence supports it).</p>
+        <pre><code><span class="comment">// for await x in sequence { body(x) }</span>
+<span class="comment">// compiles to approximately:</span>
+<span class="keyword">var</span> iterator = sequence.<span class="func">makeAsyncIterator</span>()
+<span class="keyword">while let</span> x = <span class="keyword">try await</span> iterator.<span class="func">next</span>() {
+    <span class="func">body</span>(x)
+}</code></pre>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="async-stream">3. AsyncStream &amp; AsyncThrowingStream</h2>
+
+    <p><code>AsyncStream</code> is the primary way to create custom async sequences. It bridges imperative code (callbacks, delegates, timers) into the async sequence world.</p>
+
+    <h3>3.1 AsyncStream with Continuation</h3>
+
+    <pre><code><span class="comment">// Bridging a delegate-based API to AsyncStream</span>
+<span class="keyword">class</span> <span class="type">LocationTracker</span>: <span class="type">NSObject</span>, <span class="type">CLLocationManagerDelegate</span> {
+    <span class="keyword">private let</span> manager = <span class="type">CLLocationManager</span>()
+    <span class="keyword">private var</span> continuation: <span class="type">AsyncStream</span>&lt;<span class="type">CLLocation</span>&gt;.<span class="type">Continuation</span>?
+
+    <span class="keyword">var</span> locations: <span class="type">AsyncStream</span>&lt;<span class="type">CLLocation</span>&gt; {
+        <span class="type">AsyncStream</span> { continuation <span class="keyword">in</span>
+            <span class="keyword">self</span>.continuation = continuation
+            manager.delegate = <span class="keyword">self</span>
+            manager.<span class="func">startUpdatingLocation</span>()
+
+            <span class="comment">// Called when the stream is cancelled or finished</span>
+            continuation.onTermination = { @<span class="type">Sendable</span> _ <span class="keyword">in</span>
+                <span class="keyword">self</span>.manager.<span class="func">stopUpdatingLocation</span>()
+            }
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">locationManager</span>(
+        _ manager: <span class="type">CLLocationManager</span>,
+        didUpdateLocations locations: [<span class="type">CLLocation</span>]
+    ) {
+        <span class="keyword">for</span> location <span class="keyword">in</span> locations {
+            continuation?.<span class="func">yield</span>(location)
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">locationManager</span>(
+        _ manager: <span class="type">CLLocationManager</span>,
+        didFailWithError error: <span class="type">Error</span>
+    ) {
+        continuation?.<span class="func">finish</span>()
+    }
+}
+
+<span class="comment">// Usage</span>
+<span class="keyword">let</span> tracker = <span class="type">LocationTracker</span>()
+<span class="keyword">for await</span> location <span class="keyword">in</span> tracker.locations {
+    <span class="func">print</span>(<span class="string">"Lat: \(location.coordinate.latitude)"</span>)
+}</code></pre>
+
+    <h3>3.2 AsyncStream with Unfolding</h3>
+
+    <pre><code><span class="comment">// Simpler pattern for pull-based sequences</span>
+<span class="keyword">let</span> countdown = <span class="type">AsyncStream</span>&lt;<span class="type">Int</span>&gt;.<span class="func">init</span>(unfolding: {
+    <span class="keyword">try</span>? <span class="keyword">await</span> <span class="type">Task</span>.<span class="func">sleep</span>(for: .<span class="func">seconds</span>(<span class="number">1</span>))
+    <span class="keyword">return</span> <span class="type">Int</span>.<span class="func">random</span>(in: <span class="number">1</span>...<span class="number">100</span>)
+})
+
+<span class="comment">// Timer-based stream</span>
+<span class="keyword">func</span> <span class="func">timerStream</span>(interval: <span class="type">Duration</span>) -> <span class="type">AsyncStream</span>&lt;<span class="type">Date</span>&gt; {
+    <span class="type">AsyncStream</span> { continuation <span class="keyword">in</span>
+        <span class="keyword">let</span> task = <span class="type">Task</span> {
+            <span class="keyword">while</span> !<span class="type">Task</span>.isCancelled {
+                continuation.<span class="func">yield</span>(<span class="type">Date</span>())
+                <span class="keyword">try</span>? <span class="keyword">await</span> <span class="type">Task</span>.<span class="func">sleep</span>(for: interval)
+            }
+            continuation.<span class="func">finish</span>()
+        }
+
+        continuation.onTermination = { _ <span class="keyword">in</span>
+            task.<span class="func">cancel</span>()
+        }
+    }
+}</code></pre>
+
+    <h3>3.3 AsyncThrowingStream</h3>
+
+    <pre><code><span class="comment">// Stream that can produce errors</span>
+<span class="keyword">func</span> <span class="func">eventStream</span>() -> <span class="type">AsyncThrowingStream</span>&lt;<span class="type">ServerEvent</span>, <span class="type">Error</span>&gt; {
+    <span class="type">AsyncThrowingStream</span> { continuation <span class="keyword">in</span>
+        <span class="keyword">let</span> connection = <span class="type">WebSocketConnection</span>(url: serverURL)
+
+        connection.onMessage = { message <span class="keyword">in</span>
+            <span class="keyword">do</span> {
+                <span class="keyword">let</span> event = <span class="keyword">try</span> <span class="type">JSONDecoder</span>().<span class="func">decode</span>(<span class="type">ServerEvent</span>.<span class="keyword">self</span>, from: message)
+                continuation.<span class="func">yield</span>(event)
+            } <span class="keyword">catch</span> {
+                continuation.<span class="func">finish</span>(throwing: error)
+            }
+        }
+
+        connection.onDisconnect = { error <span class="keyword">in</span>
+            <span class="keyword">if let</span> error = error {
+                continuation.<span class="func">finish</span>(throwing: error)
+            } <span class="keyword">else</span> {
+                continuation.<span class="func">finish</span>()
+            }
+        }
+
+        continuation.onTermination = { _ <span class="keyword">in</span>
+            connection.<span class="func">disconnect</span>()
+        }
+
+        connection.<span class="func">connect</span>()
+    }
+}
+
+<span class="comment">// Usage with error handling</span>
+<span class="keyword">do</span> {
+    <span class="keyword">for try await</span> event <span class="keyword">in</span> <span class="func">eventStream</span>() {
+        <span class="keyword">await</span> <span class="func">handleEvent</span>(event)
+    }
+} <span class="keyword">catch</span> {
+    <span class="func">print</span>(<span class="string">"Stream failed: \(error)"</span>)
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: AsyncStream Continuation Lifetime</div>
+        <p>The continuation must not be used after calling <code>finish()</code>. Yielding after finish is silently ignored, but it indicates a logic error. Also, if you store the continuation as a property, ensure it's properly cleaned up — a retained continuation that never finishes will keep the consuming task suspended forever.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="backpressure">4. Backpressure Handling</h2>
+
+    <p>Backpressure occurs when a producer generates data faster than the consumer can process it. AsyncSequence has a natural backpressure model: the producer is implicitly paused because the consumer must <code>await</code> each element.</p>
+
+    <h3>4.1 AsyncStream Buffering Policies</h3>
+
+    <pre><code><span class="comment">// AsyncStream.Continuation.BufferingPolicy</span>
+<span class="keyword">let</span> stream1 = <span class="type">AsyncStream</span>&lt;<span class="type">Int</span>&gt;(bufferingPolicy: .unbounded) { continuation <span class="keyword">in</span>
+    <span class="comment">// No limit — can cause unbounded memory growth!</span>
+}
+
+<span class="keyword">let</span> stream2 = <span class="type">AsyncStream</span>&lt;<span class="type">Int</span>&gt;(bufferingPolicy: .bufferingNewest(<span class="number">10</span>)) { continuation <span class="keyword">in</span>
+    <span class="comment">// Keeps newest 10 elements, drops oldest when full</span>
+}
+
+<span class="keyword">let</span> stream3 = <span class="type">AsyncStream</span>&lt;<span class="type">Int</span>&gt;(bufferingPolicy: .bufferingOldest(<span class="number">10</span>)) { continuation <span class="keyword">in</span>
+    <span class="comment">// Keeps oldest 10 elements, drops newest when full</span>
+}</code></pre>
+
+    <div class="diagram">
+Backpressure Models:
+
+Pull-based (AsyncSequence default):
+Producer ──yield──▶ Buffer ──await next()──▶ Consumer
+                    │                        │
+                    │  Producer blocked       │
+                    │  until consumer calls   │
+                    │  next()                 │
+                    └────────────────────────┘
+
+Buffered (AsyncStream):
+Producer ──yield──▶ [Buffer: max N] ──await──▶ Consumer
+                    │                           │
+                    │  If buffer full:           │
+                    │  .bufferingNewest → drop oldest
+                    │  .bufferingOldest → drop newest
+                    │  .unbounded → grow forever ⚠️
+                    └───────────────────────────┘
+    </div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: Unbounded Buffering</div>
+        <p>The default buffering policy for <code>AsyncStream</code> is <code>.unbounded</code>. If your producer is faster than your consumer (e.g., sensor data at 100Hz, consumer processing at 10Hz), the buffer grows without limit, eventually causing an out-of-memory crash. Always specify a bounded buffering policy for high-frequency streams.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="bridging">5. Bridging Combine → AsyncSequence</h2>
+
+    <pre><code><span class="comment">// Built-in bridge: Publisher.values</span>
+<span class="keyword">let</span> publisher = <span class="type">NotificationCenter</span>.default.<span class="func">publisher</span>(for: .someNotification)
+
+<span class="keyword">for await</span> notification <span class="keyword">in</span> publisher.values {
+    <span class="func">print</span>(<span class="string">"Received: \(notification)"</span>)
+}
+
+<span class="comment">// @Published property as AsyncSequence</span>
+<span class="keyword">class</span> <span class="type">SettingsStore</span>: <span class="type">ObservableObject</span> {
+    <span class="keyword">@Published var</span> theme: <span class="type">Theme</span> = .light
+}
+
+<span class="keyword">let</span> store = <span class="type">SettingsStore</span>()
+<span class="keyword">for await</span> theme <span class="keyword">in</span> store.$theme.values {
+    <span class="keyword">await</span> <span class="func">applyTheme</span>(theme)
+}
+
+<span class="comment">// Custom bridge for complex Combine pipelines</span>
+<span class="keyword">extension</span> <span class="type">Publisher</span> <span class="keyword">where</span> <span class="type">Failure</span> == <span class="type">Never</span> {
+    <span class="keyword">func</span> <span class="func">toAsyncStream</span>() -> <span class="type">AsyncStream</span>&lt;<span class="type">Output</span>&gt; {
+        <span class="type">AsyncStream</span> { continuation <span class="keyword">in</span>
+            <span class="keyword">let</span> cancellable = <span class="keyword">self</span>.<span class="func">sink</span> { completion <span class="keyword">in</span>
+                continuation.<span class="func">finish</span>()
+            } receiveValue: { value <span class="keyword">in</span>
+                continuation.<span class="func">yield</span>(value)
+            }
+
+            continuation.onTermination = { _ <span class="keyword">in</span>
+                cancellable.<span class="func">cancel</span>()
+            }
+        }
+    }
+}
+
+<span class="comment">// Bridge with Combine operators applied first</span>
+<span class="keyword">let</span> debouncedSearch = searchPublisher
+    .<span class="func">debounce</span>(for: .<span class="func">milliseconds</span>(<span class="number">300</span>), scheduler: <span class="type">RunLoop</span>.main)
+    .<span class="func">removeDuplicates</span>()
+    .values  <span class="comment">// AsyncSequence</span>
+
+<span class="keyword">for await</span> query <span class="keyword">in</span> debouncedSearch {
+    <span class="keyword">await</span> <span class="func">performSearch</span>(query)
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="continuations">6. withCheckedContinuation Patterns</h2>
+
+    <pre><code><span class="comment">// Pattern 1: Single-shot callback → async</span>
+<span class="keyword">func</span> <span class="func">requestPermission</span>() <span class="keyword">async</span> -> <span class="type">Bool</span> {
+    <span class="keyword">await</span> <span class="func">withCheckedContinuation</span> { continuation <span class="keyword">in</span>
+        <span class="type">UNUserNotificationCenter</span>.current().<span class="func">requestAuthorization</span>(
+            options: [.alert, .sound]
+        ) { granted, _ <span class="keyword">in</span>
+            continuation.<span class="func">resume</span>(returning: granted)
+        }
+    }
+}
+
+<span class="comment">// Pattern 2: Result-based callback → async throws</span>
+<span class="keyword">func</span> <span class="func">authenticate</span>() <span class="keyword">async throws</span> -> <span class="type">Token</span> {
+    <span class="keyword">try await</span> <span class="func">withCheckedThrowingContinuation</span> { continuation <span class="keyword">in</span>
+        authService.<span class="func">authenticate</span> { result <span class="keyword">in</span>
+            continuation.<span class="func">resume</span>(with: result)
+        }
+    }
+}
+
+<span class="comment">// Pattern 3: Delegate → async (one-shot)</span>
+<span class="keyword">func</span> <span class="func">pickImage</span>() <span class="keyword">async</span> -> <span class="type">UIImage</span>? {
+    <span class="keyword">await</span> <span class="func">withCheckedContinuation</span> { continuation <span class="keyword">in</span>
+        <span class="keyword">let</span> picker = <span class="type">UIImagePickerController</span>()
+        <span class="keyword">let</span> delegate = <span class="type">PickerDelegate</span> { image <span class="keyword">in</span>
+            continuation.<span class="func">resume</span>(returning: image)
+        }
+        picker.delegate = delegate
+        <span class="func">present</span>(picker)
+    }
+}
+
+<span class="comment">// Pattern 4: Wrapping DispatchQueue.async</span>
+<span class="keyword">func</span> <span class="func">runOnQueue</span>&lt;<span class="type">T</span>: <span class="type">Sendable</span>&gt;(
+    _ queue: <span class="type">DispatchQueue</span>,
+    work: <span class="keyword">@Sendable @escaping</span> () -> <span class="type">T</span>
+) <span class="keyword">async</span> -> <span class="type">T</span> {
+    <span class="keyword">await</span> <span class="func">withCheckedContinuation</span> { continuation <span class="keyword">in</span>
+        queue.<span class="func">async</span> {
+            <span class="keyword">let</span> result = <span class="func">work</span>()
+            continuation.<span class="func">resume</span>(returning: result)
+        }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="custom">7. Building Custom Async Sequences</h2>
+
+    <pre><code><span class="comment">// Custom AsyncSequence: Paginated API fetcher</span>
+<span class="keyword">struct</span> <span class="type">PaginatedFetcher</span>&lt;<span class="type">Item</span>: <span class="type">Decodable</span> &amp; <span class="type">Sendable</span>&gt;: <span class="type">AsyncSequence</span> {
+    <span class="keyword">typealias</span> <span class="type">Element</span> = [<span class="type">Item</span>]
+
+    <span class="keyword">let</span> baseURL: <span class="type">URL</span>
+    <span class="keyword">let</span> pageSize: <span class="type">Int</span>
+
+    <span class="keyword">struct</span> <span class="type">AsyncIterator</span>: <span class="type">AsyncIteratorProtocol</span> {
+        <span class="keyword">let</span> baseURL: <span class="type">URL</span>
+        <span class="keyword">let</span> pageSize: <span class="type">Int</span>
+        <span class="keyword">var</span> currentPage = <span class="number">0</span>
+        <span class="keyword">var</span> isExhausted = <span class="keyword">false</span>
+
+        <span class="keyword">mutating func</span> <span class="func">next</span>() <span class="keyword">async throws</span> -> [<span class="type">Item</span>]? {
+            <span class="keyword">guard</span> !isExhausted <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+            <span class="keyword">try</span> <span class="type">Task</span>.<span class="func">checkCancellation</span>()
+
+            <span class="keyword">var</span> components = <span class="type">URLComponents</span>(url: baseURL, resolvingAgainstBaseURL: <span class="keyword">false</span>)!
+            components.queryItems = [
+                <span class="type">URLQueryItem</span>(name: <span class="string">"page"</span>, value: <span class="string">"\(currentPage)"</span>),
+                <span class="type">URLQueryItem</span>(name: <span class="string">"size"</span>, value: <span class="string">"\(pageSize)"</span>)
+            ]
+
+            <span class="keyword">let</span> (data, _) = <span class="keyword">try await</span> <span class="type">URLSession</span>.shared.<span class="func">data</span>(from: components.url!)
+            <span class="keyword">let</span> items = <span class="keyword">try</span> <span class="type">JSONDecoder</span>().<span class="func">decode</span>([<span class="type">Item</span>].<span class="keyword">self</span>, from: data)
+
+            <span class="keyword">if</span> items.count &lt; pageSize {
+                isExhausted = <span class="keyword">true</span>
+            }
+            currentPage += <span class="number">1</span>
+
+            <span class="keyword">return</span> items.isEmpty ? <span class="keyword">nil</span> : items
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">makeAsyncIterator</span>() -> <span class="type">AsyncIterator</span> {
+        <span class="type">AsyncIterator</span>(baseURL: baseURL, pageSize: pageSize)
+    }
+}
+
+<span class="comment">// Usage: automatically paginates through all results</span>
+<span class="keyword">let</span> fetcher = <span class="type">PaginatedFetcher</span>&lt;<span class="type">User</span>&gt;(
+    baseURL: <span class="type">URL</span>(string: <span class="string">"https://api.example.com/users"</span>)!,
+    pageSize: <span class="number">50</span>
+)
+
+<span class="keyword">for try await</span> page <span class="keyword">in</span> fetcher {
+    <span class="keyword">for</span> user <span class="keyword">in</span> page {
+        <span class="keyword">await</span> <span class="func">processUser</span>(user)
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="operators">8. AsyncSequence Operators</h2>
+
+    <pre><code><span class="comment">// Built-in operators (mirror Sequence operators)</span>
+<span class="keyword">let</span> numbers = <span class="type">AsyncStream</span>&lt;<span class="type">Int</span>&gt; { <span class="comment">/* ... */</span> }
+
+<span class="comment">// map</span>
+<span class="keyword">for await</span> doubled <span class="keyword">in</span> numbers.<span class="func">map</span>({ $0 * <span class="number">2</span> }) { }
+
+<span class="comment">// filter</span>
+<span class="keyword">for await</span> even <span class="keyword">in</span> numbers.<span class="func">filter</span>({ $0.<span class="func">isMultiple</span>(of: <span class="number">2</span>) }) { }
+
+<span class="comment">// compactMap</span>
+<span class="keyword">for await</span> value <span class="keyword">in</span> strings.<span class="func">compactMap</span>({ <span class="type">Int</span>($0) }) { }
+
+<span class="comment">// prefix (take first N)</span>
+<span class="keyword">for await</span> value <span class="keyword">in</span> numbers.<span class="func">prefix</span>(<span class="number">10</span>) { }
+
+<span class="comment">// drop (skip first N)</span>
+<span class="keyword">for await</span> value <span class="keyword">in</span> numbers.<span class="func">dropFirst</span>(<span class="number">5</span>) { }
+
+<span class="comment">// first (single value)</span>
+<span class="keyword">let</span> first = <span class="keyword">await</span> numbers.<span class="func">first</span>(where: { $0 > <span class="number">100</span> })
+
+<span class="comment">// reduce</span>
+<span class="keyword">let</span> sum = <span class="keyword">await</span> numbers.<span class="func">reduce</span>(<span class="number">0</span>, +)
+
+<span class="comment">// contains</span>
+<span class="keyword">let</span> hasNegative = <span class="keyword">await</span> numbers.<span class="func">contains</span>(where: { $0 &lt; <span class="number">0</span> })
+
+<span class="comment">// Chaining operators</span>
+<span class="keyword">for await</span> result <span class="keyword">in</span> events
+    .<span class="func">filter</span> { $0.type == .userAction }
+    .<span class="func">map</span> { $0.payload }
+    .<span class="func">prefix</span>(<span class="number">100</span>) {
+    <span class="keyword">await</span> <span class="func">process</span>(result)
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">9. Architect: Choosing Between Combine, AsyncSequence, and Observation</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>In 2024+, iOS developers have three reactive/streaming frameworks: Combine, AsyncSequence, and the Observation framework. Choosing the right one for each layer of your architecture is a critical Staff-level decision.</p>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Combine</th>
+                <th>AsyncSequence</th>
+                <th>Observation</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Introduced</td>
+                <td>iOS 13 (2019)</td>
+                <td>iOS 15 (2021)</td>
+                <td>iOS 17 (2023)</td>
+            </tr>
+            <tr>
+                <td>Paradigm</td>
+                <td>Reactive (push)</td>
+                <td>Async iteration (pull)</td>
+                <td>Observation (automatic)</td>
+            </tr>
+            <tr>
+                <td>Backpressure</td>
+                <td>Demand-based (explicit)</td>
+                <td>Natural (await-based)</td>
+                <td>N/A (synchronous)</td>
+            </tr>
+            <tr>
+                <td>Operators</td>
+                <td>Rich (100+ operators)</td>
+                <td>Basic (map, filter, etc.)</td>
+                <td>None (not a stream)</td>
+            </tr>
+            <tr>
+                <td>Error handling</td>
+                <td>Typed errors in pipeline</td>
+                <td>throws / try await</td>
+                <td>N/A</td>
+            </tr>
+            <tr>
+                <td>Cancellation</td>
+                <td>AnyCancellable</td>
+                <td>Task cancellation</td>
+                <td>withObservationTracking scope</td>
+            </tr>
+            <tr>
+                <td>SwiftUI integration</td>
+                <td>@Published + ObservableObject</td>
+                <td>.task { for await }</td>
+                <td>@Observable (native)</td>
+            </tr>
+            <tr>
+                <td>Best for</td>
+                <td>Complex event processing</td>
+                <td>Streaming data, bridging</td>
+                <td>UI state management</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Recommended Architecture (2024+)</div>
+        <ul>
+            <li><strong>UI Layer</strong>: Observation framework (<code>@Observable</code>) for SwiftUI, <code>@MainActor</code> for UIKit</li>
+            <li><strong>ViewModel</strong>: <code>@Observable</code> + async/await for data loading</li>
+            <li><strong>Service Layer</strong>: async/await + AsyncSequence for streaming APIs</li>
+            <li><strong>Legacy Integration</strong>: Combine where existing code uses it; bridge to AsyncSequence via <code>.values</code></li>
+            <li><strong>Complex Event Processing</strong>: Combine for debounce/throttle/combineLatest chains (richer operators)</li>
+            <li><strong>New streaming APIs</strong>: AsyncStream for wrapping delegates and callbacks</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="04-actors-isolation.html">← Actors &amp; Isolation</a>
+        <a href="06-combine-framework.html">Next: Combine Framework →</a>
+    </div>
+</div>
+</body>
+</html>

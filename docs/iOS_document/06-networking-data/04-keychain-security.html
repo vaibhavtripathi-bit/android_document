@@ -1,0 +1,1269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Keychain &amp; Security — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Networking &amp; Data</a><span class="sep">›</span>
+        Keychain &amp; Security
+    </nav>
+
+    <h1>Keychain Services &amp; Security</h1>
+    <p class="subtitle">Encrypted credential storage, biometric protection, CryptoKit, App Attest, DeviceCheck, and architecting production-grade secure storage for iOS.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#architecture">1. Keychain Services Architecture</a></li>
+            <li><a href="#crud">2. CRUD Operations</a></li>
+            <li><a href="#accessible">3. kSecAttrAccessible Options</a></li>
+            <li><a href="#biometric">4. Biometric Protection</a></li>
+            <li><a href="#sharing">5. Keychain Sharing via App Groups</a></li>
+            <li><a href="#comparison">6. Keychain vs UserDefaults vs File Protection</a></li>
+            <li><a href="#cryptokit">7. CryptoKit</a></li>
+            <li><a href="#app-attest">8. App Attest</a></li>
+            <li><a href="#device-check">9. DeviceCheck</a></li>
+            <li><a href="#architect">10. Architect: Designing a Secure Credential Storage System</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 1: Keychain Services Architecture                    -->
+    <!-- ============================================================ -->
+    <h2 id="architecture">1. Keychain Services Architecture</h2>
+
+    <p>The iOS Keychain is an <strong>encrypted SQLite database</strong> managed by the <code>securityd</code> daemon, a system-level process running outside your app's sandbox. Unlike <code>UserDefaults</code>, keychain data is encrypted at rest using hardware-backed keys derived from the device passcode and the Secure Enclave.</p>
+
+    <p>Your app never directly reads or writes the keychain database. Instead, it communicates through the <strong>Security framework</strong>, which marshals requests to <code>securityd</code> via XPC (inter-process communication).</p>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────┐
+│                     Your Application                     │
+│                                                         │
+│   ┌──────────────┐    ┌──────────────────────────────┐  │
+│   │ SecItemAdd() │    │ SecItemCopyMatching()         │  │
+│   │ SecItemUpdate│    │ SecItemDelete()               │  │
+│   └──────┬───────┘    └──────────────┬───────────────┘  │
+│          │                           │                   │
+│          └───────────┬───────────────┘                   │
+│                      ▼                                   │
+│          ┌───────────────────────┐                       │
+│          │   Security.framework  │                       │
+│          └───────────┬───────────┘                       │
+└──────────────────────┼──────────────────────────────────┘
+                       │  XPC (inter-process communication)
+                       ▼
+          ┌────────────────────────┐
+          │    securityd daemon    │
+          │  (system-level process │
+          │   outside app sandbox) │
+          └────────────┬───────────┘
+                       │
+          ┌────────────▼───────────┐
+          │   Keychain Database    │
+          │  (encrypted SQLite)    │
+          │                        │
+          │  Protected by:         │
+          │  • Device passcode     │
+          │  • Secure Enclave key  │
+          │  • Data Protection     │
+          └────────────────────────┘
+    </div>
+
+    <h3>Keychain Item Classes</h3>
+    <p>Every keychain item belongs to exactly one class, specified by the <code>kSecClass</code> key in the query dictionary:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Class Constant</th>
+                <th>Purpose</th>
+                <th>Typical Use</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>kSecClassGenericPassword</code></td>
+                <td>Generic password storage</td>
+                <td>Auth tokens, API keys, user credentials</td>
+            </tr>
+            <tr>
+                <td><code>kSecClassInternetPassword</code></td>
+                <td>Internet password with server/protocol metadata</td>
+                <td>Website logins, HTTP auth credentials</td>
+            </tr>
+            <tr>
+                <td><code>kSecClassCertificate</code></td>
+                <td>X.509 certificates</td>
+                <td>SSL/TLS client certificates</td>
+            </tr>
+            <tr>
+                <td><code>kSecClassKey</code></td>
+                <td>Cryptographic keys</td>
+                <td>RSA/EC keys for signing or encryption</td>
+            </tr>
+            <tr>
+                <td><code>kSecClassIdentity</code></td>
+                <td>Certificate + private key pair</td>
+                <td>Client certificate authentication</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Keychain Uniqueness</div>
+        <p>For <code>kSecClassGenericPassword</code>, uniqueness is determined by the combination of <code>kSecAttrService</code> and <code>kSecAttrAccount</code>. For <code>kSecClassInternetPassword</code>, uniqueness includes <code>kSecAttrServer</code>, <code>kSecAttrProtocol</code>, <code>kSecAttrPort</code>, <code>kSecAttrPath</code>, and <code>kSecAttrAccount</code>. Attempting to add a duplicate item returns <code>errSecDuplicateItem</code> (-25299).</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 2: CRUD Operations                                   -->
+    <!-- ============================================================ -->
+    <h2 id="crud">2. CRUD Operations</h2>
+
+    <p>All keychain operations use <strong>query dictionaries</strong> — <code>[String: Any]</code> dictionaries cast to <code>CFDictionary</code>. Each operation returns an <code>OSStatus</code> code indicating success or failure.</p>
+
+    <h3>Add — SecItemAdd</h3>
+<pre><code><span class="keyword">import</span> <span class="type">Security</span>
+
+<span class="keyword">func</span> <span class="func">saveToKeychain</span>(
+    service: <span class="type">String</span>,
+    account: <span class="type">String</span>,
+    data: <span class="type">Data</span>
+) <span class="keyword">throws</span> {
+    <span class="keyword">let</span> query: [<span class="type">String</span>: <span class="type">Any</span>] = [
+        kSecClass <span class="keyword">as</span> <span class="type">String</span>:           kSecClassGenericPassword,
+        kSecAttrService <span class="keyword">as</span> <span class="type">String</span>:     service,
+        kSecAttrAccount <span class="keyword">as</span> <span class="type">String</span>:     account,
+        kSecValueData <span class="keyword">as</span> <span class="type">String</span>:       data,
+        kSecAttrAccessible <span class="keyword">as</span> <span class="type">String</span>:  kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    ]
+
+    <span class="keyword">let</span> status = <span class="func">SecItemAdd</span>(query <span class="keyword">as</span> <span class="type">CFDictionary</span>, <span class="keyword">nil</span>)
+
+    <span class="keyword">guard</span> status == errSecSuccess <span class="keyword">else</span> {
+        <span class="keyword">if</span> status == errSecDuplicateItem {
+            <span class="comment">// Item already exists — update instead</span>
+            <span class="keyword">try</span> <span class="func">updateInKeychain</span>(service: service, account: account, data: data)
+            <span class="keyword">return</span>
+        }
+        <span class="keyword">throw</span> <span class="type">KeychainError</span>.<span class="func">unhandled</span>(status: status)
+    }
+}</code></pre>
+
+    <h3>Read — SecItemCopyMatching</h3>
+<pre><code><span class="keyword">func</span> <span class="func">readFromKeychain</span>(
+    service: <span class="type">String</span>,
+    account: <span class="type">String</span>
+) <span class="keyword">throws</span> -&gt; <span class="type">Data</span> {
+    <span class="keyword">let</span> query: [<span class="type">String</span>: <span class="type">Any</span>] = [
+        kSecClass <span class="keyword">as</span> <span class="type">String</span>:           kSecClassGenericPassword,
+        kSecAttrService <span class="keyword">as</span> <span class="type">String</span>:     service,
+        kSecAttrAccount <span class="keyword">as</span> <span class="type">String</span>:     account,
+        kSecReturnData <span class="keyword">as</span> <span class="type">String</span>:      <span class="keyword">true</span>,
+        kSecMatchLimit <span class="keyword">as</span> <span class="type">String</span>:      kSecMatchLimitOne
+    ]
+
+    <span class="keyword">var</span> result: <span class="type">AnyObject</span>?
+    <span class="keyword">let</span> status = <span class="func">SecItemCopyMatching</span>(query <span class="keyword">as</span> <span class="type">CFDictionary</span>, &amp;result)
+
+    <span class="keyword">guard</span> status == errSecSuccess,
+          <span class="keyword">let</span> data = result <span class="keyword">as?</span> <span class="type">Data</span> <span class="keyword">else</span> {
+        <span class="keyword">if</span> status == errSecItemNotFound {
+            <span class="keyword">throw</span> <span class="type">KeychainError</span>.itemNotFound
+        }
+        <span class="keyword">throw</span> <span class="type">KeychainError</span>.<span class="func">unhandled</span>(status: status)
+    }
+
+    <span class="keyword">return</span> data
+}</code></pre>
+
+    <h3>Update — SecItemUpdate</h3>
+<pre><code><span class="keyword">func</span> <span class="func">updateInKeychain</span>(
+    service: <span class="type">String</span>,
+    account: <span class="type">String</span>,
+    data: <span class="type">Data</span>
+) <span class="keyword">throws</span> {
+    <span class="keyword">let</span> query: [<span class="type">String</span>: <span class="type">Any</span>] = [
+        kSecClass <span class="keyword">as</span> <span class="type">String</span>:       kSecClassGenericPassword,
+        kSecAttrService <span class="keyword">as</span> <span class="type">String</span>: service,
+        kSecAttrAccount <span class="keyword">as</span> <span class="type">String</span>: account
+    ]
+
+    <span class="keyword">let</span> attributes: [<span class="type">String</span>: <span class="type">Any</span>] = [
+        kSecValueData <span class="keyword">as</span> <span class="type">String</span>: data
+    ]
+
+    <span class="keyword">let</span> status = <span class="func">SecItemUpdate</span>(
+        query <span class="keyword">as</span> <span class="type">CFDictionary</span>,
+        attributes <span class="keyword">as</span> <span class="type">CFDictionary</span>
+    )
+
+    <span class="keyword">guard</span> status == errSecSuccess <span class="keyword">else</span> {
+        <span class="keyword">throw</span> <span class="type">KeychainError</span>.<span class="func">unhandled</span>(status: status)
+    }
+}</code></pre>
+
+    <h3>Delete — SecItemDelete</h3>
+<pre><code><span class="keyword">func</span> <span class="func">deleteFromKeychain</span>(
+    service: <span class="type">String</span>,
+    account: <span class="type">String</span>
+) <span class="keyword">throws</span> {
+    <span class="keyword">let</span> query: [<span class="type">String</span>: <span class="type">Any</span>] = [
+        kSecClass <span class="keyword">as</span> <span class="type">String</span>:       kSecClassGenericPassword,
+        kSecAttrService <span class="keyword">as</span> <span class="type">String</span>: service,
+        kSecAttrAccount <span class="keyword">as</span> <span class="type">String</span>: account
+    ]
+
+    <span class="keyword">let</span> status = <span class="func">SecItemDelete</span>(query <span class="keyword">as</span> <span class="type">CFDictionary</span>)
+
+    <span class="keyword">guard</span> status == errSecSuccess || status == errSecItemNotFound <span class="keyword">else</span> {
+        <span class="keyword">throw</span> <span class="type">KeychainError</span>.<span class="func">unhandled</span>(status: status)
+    }
+}</code></pre>
+
+    <h3>Error Handling</h3>
+<pre><code><span class="keyword">enum</span> <span class="type">KeychainError</span>: <span class="type">Error</span>, <span class="type">LocalizedError</span> {
+    <span class="keyword">case</span> itemNotFound
+    <span class="keyword">case</span> duplicateItem
+    <span class="keyword">case</span> authFailed
+    <span class="keyword">case</span> <span class="func">unhandled</span>(status: <span class="type">OSStatus</span>)
+
+    <span class="keyword">var</span> errorDescription: <span class="type">String</span>? {
+        <span class="keyword">switch self</span> {
+        <span class="keyword">case</span> .itemNotFound:
+            <span class="keyword">return</span> <span class="string">"Keychain item not found"</span>
+        <span class="keyword">case</span> .duplicateItem:
+            <span class="keyword">return</span> <span class="string">"Keychain item already exists"</span>
+        <span class="keyword">case</span> .authFailed:
+            <span class="keyword">return</span> <span class="string">"Authentication failed"</span>
+        <span class="keyword">case</span> .<span class="func">unhandled</span>(<span class="keyword">let</span> status):
+            <span class="keyword">let</span> msg = <span class="type">SecCopyErrorMessageString</span>(status, <span class="keyword">nil</span>) <span class="keyword">as</span> <span class="type">String</span>? ?? <span class="string">"Unknown"</span>
+            <span class="keyword">return</span> <span class="string">"Keychain error \(status): \(msg)"</span>
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — SecItemUpdate Query Must Not Include kSecValueData</div>
+        <p>A common mistake is including <code>kSecValueData</code> in the <em>query</em> dictionary of <code>SecItemUpdate</code>. The query identifies which item to update; the <em>attributes</em> dictionary specifies the new values. Including value data in the query causes <code>errSecItemNotFound</code> because no existing item matches a query containing the new data.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 3: kSecAttrAccessible Options                        -->
+    <!-- ============================================================ -->
+    <h2 id="accessible">3. kSecAttrAccessible Options</h2>
+
+    <p>The <code>kSecAttrAccessible</code> attribute controls <strong>when</strong> a keychain item's data is decryptable. Choosing the right level is critical for balancing security and usability.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Constant</th>
+                <th>Available When</th>
+                <th>Backup Migrates?</th>
+                <th>Best For</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>kSecAttrAccessibleWhenUnlocked</code></td>
+                <td>Device unlocked</td>
+                <td>Yes</td>
+                <td>General credentials</td>
+            </tr>
+            <tr>
+                <td><code>kSecAttrAccessibleWhenUnlockedThisDeviceOnly</code></td>
+                <td>Device unlocked</td>
+                <td>No</td>
+                <td>Session tokens, device-bound secrets</td>
+            </tr>
+            <tr>
+                <td><code>kSecAttrAccessibleAfterFirstUnlock</code></td>
+                <td>After first unlock (even if locked)</td>
+                <td>Yes</td>
+                <td>Background fetch tokens, push certs</td>
+            </tr>
+            <tr>
+                <td><code>kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly</code></td>
+                <td>After first unlock (even if locked)</td>
+                <td>No</td>
+                <td>Background tasks needing device-bound tokens</td>
+            </tr>
+            <tr>
+                <td><code>kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly</code></td>
+                <td>Device unlocked + passcode set</td>
+                <td>No</td>
+                <td>Highest security — deleted if passcode removed</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — "ThisDeviceOnly" Implications</div>
+        <p>Items with <code>ThisDeviceOnly</code> are encrypted with a key tied to the specific hardware. They are <strong>excluded from iCloud and iTunes backups</strong>, meaning they will not transfer when a user migrates to a new device. This is desirable for device-bound tokens (e.g., push notification tokens, device attestation keys) but problematic for credentials the user expects to carry over. Always consider the user experience when choosing this option.</p>
+    </div>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Default Accessibility</div>
+        <p>Use <code>kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly</code> as your default for auth tokens and API keys. It allows background operations (network refreshes, silent push handling) while keeping data device-bound. Only use <code>WhenUnlocked</code> variants if you truly need to restrict access to foreground-only scenarios.</p>
+    </div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — WhenPasscodeSet and Passcode Removal</div>
+        <p>If you use <code>kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly</code> and the user removes their device passcode, <strong>all items with this accessibility are permanently deleted</strong>. Your app must handle this gracefully — detect the missing item on next access and prompt the user to re-authenticate.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 4: Biometric Protection                              -->
+    <!-- ============================================================ -->
+    <h2 id="biometric">4. Biometric Protection</h2>
+
+    <p>Beyond accessibility timing, you can require <strong>biometric authentication</strong> (Face ID / Touch ID) or device passcode before a keychain item is decrypted. This uses <code>SecAccessControl</code> combined with <code>LAContext</code> from the LocalAuthentication framework.</p>
+
+    <h3>SecAccessControl Flags</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Flag</th>
+                <th>Behavior</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>.biometryAny</code></td>
+                <td>Any enrolled biometric (including newly added fingerprints/faces)</td>
+            </tr>
+            <tr>
+                <td><code>.biometryCurrentSet</code></td>
+                <td>Only the biometric set enrolled at time of item creation</td>
+            </tr>
+            <tr>
+                <td><code>.devicePasscode</code></td>
+                <td>Device passcode only</td>
+            </tr>
+            <tr>
+                <td><code>.userPresence</code></td>
+                <td>Biometric OR passcode (most flexible)</td>
+            </tr>
+            <tr>
+                <td><code>.or</code></td>
+                <td>Combine flags with OR logic</td>
+            </tr>
+            <tr>
+                <td><code>.and</code></td>
+                <td>Combine flags with AND logic</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Complete Biometric-Protected Keychain Item</h3>
+<pre><code><span class="keyword">import</span> <span class="type">Security</span>
+<span class="keyword">import</span> <span class="type">LocalAuthentication</span>
+
+<span class="keyword">func</span> <span class="func">saveBiometricProtected</span>(
+    service: <span class="type">String</span>,
+    account: <span class="type">String</span>,
+    data: <span class="type">Data</span>
+) <span class="keyword">throws</span> {
+    <span class="keyword">var</span> error: <span class="type">Unmanaged</span>&lt;<span class="type">CFError</span>&gt;?
+
+    <span class="keyword">guard let</span> accessControl = <span class="func">SecAccessControlCreateWithFlags</span>(
+        kCFAllocatorDefault,
+        kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly,
+        [.biometryCurrentSet, .or, .devicePasscode],
+        &amp;error
+    ) <span class="keyword">else</span> {
+        <span class="keyword">throw</span> error!.<span class="func">takeRetainedValue</span>() <span class="keyword">as</span> <span class="type">Error</span>
+    }
+
+    <span class="keyword">let</span> query: [<span class="type">String</span>: <span class="type">Any</span>] = [
+        kSecClass <span class="keyword">as</span> <span class="type">String</span>:            kSecClassGenericPassword,
+        kSecAttrService <span class="keyword">as</span> <span class="type">String</span>:      service,
+        kSecAttrAccount <span class="keyword">as</span> <span class="type">String</span>:      account,
+        kSecValueData <span class="keyword">as</span> <span class="type">String</span>:        data,
+        kSecAttrAccessControl <span class="keyword">as</span> <span class="type">String</span>: accessControl
+    ]
+
+    <span class="keyword">let</span> status = <span class="func">SecItemAdd</span>(query <span class="keyword">as</span> <span class="type">CFDictionary</span>, <span class="keyword">nil</span>)
+    <span class="keyword">guard</span> status == errSecSuccess <span class="keyword">else</span> {
+        <span class="keyword">throw</span> <span class="type">KeychainError</span>.<span class="func">unhandled</span>(status: status)
+    }
+}</code></pre>
+
+    <h3>Reading with LAContext</h3>
+<pre><code><span class="keyword">func</span> <span class="func">readBiometricProtected</span>(
+    service: <span class="type">String</span>,
+    account: <span class="type">String</span>,
+    reason: <span class="type">String</span>
+) <span class="keyword">throws</span> -&gt; <span class="type">Data</span> {
+    <span class="keyword">let</span> context = <span class="type">LAContext</span>()
+    context.localizedReason = reason
+    context.localizedCancelTitle = <span class="string">"Use Password"</span>
+
+    <span class="keyword">let</span> query: [<span class="type">String</span>: <span class="type">Any</span>] = [
+        kSecClass <span class="keyword">as</span> <span class="type">String</span>:            kSecClassGenericPassword,
+        kSecAttrService <span class="keyword">as</span> <span class="type">String</span>:      service,
+        kSecAttrAccount <span class="keyword">as</span> <span class="type">String</span>:      account,
+        kSecReturnData <span class="keyword">as</span> <span class="type">String</span>:       <span class="keyword">true</span>,
+        kSecMatchLimit <span class="keyword">as</span> <span class="type">String</span>:       kSecMatchLimitOne,
+        kSecUseAuthenticationContext <span class="keyword">as</span> <span class="type">String</span>: context
+    ]
+
+    <span class="keyword">var</span> result: <span class="type">AnyObject</span>?
+    <span class="keyword">let</span> status = <span class="func">SecItemCopyMatching</span>(query <span class="keyword">as</span> <span class="type">CFDictionary</span>, &amp;result)
+
+    <span class="keyword">guard</span> status == errSecSuccess,
+          <span class="keyword">let</span> data = result <span class="keyword">as?</span> <span class="type">Data</span> <span class="keyword">else</span> {
+        <span class="keyword">switch</span> status {
+        <span class="keyword">case</span> errSecItemNotFound:
+            <span class="keyword">throw</span> <span class="type">KeychainError</span>.itemNotFound
+        <span class="keyword">case</span> errSecUserCanceled, errSecAuthFailed:
+            <span class="keyword">throw</span> <span class="type">KeychainError</span>.authFailed
+        <span class="keyword">default</span>:
+            <span class="keyword">throw</span> <span class="type">KeychainError</span>.<span class="func">unhandled</span>(status: status)
+        }
+    }
+
+    <span class="keyword">return</span> data
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — biometryCurrentSet vs biometryAny</div>
+        <p>Using <code>.biometryAny</code> means a keychain item remains accessible even if the user adds a new fingerprint or Face ID appearance. An attacker who gains physical access and adds their own biometric can then unlock the item. Use <code>.biometryCurrentSet</code> for high-security items — the item becomes inaccessible if the biometric enrollment changes, requiring re-authentication through another channel (e.g., password login).</p>
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — LAContext Reuse</div>
+        <p>An <code>LAContext</code> instance caches the authentication result for a configurable duration via <code>touchIDAuthenticationAllowableReuseDuration</code> (max 5 minutes). Reusing the same context across multiple keychain reads avoids prompting the user repeatedly. Set to <code>0</code> to require authentication on every access, or <code>LATouchIDAuthenticationMaximumAllowableReuseDuration</code> for maximum reuse.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 5: Keychain Sharing via App Groups                   -->
+    <!-- ============================================================ -->
+    <h2 id="sharing">5. Keychain Sharing via App Groups</h2>
+
+    <p>By default, each app has its own isolated keychain namespace. To share keychain items between apps from the same development team, you use <strong>Keychain Access Groups</strong> configured through entitlements.</p>
+
+    <div class="diagram">
+┌──────────────────────────────────────────────────────┐
+│                  Keychain Database                    │
+│                                                      │
+│  ┌────────────────────────────────────────────────┐  │
+│  │  Access Group: TEAM_ID.com.company.shared      │  │
+│  │                                                │  │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐    │  │
+│  │  │ App A    │  │ App B    │  │ App Ext  │    │  │
+│  │  │ (read/   │  │ (read/   │  │ (read/   │    │  │
+│  │  │  write)  │  │  write)  │  │  write)  │    │  │
+│  │  └──────────┘  └──────────┘  └──────────┘    │  │
+│  └────────────────────────────────────────────────┘  │
+│                                                      │
+│  ┌─────────────────────┐  ┌─────────────────────┐   │
+│  │ TEAM_ID.com.app-a   │  │ TEAM_ID.com.app-b   │   │
+│  │ (App A private)     │  │ (App B private)      │   │
+│  └─────────────────────┘  └─────────────────────┘   │
+└──────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>Setup Steps</h3>
+    <ol>
+        <li>In Xcode, enable <strong>Keychain Sharing</strong> capability for each app.</li>
+        <li>Add the same keychain access group identifier (e.g., <code>com.company.shared</code>) to all apps.</li>
+        <li>Xcode generates the entitlements file with the <code>TEAM_ID</code> prefix automatically.</li>
+    </ol>
+
+    <h3>Sharing Code</h3>
+<pre><code><span class="comment">// Saving to a shared keychain group</span>
+<span class="keyword">func</span> <span class="func">saveToSharedKeychain</span>(
+    account: <span class="type">String</span>,
+    data: <span class="type">Data</span>,
+    accessGroup: <span class="type">String</span>
+) <span class="keyword">throws</span> {
+    <span class="keyword">let</span> query: [<span class="type">String</span>: <span class="type">Any</span>] = [
+        kSecClass <span class="keyword">as</span> <span class="type">String</span>:           kSecClassGenericPassword,
+        kSecAttrService <span class="keyword">as</span> <span class="type">String</span>:     <span class="string">"com.company.shared-auth"</span>,
+        kSecAttrAccount <span class="keyword">as</span> <span class="type">String</span>:     account,
+        kSecValueData <span class="keyword">as</span> <span class="type">String</span>:       data,
+        kSecAttrAccessGroup <span class="keyword">as</span> <span class="type">String</span>:  accessGroup,
+        kSecAttrAccessible <span class="keyword">as</span> <span class="type">String</span>:  kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    ]
+
+    <span class="keyword">let</span> status = <span class="func">SecItemAdd</span>(query <span class="keyword">as</span> <span class="type">CFDictionary</span>, <span class="keyword">nil</span>)
+    <span class="keyword">guard</span> status == errSecSuccess <span class="keyword">else</span> {
+        <span class="keyword">throw</span> <span class="type">KeychainError</span>.<span class="func">unhandled</span>(status: status)
+    }
+}
+
+<span class="comment">// Reading from a shared keychain group</span>
+<span class="keyword">func</span> <span class="func">readFromSharedKeychain</span>(
+    account: <span class="type">String</span>,
+    accessGroup: <span class="type">String</span>
+) <span class="keyword">throws</span> -&gt; <span class="type">Data</span> {
+    <span class="keyword">let</span> query: [<span class="type">String</span>: <span class="type">Any</span>] = [
+        kSecClass <span class="keyword">as</span> <span class="type">String</span>:           kSecClassGenericPassword,
+        kSecAttrService <span class="keyword">as</span> <span class="type">String</span>:     <span class="string">"com.company.shared-auth"</span>,
+        kSecAttrAccount <span class="keyword">as</span> <span class="type">String</span>:     account,
+        kSecReturnData <span class="keyword">as</span> <span class="type">String</span>:      <span class="keyword">true</span>,
+        kSecMatchLimit <span class="keyword">as</span> <span class="type">String</span>:      kSecMatchLimitOne,
+        kSecAttrAccessGroup <span class="keyword">as</span> <span class="type">String</span>:  accessGroup
+    ]
+
+    <span class="keyword">var</span> result: <span class="type">AnyObject</span>?
+    <span class="keyword">let</span> status = <span class="func">SecItemCopyMatching</span>(query <span class="keyword">as</span> <span class="type">CFDictionary</span>, &amp;result)
+
+    <span class="keyword">guard</span> status == errSecSuccess,
+          <span class="keyword">let</span> data = result <span class="keyword">as?</span> <span class="type">Data</span> <span class="keyword">else</span> {
+        <span class="keyword">throw</span> <span class="type">KeychainError</span>.<span class="func">unhandled</span>(status: status)
+    }
+    <span class="keyword">return</span> data
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — Keychain Access Group Configuration</div>
+        <p>The access group string must be prefixed with your <strong>Team ID</strong> (e.g., <code>ABC123DEF.com.company.shared</code>). A mismatch between the entitlements and the <code>kSecAttrAccessGroup</code> value silently fails — <code>SecItemAdd</code> returns <code>errSecMissingEntitlement</code> (-34018). Always verify your entitlements file and ensure the Team ID prefix matches your provisioning profile. This is the #1 cause of "keychain sharing doesn't work" bugs.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 6: Keychain vs UserDefaults vs File Protection       -->
+    <!-- ============================================================ -->
+    <h2 id="comparison">6. Keychain vs UserDefaults vs File Protection</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Keychain</th>
+                <th>UserDefaults</th>
+                <th>File Protection</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Encryption</strong></td>
+                <td>AES-256 via Secure Enclave</td>
+                <td>None (plain plist)</td>
+                <td>AES-256 per-file (Data Protection API)</td>
+            </tr>
+            <tr>
+                <td><strong>Backup Behavior</strong></td>
+                <td>Configurable (ThisDeviceOnly excluded)</td>
+                <td>Always included in backups</td>
+                <td>Included unless excluded via resource values</td>
+            </tr>
+            <tr>
+                <td><strong>Accessibility Control</strong></td>
+                <td>Fine-grained (6 levels + biometric)</td>
+                <td>None</td>
+                <td>4 levels (Complete, UntilFirstAuth, etc.)</td>
+            </tr>
+            <tr>
+                <td><strong>Performance</strong></td>
+                <td>Slower (IPC to securityd)</td>
+                <td>Fast (in-memory cache)</td>
+                <td>Fast (filesystem I/O)</td>
+            </tr>
+            <tr>
+                <td><strong>Data Size</strong></td>
+                <td>Small items (&lt; few KB recommended)</td>
+                <td>Moderate (plist serializable)</td>
+                <td>Unlimited (filesystem)</td>
+            </tr>
+            <tr>
+                <td><strong>Sharing</strong></td>
+                <td>Keychain Access Groups</td>
+                <td>App Groups (suite name)</td>
+                <td>App Groups (shared container)</td>
+            </tr>
+            <tr>
+                <td><strong>Persists Across Reinstall</strong></td>
+                <td>Yes (survives app deletion)</td>
+                <td>No (deleted with app)</td>
+                <td>No (deleted with app)</td>
+            </tr>
+            <tr>
+                <td><strong>Appropriate Use Cases</strong></td>
+                <td>Passwords, tokens, keys, certificates</td>
+                <td>Preferences, feature flags, non-sensitive settings</td>
+                <td>Documents, cached data, large encrypted files</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Storage Decision Matrix</div>
+        <p><strong>Is it a secret?</strong> → Keychain. <strong>Is it a user preference?</strong> → UserDefaults. <strong>Is it a large file needing encryption?</strong> → File Protection with <code>.completeFileProtection</code>. Never store tokens, passwords, or API keys in UserDefaults — it's a plain plist readable by anyone with device access or a backup.</p>
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Keychain Persistence Across Reinstall</div>
+        <p>Keychain items survive app uninstallation and reinstallation. This is by design — it allows SSO-like experiences where a user reinstalls an app and is still logged in. However, it can also cause bugs: stale tokens from a previous install may conflict with fresh state. Always implement a "first launch" check (e.g., a UserDefaults flag) and clear keychain items on first launch if your app requires a clean slate.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 7: CryptoKit                                         -->
+    <!-- ============================================================ -->
+    <h2 id="cryptokit">7. CryptoKit</h2>
+
+    <p>Apple's <code>CryptoKit</code> framework (iOS 13+) provides a modern, Swift-native API for cryptographic operations. It wraps hardware-accelerated primitives and integrates with the Secure Enclave.</p>
+
+    <h3>AES-GCM Symmetric Encryption</h3>
+<pre><code><span class="keyword">import</span> <span class="type">CryptoKit</span>
+
+<span class="keyword">func</span> <span class="func">encryptAESGCM</span>(data: <span class="type">Data</span>, key: <span class="type">SymmetricKey</span>) <span class="keyword">throws</span> -&gt; <span class="type">Data</span> {
+    <span class="keyword">let</span> sealedBox = <span class="keyword">try</span> <span class="type">AES</span>.<span class="type">GCM</span>.<span class="func">seal</span>(data, using: key)
+
+    <span class="comment">// Combined representation: nonce + ciphertext + tag</span>
+    <span class="keyword">guard let</span> combined = sealedBox.combined <span class="keyword">else</span> {
+        <span class="keyword">throw</span> <span class="type">CryptoError</span>.sealingFailed
+    }
+    <span class="keyword">return</span> combined
+}
+
+<span class="keyword">func</span> <span class="func">decryptAESGCM</span>(combined: <span class="type">Data</span>, key: <span class="type">SymmetricKey</span>) <span class="keyword">throws</span> -&gt; <span class="type">Data</span> {
+    <span class="keyword">let</span> sealedBox = <span class="keyword">try</span> <span class="type">AES</span>.<span class="type">GCM</span>.<span class="type">SealedBox</span>(combined: combined)
+    <span class="keyword">return</span> <span class="keyword">try</span> <span class="type">AES</span>.<span class="type">GCM</span>.<span class="func">open</span>(sealedBox, using: key)
+}
+
+<span class="comment">// Generate a 256-bit symmetric key</span>
+<span class="keyword">let</span> key = <span class="type">SymmetricKey</span>(size: .bits256)</code></pre>
+
+    <h3>Hashing — SHA256 / SHA384 / SHA512</h3>
+<pre><code><span class="keyword">import</span> <span class="type">CryptoKit</span>
+
+<span class="keyword">let</span> data = <span class="string">"Hello, Keychain!"</span>.<span class="func">data</span>(using: .utf8)!
+
+<span class="keyword">let</span> sha256 = <span class="type">SHA256</span>.<span class="func">hash</span>(data: data)
+<span class="keyword">let</span> sha384 = <span class="type">SHA384</span>.<span class="func">hash</span>(data: data)
+<span class="keyword">let</span> sha512 = <span class="type">SHA512</span>.<span class="func">hash</span>(data: data)
+
+<span class="comment">// Convert to hex string</span>
+<span class="keyword">let</span> hexString = sha256.<span class="func">compactMap</span> { <span class="type">String</span>(format: <span class="string">"%02x"</span>, $0) }.<span class="func">joined</span>()
+<span class="func">print</span>(hexString) <span class="comment">// 64-character hex string</span></code></pre>
+
+    <h3>HMAC — Message Authentication</h3>
+<pre><code><span class="keyword">import</span> <span class="type">CryptoKit</span>
+
+<span class="keyword">let</span> key = <span class="type">SymmetricKey</span>(size: .bits256)
+<span class="keyword">let</span> message = <span class="string">"Verify this message"</span>.<span class="func">data</span>(using: .utf8)!
+
+<span class="comment">// Create HMAC</span>
+<span class="keyword">let</span> authCode = <span class="type">HMAC</span>&lt;<span class="type">SHA256</span>&gt;.<span class="func">authenticationCode</span>(for: message, using: key)
+
+<span class="comment">// Verify HMAC</span>
+<span class="keyword">let</span> isValid = <span class="type">HMAC</span>&lt;<span class="type">SHA256</span>&gt;.<span class="func">isValidAuthenticationCode</span>(
+    authCode,
+    authenticating: message,
+    using: key
+)
+<span class="func">print</span>(<span class="string">"HMAC valid: \(isValid)"</span>) <span class="comment">// true</span></code></pre>
+
+    <h3>Elliptic Curve Operations — P256 Signing</h3>
+<pre><code><span class="keyword">import</span> <span class="type">CryptoKit</span>
+
+<span class="comment">// Generate P-256 key pair</span>
+<span class="keyword">let</span> privateKey = <span class="type">P256</span>.<span class="type">Signing</span>.<span class="type">PrivateKey</span>()
+<span class="keyword">let</span> publicKey = privateKey.publicKey
+
+<span class="comment">// Sign data</span>
+<span class="keyword">let</span> dataToSign = <span class="string">"Critical transaction"</span>.<span class="func">data</span>(using: .utf8)!
+<span class="keyword">let</span> signature = <span class="keyword">try</span> privateKey.<span class="func">signature</span>(for: dataToSign)
+
+<span class="comment">// Verify signature</span>
+<span class="keyword">let</span> isSignatureValid = publicKey.<span class="func">isValidSignature</span>(signature, for: dataToSign)
+<span class="func">print</span>(<span class="string">"Signature valid: \(isSignatureValid)"</span>) <span class="comment">// true</span>
+
+<span class="comment">// Export public key for server</span>
+<span class="keyword">let</span> publicKeyData = publicKey.rawRepresentation</code></pre>
+
+    <h3>Curve25519 Key Agreement</h3>
+<pre><code><span class="keyword">import</span> <span class="type">CryptoKit</span>
+
+<span class="comment">// Alice generates her key pair</span>
+<span class="keyword">let</span> alicePrivate = <span class="type">Curve25519</span>.<span class="type">KeyAgreement</span>.<span class="type">PrivateKey</span>()
+<span class="keyword">let</span> alicePublic = alicePrivate.publicKey
+
+<span class="comment">// Bob generates his key pair</span>
+<span class="keyword">let</span> bobPrivate = <span class="type">Curve25519</span>.<span class="type">KeyAgreement</span>.<span class="type">PrivateKey</span>()
+<span class="keyword">let</span> bobPublic = bobPrivate.publicKey
+
+<span class="comment">// Both derive the same shared secret</span>
+<span class="keyword">let</span> aliceShared = <span class="keyword">try</span> alicePrivate.<span class="func">sharedSecretFromKeyAgreement</span>(with: bobPublic)
+<span class="keyword">let</span> bobShared = <span class="keyword">try</span> bobPrivate.<span class="func">sharedSecretFromKeyAgreement</span>(with: alicePublic)
+
+<span class="comment">// Derive a symmetric key from the shared secret</span>
+<span class="keyword">let</span> symmetricKey = aliceShared.<span class="func">hkdfDerivedSymmetricKey</span>(
+    using: <span class="type">SHA256</span>.<span class="keyword">self</span>,
+    salt: <span class="string">"salt"</span>.<span class="func">data</span>(using: .utf8)!,
+    sharedInfo: <span class="string">"MyApp-E2E"</span>.<span class="func">data</span>(using: .utf8)!,
+    outputByteCount: <span class="number">32</span>
+)</code></pre>
+
+    <h3>Secure Enclave Key Generation</h3>
+<pre><code><span class="keyword">import</span> <span class="type">CryptoKit</span>
+
+<span class="comment">// P-256 key stored in the Secure Enclave — never leaves hardware</span>
+<span class="keyword">let</span> sePrivateKey = <span class="keyword">try</span> <span class="type">SecureEnclave</span>.<span class="type">P256</span>.<span class="type">Signing</span>.<span class="type">PrivateKey</span>()
+
+<span class="comment">// Sign with the SE-backed key</span>
+<span class="keyword">let</span> payload = <span class="string">"Authenticate me"</span>.<span class="func">data</span>(using: .utf8)!
+<span class="keyword">let</span> seSignature = <span class="keyword">try</span> sePrivateKey.<span class="func">signature</span>(for: payload)
+
+<span class="comment">// Verify with the public key (can be exported)</span>
+<span class="keyword">let</span> sePublicKey = sePrivateKey.publicKey
+<span class="keyword">let</span> valid = sePublicKey.<span class="func">isValidSignature</span>(seSignature, for: payload)
+
+<span class="comment">// Persist the SE key reference in the keychain</span>
+<span class="keyword">let</span> keyData = sePrivateKey.dataRepresentation</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Secure Enclave for Signing Keys</div>
+        <p>Always use <code>SecureEnclave.P256</code> for signing keys that protect high-value operations (payments, authentication challenges). The private key material <strong>never leaves the Secure Enclave hardware</strong> — even a kernel-level compromise cannot extract it. Store the key's <code>dataRepresentation</code> in the keychain so you can reconstruct the reference after app restart.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 8: App Attest                                        -->
+    <!-- ============================================================ -->
+    <h2 id="app-attest">8. App Attest</h2>
+
+    <p><strong>App Attest</strong> (iOS 14+) allows your server to verify that requests come from a legitimate, unmodified instance of your app running on genuine Apple hardware. It uses the <code>DCAppAttestService</code> API and Apple's attestation servers.</p>
+
+    <div class="diagram">
+┌──────────┐         ┌──────────────┐         ┌─────────────────┐
+│  Your    │  1. Generate key       │         │                 │
+│  App     │─────────────────────►  │ Secure  │                 │
+│          │                        │ Enclave │                 │
+│          │  2. attestKey(keyId,   │         │                 │
+│          │     clientDataHash)    │         │                 │
+│          │─────────────────────►  │         │                 │
+│          │                        │─────────┤  Apple Attest   │
+│          │                        │ 3.Attest│  Service        │
+│          │  4. Attestation object │  request│                 │
+│          │◄─────────────────────  │◄────────┤                 │
+│          │                        │         │                 │
+│          │  5. Send attestation   │         │                 │
+│          │     to your server     │         │                 │
+│          │──────────────────┐     │         │                 │
+└──────────┘                  │     └─────────┘  └──────────────┘
+                              ▼
+                    ┌──────────────────┐
+                    │   Your Server    │
+                    │                  │
+                    │  6. Verify with  │
+                    │  Apple root cert │
+                    │  7. Extract      │
+                    │  public key      │
+                    │  8. Store key    │
+                    │  for assertions  │
+                    └──────────────────┘
+    </div>
+
+    <h3>Implementation</h3>
+<pre><code><span class="keyword">import</span> <span class="type">DeviceCheck</span>
+<span class="keyword">import</span> <span class="type">CryptoKit</span>
+
+<span class="keyword">final class</span> <span class="type">AppAttestManager</span> {
+    <span class="keyword">private let</span> service = <span class="type">DCAppAttestService</span>.shared
+
+    <span class="keyword">func</span> <span class="func">generateKeyAndAttest</span>() <span class="keyword">async throws</span> -&gt; (<span class="type">String</span>, <span class="type">Data</span>) {
+        <span class="comment">// 1. Check if App Attest is supported</span>
+        <span class="keyword">guard</span> service.isSupported <span class="keyword">else</span> {
+            <span class="keyword">throw</span> <span class="type">AttestError</span>.notSupported
+        }
+
+        <span class="comment">// 2. Generate a key pair in the Secure Enclave</span>
+        <span class="keyword">let</span> keyId = <span class="keyword">try await</span> service.<span class="func">generateKey</span>()
+
+        <span class="comment">// 3. Create a challenge hash from your server's challenge</span>
+        <span class="keyword">let</span> serverChallenge = <span class="keyword">try await</span> <span class="func">fetchChallengeFromServer</span>()
+        <span class="keyword">let</span> challengeHash = <span class="type">Data</span>(<span class="type">SHA256</span>.<span class="func">hash</span>(data: serverChallenge))
+
+        <span class="comment">// 4. Attest the key — Apple verifies device + app integrity</span>
+        <span class="keyword">let</span> attestation = <span class="keyword">try await</span> service.<span class="func">attestKey</span>(keyId, clientDataHash: challengeHash)
+
+        <span class="comment">// 5. Send keyId + attestation to your server for verification</span>
+        <span class="keyword">return</span> (keyId, attestation)
+    }
+
+    <span class="keyword">func</span> <span class="func">generateAssertion</span>(
+        keyId: <span class="type">String</span>,
+        requestData: <span class="type">Data</span>
+    ) <span class="keyword">async throws</span> -&gt; <span class="type">Data</span> {
+        <span class="keyword">let</span> clientDataHash = <span class="type">Data</span>(<span class="type">SHA256</span>.<span class="func">hash</span>(data: requestData))
+        <span class="keyword">return</span> <span class="keyword">try await</span> service.<span class="func">generateAssertion</span>(keyId, clientDataHash: clientDataHash)
+    }
+
+    <span class="keyword">private func</span> <span class="func">fetchChallengeFromServer</span>() <span class="keyword">async throws</span> -&gt; <span class="type">Data</span> {
+        <span class="keyword">let</span> url = <span class="type">URL</span>(string: <span class="string">"https://api.example.com/attest/challenge"</span>)!
+        <span class="keyword">let</span> (data, _) = <span class="keyword">try await</span> <span class="type">URLSession</span>.shared.<span class="func">data</span>(from: url)
+        <span class="keyword">return</span> data
+    }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Attestation vs Assertion</div>
+        <p><strong>Attestation</strong> is a one-time operation that proves the key was generated on genuine Apple hardware running your unmodified app. Your server verifies the attestation object against Apple's root certificate and extracts the public key. <strong>Assertions</strong> are subsequent requests signed with the attested key — your server verifies these using the stored public key. Attestation is expensive (network round-trip to Apple); assertions are cheap (local signing).</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 9: DeviceCheck                                       -->
+    <!-- ============================================================ -->
+    <h2 id="device-check">9. DeviceCheck</h2>
+
+    <p><code>DeviceCheck</code> (iOS 11+) provides a server-side mechanism to store <strong>two bits of data per device</strong> on Apple's servers. Unlike App Attest, it doesn't verify app integrity — it tracks device state across app reinstalls and even factory resets (tied to hardware, not software).</p>
+
+    <h3>DCDevice API</h3>
+<pre><code><span class="keyword">import</span> <span class="type">DeviceCheck</span>
+
+<span class="keyword">final class</span> <span class="type">DeviceCheckManager</span> {
+    <span class="keyword">func</span> <span class="func">generateToken</span>() <span class="keyword">async throws</span> -&gt; <span class="type">Data</span> {
+        <span class="keyword">guard</span> <span class="type">DCDevice</span>.current.isSupported <span class="keyword">else</span> {
+            <span class="keyword">throw</span> <span class="type">DeviceCheckError</span>.notSupported
+        }
+
+        <span class="keyword">return</span> <span class="keyword">try await</span> <span class="type">DCDevice</span>.current.<span class="func">generateToken</span>()
+    }
+
+    <span class="keyword">func</span> <span class="func">sendTokenToServer</span>(token: <span class="type">Data</span>) <span class="keyword">async throws</span> {
+        <span class="keyword">let</span> tokenBase64 = token.<span class="func">base64EncodedString</span>()
+
+        <span class="keyword">var</span> request = <span class="type">URLRequest</span>(
+            url: <span class="type">URL</span>(string: <span class="string">"https://api.example.com/devicecheck/verify"</span>)!
+        )
+        request.httpMethod = <span class="string">"POST"</span>
+        request.httpBody = <span class="keyword">try</span> <span class="type">JSONEncoder</span>().<span class="func">encode</span>(
+            [<span class="string">"device_token"</span>: tokenBase64]
+        )
+        request.<span class="func">setValue</span>(<span class="string">"application/json"</span>, forHTTPHeaderField: <span class="string">"Content-Type"</span>)
+
+        <span class="keyword">let</span> (_, response) = <span class="keyword">try await</span> <span class="type">URLSession</span>.shared.<span class="func">data</span>(for: request)
+
+        <span class="keyword">guard let</span> httpResponse = response <span class="keyword">as?</span> <span class="type">HTTPURLResponse</span>,
+              httpResponse.statusCode == <span class="number">200</span> <span class="keyword">else</span> {
+            <span class="keyword">throw</span> <span class="type">DeviceCheckError</span>.serverRejected
+        }
+    }
+}</code></pre>
+
+    <h3>Server-Side: Query and Update Bits</h3>
+    <p>Your server calls Apple's DeviceCheck API to read/write the two bits:</p>
+<pre><code><span class="comment">// Server-side (conceptual — typically Node.js/Python/Go)</span>
+<span class="comment">// POST https://api.devicecheck.apple.com/v1/query_two_bits</span>
+<span class="comment">// POST https://api.devicecheck.apple.com/v1/update_two_bits</span>
+<span class="comment">//</span>
+<span class="comment">// Request body:</span>
+<span class="comment">// {</span>
+<span class="comment">//   "device_token": "&lt;base64-encoded token from client&gt;",</span>
+<span class="comment">//   "transaction_id": "&lt;unique UUID&gt;",</span>
+<span class="comment">//   "timestamp": 1616000000000</span>
+<span class="comment">// }</span>
+<span class="comment">//</span>
+<span class="comment">// For update_two_bits, also include:</span>
+<span class="comment">//   "bit0": true,</span>
+<span class="comment">//   "bit1": false</span></code></pre>
+
+    <h3>Use Cases</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Use Case</th>
+                <th>Bit 0</th>
+                <th>Bit 1</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Free trial tracking</td>
+                <td>Trial used = true</td>
+                <td>Reserved</td>
+            </tr>
+            <tr>
+                <td>Fraud prevention</td>
+                <td>Flagged device = true</td>
+                <td>Severity (false = low, true = high)</td>
+            </tr>
+            <tr>
+                <td>Promotional offer</td>
+                <td>Offer claimed = true</td>
+                <td>Offer type</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>App Attest vs DeviceCheck</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Feature</th>
+                <th>App Attest</th>
+                <th>DeviceCheck</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Purpose</strong></td>
+                <td>Verify app + device integrity</td>
+                <td>Track per-device state</td>
+            </tr>
+            <tr>
+                <td><strong>iOS Version</strong></td>
+                <td>14+</td>
+                <td>11+</td>
+            </tr>
+            <tr>
+                <td><strong>Server State</strong></td>
+                <td>Public key per device</td>
+                <td>2 bits per device</td>
+            </tr>
+            <tr>
+                <td><strong>Verifies App Integrity</strong></td>
+                <td>Yes</td>
+                <td>No</td>
+            </tr>
+            <tr>
+                <td><strong>Survives Reinstall</strong></td>
+                <td>No (new key needed)</td>
+                <td>Yes (hardware-bound)</td>
+            </tr>
+            <tr>
+                <td><strong>Typical Use</strong></td>
+                <td>API request signing, anti-fraud</td>
+                <td>Trial abuse, device flagging</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 10: Architect Callout                                -->
+    <!-- ============================================================ -->
+    <h2 id="architect">10. Designing a Secure Credential Storage System</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect — Production Credential Storage Architecture</div>
+        <p>At L6/Staff level, you're expected to design a complete secure storage layer that handles auth tokens, refresh tokens, API keys, biometric unlock, and migration from insecure storage. Below is a production-grade architecture.</p>
+    </div>
+
+    <h3>Architecture Overview</h3>
+    <div class="diagram">
+┌──────────────────────────────────────────────────────────────┐
+│                     Application Layer                        │
+│                                                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ Login Flow   │  │ API Client   │  │ Token Refresh     │   │
+│  └──────┬───────┘  └──────┬───────┘  └────────┬─────────┘   │
+│         │                 │                    │              │
+│         └─────────────────┼────────────────────┘              │
+│                           ▼                                   │
+│              ┌────────────────────────┐                       │
+│              │   CredentialManager    │                       │
+│              │   (single entry point) │                       │
+│              └────────────┬───────────┘                       │
+│                           │                                   │
+│         ┌─────────────────┼─────────────────┐                │
+│         ▼                 ▼                  ▼                │
+│  ┌─────────────┐  ┌─────────────┐  ┌──────────────────┐     │
+│  │ Keychain    │  │ Biometric   │  │ Migration        │     │
+│  │ Store       │  │ Auth Layer  │  │ Service          │     │
+│  └──────┬──────┘  └──────┬──────┘  └────────┬─────────┘     │
+│         │                │                   │               │
+└─────────┼────────────────┼───────────────────┼───────────────┘
+          │                │                   │
+          ▼                ▼                   ▼
+   ┌─────────────┐  ┌─────────────┐  ┌──────────────────┐
+   │  securityd  │  │  Secure     │  │  UserDefaults    │
+   │  + Keychain │  │  Enclave    │  │  (legacy read)   │
+   └─────────────┘  └─────────────┘  └──────────────────┘
+    </div>
+
+    <h3>Token Refresh Flow</h3>
+    <div class="diagram">
+┌───────┐    1. API call (access token)     ┌──────────┐
+│ App   │──────────────────────────────────►│  Server  │
+│       │                                   │          │
+│       │    2. 401 Unauthorized            │          │
+│       │◄──────────────────────────────────│          │
+│       │                                   │          │
+│       │    3. Read refresh token           │          │
+│       │──► Keychain                       │          │
+│       │                                   │          │
+│       │    4. POST /token/refresh          │          │
+│       │──────────────────────────────────►│          │
+│       │                                   │          │
+│       │    5. New access + refresh tokens  │          │
+│       │◄──────────────────────────────────│          │
+│       │                                   │          │
+│       │    6. Store both in Keychain       │          │
+│       │──► Keychain                       │          │
+│       │                                   │          │
+│       │    7. Retry original request       │          │
+│       │──────────────────────────────────►│          │
+└───────┘                                   └──────────┘
+    </div>
+
+    <h3>Production-Ready KeychainManager</h3>
+<pre><code><span class="keyword">import</span> <span class="type">Foundation</span>
+<span class="keyword">import</span> <span class="type">Security</span>
+<span class="keyword">import</span> <span class="type">LocalAuthentication</span>
+
+<span class="keyword">protocol</span> <span class="type">SecureStorable</span> {
+    <span class="keyword">func</span> <span class="func">save</span>(_ data: <span class="type">Data</span>, for key: <span class="type">CredentialKey</span>) <span class="keyword">throws</span>
+    <span class="keyword">func</span> <span class="func">read</span>(_ key: <span class="type">CredentialKey</span>) <span class="keyword">throws</span> -&gt; <span class="type">Data</span>
+    <span class="keyword">func</span> <span class="func">delete</span>(_ key: <span class="type">CredentialKey</span>) <span class="keyword">throws</span>
+    <span class="keyword">func</span> <span class="func">deleteAll</span>() <span class="keyword">throws</span>
+}
+
+<span class="keyword">enum</span> <span class="type">CredentialKey</span>: <span class="type">String</span>, <span class="type">CaseIterable</span> {
+    <span class="keyword">case</span> accessToken
+    <span class="keyword">case</span> refreshToken
+    <span class="keyword">case</span> apiKey
+    <span class="keyword">case</span> userPin
+    <span class="keyword">case</span> encryptionKey
+
+    <span class="keyword">var</span> requiresBiometric: <span class="type">Bool</span> {
+        <span class="keyword">switch self</span> {
+        <span class="keyword">case</span> .refreshToken, .userPin, .encryptionKey: <span class="keyword">return true</span>
+        <span class="keyword">default</span>: <span class="keyword">return false</span>
+        }
+    }
+
+    <span class="keyword">var</span> accessibility: <span class="type">CFString</span> {
+        <span class="keyword">switch self</span> {
+        <span class="keyword">case</span> .accessToken:
+            <span class="keyword">return</span> kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        <span class="keyword">case</span> .refreshToken, .userPin, .encryptionKey:
+            <span class="keyword">return</span> kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly
+        <span class="keyword">case</span> .apiKey:
+            <span class="keyword">return</span> kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        }
+    }
+}
+
+<span class="keyword">final class</span> <span class="type">KeychainManager</span>: <span class="type">SecureStorable</span> {
+    <span class="keyword">static let</span> shared = <span class="type">KeychainManager</span>()
+
+    <span class="keyword">private let</span> service: <span class="type">String</span>
+    <span class="keyword">private let</span> accessGroup: <span class="type">String</span>?
+
+    <span class="keyword">init</span>(
+        service: <span class="type">String</span> = <span class="type">Bundle</span>.main.bundleIdentifier ?? <span class="string">"com.app.keychain"</span>,
+        accessGroup: <span class="type">String</span>? = <span class="keyword">nil</span>
+    ) {
+        <span class="keyword">self</span>.service = service
+        <span class="keyword">self</span>.accessGroup = accessGroup
+    }
+
+    <span class="comment">// MARK: - Save</span>
+
+    <span class="keyword">func</span> <span class="func">save</span>(_ data: <span class="type">Data</span>, for key: <span class="type">CredentialKey</span>) <span class="keyword">throws</span> {
+        <span class="keyword">try</span> <span class="func">delete</span>(key)
+
+        <span class="keyword">var</span> query = <span class="func">baseQuery</span>(for: key)
+        query[kSecValueData <span class="keyword">as</span> <span class="type">String</span>] = data
+
+        <span class="keyword">if</span> key.requiresBiometric {
+            query[kSecAttrAccessControl <span class="keyword">as</span> <span class="type">String</span>] = <span class="keyword">try</span> <span class="func">biometricAccessControl</span>(for: key)
+        } <span class="keyword">else</span> {
+            query[kSecAttrAccessible <span class="keyword">as</span> <span class="type">String</span>] = key.accessibility
+        }
+
+        <span class="keyword">let</span> status = <span class="func">SecItemAdd</span>(query <span class="keyword">as</span> <span class="type">CFDictionary</span>, <span class="keyword">nil</span>)
+        <span class="keyword">guard</span> status == errSecSuccess <span class="keyword">else</span> {
+            <span class="keyword">throw</span> <span class="type">KeychainError</span>.<span class="func">unhandled</span>(status: status)
+        }
+    }
+
+    <span class="comment">// MARK: - Read</span>
+
+    <span class="keyword">func</span> <span class="func">read</span>(_ key: <span class="type">CredentialKey</span>) <span class="keyword">throws</span> -&gt; <span class="type">Data</span> {
+        <span class="keyword">var</span> query = <span class="func">baseQuery</span>(for: key)
+        query[kSecReturnData <span class="keyword">as</span> <span class="type">String</span>] = <span class="keyword">true</span>
+        query[kSecMatchLimit <span class="keyword">as</span> <span class="type">String</span>] = kSecMatchLimitOne
+
+        <span class="keyword">if</span> key.requiresBiometric {
+            <span class="keyword">let</span> context = <span class="type">LAContext</span>()
+            context.localizedReason = <span class="string">"Access secure credentials"</span>
+            query[kSecUseAuthenticationContext <span class="keyword">as</span> <span class="type">String</span>] = context
+        }
+
+        <span class="keyword">var</span> result: <span class="type">AnyObject</span>?
+        <span class="keyword">let</span> status = <span class="func">SecItemCopyMatching</span>(query <span class="keyword">as</span> <span class="type">CFDictionary</span>, &amp;result)
+
+        <span class="keyword">guard</span> status == errSecSuccess,
+              <span class="keyword">let</span> data = result <span class="keyword">as?</span> <span class="type">Data</span> <span class="keyword">else</span> {
+            <span class="keyword">switch</span> status {
+            <span class="keyword">case</span> errSecItemNotFound:
+                <span class="keyword">throw</span> <span class="type">KeychainError</span>.itemNotFound
+            <span class="keyword">case</span> errSecUserCanceled, errSecAuthFailed:
+                <span class="keyword">throw</span> <span class="type">KeychainError</span>.authFailed
+            <span class="keyword">default</span>:
+                <span class="keyword">throw</span> <span class="type">KeychainError</span>.<span class="func">unhandled</span>(status: status)
+            }
+        }
+        <span class="keyword">return</span> data
+    }
+
+    <span class="comment">// MARK: - Delete</span>
+
+    <span class="keyword">func</span> <span class="func">delete</span>(_ key: <span class="type">CredentialKey</span>) <span class="keyword">throws</span> {
+        <span class="keyword">let</span> query = <span class="func">baseQuery</span>(for: key)
+        <span class="keyword">let</span> status = <span class="func">SecItemDelete</span>(query <span class="keyword">as</span> <span class="type">CFDictionary</span>)
+        <span class="keyword">guard</span> status == errSecSuccess || status == errSecItemNotFound <span class="keyword">else</span> {
+            <span class="keyword">throw</span> <span class="type">KeychainError</span>.<span class="func">unhandled</span>(status: status)
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">deleteAll</span>() <span class="keyword">throws</span> {
+        <span class="keyword">for</span> key <span class="keyword">in</span> <span class="type">CredentialKey</span>.allCases {
+            <span class="keyword">try</span> <span class="func">delete</span>(key)
+        }
+    }
+
+    <span class="comment">// MARK: - Private Helpers</span>
+
+    <span class="keyword">private func</span> <span class="func">baseQuery</span>(for key: <span class="type">CredentialKey</span>) -&gt; [<span class="type">String</span>: <span class="type">Any</span>] {
+        <span class="keyword">var</span> query: [<span class="type">String</span>: <span class="type">Any</span>] = [
+            kSecClass <span class="keyword">as</span> <span class="type">String</span>:       kSecClassGenericPassword,
+            kSecAttrService <span class="keyword">as</span> <span class="type">String</span>: service,
+            kSecAttrAccount <span class="keyword">as</span> <span class="type">String</span>: key.rawValue
+        ]
+        <span class="keyword">if let</span> group = accessGroup {
+            query[kSecAttrAccessGroup <span class="keyword">as</span> <span class="type">String</span>] = group
+        }
+        <span class="keyword">return</span> query
+    }
+
+    <span class="keyword">private func</span> <span class="func">biometricAccessControl</span>(
+        for key: <span class="type">CredentialKey</span>
+    ) <span class="keyword">throws</span> -&gt; <span class="type">SecAccessControl</span> {
+        <span class="keyword">var</span> error: <span class="type">Unmanaged</span>&lt;<span class="type">CFError</span>&gt;?
+        <span class="keyword">guard let</span> access = <span class="func">SecAccessControlCreateWithFlags</span>(
+            kCFAllocatorDefault,
+            key.accessibility,
+            [.biometryCurrentSet, .or, .devicePasscode],
+            &amp;error
+        ) <span class="keyword">else</span> {
+            <span class="keyword">throw</span> error!.<span class="func">takeRetainedValue</span>() <span class="keyword">as</span> <span class="type">Error</span>
+        }
+        <span class="keyword">return</span> access
+    }
+}</code></pre>
+
+    <h3>CredentialManager — High-Level Facade</h3>
+<pre><code><span class="keyword">final class</span> <span class="type">CredentialManager</span> {
+    <span class="keyword">private let</span> store: <span class="type">SecureStorable</span>
+    <span class="keyword">private let</span> encoder = <span class="type">JSONEncoder</span>()
+    <span class="keyword">private let</span> decoder = <span class="type">JSONDecoder</span>()
+
+    <span class="keyword">init</span>(store: <span class="type">SecureStorable</span> = <span class="type">KeychainManager</span>.shared) {
+        <span class="keyword">self</span>.store = store
+    }
+
+    <span class="comment">// MARK: - Token Management</span>
+
+    <span class="keyword">func</span> <span class="func">storeTokens</span>(access: <span class="type">String</span>, refresh: <span class="type">String</span>) <span class="keyword">throws</span> {
+        <span class="keyword">guard let</span> accessData = access.<span class="func">data</span>(using: .utf8),
+              <span class="keyword">let</span> refreshData = refresh.<span class="func">data</span>(using: .utf8) <span class="keyword">else</span> {
+            <span class="keyword">throw</span> <span class="type">KeychainError</span>.<span class="func">unhandled</span>(status: errSecParam)
+        }
+        <span class="keyword">try</span> store.<span class="func">save</span>(accessData, for: .accessToken)
+        <span class="keyword">try</span> store.<span class="func">save</span>(refreshData, for: .refreshToken)
+    }
+
+    <span class="keyword">func</span> <span class="func">getAccessToken</span>() <span class="keyword">throws</span> -&gt; <span class="type">String</span> {
+        <span class="keyword">let</span> data = <span class="keyword">try</span> store.<span class="func">read</span>(.accessToken)
+        <span class="keyword">guard let</span> token = <span class="type">String</span>(data: data, encoding: .utf8) <span class="keyword">else</span> {
+            <span class="keyword">throw</span> <span class="type">KeychainError</span>.<span class="func">unhandled</span>(status: errSecDecode)
+        }
+        <span class="keyword">return</span> token
+    }
+
+    <span class="keyword">func</span> <span class="func">getRefreshToken</span>() <span class="keyword">throws</span> -&gt; <span class="type">String</span> {
+        <span class="keyword">let</span> data = <span class="keyword">try</span> store.<span class="func">read</span>(.refreshToken)
+        <span class="keyword">guard let</span> token = <span class="type">String</span>(data: data, encoding: .utf8) <span class="keyword">else</span> {
+            <span class="keyword">throw</span> <span class="type">KeychainError</span>.<span class="func">unhandled</span>(status: errSecDecode)
+        }
+        <span class="keyword">return</span> token
+    }
+
+    <span class="keyword">func</span> <span class="func">clearAllCredentials</span>() <span class="keyword">throws</span> {
+        <span class="keyword">try</span> store.<span class="func">deleteAll</span>()
+    }
+}</code></pre>
+
+    <h3>Migration from UserDefaults to Keychain</h3>
+<pre><code><span class="keyword">final class</span> <span class="type">KeychainMigrationService</span> {
+    <span class="keyword">private static let</span> migrationKey = <span class="string">"keychain_migration_v1_complete"</span>
+
+    <span class="keyword">static func</span> <span class="func">migrateIfNeeded</span>(credentialManager: <span class="type">CredentialManager</span>) {
+        <span class="keyword">let</span> defaults = <span class="type">UserDefaults</span>.standard
+
+        <span class="keyword">guard</span> !defaults.<span class="func">bool</span>(forKey: migrationKey) <span class="keyword">else</span> { <span class="keyword">return</span> }
+
+        <span class="comment">// Read legacy tokens from UserDefaults</span>
+        <span class="keyword">if let</span> legacyAccess = defaults.<span class="func">string</span>(forKey: <span class="string">"access_token"</span>),
+           <span class="keyword">let</span> legacyRefresh = defaults.<span class="func">string</span>(forKey: <span class="string">"refresh_token"</span>) {
+
+            <span class="keyword">do</span> {
+                <span class="keyword">try</span> credentialManager.<span class="func">storeTokens</span>(
+                    access: legacyAccess,
+                    refresh: legacyRefresh
+                )
+
+                <span class="comment">// Remove from UserDefaults after successful migration</span>
+                defaults.<span class="func">removeObject</span>(forKey: <span class="string">"access_token"</span>)
+                defaults.<span class="func">removeObject</span>(forKey: <span class="string">"refresh_token"</span>)
+            } <span class="keyword">catch</span> {
+                <span class="comment">// Log but don't crash — retry on next launch</span>
+                <span class="func">print</span>(<span class="string">"Migration failed: \(error)"</span>)
+                <span class="keyword">return</span>
+            }
+        }
+
+        defaults.<span class="func">set</span>(<span class="keyword">true</span>, forKey: migrationKey)
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Architect's Checklist for Secure Storage</div>
+        <ul>
+            <li><strong>Protocol-based abstraction</strong> — <code>SecureStorable</code> protocol enables testing with mock keychain</li>
+            <li><strong>Delete-before-add pattern</strong> — avoids <code>errSecDuplicateItem</code> without try-update-then-add complexity</li>
+            <li><strong>Biometric per credential type</strong> — not all credentials need biometric; access tokens used in background must not require it</li>
+            <li><strong>Atomic migration</strong> — only mark migration complete after successful write; remove old data after confirmed migration</li>
+            <li><strong>Access group support</strong> — optional shared keychain for multi-app architectures</li>
+            <li><strong>Centralized error handling</strong> — <code>KeychainError</code> enum maps OSStatus to meaningful errors</li>
+            <li><strong>First-launch cleanup</strong> — detect fresh install via UserDefaults flag and clear stale keychain items from previous installs</li>
+        </ul>
+    </div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — Keychain on Simulator</div>
+        <p>The iOS Simulator does not have a Secure Enclave, and keychain behavior differs from physical devices. Biometric-protected items may behave unexpectedly, and <code>kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly</code> has no effect since the Simulator has no passcode. Always test keychain code on a <strong>physical device</strong> before shipping. Use <code>#if targetEnvironment(simulator)</code> guards to provide fallback behavior during development.</p>
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know — Interview Talking Points</div>
+        <p>When discussing secure credential storage at L6 level, demonstrate understanding of:</p>
+        <ul>
+            <li><strong>Threat modeling</strong> — What are you protecting against? Jailbreak? Physical access? Network MITM? Backup extraction?</li>
+            <li><strong>Defense in depth</strong> — Keychain encryption + biometric + certificate pinning + App Attest form layered security</li>
+            <li><strong>Token lifecycle</strong> — Short-lived access tokens (15 min), longer refresh tokens (30 days), rotation on use, revocation on logout</li>
+            <li><strong>Migration strategy</strong> — How to move from insecure storage without data loss or requiring re-login for all users</li>
+            <li><strong>Testability</strong> — Protocol-based keychain abstraction allows unit testing without hitting real keychain</li>
+            <li><strong>Failure modes</strong> — What happens when biometric fails? Passcode removed? Device restored from backup? Keychain corrupted?</li>
+            <li><strong>Compliance</strong> — GDPR right-to-erasure requires clearing all keychain items; HIPAA requires encryption at rest (keychain satisfies this)</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="03-swift-data.html">&larr; SwiftData</a>
+        <a href="05-file-system-sandbox.html">Next: File System &amp; Sandbox &rarr;</a>
+    </div>
+</div>
+</body>
+</html>

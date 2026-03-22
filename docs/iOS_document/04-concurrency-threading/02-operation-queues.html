@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Operation Queues — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Concurrency &amp; Threading</a><span class="sep">›</span>
+        Operation Queues
+    </nav>
+
+    <h1>Operation Queues</h1>
+    <p class="subtitle">The higher-level concurrency abstraction built on GCD — dependency graphs, cooperative cancellation, KVO-based state machines, and when OperationQueue is the right choice over raw dispatch queues or async/await.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#architecture">1. OperationQueue / Operation Architecture</a></li>
+            <li><a href="#lifecycle">2. Operation Lifecycle &amp; State Machine</a></li>
+            <li><a href="#dependencies">3. Dependencies Between Operations</a></li>
+            <li><a href="#cancellation">4. Cooperative Cancellation</a></li>
+            <li><a href="#kvo">5. KVO on isFinished / isExecuting / isReady</a></li>
+            <li><a href="#custom-operations">6. Building Custom Async Operations</a></li>
+            <li><a href="#block-operation">7. BlockOperation</a></li>
+            <li><a href="#comparison">8. When to Use OperationQueue over GCD</a></li>
+            <li><a href="#architect">9. Architect: Complex Dependency Graphs for Data Pipelines</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architecture">1. OperationQueue / Operation Architecture</h2>
+
+    <p><code>OperationQueue</code> and <code>Operation</code> (formerly <code>NSOperationQueue</code> and <code>NSOperation</code>) provide an object-oriented abstraction over GCD. While GCD works with blocks and queues, the Operation framework works with <strong>objects that encapsulate work</strong> — giving you dependency management, cancellation, KVO observation, and reusability that raw GCD blocks don't provide.</p>
+
+    <h3>1.1 Class Hierarchy</h3>
+
+    <div class="diagram">
+Operation (abstract base class)
+    ├── BlockOperation (convenience for block-based work)
+    ├── Your custom Operation subclass
+    │       ├── Synchronous operation (override main())
+    │       └── Asynchronous operation (override start(), manage state)
+    └── (Internal) _NSOperationInternal
+
+OperationQueue
+    ├── .main (singleton — dispatches to main thread)
+    └── Custom instances (dispatch to background)
+         └── Backed by a GCD concurrent queue internally
+    </div>
+
+    <h3>1.2 Relationship to GCD</h3>
+
+    <p><code>OperationQueue</code> uses GCD internally. Each <code>OperationQueue</code> has an underlying <code>DispatchQueue</code> that it dispatches operations to. You can even access it via <code>underlyingQueue</code>:</p>
+
+    <pre><code><span class="keyword">let</span> opQueue = <span class="type">OperationQueue</span>()
+opQueue.name = <span class="string">"com.app.imageProcessing"</span>
+opQueue.maxConcurrentOperationCount = <span class="number">4</span>
+opQueue.qualityOfService = .userInitiated
+
+<span class="comment">// Access the underlying GCD queue</span>
+<span class="keyword">let</span> gcdQueue = opQueue.underlyingQueue
+<span class="comment">// You can set a custom underlying queue:</span>
+opQueue.underlyingQueue = <span class="type">DispatchQueue</span>(
+    label: <span class="string">"com.app.imageProcessing.gcd"</span>,
+    qos: .userInitiated,
+    attributes: .concurrent
+)</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Why Operation Exists When We Have GCD</div>
+        <p>GCD is low-level and block-based — perfect for simple async dispatch but awkward for complex workflows. Operation adds: (1) <strong>Dependencies</strong> — "don't start B until A finishes"; (2) <strong>Cancellation</strong> — propagated through the dependency graph; (3) <strong>State observation</strong> — KVO on isReady/isExecuting/isFinished; (4) <strong>Reusability</strong> — encapsulate complex work in a class; (5) <strong>maxConcurrentOperationCount</strong> — built-in concurrency limiting without semaphores. These features make Operation the right choice for complex data processing pipelines.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="lifecycle">2. Operation Lifecycle &amp; State Machine</h2>
+
+    <p>Every <code>Operation</code> follows a strict state machine. Understanding this is critical for building custom async operations correctly.</p>
+
+    <div class="diagram">
+Operation State Machine:
+
+                    ┌──────────┐
+                    │  Pending  │  isReady = false
+                    │           │  (waiting for dependencies)
+                    └─────┬────┘
+                          │ All dependencies finished
+                          ▼
+                    ┌──────────┐
+                    │  Ready   │  isReady = true
+                    │           │  (waiting for queue slot)
+                    └─────┬────┘
+                          │ Queue picks it up, calls start()
+                          ▼
+                    ┌──────────┐
+                    │ Executing│  isExecuting = true
+                    │           │  (main() running)
+                    └─────┬────┘
+                          │ main() returns (sync) or
+                          │ you set isFinished = true (async)
+                          ▼
+                    ┌──────────┐
+                    │ Finished │  isFinished = true
+                    │           │  (cleanup, dependents notified)
+                    └──────────┘
+
+Cancellation can happen at ANY state:
+  - Pending → cancel() → still moves to Finished (skips execution)
+  - Ready → cancel() → still starts, but isCancelled = true
+  - Executing → cancel() → isCancelled = true (must check manually)
+    </div>
+
+    <h3>2.1 Key Properties</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Property</th>
+                <th>Type</th>
+                <th>Description</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>isReady</code></td>
+                <td>Bool (KVO)</td>
+                <td>True when all dependencies are finished. Queue checks this before starting.</td>
+            </tr>
+            <tr>
+                <td><code>isExecuting</code></td>
+                <td>Bool (KVO)</td>
+                <td>True while the operation is actively running.</td>
+            </tr>
+            <tr>
+                <td><code>isFinished</code></td>
+                <td>Bool (KVO)</td>
+                <td>True when the operation is complete. Triggers dependent operations.</td>
+            </tr>
+            <tr>
+                <td><code>isCancelled</code></td>
+                <td>Bool (KVO)</td>
+                <td>True after cancel() is called. Must be checked cooperatively.</td>
+            </tr>
+            <tr>
+                <td><code>isAsynchronous</code></td>
+                <td>Bool</td>
+                <td>If true, the operation manages its own execution lifecycle.</td>
+            </tr>
+            <tr>
+                <td><code>queuePriority</code></td>
+                <td>QueuePriority</td>
+                <td>Scheduling priority within the queue (not system QoS).</td>
+            </tr>
+            <tr>
+                <td><code>qualityOfService</code></td>
+                <td>QualityOfService</td>
+                <td>Maps to GCD QoS for thread scheduling.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="dependencies">3. Dependencies Between Operations</h2>
+
+    <p>Dependencies are the killer feature of Operation. You can express "B depends on A" — meaning B won't start until A's <code>isFinished</code> becomes true. Dependencies work <strong>across queues</strong>.</p>
+
+    <pre><code><span class="keyword">let</span> downloadOp = <span class="type">DownloadOperation</span>(url: imageURL)
+<span class="keyword">let</span> decodeOp = <span class="type">DecodeOperation</span>()
+<span class="keyword">let</span> filterOp = <span class="type">FilterOperation</span>(filter: .sepia)
+<span class="keyword">let</span> displayOp = <span class="type">DisplayOperation</span>(imageView: imageView)
+
+<span class="comment">// Build the dependency chain</span>
+decodeOp.<span class="func">addDependency</span>(downloadOp)   <span class="comment">// Decode after download</span>
+filterOp.<span class="func">addDependency</span>(decodeOp)     <span class="comment">// Filter after decode</span>
+displayOp.<span class="func">addDependency</span>(filterOp)    <span class="comment">// Display after filter</span>
+
+<span class="comment">// Operations can run on different queues!</span>
+<span class="keyword">let</span> networkQueue = <span class="type">OperationQueue</span>()
+<span class="keyword">let</span> processingQueue = <span class="type">OperationQueue</span>()
+
+networkQueue.<span class="func">addOperation</span>(downloadOp)
+processingQueue.<span class="func">addOperation</span>(decodeOp)
+processingQueue.<span class="func">addOperation</span>(filterOp)
+<span class="type">OperationQueue</span>.main.<span class="func">addOperation</span>(displayOp)
+
+<span class="comment">// Dependency graph:</span>
+<span class="comment">// Download → Decode → Filter → Display</span>
+<span class="comment">//  (network)  (bg)     (bg)    (main)</span></code></pre>
+
+    <h3>3.1 Passing Data Between Dependent Operations</h3>
+
+    <p>Operations don't have a built-in data passing mechanism. You need to design this yourself:</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">DownloadOperation</span>: <span class="type">Operation</span> {
+    <span class="keyword">let</span> url: <span class="type">URL</span>
+    <span class="keyword">var</span> downloadedData: <span class="type">Data</span>?  <span class="comment">// Output property</span>
+
+    <span class="keyword">init</span>(url: <span class="type">URL</span>) { <span class="keyword">self</span>.url = url; <span class="keyword">super</span>.<span class="func">init</span>() }
+
+    <span class="keyword">override func</span> <span class="func">main</span>() {
+        <span class="keyword">guard</span> !isCancelled <span class="keyword">else</span> { <span class="keyword">return</span> }
+        downloadedData = <span class="keyword">try</span>? <span class="type">Data</span>(contentsOf: url)
+    }
+}
+
+<span class="keyword">class</span> <span class="type">DecodeOperation</span>: <span class="type">Operation</span> {
+    <span class="keyword">var</span> inputData: <span class="type">Data</span>?     <span class="comment">// Input property</span>
+    <span class="keyword">var</span> decodedImage: <span class="type">UIImage</span>? <span class="comment">// Output property</span>
+
+    <span class="keyword">override func</span> <span class="func">main</span>() {
+        <span class="keyword">guard</span> !isCancelled <span class="keyword">else</span> { <span class="keyword">return</span> }
+
+        <span class="comment">// Pull data from dependency</span>
+        <span class="keyword">let</span> data = inputData ?? {
+            <span class="keyword">let</span> downloadOp = dependencies
+                .<span class="func">compactMap</span> { $0 <span class="keyword">as</span>? <span class="type">DownloadOperation</span> }
+                .first
+            <span class="keyword">return</span> downloadOp?.downloadedData
+        }()
+
+        <span class="keyword">guard let</span> data = data <span class="keyword">else</span> { <span class="keyword">return</span> }
+        decodedImage = <span class="type">UIImage</span>(data: data)
+    }
+}
+
+<span class="comment">// Adapter pattern for cleaner data passing</span>
+<span class="keyword">class</span> <span class="type">AdapterOperation</span>&lt;<span class="type">Input</span>, <span class="type">Output</span>&gt;: <span class="type">Operation</span> {
+    <span class="keyword">let</span> transform: (<span class="type">Input</span>) -> <span class="type">Output</span>
+    <span class="keyword">var</span> input: <span class="type">Input</span>?
+    <span class="keyword">var</span> output: <span class="type">Output</span>?
+
+    <span class="keyword">init</span>(transform: <span class="keyword">@escaping</span> (<span class="type">Input</span>) -> <span class="type">Output</span>) {
+        <span class="keyword">self</span>.transform = transform
+        <span class="keyword">super</span>.<span class="func">init</span>()
+    }
+
+    <span class="keyword">override func</span> <span class="func">main</span>() {
+        <span class="keyword">guard</span> !isCancelled, <span class="keyword">let</span> input = input <span class="keyword">else</span> { <span class="keyword">return</span> }
+        output = <span class="func">transform</span>(input)
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: Circular Dependencies</div>
+        <p>If operation A depends on B and B depends on A, <strong>neither will ever execute</strong>. The queue will deadlock silently — no crash, no warning, just operations stuck in the "pending" state forever. Always validate your dependency graph is a DAG (Directed Acyclic Graph). For complex pipelines, consider building a validation step that detects cycles before adding operations to the queue.</p>
+    </div>
+
+    <h3>3.2 Dependency Graph Visualization</h3>
+
+    <div class="diagram">
+Complex Dependency Graph Example (Image Processing Pipeline):
+
+    ┌──────────┐     ┌──────────┐
+    │Download A│     │Download B│
+    └────┬─────┘     └────┬─────┘
+         │                │
+         ▼                ▼
+    ┌──────────┐     ┌──────────┐
+    │ Decode A │     │ Decode B │
+    └────┬─────┘     └────┬─────┘
+         │                │
+         └───────┬────────┘
+                 │
+                 ▼
+           ┌──────────┐
+           │  Merge   │  (depends on BOTH decodes)
+           └────┬─────┘
+                │
+                ▼
+           ┌──────────┐
+           │  Filter  │
+           └────┬─────┘
+                │
+                ▼
+           ┌──────────┐
+           │ Display  │  (on main queue)
+           └──────────┘
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="cancellation">4. Cooperative Cancellation</h2>
+
+    <p>Cancellation in the Operation framework is <strong>cooperative</strong> — calling <code>cancel()</code> sets a flag, but the operation must check it and respond appropriately.</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">LargeFileProcessor</span>: <span class="type">Operation</span> {
+    <span class="keyword">let</span> fileURL: <span class="type">URL</span>
+
+    <span class="keyword">init</span>(fileURL: <span class="type">URL</span>) {
+        <span class="keyword">self</span>.fileURL = fileURL
+        <span class="keyword">super</span>.<span class="func">init</span>()
+    }
+
+    <span class="keyword">override func</span> <span class="func">main</span>() {
+        <span class="comment">// Check before starting</span>
+        <span class="keyword">guard</span> !isCancelled <span class="keyword">else</span> { <span class="keyword">return</span> }
+
+        <span class="keyword">let</span> data = <span class="keyword">try</span>? <span class="type">Data</span>(contentsOf: fileURL)
+        <span class="keyword">guard let</span> data = data <span class="keyword">else</span> { <span class="keyword">return</span> }
+
+        <span class="keyword">let</span> chunkSize = <span class="number">1024</span> * <span class="number">1024</span>  <span class="comment">// 1MB chunks</span>
+        <span class="keyword">var</span> offset = <span class="number">0</span>
+
+        <span class="keyword">while</span> offset &lt; data.count {
+            <span class="comment">// Check cancellation at each iteration</span>
+            <span class="keyword">guard</span> !isCancelled <span class="keyword">else</span> {
+                <span class="func">cleanupPartialWork</span>()
+                <span class="keyword">return</span>
+            }
+
+            <span class="keyword">let</span> end = <span class="func">min</span>(offset + chunkSize, data.count)
+            <span class="keyword">let</span> chunk = data[offset..&lt;end]
+            <span class="func">processChunk</span>(chunk)
+            offset = end
+        }
+    }
+}
+
+<span class="comment">// Cancellation propagation through the queue</span>
+<span class="keyword">let</span> queue = <span class="type">OperationQueue</span>()
+queue.<span class="func">addOperations</span>([op1, op2, op3, op4], waitUntilFinished: <span class="keyword">false</span>)
+
+<span class="comment">// Cancel everything</span>
+queue.<span class="func">cancelAllOperations</span>()
+<span class="comment">// This calls cancel() on each operation in the queue.</span>
+<span class="comment">// Pending operations will have isCancelled = true when they start.</span>
+<span class="comment">// Running operations must check isCancelled themselves.</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Cancellation and Dependencies</div>
+        <p>When you cancel an operation, its dependents are <strong>not</strong> automatically cancelled. A cancelled operation still transitions to <code>isFinished = true</code> (after its <code>start()</code> is called), which satisfies the dependency. The dependent operation will then start — with its own <code>isCancelled</code> still false. If you want cascading cancellation, you must implement it yourself, either by checking the dependency's <code>isCancelled</code> in the dependent's <code>main()</code>, or by cancelling the entire queue.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="kvo">5. KVO on isFinished / isExecuting / isReady</h2>
+
+    <p>The Operation framework relies heavily on KVO (Key-Value Observing) for its state machine. The queue observes <code>isReady</code>, <code>isExecuting</code>, and <code>isFinished</code> to know when to schedule and clean up operations.</p>
+
+    <h3>5.1 Why KVO Matters for Custom Operations</h3>
+
+    <p>For <strong>synchronous</strong> operations (override <code>main()</code>), the base class handles all KVO notifications. For <strong>asynchronous</strong> operations (override <code>start()</code>), you must manually fire KVO notifications when state changes — otherwise the queue won't know your operation finished.</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">AsyncNetworkOperation</span>: <span class="type">Operation</span> {
+    <span class="keyword">private var</span> _isExecuting = <span class="keyword">false</span>
+    <span class="keyword">private var</span> _isFinished = <span class="keyword">false</span>
+
+    <span class="keyword">override var</span> isExecuting: <span class="type">Bool</span> { _isExecuting }
+    <span class="keyword">override var</span> isFinished: <span class="type">Bool</span> { _isFinished }
+    <span class="keyword">override var</span> isAsynchronous: <span class="type">Bool</span> { <span class="keyword">true</span> }
+
+    <span class="keyword">override func</span> <span class="func">start</span>() {
+        <span class="keyword">guard</span> !isCancelled <span class="keyword">else</span> {
+            <span class="func">finish</span>()
+            <span class="keyword">return</span>
+        }
+
+        <span class="func">willChangeValue</span>(forKey: <span class="string">"isExecuting"</span>)
+        _isExecuting = <span class="keyword">true</span>
+        <span class="func">didChangeValue</span>(forKey: <span class="string">"isExecuting"</span>)
+
+        <span class="comment">// Start async work</span>
+        <span class="type">URLSession</span>.shared.<span class="func">dataTask</span>(with: request) { [<span class="keyword">weak self</span>] data, _, error <span class="keyword">in</span>
+            <span class="keyword">self</span>?.<span class="func">handleResponse</span>(data: data, error: error)
+            <span class="keyword">self</span>?.<span class="func">finish</span>()
+        }.<span class="func">resume</span>()
+    }
+
+    <span class="keyword">private func</span> <span class="func">finish</span>() {
+        <span class="func">willChangeValue</span>(forKey: <span class="string">"isExecuting"</span>)
+        <span class="func">willChangeValue</span>(forKey: <span class="string">"isFinished"</span>)
+        _isExecuting = <span class="keyword">false</span>
+        _isFinished = <span class="keyword">true</span>
+        <span class="func">didChangeValue</span>(forKey: <span class="string">"isFinished"</span>)
+        <span class="func">didChangeValue</span>(forKey: <span class="string">"isExecuting"</span>)
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: Missing KVO Notifications</div>
+        <p>If you forget to fire <code>willChangeValue</code>/<code>didChangeValue</code> for <code>isFinished</code>, the queue will <strong>never remove your operation</strong>. It will stay in the queue's <code>operations</code> array forever, and any operations that depend on it will never start. This is one of the most common bugs with custom async operations. Always use a helper method like <code>finish()</code> above to ensure KVO is fired correctly.</p>
+    </div>
+
+    <h3>5.2 Thread Safety for KVO Properties</h3>
+
+    <pre><code><span class="comment">// Thread-safe async operation base class</span>
+<span class="keyword">class</span> <span class="type">AsyncOperation</span>: <span class="type">Operation</span> {
+    <span class="keyword">private let</span> stateQueue = <span class="type">DispatchQueue</span>(
+        label: <span class="string">"com.app.operation.state"</span>,
+        attributes: .concurrent
+    )
+
+    <span class="keyword">private var</span> _isExecuting = <span class="keyword">false</span>
+    <span class="keyword">private var</span> _isFinished = <span class="keyword">false</span>
+
+    <span class="keyword">override var</span> isExecuting: <span class="type">Bool</span> {
+        stateQueue.<span class="func">sync</span> { _isExecuting }
+    }
+
+    <span class="keyword">override var</span> isFinished: <span class="type">Bool</span> {
+        stateQueue.<span class="func">sync</span> { _isFinished }
+    }
+
+    <span class="keyword">override var</span> isAsynchronous: <span class="type">Bool</span> { <span class="keyword">true</span> }
+
+    <span class="keyword">override func</span> <span class="func">start</span>() {
+        <span class="keyword">guard</span> !isCancelled <span class="keyword">else</span> {
+            <span class="func">markFinished</span>()
+            <span class="keyword">return</span>
+        }
+
+        <span class="func">willChangeValue</span>(forKey: <span class="string">"isExecuting"</span>)
+        stateQueue.<span class="func">sync</span>(flags: .barrier) { _isExecuting = <span class="keyword">true</span> }
+        <span class="func">didChangeValue</span>(forKey: <span class="string">"isExecuting"</span>)
+
+        <span class="func">execute</span>()  <span class="comment">// Subclasses override this</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">execute</span>() {
+        <span class="func">fatalError</span>(<span class="string">"Subclasses must override execute()"</span>)
+    }
+
+    <span class="keyword">func</span> <span class="func">markFinished</span>() {
+        <span class="func">willChangeValue</span>(forKey: <span class="string">"isExecuting"</span>)
+        <span class="func">willChangeValue</span>(forKey: <span class="string">"isFinished"</span>)
+        stateQueue.<span class="func">sync</span>(flags: .barrier) {
+            _isExecuting = <span class="keyword">false</span>
+            _isFinished = <span class="keyword">true</span>
+        }
+        <span class="func">didChangeValue</span>(forKey: <span class="string">"isFinished"</span>)
+        <span class="func">didChangeValue</span>(forKey: <span class="string">"isExecuting"</span>)
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="custom-operations">6. Building Custom Async Operations</h2>
+
+    <pre><code><span class="comment">// Real-world example: Image download + cache operation</span>
+<span class="keyword">final class</span> <span class="type">ImageFetchOperation</span>: <span class="type">AsyncOperation</span> {
+    <span class="keyword">let</span> url: <span class="type">URL</span>
+    <span class="keyword">private let</span> cache: <span class="type">NSCache</span>&lt;<span class="type">NSURL</span>, <span class="type">UIImage</span>&gt;
+    <span class="keyword">private var</span> task: <span class="type">URLSessionDataTask</span>?
+
+    <span class="keyword">var</span> fetchedImage: <span class="type">UIImage</span>?
+    <span class="keyword">var</span> fetchError: <span class="type">Error</span>?
+
+    <span class="keyword">init</span>(url: <span class="type">URL</span>, cache: <span class="type">NSCache</span>&lt;<span class="type">NSURL</span>, <span class="type">UIImage</span>&gt;) {
+        <span class="keyword">self</span>.url = url
+        <span class="keyword">self</span>.cache = cache
+        <span class="keyword">super</span>.<span class="func">init</span>()
+    }
+
+    <span class="keyword">override func</span> <span class="func">execute</span>() {
+        <span class="comment">// Check cache first</span>
+        <span class="keyword">if let</span> cached = cache.<span class="func">object</span>(forKey: url <span class="keyword">as</span> <span class="type">NSURL</span>) {
+            fetchedImage = cached
+            <span class="func">markFinished</span>()
+            <span class="keyword">return</span>
+        }
+
+        task = <span class="type">URLSession</span>.shared.<span class="func">dataTask</span>(with: url) { [<span class="keyword">weak self</span>] data, _, error <span class="keyword">in</span>
+            <span class="keyword">guard let self</span> = <span class="keyword">self</span> <span class="keyword">else</span> { <span class="keyword">return</span> }
+
+            <span class="keyword">if</span> <span class="keyword">self</span>.isCancelled {
+                <span class="keyword">self</span>.<span class="func">markFinished</span>()
+                <span class="keyword">return</span>
+            }
+
+            <span class="keyword">if let</span> data = data, <span class="keyword">let</span> image = <span class="type">UIImage</span>(data: data) {
+                <span class="keyword">self</span>.cache.<span class="func">setObject</span>(image, forKey: <span class="keyword">self</span>.url <span class="keyword">as</span> <span class="type">NSURL</span>)
+                <span class="keyword">self</span>.fetchedImage = image
+            } <span class="keyword">else</span> {
+                <span class="keyword">self</span>.fetchError = error
+            }
+
+            <span class="keyword">self</span>.<span class="func">markFinished</span>()
+        }
+        task?.<span class="func">resume</span>()
+    }
+
+    <span class="keyword">override func</span> <span class="func">cancel</span>() {
+        task?.<span class="func">cancel</span>()
+        <span class="keyword">super</span>.<span class="func">cancel</span>()
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="block-operation">7. BlockOperation</h2>
+
+    <p><code>BlockOperation</code> is a concrete subclass that wraps one or more closures. It's the simplest way to use the Operation framework without subclassing.</p>
+
+    <pre><code><span class="comment">// Simple BlockOperation</span>
+<span class="keyword">let</span> op = <span class="type">BlockOperation</span> {
+    <span class="func">print</span>(<span class="string">"Processing data..."</span>)
+    <span class="func">processData</span>()
+}
+
+<span class="comment">// Multiple execution blocks (all run concurrently!)</span>
+<span class="keyword">let</span> multiOp = <span class="type">BlockOperation</span>()
+multiOp.<span class="func">addExecutionBlock</span> { <span class="func">processChunk1</span>() }
+multiOp.<span class="func">addExecutionBlock</span> { <span class="func">processChunk2</span>() }
+multiOp.<span class="func">addExecutionBlock</span> { <span class="func">processChunk3</span>() }
+<span class="comment">// The operation finishes when ALL blocks complete</span>
+
+<span class="comment">// Completion block (runs after all execution blocks)</span>
+multiOp.completionBlock = {
+    <span class="func">print</span>(<span class="string">"All chunks processed"</span>)
+}
+
+<span class="comment">// Using with dependencies</span>
+<span class="keyword">let</span> fetchOp = <span class="type">BlockOperation</span> { <span class="func">fetchData</span>() }
+<span class="keyword">let</span> parseOp = <span class="type">BlockOperation</span> { <span class="func">parseData</span>() }
+<span class="keyword">let</span> saveOp = <span class="type">BlockOperation</span> { <span class="func">saveToDatabase</span>() }
+
+parseOp.<span class="func">addDependency</span>(fetchOp)
+saveOp.<span class="func">addDependency</span>(parseOp)
+
+<span class="keyword">let</span> queue = <span class="type">OperationQueue</span>()
+queue.<span class="func">addOperations</span>([fetchOp, parseOp, saveOp], waitUntilFinished: <span class="keyword">false</span>)</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: BlockOperation Execution Blocks are Concurrent</div>
+        <p>When you add multiple execution blocks to a <code>BlockOperation</code>, they run <strong>concurrently</strong>, not sequentially. The operation is only considered finished when all blocks complete. If your blocks share mutable state, you'll have a data race. Use separate operations with dependencies for sequential execution.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="comparison">8. When to Use OperationQueue over GCD</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Feature</th>
+                <th>GCD (DispatchQueue)</th>
+                <th>OperationQueue</th>
+                <th>async/await</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Dependencies</td>
+                <td>Manual (chaining blocks)</td>
+                <td>Built-in, cross-queue</td>
+                <td>Implicit (await)</td>
+            </tr>
+            <tr>
+                <td>Cancellation</td>
+                <td>DispatchWorkItem (limited)</td>
+                <td>Built-in, cooperative</td>
+                <td>Task.cancel() cooperative</td>
+            </tr>
+            <tr>
+                <td>Max concurrency</td>
+                <td>Semaphore (manual)</td>
+                <td>maxConcurrentOperationCount</td>
+                <td>TaskGroup (cooperative)</td>
+            </tr>
+            <tr>
+                <td>State observation</td>
+                <td>None</td>
+                <td>KVO on all state properties</td>
+                <td>None (structured)</td>
+            </tr>
+            <tr>
+                <td>Reusability</td>
+                <td>Closures (not reusable)</td>
+                <td>Operation subclasses</td>
+                <td>async functions</td>
+            </tr>
+            <tr>
+                <td>Overhead</td>
+                <td>Minimal (C-level)</td>
+                <td>Higher (ObjC objects, KVO)</td>
+                <td>Moderate (continuations)</td>
+            </tr>
+            <tr>
+                <td>Thread explosion</td>
+                <td>Possible</td>
+                <td>Controlled via maxConcurrent</td>
+                <td>Impossible (cooperative)</td>
+            </tr>
+            <tr>
+                <td>Best for</td>
+                <td>Simple async dispatch</td>
+                <td>Complex dependency graphs</td>
+                <td>Most new code</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Decision Framework</div>
+        <ul>
+            <li><strong>Use OperationQueue when</strong>: You need complex dependency graphs, KVO observation of task state, or you're working with legacy code that expects Operations</li>
+            <li><strong>Use GCD when</strong>: You need simple async dispatch, barriers for reader-writer patterns, or DispatchSource for system events</li>
+            <li><strong>Use async/await when</strong>: Writing new code — it's safer (no thread explosion), more readable, and has better cancellation support</li>
+            <li><strong>Avoid</strong>: Mixing all three in the same subsystem — pick one primary concurrency model per module</li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">9. Architect: Complex Dependency Graphs for Data Pipelines</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>At the Staff level, you'll design data processing pipelines that involve downloading, parsing, transforming, and persisting data — often with complex dependencies, error handling, and cancellation requirements. OperationQueue excels here because it makes the dependency graph explicit and observable.</p>
+    </div>
+
+    <h3>9.1 Real-World Pipeline: Social Feed Sync</h3>
+
+    <div class="diagram">
+Social Feed Sync Pipeline:
+
+┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+│ Fetch Posts  │  │ Fetch Users │  │ Fetch Media │
+│  (network)  │  │  (network)  │  │  (network)  │
+└──────┬──────┘  └──────┬──────┘  └──────┬──────┘
+       │                │                │
+       └────────┬───────┘                │
+                │                        │
+                ▼                        │
+       ┌────────────────┐               │
+       │  Merge Posts   │               │
+       │  + User Data   │               │
+       └───────┬────────┘               │
+               │                        │
+               └──────────┬─────────────┘
+                          │
+                          ▼
+                 ┌────────────────┐
+                 │  Resolve Media │
+                 │  References    │
+                 └───────┬────────┘
+                         │
+               ┌─────────┼─────────┐
+               │         │         │
+               ▼         ▼         ▼
+         ┌──────────┐ ┌────────┐ ┌──────────┐
+         │ Save to  │ │ Update │ │ Notify   │
+         │ Core Data│ │ Cache  │ │ UI       │
+         └──────────┘ └────────┘ └──────────┘
+    </div>
+
+    <pre><code><span class="keyword">final class</span> <span class="type">FeedSyncPipeline</span> {
+    <span class="keyword">private let</span> networkQueue: <span class="type">OperationQueue</span>
+    <span class="keyword">private let</span> processingQueue: <span class="type">OperationQueue</span>
+    <span class="keyword">private let</span> persistenceQueue: <span class="type">OperationQueue</span>
+
+    <span class="keyword">init</span>() {
+        networkQueue = <span class="type">OperationQueue</span>()
+        networkQueue.name = <span class="string">"com.app.feed.network"</span>
+        networkQueue.maxConcurrentOperationCount = <span class="number">3</span>
+        networkQueue.qualityOfService = .userInitiated
+
+        processingQueue = <span class="type">OperationQueue</span>()
+        processingQueue.name = <span class="string">"com.app.feed.processing"</span>
+        processingQueue.maxConcurrentOperationCount = <span class="number">2</span>
+        processingQueue.qualityOfService = .utility
+
+        persistenceQueue = <span class="type">OperationQueue</span>()
+        persistenceQueue.name = <span class="string">"com.app.feed.persistence"</span>
+        persistenceQueue.maxConcurrentOperationCount = <span class="number">1</span>
+        persistenceQueue.qualityOfService = .utility
+    }
+
+    <span class="keyword">func</span> <span class="func">syncFeed</span>() {
+        <span class="keyword">let</span> fetchPosts = <span class="type">FetchPostsOperation</span>()
+        <span class="keyword">let</span> fetchUsers = <span class="type">FetchUsersOperation</span>()
+        <span class="keyword">let</span> fetchMedia = <span class="type">FetchMediaMetadataOperation</span>()
+
+        <span class="keyword">let</span> mergePosts = <span class="type">MergePostsUsersOperation</span>()
+        mergePosts.<span class="func">addDependency</span>(fetchPosts)
+        mergePosts.<span class="func">addDependency</span>(fetchUsers)
+
+        <span class="keyword">let</span> resolveMedia = <span class="type">ResolveMediaOperation</span>()
+        resolveMedia.<span class="func">addDependency</span>(mergePosts)
+        resolveMedia.<span class="func">addDependency</span>(fetchMedia)
+
+        <span class="keyword">let</span> saveToDB = <span class="type">SaveToCoreDataOperation</span>()
+        <span class="keyword">let</span> updateCache = <span class="type">UpdateCacheOperation</span>()
+        <span class="keyword">let</span> notifyUI = <span class="type">BlockOperation</span> {
+            <span class="type">DispatchQueue</span>.main.<span class="func">async</span> {
+                <span class="type">NotificationCenter</span>.default.<span class="func">post</span>(
+                    name: .<span class="attr">feedDidSync</span>, object: <span class="keyword">nil</span>
+                )
+            }
+        }
+
+        saveToDB.<span class="func">addDependency</span>(resolveMedia)
+        updateCache.<span class="func">addDependency</span>(resolveMedia)
+        notifyUI.<span class="func">addDependency</span>(saveToDB)
+        notifyUI.<span class="func">addDependency</span>(updateCache)
+
+        <span class="comment">// Dispatch to appropriate queues</span>
+        networkQueue.<span class="func">addOperations</span>(
+            [fetchPosts, fetchUsers, fetchMedia],
+            waitUntilFinished: <span class="keyword">false</span>
+        )
+        processingQueue.<span class="func">addOperations</span>(
+            [mergePosts, resolveMedia],
+            waitUntilFinished: <span class="keyword">false</span>
+        )
+        persistenceQueue.<span class="func">addOperations</span>(
+            [saveToDB, updateCache],
+            waitUntilFinished: <span class="keyword">false</span>
+        )
+        <span class="type">OperationQueue</span>.main.<span class="func">addOperation</span>(notifyUI)
+    }
+
+    <span class="keyword">func</span> <span class="func">cancelSync</span>() {
+        networkQueue.<span class="func">cancelAllOperations</span>()
+        processingQueue.<span class="func">cancelAllOperations</span>()
+        persistenceQueue.<span class="func">cancelAllOperations</span>()
+    }
+}</code></pre>
+
+    <h3>9.2 Design Principles for Operation Pipelines</h3>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Pipeline Architecture</div>
+        <ul>
+            <li><strong>Separate queues by concern</strong>: Network, processing, and persistence queues with different concurrency limits and QoS</li>
+            <li><strong>Operations as value transformers</strong>: Each operation takes input, produces output — pure transformation where possible</li>
+            <li><strong>Error propagation</strong>: Store errors on operations; dependents check dependency errors before proceeding</li>
+            <li><strong>Cancellation at every level</strong>: Check <code>isCancelled</code> at the start of <code>main()</code> and at every significant checkpoint</li>
+            <li><strong>Progress reporting</strong>: Use <code>Progress</code> objects (composable, KVO-observable) for UI feedback</li>
+            <li><strong>Testability</strong>: Inject queues and dependencies; test operations in isolation</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="01-gcd-internals.html">← GCD Internals</a>
+        <a href="03-swift-concurrency.html">Next: Swift Concurrency →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Swift Runtime &amp; ABI — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">System Frameworks</a><span class="sep">›</span>
+        Swift Runtime &amp; ABI
+    </nav>
+
+    <p style="margin-bottom: 12px;">
+        <span class="tag tag-l6">L6</span>
+        <span class="tag tag-architect">Architect</span>
+        <span class="tag tag-senior">Staff+</span>
+    </p>
+    <h1>Swift Runtime &amp; ABI</h1>
+    <p class="subtitle" style="margin-bottom: 24px;">A Staff-level deep dive into type metadata, witness tables, existential containers, generic specialization, ObjC bridging, dispatch, <code>swiftinterface</code>, library evolution, and ABI stability—what the compiler generates, what the runtime does at call sites, and how those choices show up in performance, binary size, and cross-module compatibility.</p>
+
+    <div class="toc">
+        <h3>On This Page</h3>
+        <ul>
+            <li><a href="#intro">Why the Runtime Shows Up in Staff Interviews</a></li>
+            <li><a href="#type-metadata">Swift Type Metadata</a></li>
+            <li><a href="#witness-tables">Protocol Witness Tables</a></li>
+            <li><a href="#existentials">Existential Containers</a></li>
+            <li><a href="#generics">Generic Specialization vs Unspecialized Dispatch</a></li>
+            <li><a href="#objc-bridging"><code>@objc</code> Bridging Cost</a></li>
+            <li><a href="#dynamic-dispatch"><code>dynamic</code> and Dispatch</a></li>
+            <li><a href="#module-stability">Module Stability (<code>swiftinterface</code>)</a></li>
+            <li><a href="#library-evolution">Library Evolution</a></li>
+            <li><a href="#abi-stability">ABI Stability</a></li>
+            <li><a href="#architect-scale">Architect Perspective: Existentials vs Generics at Scale</a></li>
+        </ul>
+    </div>
+
+    <h2 id="intro">Why the Runtime Shows Up in Staff Interviews</h2>
+
+    <p>Swift is not “just a compiled language.” The runtime carries type information, resolves protocol conformances, copies and destroys values of unknown layout, and participates in resilient loading across module boundaries. At L6, interviewers expect you to connect API choices—<code>any</code> vs <code>some</code>, generic constraints, <code>@frozen</code>, package visibility—to <em>machine behavior</em>: extra indirection, metadata passing, heap allocation, and code size from specialization.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: The Swift ABI Is a Contract</div>
+        <p>The Application Binary Interface (ABI) specifies calling conventions, type layout rules, and runtime data structures that must remain compatible across compiler versions and dynamically linked libraries. Your source-level mental model (protocols, generics, structs) is lowered to SIL, then LLVM IR, then object code that agrees with the OS-shipped Swift runtime on device.</p>
+    </div>
+
+    <h2 id="type-metadata">1. Swift Type Metadata</h2>
+
+    <p>Every concrete Swift type that can exist at runtime has (or can lazily obtain) <strong>type metadata</strong>: a runtime record describing the type’s kind, size-related operations, and (for structs/classes/enums) a <strong>type descriptor</strong> holding nominal information such as mangled name, field descriptors, and generic parameters.</p>
+
+    <h3>Metadata record (conceptual layout)</h3>
+
+    <p>Exact layouts evolve with Swift versions, but the conceptual model is stable enough for interviews: metadata begins with a <strong>kind</strong> (enum discriminating struct/class/enum/optional/etc.), followed by headers and pointers to auxiliary tables. A central piece is the <strong>value witness table (VWT)</strong> pointer: a table of function pointers that know how to <em>move</em>, <em>copy</em>, <em>destroy</em>, and report <em>size</em>, <em>stride</em>, and <em>alignment</em> for values of that type, without compile-time knowledge of the concrete type.</p>
+
+    <div class="diagram">Swift Type Metadata (64-bit, schematic)
+┌─────────────────────────────────────────────────────────────┐
+│ Kind (metadata kind / flags)                                 │
+├─────────────────────────────────────────────────────────────┤
+│ … layout-specific header (depends on class vs value type) … │
+├─────────────────────────────────────────────────────────────┤
+│ Pointer to Value Witness Table (VWT)                         │
+├─────────────────────────────────────────────────────────────┤
+│ Pointer to Type Descriptor (nominal: name, fields, generics) │
+├─────────────────────────────────────────────────────────────┤
+│ … further fields: superclass, generic args, field offsets … │
+└─────────────────────────────────────────────────────────────┘
+        │
+        ▼
+   Value Witness Table (per type)
+   ┌──────────────────────────┐
+   │ destroy                  │
+   │ initializeBufferWithCopy │
+   │ assignWithCopy           │
+   │ assignWithTake           │
+   │ initBufferWithCopyOfBuffer│
+   │ …                        │
+   │ size / stride / flags    │
+   └──────────────────────────┘</div>
+
+    <h3>Value witness table (VWT)</h3>
+
+    <p>The VWT abstracts <strong>value semantics</strong> for types passed as generic parameters or stored in existential buffers. Key witnesses include:</p>
+
+    <ul>
+        <li><strong>size, stride, alignment</strong> — used for stack allocation, tuple/existential layout, and memcpy sizing.</li>
+        <li><strong>destroy</strong> — deinitialize without deallocating memory (run deinit logic for contained references, etc.).</li>
+        <li><strong>initializeWithCopy / assignWithCopy / assignWithTake</strong> — copy/move rules respecting ARC and uniqueness.</li>
+        <li><strong>Buffer operations</strong> — initialize uninitialized memory, copy into/out of raw buffers (important for generics and runtime generic code).</li>
+    </ul>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: “Cheap struct” ≠ cheap at runtime</div>
+        <p>A small struct can become expensive when erased into an existential: the same VWT operations may run indirectly, and large values may heap-allocate inside the existential container. The static type’s beauty in source does not guarantee the dynamic representation is pointer-sized.</p>
+    </div>
+
+    <h3>Type descriptor</h3>
+
+    <p>The <strong>type descriptor</strong> (nominal type descriptor) stores reflection-oriented and linkage-oriented information: mangled name, field layout descriptors, generic context (parameter counts, requirements), and hooks for metadata instantiation. For generic types, the full metadata is often built at runtime by a <strong>metadata accessor</strong> function that fills in generic arguments and applies conditional conformance logic.</p>
+
+    <h3>Lazy metadata for generic types</h3>
+
+    <p>For <code>Array&lt;Int&gt;</code> vs <code>Array&lt;String&gt;</code>, you do not get one monolithic compile-time blob for all instantiations in the general case. Instead, the runtime (or compiler-emitted thunks) constructs or fetches metadata keyed by concrete generic arguments. Interview narrative: “The generic type’s descriptor is shared; the <em>full metadata record</em> is completed with per-argument metadata pointers.”</p>
+
+    <pre><code><span class="comment">// Generic nominal type: per specialization may share descriptor,</span>
+<span class="comment">// but complete metadata is keyed by Element's metadata.</span>
+<span class="keyword">struct</span> <span class="type">Box</span>&lt;<span class="type">T</span>&gt; {
+    <span class="keyword">var</span> value: <span class="type">T</span>
+}
+
+<span class="keyword">func</span> <span class="func">printType</span>&lt;<span class="type">T</span>&gt;(<span class="keyword">_</span> value: <span class="type">T</span>) {
+    <span class="comment">// Compiler may pass T's metadata as a hidden argument</span>
+    <span class="comment">// when this is not specialized at the call site.</span>
+    <span class="func">print</span>(<span class="type">T</span>.<span class="keyword">self</span>)
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Name the hidden costs</div>
+        <p>When discussing unspecialized generics in interviews, explicitly mention <strong>metadata pointers</strong> and <strong>value witness calls</strong> through the VWT instead of inlined memcpy. Pair that with “when WMO / inlining / same-module constraints enable specialization, those costs often disappear.”</p>
+    </div>
+
+    <h3>SIL angle</h3>
+
+    <p>In unspecialized generic SIL, you will see operations like <code>copy_addr</code>, <code>destroy_addr</code>, and witness-mediated retains/releases. After specialization, many of those become direct operations on concrete types. Searching IR for heavy witness traffic is a practical signal that a hot loop is not specialized.</p>
+
+    <h2 id="witness-tables">2. Protocol Witness Tables</h2>
+
+    <p>Swift implements protocol requirements via <strong>protocol witness tables (PWTs)</strong>: one table per <strong>(concrete type, protocol)</strong> pair that the type conforms to. The table holds function pointers for each requirement in the protocol’s witness signature (including default implementations resolved at compile time).</p>
+
+    <div class="diagram">Protocol Witness Table (conceptual)
+Protocol: Drawable
+ Requirements: draw() -> Void, bounds() -> Rect
+
+Witness table for struct Icon : Drawable
+┌─────────────────────────────────────┐
+│ *draw   ────────► Icon.draw           │
+│ *bounds ────────► Icon.bounds         │
+│ associated type witnesses (if any)  │
+│ (resilient layout may add fields)     │
+└─────────────────────────────────────┘
+
+At a call site on T: Drawable (unspecialized):
+  existential or generic value carries (value, metadata, witness table*)
+  call witness_table[i](args...)  // indirect through function pointer</div>
+
+    <h3>Associated type witnesses</h3>
+
+    <p>Protocols with associated types compile to requirements that depend on <strong>witnessed associated types</strong>. The witness table (and related structures) records which concrete types satisfy <code>associatedtype</code> requirements, and requirement signatures may chain into further witness tables (e.g., where <code>Element: Equatable</code>).</p>
+
+    <pre><code><span class="keyword">protocol</span> <span class="type">Container</span> {
+    <span class="keyword">associatedtype</span> <span class="type">Element</span>
+    <span class="keyword">func</span> <span class="func">count</span>() -&gt; <span class="type">Int</span>
+}
+
+<span class="keyword">struct</span> <span class="type">IntBag</span>: <span class="type">Container</span> {
+    <span class="keyword">typealias</span> <span class="type">Element</span> = <span class="type">Int</span>
+    <span class="keyword">func</span> <span class="func">count</span>() -&gt; <span class="type">Int</span> { <span class="number">0</span> }
+}</code></pre>
+
+    <h3>Conditional conformances</h3>
+
+    <p><code>extension Array: Equatable where Element: Equatable</code> does not create one static witness table for <code>Array</code> globally. Instead, conformance is <strong>conditional</strong>: whether <code>Array&lt;T&gt;: Equatable</code> holds depends on whether <code>T: Equatable</code>. The runtime participates in <strong>conformance lookup</strong> that can construct or fetch the appropriate witness table given metadata for <code>T</code>.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Conformance is not “just a flag”</div>
+        <p>Interview-grade explanation: conditional conformances require runtime reasoning (or compile-time proofs in fully specialized code) to ensure the correct witness table is used. This is why crossing module boundaries, resilience, and existential erasure interact nontrivially with “does this conformance exist?”</p>
+    </div>
+
+    <h3>Protocol inheritance and witness chains</h3>
+
+    <p>When protocols inherit, the witness table model reflects the requirement set. Implementations can be shared via defaults, but dispatch still resolves through the witness table layout expected for the protocol being used as the existential’s constraint. For multiple constraints (<code>any A &amp; B</code>), Swift uses <strong>existential composition</strong> layouts with multiple witness table pointers (alongside the existential’s value buffer and metadata).</p>
+
+    <h2 id="existentials">3. Existential Containers</h2>
+
+    <p>An <strong>existential</strong> value stores a payload of <em>unknown concrete type</em> that satisfies one or more protocol constraints (or <code>Any</code>/<code>AnyObject</code>). The runtime representation is an <strong>existential container</strong>: a fixed-size inline buffer, a pointer to type metadata, and pointer(s) to protocol witness table(s).</p>
+
+    <h3>Inline buffer: three words (64-bit)</h3>
+
+    <p>On 64-bit Apple platforms, the “small” existential inline buffer is typically <strong>3 machine words</strong> (<strong>24 bytes</strong>). If the concrete value’s size/alignment cannot fit, the compiler/runtime places the value on the <strong>heap</strong> and stores an indirect reference in the buffer (with appropriate flags). This is a classic performance cliff: many “small” structs fit; a single fat field can force allocation.</p>
+
+    <div class="diagram">Opaque existential (e.g. any Drawable) — 64-bit schematic
+┌────────────────────────────────────────────────────────────┐
+│ Inline value buffer (3 × 8 bytes = 24 bytes)               │
+│  [ word0 | word1 | word2 ]  (small value bitwise, or ptr)  │
+├────────────────────────────────────────────────────────────┤
+│ Pointer to type metadata (describes concrete type)         │
+├────────────────────────────────────────────────────────────┤
+│ Pointer to protocol witness table (Drawable)               │
+└────────────────────────────────────────────────────────────┘
+If value &gt; inline capacity or alignment too strict:
+  buffer may hold pointer to heap box + “isIndirect” flags</div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Existentials defeat devirtualization</div>
+        <p>Even when the concrete type is “obvious” to a human reader, an existential call typically becomes an indirect call through a witness unless the optimizer proves a concrete type (<code>opening</code> an existential) or you avoid existential typing at the boundary.</p>
+    </div>
+
+    <h3><code>Any</code> vs <code>AnyObject</code></h3>
+
+    <p><code>Any</code> is an <strong>opaque</strong> existential for any type (value or reference). <code>AnyObject</code> is a <strong>class</strong> existential: the payload is known to be a reference-counted object pointer; layout and dispatch differ from arbitrary value types. Mixing them incorrectly (e.g., assuming <code>Any</code> is always a pointer) is a common conceptual bug.</p>
+
+    <h3>Why <code>any Protocol</code> (Swift 5.6+)</h3>
+
+    <p>Swift made existential types <strong>explicit</strong> with <code>any</code> to reduce accidental type erasure and to carve syntax space for <code>some Protocol</code> (opaque types) as a distinct feature. Semantically, <code>any Drawable</code> tells both the compiler and readers: “this is an existential box; witness indirection and runtime type metadata are in play.”</p>
+
+    <h3>Performance costs (interview checklist)</h3>
+
+    <ul>
+        <li><strong>Indirect calls</strong> for protocol requirements.</li>
+        <li><strong>Metadata / witness passing</strong> at ABI level for many operations.</li>
+        <li><strong>Heap allocation</strong> when the value does not fit the inline buffer.</li>
+        <li><strong>Optimizer barriers</strong>: fewer cross-module devirtualization guarantees than specialized generics.</li>
+    </ul>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Representation</th>
+                <th>Typing</th>
+                <th>Typical dispatch</th>
+                <th>Binary / runtime</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>any P</code></td>
+                <td>Existential (erased)</td>
+                <td>Witness + metadata</td>
+                <td>Smaller type explosion; more indirect ops</td>
+            </tr>
+            <tr>
+                <td><code>some P</code> (opaque result)</td>
+                <td>Fixed concrete type hidden from callers</td>
+                <td>Often static at ABI boundary</td>
+                <td>Can avoid existential in public signatures</td>
+            </tr>
+            <tr>
+                <td><code>func f&lt;T: P&gt;(_ x: T)</code></td>
+                <td>Generic (open)</td>
+                <td>Specialized or unspecialized</td>
+                <td>Specialization can duplicate code; fast when specialized</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="keyword">protocol</span> <span class="type">Renderer</span> {
+    <span class="keyword">func</span> <span class="func">draw</span>()
+}
+
+<span class="comment">// Existential: dynamic type inside the box</span>
+<span class="keyword">func</span> <span class="func">renderAll</span>(<span class="keyword">_</span> items: [<span class="keyword">any</span> <span class="type">Renderer</span>]) {
+    <span class="keyword">for</span> item <span class="keyword">in</span> items { item.<span class="func">draw</span>() }
+}
+
+<span class="comment">// Generic: specialization-friendly at call sites</span>
+<span class="keyword">func</span> <span class="func">renderOne</span>&lt;<span class="type">T</span>: <span class="type">Renderer</span>&gt;(<span class="keyword">_</span> item: <span class="type">T</span>) {
+    item.<span class="func">draw</span>()
+}</code></pre>
+
+    <h2 id="generics">4. Generic Specialization vs Unspecialized Dispatch</h2>
+
+    <p>Swift generics are implemented with a hybrid strategy: the compiler can <strong>monomorphize</strong> (emit specialized copies of functions) for concrete types, but also emit <strong>unspecialized</strong> versions that accept hidden runtime parameters: type metadata, witness tables, and sometimes coroutine/context pointers.</p>
+
+    <h3>When specialization tends to happen</h3>
+
+    <ul>
+        <li><strong>Same module</strong> visibility: the compiler sees concrete call sites.</li>
+        <li><strong>Whole-module optimization (WMO)</strong>: cross-function visibility increases specialization opportunities.</li>
+        <li><strong><code>@inlinable</code></strong> bodies in resilient libraries: client modules can specialize using the exposed SIL-like source.</li>
+        <li><strong>Generic types used with internal concrete types</strong> in a translation unit with optimization enabled.</li>
+    </ul>
+
+    <div class="callout callout-info">
+        <div class="callout-title">SIL: Hidden generic parameters</div>
+        <p>Unspecialized generic SIL lowers calls to runtime-aware entry points. You will see patterns that pass <code>%T</code> metadata to <code>alloc_stack</code> sizing, or call witnesses for <code>copy_addr</code>. After specialization (<code>-O -whole-module-optimization</code>), many generic functions collapse into concrete LLVM types with direct calls.</p>
+    </div>
+
+    <h3>Performance gap</h3>
+
+    <p>For hot loops over small value types, specialization commonly yields <strong>large speedups</strong> (interview figures often cite <strong>10×–100×</strong> for microbenchmarks) by replacing indirect value operations with inlined memory ops and removing metadata plumbing. The exact number is workload-dependent; the <em>qualitative</em> claim—existentials and unspecialized generics are slower in tight loops—is what matters.</p>
+
+    <h3>How to inspect specialization (practical)</h3>
+
+    <ol>
+        <li>Emit SIL: <code>swiftc -emit-sil -O -whole-module-optimization MyModule.swift</code> (flags vary with packages).</li>
+        <li>Search for your generic function name; compare specialized variants (<code>$s…</code> manglings) vs a single generic entry.</li>
+        <li>Use Instruments (Time Profiler) + symbols to see if hot calls land in small specialized thunks vs shared generic shims.</li>
+    </ol>
+
+    <div class="diagram">Dispatch &amp; specialization landscape
+Static (struct method, final, WMO devirt)
+   fastest ─────────────────────────────────────► slowest
+Generic specialized (concrete T)
+Generic unspecialized (metadata + VWT + PWT)
+Existential (erase type; witness calls)
+@objc dynamic message_send
+──────────────────────────────────────────────────────────────</div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: “We made it generic for testability”</div>
+        <p>Abstraction through generics without specialization can move overhead from “compile time” to “every iteration at runtime.” Staff-level mitigation: type-erased boundaries at the edges, generics in the core, or forcing specialization with <code>@inline(__always)</code> judiciously (not as a default hammer).</p>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Mechanism</th>
+                <th>What the CPU sees</th>
+                <th>Code size</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Specialized generic</td>
+                <td>Direct ops, inlined witnesses often eliminated</td>
+                <td>Higher (per type)</td>
+            </tr>
+            <tr>
+                <td>Unspecialized generic</td>
+                <td>Shared function + metadata/Witness indirection</td>
+                <td>Lower duplication</td>
+            </tr>
+            <tr>
+                <td>Existential</td>
+                <td>Witness calls; possible heap boxing</td>
+                <td>Often middling; can avoid generics explosion</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h2 id="objc-bridging">5. <code>@objc</code> Bridging Cost</h2>
+
+    <p>Swift interoperates with Objective-C via the Objective-C runtime and toll-free bridging for many Foundation types. Crossing the boundary has semantic and performance implications: copies, retain counts, and lazy adapters.</p>
+
+    <h3>Swift → ObjC</h3>
+
+    <p>When you pass a <code>String</code> into an API typed as <code>NSString</code>, the bridge may create an <code>NSString</code> representation. <strong>Copy semantics</strong> matter: some paths copy Unicode storage; others may use tagged pointers or shared immutable backing depending on usage and SDK implementation details. Treat bridges as <em>potential allocations</em> in hot paths.</p>
+
+    <h3>ObjC → Swift</h3>
+
+    <p><code>NSArray</code> bridged to <code>Array</code> can be <strong>lazy</strong> (O(1) wrapper) until mutation or element access requires Swift-native representation. This is powerful but subtle: repeated Swift-level access can trigger materialization.</p>
+
+    <pre><code><span class="keyword">import</span> Foundation
+
+<span class="keyword">let</span> nsArray = [<span class="string">"a"</span>, <span class="string">"b"</span>] <span class="keyword">as</span> NSArray
+<span class="keyword">let</span> swiftArray = nsArray <span class="keyword">as</span> [String]  <span class="comment">// bridging may be lazy</span>
+
+<span class="keyword">@objc</span> <span class="keyword">class</span> <span class="type">Greeter</span>: NSObject {
+    <span class="keyword">@objc</span> <span class="keyword">func</span> <span class="func">say</span>(<span class="keyword">_</span> message: String) {
+        <span class="func">print</span>(message)
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Isolate bridging boundaries</div>
+        <p>Push <code>NSString</code>/<code>NSArray</code> handling to the UIKit/legacy seam; convert once. In performance-sensitive pipelines (audio, rendering, parsing), prefer pure Swift buffers (<code>Data</code>, <code>UnsafeBufferPointer</code>) with explicit copies you can reason about.</p>
+    </div>
+
+    <h3><code>@objc</code> inference and exposure</h3>
+
+    <p>Members of <code>NSObject</code> subclasses can infer <code>@objc</code> under certain rules; exposing selectors to the ObjC runtime increases dynamic dispatch surfaces and impacts symbol visibility. Swift-only APIs avoid that tax.</p>
+
+    <h3>Dynamic dispatch requirement</h3>
+
+    <p>Selectors invoked via <code>perform(_:)</code>, KVO, or method swizzling require the ObjC message path. Pure Swift vtable dispatch is invisible to <code>objc_msgSend</code> unless exposed appropriately. This is why “we marked it <code>@objc</code> but swizzling still doesn’t hit” failures appear: visibility, final, and dispatch kind still matter.</p>
+
+    <h2 id="dynamic-dispatch">6. <code>dynamic</code> Keyword and Dispatch</h2>
+
+    <p>Swift uses multiple dispatch strategies:</p>
+
+    <ul>
+        <li><strong>Static dispatch</strong> — struct methods, <code>final</code> class methods, often inlined.</li>
+        <li><strong>Vtable dispatch</strong> — class inheritance without <code>final</code>.</li>
+        <li><strong>Objective-C message dispatch</strong> — <code>@objc dynamic</code> and ObjC APIs: <code>objc_msgSend</code> family.</li>
+    </ul>
+
+    <div class="diagram">Class call site (simplified)
+Swift vtable dispatch:
+  object header → class metadata → vtable[slot] → impl
+
+ObjC message dispatch:
+  object → isa → objc_msgSend(selector, …)
+      → method lookup (cached after warm-up) → impl</div>
+
+    <p>The <code>dynamic</code> modifier forces <strong>message dispatch</strong> for ObjC-visible members, enabling runtime features like <strong>KVO</strong> and <strong>method swizzling</strong>. It is strictly slower than static dispatch in microbenchmarks and blocks some devirtualization.</p>
+
+    <pre><code><span class="keyword">import</span> Foundation
+
+<span class="keyword">class</span> <span class="type">Account</span>: NSObject {
+    <span class="keyword">dynamic var</span> balance: <span class="type">Int</span> = <span class="number">0</span>  <span class="comment">// ObjC runtime visible</span>
+}
+
+<span class="comment">// KVO requires dynamic dispatch + ObjC object graph</span>
+<span class="keyword">let</span> a = <span class="type">Account</span>()
+a.<span class="func">observe</span>(\.balance, options: [.new]) { _, change <span class="keyword">in</span>
+    <span class="comment">// …</span>
+}</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must Know</div>
+        <p>Choose <code>dynamic</code> only where runtime features mandate it. For most SwiftUI/UIKit state, prefer Swift observation patterns where appropriate. At Staff level, articulate <strong>why</strong> KVO implies message dispatch and what invariants break if you “just make it Swift.”</p>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Dispatch</th>
+                <th>Typical use</th>
+                <th>Runtime flexibility</th>
+                <th>Performance</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Static</td>
+                <td>Structs, enums, <code>final</code>, WMO devirt</td>
+                <td>Low</td>
+                <td>Best</td>
+            </tr>
+            <tr>
+                <td>Vtable</td>
+                <td>Non-final classes</td>
+                <td>Medium (override)</td>
+                <td>Good</td>
+            </tr>
+            <tr>
+                <td>Message (<code>dynamic</code>)</td>
+                <td>KVO, swizzling, ObjC dynamism</td>
+                <td>High</td>
+                <td>Most variable</td>
+            </tr>
+            <tr>
+                <td>Witness (existential/generic)</td>
+                <td>Protocols, type erasure</td>
+                <td>High for protocols</td>
+                <td>Depends on specialization</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h2 id="module-stability">7. Module Stability (<code>swiftinterface</code>)</h2>
+
+    <p><strong>Module stability</strong> enables shipping precompiled Swift modules that clients using <em>different Swift compiler versions</em> can import—within the compatibility promises of a given Xcode/Swift release. The textual <code>.swiftinterface</code> file is a major piece of that story: it describes the module’s public API in Swift source form, which the importing compiler can parse and synthesize AST against, while linking to ABI-stable binaries.</p>
+
+    <h3>Generation</h3>
+
+    <p>Build systems invoke the compiler with flags like <code>-emit-module-interface</code> (often via Xcode’s “Build Libraries for Distribution”). The emitted interface strips private declarations and encodes resilient attributes.</p>
+
+    <h3>Included vs excluded (conceptual)</h3>
+
+    <ul>
+        <li><strong>Included</strong>: <code>public</code>/<code>open</code> APIs, types, protocol requirements, inlinable function bodies when required, attributes affecting clients (<code>@available</code>, resilience annotations).</li>
+        <li><strong>Excluded</strong>: <code>private</code>/<code>fileprivate</code>/<code>internal</code> details (unless made visible via <code>@usableFromInline</code> + <code>@inlinable</code> patterns), many file-level implementation helpers.</li>
+    </ul>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Relationship to ABI stability</div>
+        <p><strong>ABI stability</strong> (Swift 5) defines runtime layout and calling conventions on Apple platforms. <strong>Module stability</strong> addresses <em>compiler</em> interoperability: can a newer compiler import a library built with an older Swift? They overlap but are not identical concerns—interviews reward keeping them distinct.</p>
+    </div>
+
+    <pre><code><span class="comment">// Hypothetical excerpt from a .swiftinterface</span>
+<span class="comment">// swift-interface-version: 5.0</span>
+<span class="keyword">import</span> Swift
+<span class="keyword">@frozen</span> <span class="keyword">public</span> <span class="keyword">enum</span> <span class="type">Result</span>&lt;<span class="type">T</span>&gt; {
+  <span class="keyword">case</span> ok(<span class="type">T</span>)
+  <span class="keyword">case</span> err(<span class="type">Error</span>)
+}</code></pre>
+
+    <h2 id="library-evolution">8. Library Evolution</h2>
+
+    <p>Swift’s <strong>library evolution</strong> mode (<code>-enable-library-evolution</code>) models shipping binary frameworks whose clients you do not recompile on every release. The compiler then defaults many types to <strong>resilient</strong> layouts: clients must not assume fixed offsets for non-frozen structs or non-exhaustive enums.</p>
+
+    <h3><code>@frozen</code></h3>
+
+    <p>Applied to structs and enums, <code>@frozen</code> promises a <strong>fixed layout</strong> to clients: no new stored properties/cases will appear in future library versions without breaking binary compatibility. This restores performance for direct field access but constrains the library author.</p>
+
+    <h3><code>@inlinable</code> and <code>@usableFromInline</code></h3>
+
+    <p><code>@inlinable</code> exposes function bodies to clients for inlining and specialization. That visibility leaks implementation details into the module interface; breaking changes become semver-critical. <code>@usableFromInline</code> elevates internal symbols so <code>@inlinable</code> code can reference them without making them fully public.</p>
+
+    <h3>Non-frozen enums and <code>@unknown default</code></h3>
+
+    <p>Clients compiling against resilient enums must handle future cases: switch statements use <code>@unknown default</code> (or be non-exhaustive in language rules) to tolerate library updates adding cases without recompilation.</p>
+
+    <pre><code><span class="comment">// Library (evolution enabled) — illustrative</span>
+<span class="keyword">public</span> <span class="keyword">struct</span> <span class="type">Point</span> {  <span class="comment">// non-frozen by default in resilient build</span>
+    <span class="keyword">public var</span> x, y: <span class="type">Double</span>
+}
+
+<span class="keyword">@frozen</span> <span class="keyword">public</span> <span class="keyword">enum</span> <span class="type">Axis</span> {
+    <span class="keyword">case</span> horizontal, vertical
+}
+
+<span class="keyword">@inlinable</span>
+<span class="keyword">public</span> <span class="keyword">func</span> <span class="func">clamp</span>(<span class="keyword">_</span> x: <span class="type">Double</span>, <span class="keyword">_</span> lo: <span class="type">Double</span>, <span class="keyword">_</span> hi: <span class="type">Double</span>) -&gt; <span class="type">Double</span> {
+    <span class="func">min</span>(hi, <span class="func">max</span>(lo, x))
+}</code></pre>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Attribute / mode</th>
+                <th>Layout</th>
+                <th>Client compile assumptions</th>
+                <th>Performance</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Non-frozen struct</td>
+                <td>Resilient access pattern</td>
+                <td>No fixed field offsets</td>
+                <td>Extra indirection vs frozen</td>
+            </tr>
+            <tr>
+                <td><code>@frozen</code> struct/enum</td>
+                <td>Fixed</td>
+                <td>Direct access / exhaustive switches</td>
+                <td>Faster access; harder to evolve</td>
+            </tr>
+            <tr>
+                <td><code>@inlinable</code></td>
+                <td>N/A (code)</td>
+                <td>Body visible in interface</td>
+                <td>More specialization; ABI coupling</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Accidental ABI coupling</div>
+        <p>Marking large chunks of your framework <code>@inlinable</code> can pin you to implementation details clients accidentally depend on at compile time. Treat inlinable surface like a second public API—review diffs carefully.</p>
+    </div>
+
+    <h2 id="abi-stability">9. ABI Stability</h2>
+
+    <p>Swift achieved <strong>ABI stability</strong> on Apple platforms in Swift 5.0. Practically: the Swift <strong>runtime and standard library ship with the OS</strong>; apps generally do not bundle a second Swift runtime as part of their binary payload for system ABI-stable slices. Types, calling conventions, metadata formats, and runtime functions agree across processes and dylibs.</p>
+
+    <h3>What is stable</h3>
+
+    <ul>
+        <li><strong>Calling conventions</strong> for Swift functions, including generics and protocol witness conventions at the ABI level.</li>
+        <li><strong>Type layout rules</strong> for ABI-visible types subject to resilience attributes.</li>
+        <li><strong>Runtime entry points</strong> in <code>/usr/lib/swift/</code> (paths vary by OS generation; simulators and toolchains differ).</li>
+    </ul>
+
+    <h3>Back-deployment considerations</h3>
+
+    <p>Using the latest language features while targeting older OS versions interacts with <strong>availability</strong>, <strong>stdlib shipping</strong>, and sometimes <strong>toolchain bundling</strong> for non-ABI-stable targets (historically relevant on non-Apple or embedded contexts). On iOS, interviews often focus: “ABI stable on device; still care about resilient frameworks when distributing binary SDKs.”</p>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Speak precisely</div>
+        <p>Distinguish <strong>source stability</strong>, <strong>ABI stability</strong>, and <strong>module stability</strong>. A Staff answer that collapses them reads as memorization; separating them reads as engineering judgment.</p>
+    </div>
+
+    <h2 id="architect-scale">10. Architect Perspective: Existentials vs Generics at Scale</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must Know — Performance at Scale</div>
+        <p>At scale, existential-heavy models inflate <strong>witness indirection</strong> and block inlining in cross-module graphs—fine for UI glue, painful in per-frame or per-row hot paths. Generics explode <strong>code size</strong> when specialized across many concrete types (templates-like duplication), but yield predictable CPU profiles. Opaque types (<code>some</code>) let you hide concrete implementations across module boundaries without forcing callers to pay existential tax in your public API.</p>
+        <p><strong>Decision heuristics:</strong> Use <code>any</code> for heterogeneous collections and plugin boundaries where the set of concrete types is open-ended. Use generics in internal kernels where specialization matters. Use <code>some</code> in returns to preserve abstraction without erasing type identity at compile time. Measure with Instruments + binary size reports when a module introduces many generic specializations (e.g., parsers, codecs).</p>
+        <p><strong>Binary size narrative:</strong> Specialization duplicates monomorphized bodies; existentials centralize code but add runtime overhead. The optimal design often <strong>layers</strong> type erasure at the edges and keeps generics in the core—mirroring how resilient Apple frameworks expose existential protocols while internally optimizing hot paths.</p>
+    </div>
+
+    <h3>Quick comparison: <code>any</code> vs <code>some</code> vs generics</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Feature</th>
+                <th><code>any P</code></th>
+                <th><code>some P</code></th>
+                <th><code>&lt;T: P&gt;</code></th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Type identity at call site</td>
+                <td>Erased</td>
+                <td>Concrete but hidden</td>
+                <td>Open, per call site</td>
+            </tr>
+            <tr>
+                <td>Storage model</td>
+                <td>Existential container</td>
+                <td>Concrete backing type</td>
+                <td>Concrete per specialization</td>
+            </tr>
+            <tr>
+                <td>Best for</td>
+                <td>Heterogeneous collections</td>
+                <td>ABI-stable abstraction</td>
+                <td>Performance-critical internals</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Edge: existential plugin list</span>
+<span class="keyword">var</span> plugins: [<span class="keyword">any</span> <span class="type">Plugin</span>] = []
+
+<span class="comment">// Core: generic algorithm (specialization-friendly)</span>
+<span class="keyword">func</span> <span class="func">run</span>&lt;<span class="type">P</span>: <span class="type">Plugin</span>&gt;(<span class="keyword">_</span> p: <span class="type">P</span>) { p.<span class="func">execute</span>() }
+
+<span class="comment">// Public API hiding concrete engine type</span>
+<span class="keyword">func</span> <span class="func">makeEngine</span>() -&gt; <span class="keyword">some</span> <span class="type">Engine</span> { <span class="type">FastEngine</span>() }</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Staff Interview Synthesis</div>
+        <p>Close loops: “Metadata + VWT describe <em>how to move values</em>; PWT describes <em>how to call requirements</em>; existentials bundle both; generics pass them as hidden parameters unless specialized; library evolution changes what clients can assume about layout; module interfaces document what crosses compiler versions; ABI stability defines what crosses OS releases.” If you can draw the existential box and narrate one specialization example from SIL to CPU, you have demonstrated Staff depth.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="02-objc-runtime.html">← Objective-C Runtime</a>
+        <a href="04-notification-push.html">Notifications &amp; Push →</a>
+    </div>
+</div>
+</body>
+</html>

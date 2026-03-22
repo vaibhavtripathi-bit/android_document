@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Energy &amp; Thermal Management — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Memory &amp; Performance</a><span class="sep">›</span>
+        Energy &amp; Thermal Management
+    </nav>
+
+    <h1>Energy &amp; Thermal Management</h1>
+    <p class="subtitle">Designing for battery life and thermal throttling — the performance dimensions that users feel but developers often ignore.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#thermal-state">ProcessInfo.ThermalState</a></li>
+            <li><a href="#throttling">CPU/GPU Throttling Behavior</a></li>
+            <li><a href="#background-energy">Background Energy Budget</a></li>
+            <li><a href="#bgtask">BGTaskScheduler Energy Awareness</a></li>
+            <li><a href="#location">Location Accuracy vs Energy</a></li>
+            <li><a href="#network-coalescing">Network Coalescing</a></li>
+            <li><a href="#push-vs-poll">Push vs Poll</a></li>
+            <li><a href="#metrickit-energy">MetricKit Energy Metrics</a></li>
+            <li><a href="#thermal-design">Designing for Thermal Throttling</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="thermal-state">ProcessInfo.ThermalState</h2>
+
+    <p>iOS exposes the device's thermal state through <code>ProcessInfo.processInfo.thermalState</code>. As the device heats up, the system throttles CPU and GPU performance to prevent hardware damage.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>State</th>
+                <th>Meaning</th>
+                <th>CPU Impact</th>
+                <th>Your Response</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>.nominal</code></td>
+                <td>Normal operating temperature</td>
+                <td>Full performance</td>
+                <td>No action needed</td>
+            </tr>
+            <tr>
+                <td><code>.fair</code></td>
+                <td>Slightly elevated temperature</td>
+                <td>Minor throttling possible</td>
+                <td>Reduce non-essential work</td>
+            </tr>
+            <tr>
+                <td><code>.serious</code></td>
+                <td>Significant thermal pressure</td>
+                <td>Noticeable throttling (50-70%)</td>
+                <td>Reduce quality, defer work</td>
+            </tr>
+            <tr>
+                <td><code>.critical</code></td>
+                <td>Near thermal shutdown</td>
+                <td>Severe throttling (30-50%)</td>
+                <td>Minimum viable operation</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="keyword">import</span> <span class="type">Foundation</span>
+
+<span class="keyword">class</span> <span class="type">ThermalStateManager</span> {
+    <span class="keyword">private var</span> observer: <span class="type">NSObjectProtocol</span>?
+
+    <span class="keyword">init</span>() {
+        observer = <span class="type">NotificationCenter</span>.default.<span class="func">addObserver</span>(
+            forName: <span class="type">ProcessInfo</span>.thermalStateDidChangeNotification,
+            object: <span class="keyword">nil</span>,
+            queue: .main
+        ) { [<span class="keyword">weak self</span>] _ <span class="keyword">in</span>
+            self?.<span class="func">handleThermalStateChange</span>()
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">handleThermalStateChange</span>() {
+        <span class="keyword">let</span> state = <span class="type">ProcessInfo</span>.processInfo.thermalState
+
+        <span class="keyword">switch</span> state {
+        <span class="keyword">case</span> .nominal:
+            <span class="func">restoreFullQuality</span>()
+        <span class="keyword">case</span> .fair:
+            <span class="func">reduceBackgroundWork</span>()
+        <span class="keyword">case</span> .serious:
+            <span class="func">reduceRenderQuality</span>()
+            <span class="func">pauseNonEssentialDownloads</span>()
+            <span class="func">reduceFrameRate</span>(to: <span class="number">30</span>)
+        <span class="keyword">case</span> .critical:
+            <span class="func">minimumViableMode</span>()
+            <span class="func">reduceFrameRate</span>(to: <span class="number">20</span>)
+            <span class="func">stopAllBackgroundWork</span>()
+        <span class="keyword">@unknown default</span>:
+            <span class="keyword">break</span>
+        }
+    }
+
+    <span class="keyword">deinit</span> {
+        <span class="keyword">if let</span> observer = observer {
+            <span class="type">NotificationCenter</span>.default.<span class="func">removeObserver</span>(observer)
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Thermal Throttling Mechanics</div>
+        <p>When the SoC temperature rises, iOS reduces clock frequencies in stages. The A-series chips have performance (P) and efficiency (E) cores. Throttling first migrates work from P-cores to E-cores, then reduces P-core frequency, then reduces E-core frequency. GPU throttling follows a similar pattern. At <code>.critical</code>, the device may also dim the display and disable the camera flash. The key insight: <strong>your app's performance characteristics change dynamically</strong> — code that runs in 16ms at <code>.nominal</code> might take 40ms at <code>.serious</code>, causing frame drops.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="throttling">CPU/GPU Throttling Behavior</h2>
+
+    <div class="diagram">
+Thermal Throttling Progression:
+┌──────────────────────────────────────────────────────────┐
+│ Temperature →                                            │
+│                                                          │
+│ .nominal    .fair       .serious      .critical          │
+│ ─────────────────────────────────────────────────────    │
+│                                                          │
+│ CPU:                                                     │
+│ ████████████████████████                                 │
+│ ████████████████████  ← P-core freq reduced              │
+│ ██████████████████    ← Work migrated to E-cores         │
+│ ████████████          ← E-core freq reduced              │
+│                                                          │
+│ GPU:                                                     │
+│ ████████████████████████                                 │
+│ ████████████████████                                     │
+│ ██████████████                                           │
+│ ████████                                                 │
+│                                                          │
+│ Display:                                                 │
+│ ████████████████████████                                 │
+│ ████████████████████████                                 │
+│ ████████████████████  ← Brightness reduced               │
+│ ██████████████        ← ProMotion drops to 60Hz          │
+└──────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>Adaptive Quality Pattern</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">AdaptiveRenderer</span> {
+    <span class="keyword">enum</span> <span class="type">QualityLevel</span> {
+        <span class="keyword">case</span> high, medium, low, minimal
+    }
+
+    <span class="keyword">var</span> currentQuality: <span class="type">QualityLevel</span> {
+        <span class="keyword">switch</span> <span class="type">ProcessInfo</span>.processInfo.thermalState {
+        <span class="keyword">case</span> .nominal:  <span class="keyword">return</span> .high
+        <span class="keyword">case</span> .fair:     <span class="keyword">return</span> .medium
+        <span class="keyword">case</span> .serious:  <span class="keyword">return</span> .low
+        <span class="keyword">case</span> .critical: <span class="keyword">return</span> .minimal
+        <span class="keyword">@unknown default</span>: <span class="keyword">return</span> .medium
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">renderFrame</span>() {
+        <span class="keyword">switch</span> currentQuality {
+        <span class="keyword">case</span> .high:
+            <span class="func">renderAtFullResolution</span>()
+            <span class="func">applyPostProcessing</span>()
+            <span class="func">renderShadows</span>(quality: .high)
+        <span class="keyword">case</span> .medium:
+            <span class="func">renderAtFullResolution</span>()
+            <span class="func">renderShadows</span>(quality: .medium)
+        <span class="keyword">case</span> .low:
+            <span class="func">renderAtHalfResolution</span>()
+            <span class="func">disableShadows</span>()
+        <span class="keyword">case</span> .minimal:
+            <span class="func">renderAtQuarterResolution</span>()
+            <span class="func">disableAllEffects</span>()
+        }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="background-energy">Background Energy Budget</h2>
+
+    <p>iOS strictly limits background energy usage. Apps that consume too much energy in the background are throttled or terminated.</p>
+
+    <div class="diagram">
+Background Energy Budget:
+┌──────────────────────────────────────────────────────────┐
+│                                                          │
+│  Foreground:  Unlimited energy (user is actively using)  │
+│                                                          │
+│  Background:                                             │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │ beginBackgroundTask:  ~30 seconds of CPU time      │  │
+│  │ BGAppRefreshTask:     ~30 seconds, system-scheduled│  │
+│  │ BGProcessingTask:     ~minutes, overnight charging │  │
+│  │ Silent push:          ~30 seconds                  │  │
+│  │ Background audio:     Continuous (but monitored)   │  │
+│  │ Background location:  Continuous (but monitored)   │  │
+│  │ VoIP push:            ~30 seconds per push         │  │
+│  └────────────────────────────────────────────────────┘  │
+│                                                          │
+│  Penalty for excessive background energy:                │
+│  1. System delays your background launches               │
+│  2. System reduces your background refresh frequency     │
+│  3. Ultimately: app is terminated                        │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+    </div>
+
+    <pre><code><span class="comment">// Efficient background work pattern</span>
+<span class="keyword">func</span> <span class="func">applicationDidEnterBackground</span>(_ application: <span class="type">UIApplication</span>) {
+    <span class="keyword">var</span> taskID: <span class="type">UIBackgroundTaskIdentifier</span> = .invalid
+
+    taskID = application.<span class="func">beginBackgroundTask</span>(withName: <span class="string">"SaveState"</span>) {
+        <span class="comment">// Expiration handler: clean up and end task</span>
+        application.<span class="func">endBackgroundTask</span>(taskID)
+        taskID = .invalid
+    }
+
+    <span class="type">DispatchQueue</span>.global(qos: .utility).<span class="func">async</span> {
+        <span class="comment">// Do minimal work — save state, flush caches</span>
+        <span class="keyword">self</span>.<span class="func">saveApplicationState</span>()
+        <span class="keyword">self</span>.<span class="func">flushPendingAnalytics</span>()
+
+        <span class="type">DispatchQueue</span>.main.<span class="func">async</span> {
+            application.<span class="func">endBackgroundTask</span>(taskID)
+            taskID = .invalid
+        }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="bgtask">BGTaskScheduler Energy Awareness</h2>
+
+    <pre><code><span class="keyword">import</span> <span class="type">BackgroundTasks</span>
+
+<span class="keyword">class</span> <span class="type">BackgroundTaskManager</span> {
+
+    <span class="keyword">func</span> <span class="func">registerTasks</span>() {
+        <span class="type">BGTaskScheduler</span>.shared.<span class="func">register</span>(
+            forTaskWithIdentifier: <span class="string">"com.app.refresh"</span>,
+            using: <span class="keyword">nil</span>
+        ) { task <span class="keyword">in</span>
+            <span class="keyword">self</span>.<span class="func">handleAppRefresh</span>(task: task <span class="keyword">as!</span> <span class="type">BGAppRefreshTask</span>)
+        }
+
+        <span class="type">BGTaskScheduler</span>.shared.<span class="func">register</span>(
+            forTaskWithIdentifier: <span class="string">"com.app.processing"</span>,
+            using: <span class="keyword">nil</span>
+        ) { task <span class="keyword">in</span>
+            <span class="keyword">self</span>.<span class="func">handleProcessing</span>(task: task <span class="keyword">as!</span> <span class="type">BGProcessingTask</span>)
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">scheduleRefresh</span>() {
+        <span class="keyword">let</span> request = <span class="type">BGAppRefreshTaskRequest</span>(identifier: <span class="string">"com.app.refresh"</span>)
+        request.earliestBeginDate = <span class="type">Date</span>(timeIntervalSinceNow: <span class="number">15</span> * <span class="number">60</span>)
+        <span class="keyword">try</span>? <span class="type">BGTaskScheduler</span>.shared.<span class="func">submit</span>(request)
+    }
+
+    <span class="keyword">func</span> <span class="func">scheduleProcessing</span>() {
+        <span class="keyword">let</span> request = <span class="type">BGProcessingTaskRequest</span>(identifier: <span class="string">"com.app.processing"</span>)
+        request.requiresNetworkConnectivity = <span class="keyword">true</span>
+        request.requiresExternalPower = <span class="keyword">true</span>  <span class="comment">// Only when charging</span>
+        <span class="keyword">try</span>? <span class="type">BGTaskScheduler</span>.shared.<span class="func">submit</span>(request)
+    }
+
+    <span class="keyword">private func</span> <span class="func">handleAppRefresh</span>(task: <span class="type">BGAppRefreshTask</span>) {
+        <span class="func">scheduleRefresh</span>()  <span class="comment">// Schedule next refresh</span>
+
+        <span class="keyword">let</span> operation = <span class="type">RefreshOperation</span>()
+
+        task.expirationHandler = {
+            operation.<span class="func">cancel</span>()
+        }
+
+        operation.completionBlock = {
+            task.<span class="func">setTaskCompleted</span>(success: !operation.isCancelled)
+        }
+
+        <span class="type">OperationQueue</span>().<span class="func">addOperation</span>(operation)
+    }
+
+    <span class="keyword">private func</span> <span class="func">handleProcessing</span>(task: <span class="type">BGProcessingTask</span>) {
+        <span class="keyword">let</span> operation = <span class="type">HeavyProcessingOperation</span>()
+
+        task.expirationHandler = {
+            operation.<span class="func">cancel</span>()
+        }
+
+        operation.completionBlock = {
+            task.<span class="func">setTaskCompleted</span>(success: !operation.isCancelled)
+        }
+
+        <span class="type">OperationQueue</span>().<span class="func">addOperation</span>(operation)
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: BGProcessingTask for Heavy Work</div>
+        <p>Use <code>BGProcessingTask</code> with <code>requiresExternalPower = true</code> for heavy operations like ML model training, database maintenance, or large sync operations. The system will only run these when the device is charging (usually overnight), giving you minutes of CPU time instead of seconds. This is the energy-optimal way to do heavy background work.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="location">Location Accuracy vs Energy</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Accuracy</th>
+                <th>Energy Cost</th>
+                <th>Hardware Used</th>
+                <th>Use Case</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>kCLLocationAccuracyBest</code></td>
+                <td>Very High</td>
+                <td>GPS + WiFi + Cell + Barometer</td>
+                <td>Turn-by-turn navigation</td>
+            </tr>
+            <tr>
+                <td><code>kCLLocationAccuracyNearestTenMeters</code></td>
+                <td>High</td>
+                <td>GPS + WiFi</td>
+                <td>Fitness tracking</td>
+            </tr>
+            <tr>
+                <td><code>kCLLocationAccuracyHundredMeters</code></td>
+                <td>Medium</td>
+                <td>WiFi + Cell</td>
+                <td>City-level features</td>
+            </tr>
+            <tr>
+                <td><code>kCLLocationAccuracyKilometer</code></td>
+                <td>Low</td>
+                <td>Cell tower</td>
+                <td>Weather, regional content</td>
+            </tr>
+            <tr>
+                <td><code>kCLLocationAccuracyReduced</code></td>
+                <td>Minimal</td>
+                <td>Approximate (iOS 14+)</td>
+                <td>Privacy-respecting features</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="keyword">import</span> <span class="type">CoreLocation</span>
+
+<span class="keyword">class</span> <span class="type">EnergyAwareLocationManager</span>: <span class="type">NSObject</span>, <span class="type">CLLocationManagerDelegate</span> {
+    <span class="keyword">private let</span> manager = <span class="type">CLLocationManager</span>()
+
+    <span class="keyword">func</span> <span class="func">startEfficientTracking</span>() {
+        manager.delegate = <span class="keyword">self</span>
+
+        <span class="comment">// Use significant location changes for background</span>
+        <span class="comment">// Only fires when user moves ~500m — very low energy</span>
+        manager.<span class="func">startMonitoringSignificantLocationChanges</span>()
+    }
+
+    <span class="keyword">func</span> <span class="func">startPreciseTracking</span>() {
+        manager.desiredAccuracy = <span class="type">kCLLocationAccuracyBest</span>
+        manager.distanceFilter = <span class="number">10</span>  <span class="comment">// Only update every 10m</span>
+        manager.activityType = .fitness
+        manager.allowsBackgroundLocationUpdates = <span class="keyword">true</span>
+        manager.pausesLocationUpdatesAutomatically = <span class="keyword">true</span>
+        manager.<span class="func">startUpdatingLocation</span>()
+    }
+
+    <span class="keyword">func</span> <span class="func">locationManager</span>(_ manager: <span class="type">CLLocationManager</span>,
+        <span class="func">didUpdateLocations</span> locations: [<span class="type">CLLocation</span>]) {
+        <span class="keyword">guard let</span> location = locations.last <span class="keyword">else</span> { <span class="keyword">return</span> }
+
+        <span class="comment">// Defer processing to reduce CPU wake-ups</span>
+        <span class="func">batchLocationUpdate</span>(location)
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="network-coalescing">Network Coalescing</h2>
+
+    <p>Every network request wakes the cellular/WiFi radio. The radio stays powered for ~10-30 seconds after each request (the "tail energy" problem). Coalescing requests reduces the number of radio wake-ups.</p>
+
+    <div class="diagram">
+Network Energy: Individual vs Coalesced Requests
+
+Individual (bad):
+Radio: ████░░░░████░░░░████░░░░████░░░░████░░░░
+       req1 tail req2 tail req3 tail req4 tail req5 tail
+       Total radio-on time: ~150 seconds
+
+Coalesced (good):
+Radio: ░░░░░░░░░░░░░░░░░░░░████████████░░░░░░░░
+                              all 5 reqs    tail
+       Total radio-on time: ~40 seconds
+
+Energy savings: ~73% reduction in radio energy
+    </div>
+
+    <pre><code><span class="keyword">class</span> <span class="type">NetworkCoalescer</span> {
+    <span class="keyword">private var</span> pendingRequests: [<span class="type">URLRequest</span>] = []
+    <span class="keyword">private var</span> flushTimer: <span class="type">Timer</span>?
+    <span class="keyword">private let</span> maxBatchSize = <span class="number">10</span>
+    <span class="keyword">private let</span> maxDelay: <span class="type">TimeInterval</span> = <span class="number">5.0</span>
+
+    <span class="keyword">func</span> <span class="func">enqueue</span>(_ request: <span class="type">URLRequest</span>) {
+        pendingRequests.<span class="func">append</span>(request)
+
+        <span class="keyword">if</span> pendingRequests.count >= maxBatchSize {
+            <span class="func">flush</span>()
+        } <span class="keyword">else if</span> flushTimer == <span class="keyword">nil</span> {
+            flushTimer = <span class="type">Timer</span>.<span class="func">scheduledTimer</span>(
+                withTimeInterval: maxDelay, repeats: <span class="keyword">false</span>
+            ) { [<span class="keyword">weak self</span>] _ <span class="keyword">in</span>
+                self?.<span class="func">flush</span>()
+            }
+        }
+    }
+
+    <span class="keyword">private func</span> <span class="func">flush</span>() {
+        flushTimer?.<span class="func">invalidate</span>()
+        flushTimer = <span class="keyword">nil</span>
+
+        <span class="keyword">let</span> batch = pendingRequests
+        pendingRequests.<span class="func">removeAll</span>()
+
+        <span class="comment">// Send all requests in rapid succession</span>
+        <span class="comment">// HTTP/2 multiplexing sends them on one connection</span>
+        <span class="keyword">for</span> request <span class="keyword">in</span> batch {
+            <span class="type">URLSession</span>.shared.<span class="func">dataTask</span>(with: request) { _, _, _ <span class="keyword">in</span> }.<span class="func">resume</span>()
+        }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="push-vs-poll">Push vs Poll</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Approach</th>
+                <th>Energy Cost</th>
+                <th>Latency</th>
+                <th>Use When</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Push (APNs)</strong></td>
+                <td>Very low (system manages connection)</td>
+                <td>Seconds</td>
+                <td>Real-time updates, messages, alerts</td>
+            </tr>
+            <tr>
+                <td><strong>Background Fetch</strong></td>
+                <td>Low (system-scheduled)</td>
+                <td>Minutes to hours</td>
+                <td>Content prefetching, feed updates</td>
+            </tr>
+            <tr>
+                <td><strong>Polling (timer-based)</strong></td>
+                <td>High (radio wake per poll)</td>
+                <td>Depends on interval</td>
+                <td>Avoid — use push or background fetch</td>
+            </tr>
+            <tr>
+                <td><strong>WebSocket</strong></td>
+                <td>Medium-high (keeps connection alive)</td>
+                <td>Milliseconds</td>
+                <td>Chat, live data, gaming</td>
+            </tr>
+            <tr>
+                <td><strong>Server-Sent Events</strong></td>
+                <td>Medium (one-way connection)</td>
+                <td>Milliseconds</td>
+                <td>Live feeds, dashboards</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Polling in Background</div>
+        <p>Never use timer-based polling in the background. iOS will throttle your timers, and each poll wakes the radio for 10-30 seconds. A 30-second poll interval means the radio is essentially always on. Use APNs silent push to trigger background fetches — the push infrastructure shares a single persistent connection across all apps, making it far more energy-efficient than per-app connections.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="metrickit-energy">MetricKit Energy Metrics</h2>
+
+    <pre><code><span class="keyword">import</span> <span class="type">MetricKit</span>
+
+<span class="keyword">class</span> <span class="type">EnergyMetricsCollector</span>: <span class="type">NSObject</span>, <span class="type">MXMetricManagerSubscriber</span> {
+
+    <span class="keyword">func</span> <span class="func">didReceive</span>(_ payloads: [<span class="type">MXMetricPayload</span>]) {
+        <span class="keyword">for</span> payload <span class="keyword">in</span> payloads {
+            <span class="comment">// CPU metrics (energy proxy)</span>
+            <span class="keyword">if let</span> cpu = payload.cpuMetrics {
+                <span class="keyword">let</span> cpuTime = cpu.cumulativeCPUTime
+                <span class="func">report</span>(<span class="string">"cpu_time_seconds"</span>, value: cpuTime)
+            }
+
+            <span class="comment">// GPU metrics</span>
+            <span class="keyword">if let</span> gpu = payload.gpuMetrics {
+                <span class="keyword">let</span> gpuTime = gpu.cumulativeGPUTime
+                <span class="func">report</span>(<span class="string">"gpu_time_seconds"</span>, value: gpuTime)
+            }
+
+            <span class="comment">// Location metrics</span>
+            <span class="keyword">if let</span> location = payload.locationActivityMetrics {
+                <span class="func">report</span>(<span class="string">"location_best_accuracy_time"</span>,
+                    value: location.cumulativeBestAccuracyTime)
+                <span class="func">report</span>(<span class="string">"location_10m_accuracy_time"</span>,
+                    value: location.cumulativeBestAccuracyForNavigationTime)
+            }
+
+            <span class="comment">// Network metrics</span>
+            <span class="keyword">if let</span> network = payload.networkTransferMetrics {
+                <span class="func">report</span>(<span class="string">"cellular_upload"</span>,
+                    value: network.cumulativeCellularUpload)
+                <span class="func">report</span>(<span class="string">"cellular_download"</span>,
+                    value: network.cumulativeCellularDownload)
+                <span class="func">report</span>(<span class="string">"wifi_upload"</span>,
+                    value: network.cumulativeWifiUpload)
+                <span class="func">report</span>(<span class="string">"wifi_download"</span>,
+                    value: network.cumulativeWifiDownload)
+            }
+
+            <span class="comment">// Display metrics</span>
+            <span class="keyword">if let</span> display = payload.displayMetrics {
+                <span class="keyword">if let</span> apl = display.averagePixelLuminance {
+                    <span class="func">report</span>(<span class="string">"avg_pixel_luminance"</span>, value: apl)
+                }
+            }
+        }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="thermal-design">Designing for Thermal Throttling</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: Designing for Sustained Workloads</div>
+        <p>For apps with sustained heavy workloads (video processing, AR, gaming, ML inference), thermal throttling is not an edge case — it's the steady state. Here's how to design for it:</p>
+    </div>
+
+    <h3>Sustained Performance Architecture</h3>
+
+    <div class="diagram">
+Adaptive Performance System:
+┌──────────────────────────────────────────────────────────┐
+│                                                          │
+│  ┌──────────────┐    ┌──────────────┐                   │
+│  │ Thermal State│    │ Frame Time   │                   │
+│  │ Monitor      │    │ Monitor      │                   │
+│  └──────┬───────┘    └──────┬───────┘                   │
+│         │                   │                            │
+│         ▼                   ▼                            │
+│  ┌──────────────────────────────────┐                   │
+│  │     Performance Controller       │                   │
+│  │                                  │                   │
+│  │  Target: Consistent frame time   │                   │
+│  │  Input: thermal state + FPS      │                   │
+│  │  Output: quality level           │                   │
+│  └──────────────┬───────────────────┘                   │
+│                 │                                        │
+│         ┌───────┼───────┐                                │
+│         ▼       ▼       ▼                                │
+│  ┌──────────┐ ┌─────┐ ┌──────────┐                     │
+│  │ Render   │ │ AI  │ │ Physics  │                      │
+│  │ Quality  │ │ LOD │ │ Fidelity │                      │
+│  └──────────┘ └─────┘ └──────────┘                     │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+    </div>
+
+    <pre><code><span class="keyword">class</span> <span class="type">PerformanceController</span> {
+    <span class="keyword">private var</span> frameTimeHistory: [<span class="type">CFTimeInterval</span>] = []
+    <span class="keyword">private let</span> targetFrameTime: <span class="type">CFTimeInterval</span> = <span class="number">1.0</span> / <span class="number">60.0</span>
+    <span class="keyword">private var</span> displayLink: <span class="type">CADisplayLink</span>?
+
+    <span class="keyword">var</span> qualityLevel: <span class="type">Float</span> = <span class="number">1.0</span>  <span class="comment">// 0.0 (minimum) to 1.0 (maximum)</span>
+
+    <span class="keyword">func</span> <span class="func">startMonitoring</span>() {
+        displayLink = <span class="type">CADisplayLink</span>(target: <span class="keyword">self</span>, selector: <span class="keyword">#selector</span>(<span class="func">tick</span>))
+        displayLink?.<span class="func">add</span>(to: .main, forMode: .common)
+    }
+
+    <span class="keyword">@objc private func</span> <span class="func">tick</span>(_ link: <span class="type">CADisplayLink</span>) {
+        <span class="keyword">let</span> frameTime = link.targetTimestamp - link.timestamp
+        frameTimeHistory.<span class="func">append</span>(frameTime)
+
+        <span class="keyword">if</span> frameTimeHistory.count > <span class="number">60</span> {
+            frameTimeHistory.<span class="func">removeFirst</span>()
+        }
+
+        <span class="func">adjustQuality</span>()
+    }
+
+    <span class="keyword">private func</span> <span class="func">adjustQuality</span>() {
+        <span class="keyword">let</span> avgFrameTime = frameTimeHistory.<span class="func">reduce</span>(<span class="number">0</span>, +) / <span class="type">Double</span>(frameTimeHistory.count)
+        <span class="keyword">let</span> thermalState = <span class="type">ProcessInfo</span>.processInfo.thermalState
+
+        <span class="keyword">let</span> thermalFactor: <span class="type">Float</span>
+        <span class="keyword">switch</span> thermalState {
+        <span class="keyword">case</span> .nominal:  thermalFactor = <span class="number">1.0</span>
+        <span class="keyword">case</span> .fair:     thermalFactor = <span class="number">0.8</span>
+        <span class="keyword">case</span> .serious:  thermalFactor = <span class="number">0.5</span>
+        <span class="keyword">case</span> .critical: thermalFactor = <span class="number">0.3</span>
+        <span class="keyword">@unknown default</span>: thermalFactor = <span class="number">0.5</span>
+        }
+
+        <span class="keyword">let</span> frameFactor = <span class="type">Float</span>(targetFrameTime / avgFrameTime)
+
+        <span class="comment">// Blend thermal and frame-time signals</span>
+        <span class="keyword">let</span> targetQuality = <span class="func">min</span>(thermalFactor, frameFactor)
+        qualityLevel = qualityLevel * <span class="number">0.9</span> + targetQuality * <span class="number">0.1</span>  <span class="comment">// Smooth</span>
+    }
+}</code></pre>
+
+    <h3>Energy Optimization Checklist</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Area</th>
+                <th>Optimization</th>
+                <th>Impact</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>CPU</td>
+                <td>Use appropriate QoS classes for work</td>
+                <td>System can schedule on E-cores</td>
+            </tr>
+            <tr>
+                <td>CPU</td>
+                <td>Batch work instead of frequent small tasks</td>
+                <td>Reduces CPU wake-ups</td>
+            </tr>
+            <tr>
+                <td>Network</td>
+                <td>Coalesce requests, use HTTP/2</td>
+                <td>Reduces radio wake-ups</td>
+            </tr>
+            <tr>
+                <td>Network</td>
+                <td>Use push instead of polling</td>
+                <td>Eliminates periodic radio use</td>
+            </tr>
+            <tr>
+                <td>Location</td>
+                <td>Use lowest accuracy needed</td>
+                <td>GPS is the biggest energy drain</td>
+            </tr>
+            <tr>
+                <td>Location</td>
+                <td>Use significant location changes in background</td>
+                <td>~10x less energy than continuous</td>
+            </tr>
+            <tr>
+                <td>Display</td>
+                <td>Use dark mode, reduce animations</td>
+                <td>OLED displays: dark pixels = less energy</td>
+            </tr>
+            <tr>
+                <td>GPU</td>
+                <td>Reduce overdraw, use opaque views</td>
+                <td>Less GPU work = less heat</td>
+            </tr>
+            <tr>
+                <td>Background</td>
+                <td>Use BGProcessingTask with requiresExternalPower</td>
+                <td>Heavy work only when charging</td>
+            </tr>
+            <tr>
+                <td>Timers</td>
+                <td>Use tolerance on timers</td>
+                <td>System coalesces timer fires</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Timer tolerance allows the system to coalesce timer fires</span>
+<span class="keyword">let</span> timer = <span class="type">Timer</span>.<span class="func">scheduledTimer</span>(withTimeInterval: <span class="number">60</span>, repeats: <span class="keyword">true</span>) { _ <span class="keyword">in</span>
+    <span class="func">refreshData</span>()
+}
+timer.tolerance = <span class="number">10</span>  <span class="comment">// System can fire anywhere in 60-70s window</span>
+<span class="comment">// This lets the system batch your timer with other timers,</span>
+<span class="comment">// reducing CPU wake-ups significantly</span></code></pre>
+
+    <div class="nav-footer">
+        <a href="06-instruments-profiling.html">← Previous: Instruments</a>
+        <a href="08-interview-qa.html">Next: Interview Q&amp;A →</a>
+    </div>
+</div>
+</body>
+</html>

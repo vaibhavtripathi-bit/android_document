@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Runtime Security &amp; Hardware Protections — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Security &amp; Privacy</a><span class="sep">›</span>
+        Runtime Security
+    </nav>
+
+    <h1>Runtime Security &amp; Hardware Protections</h1>
+    <p class="subtitle">ASLR, stack canaries, Pointer Authentication Codes, __DATA_CONST hardening, W^X enforcement, memory tagging, Swift vs ObjC runtime attack surfaces, and the Hardened Runtime — the full hardware-to-software defense stack that protects every iOS process at runtime.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#aslr">1. ASLR (Address Space Layout Randomization)</a></li>
+            <li><a href="#stack-canaries">2. Stack Canaries</a></li>
+            <li><a href="#pac">3. Pointer Authentication Codes (PAC) — A12+</a></li>
+            <li><a href="#data-const">4. __DATA_CONST Segment Hardening</a></li>
+            <li><a href="#mte">5. Memory Tagging Extension (MTE)</a></li>
+            <li><a href="#swift-vs-objc">6. Swift vs ObjC Runtime Security</a></li>
+            <li><a href="#hardened-runtime">7. Hardened Runtime</a></li>
+            <li><a href="#wxe">8. W^X (Write XOR Execute)</a></li>
+            <li><a href="#architect">9. Architect: Defense-in-Depth Security Architecture</a></li>
+        </ul>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 1: ASLR                                                     -->
+    <!-- ================================================================== -->
+
+    <h2 id="aslr">1. ASLR (Address Space Layout Randomization)</h2>
+
+    <p>ASLR is the foundational memory-layout defense on iOS. It randomizes the virtual addresses at which the executable, shared libraries, stack, heap, and mmap regions are loaded each time a process starts. An attacker who discovers a gadget address in one run cannot reuse it in the next — the entire address space has shifted.</p>
+
+    <h3>1.1 What ASLR Randomizes</h3>
+
+    <ul>
+        <li><strong>Main executable base</strong> — the __TEXT segment of your Mach-O binary is loaded at a random base address (requires PIE)</li>
+        <li><strong>dyld_shared_cache</strong> — the giant pre-linked blob of all system frameworks (~1.5 GB) is mapped at a random address chosen at boot time (not per-process — shared across all processes for memory efficiency)</li>
+        <li><strong>Stack</strong> — the initial stack pointer is randomized with a random gap at the top of the stack region</li>
+        <li><strong>Heap</strong> — malloc zones and mmap regions are placed at randomized base addresses</li>
+        <li><strong>dyld itself</strong> — the dynamic linker's load address is randomized</li>
+    </ul>
+
+    <h3>1.2 Entropy Levels on iOS</h3>
+
+    <table>
+        <thead>
+            <tr><th>Region</th><th>Entropy (bits)</th><th>Possible Positions</th><th>Notes</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Main executable (PIE)</td><td>~16 bits</td><td>~65,536</td><td>Slide granularity is 4 KB page-aligned</td></tr>
+            <tr><td>dyld_shared_cache</td><td>~16 bits</td><td>~65,536</td><td>Randomized once at boot, shared across processes</td></tr>
+            <tr><td>Stack</td><td>~8 bits</td><td>~256</td><td>Random gap within the stack region</td></tr>
+            <tr><td>Heap (mmap)</td><td>~16 bits</td><td>~65,536</td><td>Per-allocation randomization in modern allocators</td></tr>
+            <tr><td>dyld load address</td><td>~16 bits</td><td>~65,536</td><td>Separate from main executable slide</td></tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — dyld_shared_cache Randomization</div>
+        <p>The shared cache is randomized <em>once per boot</em>, not per process launch. This is a deliberate trade-off: per-process randomization would prevent page sharing across processes, wasting hundreds of megabytes of RAM. The boot-time randomization still defeats remote attacks (attacker can't predict the layout of a target device) but means a local attacker who leaks one process's shared cache address knows it for all processes until reboot.</p>
+    </div>
+
+    <h3>1.3 PIE (Position Independent Executable)</h3>
+
+    <p>ASLR for the main executable requires the binary to be compiled as a <strong>Position Independent Executable (PIE)</strong>. Since iOS 4.3, Apple has required all App Store binaries to be PIE. The compiler generates position-independent code using PC-relative addressing — no absolute addresses are baked into the __TEXT segment.</p>
+
+    <pre><code><span class="comment">// Check if a Mach-O is PIE (in terminal):</span>
+<span class="comment">// The MH_PIE flag (0x200000) must be set in the header</span>
+$ otool -hv MyApp
+Mach header
+      magic  cputype cpusubtype  caps    filetype ncmds sizeofcmds      flags
+MH_MAGIC_64   ARM64        ALL  0x00     EXECUTE    42       5280   NOUNDEFS DYLDLINK TWOLEVEL PIE</code></pre>
+
+    <h3>1.4 How ASLR Defeats ROP/JOP Attacks</h3>
+
+    <p><strong>Return-Oriented Programming (ROP)</strong> chains together small instruction sequences ("gadgets") ending in <code>ret</code> instructions, found at known addresses in libraries. ASLR breaks this by making gadget addresses unpredictable. The attacker must first leak a pointer to de-randomize the layout — turning a single vulnerability into a two-stage exploit.</p>
+
+    <div class="diagram">
+WITHOUT ASLR — Fixed Layout (Predictable)
+┌──────────────────────────────────────────────────┐
+│ 0x100000000  │ __TEXT (executable code)           │
+├──────────────┼───────────────────────────────────┤
+│ 0x100080000  │ __DATA (globals, GOT)              │
+├──────────────┼───────────────────────────────────┤
+│ 0x180000000  │ dyld_shared_cache (UIKit, etc.)    │
+├──────────────┼───────────────────────────────────┤
+│ 0x16FDFC000  │ Stack ↓                            │
+├──────────────┼───────────────────────────────────┤
+│ 0x600000000  │ Heap ↑                             │
+└──────────────┴───────────────────────────────────┘
+  Attacker knows: gadget at 0x180042A3C → always valid
+
+WITH ASLR — Randomized Layout (Unpredictable)
+┌──────────────────────────────────────────────────┐
+│ 0x102A40000  │ __TEXT  (+0x2A40000 slide)         │
+├──────────────┼───────────────────────────────────┤
+│ 0x102AC0000  │ __DATA (+0x2A40000 slide)          │
+├──────────────┼───────────────────────────────────┤
+│ 0x1837B0000  │ dyld_shared_cache (+0x37B0000)     │
+├──────────────┼───────────────────────────────────┤
+│ 0x16F8A4000  │ Stack (random gap)                 │
+├──────────────┼───────────────────────────────────┤
+│ 0x60013C000  │ Heap (random base)                 │
+└──────────────┴───────────────────────────────────┘
+  Attacker's gadget at 0x180042A3C → INVALID (SIGBUS/SIGSEGV)
+    </div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — ASLR Is Not Enough Alone</div>
+        <p>ASLR is probabilistic, not deterministic. On 32-bit devices (now obsolete), entropy was as low as 8 bits — brute-forceable in seconds. Even on 64-bit, a single pointer leak (e.g., via a format string bug or an info-leak vulnerability) de-randomizes the entire region. ASLR must be combined with PAC, stack canaries, and W^X for meaningful protection.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 2: STACK CANARIES                                           -->
+    <!-- ================================================================== -->
+
+    <h2 id="stack-canaries">2. Stack Canaries</h2>
+
+    <p>A stack canary (also called a stack cookie or stack guard) is a random value placed on the stack between local variables and the saved return address. Before a function returns, the compiler-inserted code checks whether the canary has been modified. If it has, a buffer overflow has occurred, and the process is immediately terminated — preventing the attacker from hijacking control flow via a corrupted return address.</p>
+
+    <h3>2.1 How Stack Canaries Work</h3>
+
+    <div class="diagram">
+Stack Frame Layout (ARM64, with canary)
+
+High Address
+┌─────────────────────────────────┐
+│  Caller's Frame                 │
+├─────────────────────────────────┤
+│  Return Address (LR saved)      │  ← attacker wants to overwrite this
+├─────────────────────────────────┤
+│  Saved Frame Pointer (FP/x29)   │
+├─────────────────────────────────┤
+│  ▓▓▓ STACK CANARY ▓▓▓           │  ← random value, checked before ret
+├─────────────────────────────────┤
+│  Local Variable N               │
+│  ...                            │
+│  Local Variable 2               │
+│  Local Variable 1               │  ← buffer overflow starts here
+├─────────────────────────────────┤
+│  [buffer being overflowed]      │  ← write goes UP toward canary
+└─────────────────────────────────┘
+Low Address
+
+Overflow path: buffer → locals → CANARY (corrupted!) → FP → LR
+                                    ↑
+                              Detection point: __stack_chk_fail()
+    </div>
+
+    <h3>2.2 Canary Lifecycle</h3>
+
+    <ol>
+        <li><strong>Process start</strong>: The dynamic linker generates a random canary value and stores it in a thread-local variable (<code>__stack_chk_guard</code>)</li>
+        <li><strong>Function prologue</strong>: The compiler inserts code to load the canary and push it onto the stack after the saved registers</li>
+        <li><strong>Function epilogue</strong>: Before the function returns, the compiler inserts code to compare the stack canary with the stored reference value</li>
+        <li><strong>Mismatch</strong>: If the values differ, <code>__stack_chk_fail()</code> is called, which calls <code>abort()</code> — the process is killed immediately</li>
+    </ol>
+
+    <pre><code><span class="comment">// Pseudo-assembly of canary check (ARM64)</span>
+<span class="comment">// Function prologue:</span>
+adrp    x8, ___stack_chk_guard@PAGE
+ldr     x8, [x8, ___stack_chk_guard@PAGEOFF]
+stur    x8, [x29, <span class="number">#-8</span>]          <span class="comment">// store canary on stack</span>
+
+<span class="comment">// ... function body ...</span>
+
+<span class="comment">// Function epilogue:</span>
+ldur    x8, [x29, <span class="number">#-8</span>]          <span class="comment">// load canary from stack</span>
+adrp    x9, ___stack_chk_guard@PAGE
+ldr     x9, [x9, ___stack_chk_guard@PAGEOFF]
+cmp     x8, x9                     <span class="comment">// compare with reference</span>
+b.ne    __stack_chk_fail_abort     <span class="comment">// MISMATCH → abort()</span>
+ret</code></pre>
+
+    <h3>2.3 Compiler Flags</h3>
+
+    <table>
+        <thead>
+            <tr><th>Flag</th><th>Behavior</th><th>iOS Default</th></tr>
+        </thead>
+        <tbody>
+            <tr><td><code>-fstack-protector</code></td><td>Protects functions with <code>char</code> arrays &gt; 8 bytes</td><td>No</td></tr>
+            <tr><td><code>-fstack-protector-strong</code></td><td>Protects functions with any arrays, address-taken locals, or structs with arrays</td><td><strong>Yes (default)</strong></td></tr>
+            <tr><td><code>-fstack-protector-all</code></td><td>Protects every function (significant performance cost)</td><td>No</td></tr>
+            <tr><td><code>-fno-stack-protector</code></td><td>Disables canaries entirely</td><td>No (dangerous)</td></tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — Canaries Don't Protect Everything</div>
+        <p>Stack canaries only detect <em>linear</em> buffer overflows that write sequentially past the buffer. An attacker who can write to an arbitrary offset (e.g., via an index-out-of-bounds bug) can skip over the canary and directly overwrite the return address. Canaries also don't protect heap allocations at all. They are one layer in a defense-in-depth strategy.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 3: PAC                                                      -->
+    <!-- ================================================================== -->
+
+    <h2 id="pac">3. Pointer Authentication Codes (PAC) — A12+</h2>
+
+    <p>Pointer Authentication is Apple's most significant hardware security feature since ASLR. Introduced with the A12 Bionic (2018), PAC uses the unused upper bits of 64-bit pointers to store a cryptographic signature (the PAC). Any attempt to tamper with a signed pointer — even by a single bit — invalidates the signature, causing a fault when the pointer is authenticated. This defeats ROP, JOP, and other code-reuse attacks at the hardware level.</p>
+
+    <h3>3.1 How PAC Works</h3>
+
+    <p>On ARM64, virtual addresses on iOS use only 36–39 bits (depending on the page size and virtual address space configuration). The upper bits (bits 47–63 in a 48-bit VA space) are unused. PAC repurposes these bits to store a truncated QARMA cryptographic hash of:</p>
+
+    <ol>
+        <li>The pointer value itself (the address)</li>
+        <li>A <strong>context value</strong> (a modifier — typically the stack pointer or a type discriminator)</li>
+        <li>A <strong>secret key</strong> stored in a system register, inaccessible to userspace</li>
+    </ol>
+
+    <div class="diagram">
+PAC Pointer Format (ARM64e, 48-bit VA)
+
+ 63       56 55     48 47                                    0
+┌──────────┬─────────┬──────────────────────────────────────────┐
+│  PAC     │  PAC    │          Virtual Address                  │
+│ (high)   │ (low)   │  (actual pointer value, 48 bits)          │
+│  8 bits  │  8 bits │                                           │
+└──────────┴─────────┴──────────────────────────────────────────┘
+     ↑
+     └── Cryptographic signature = QARMA(pointer, context, key)
+
+Signing:   raw_ptr  ──→  PACIA x0, sp  ──→  signed_ptr (PAC in upper bits)
+Verifying: signed_ptr ──→  AUTIA x0, sp  ──→  raw_ptr (or FAULT if tampered)
+
+If attacker modifies any bit of the pointer:
+  signed_ptr' ──→ AUTIA x0, sp ──→ ❌ PAC mismatch → upper bits corrupted
+                                     → dereference causes SIGSEGV
+    </div>
+
+    <h3>3.2 PAC Keys</h3>
+
+    <p>ARM64e defines five PAC keys, each stored in a dedicated system register:</p>
+
+    <table>
+        <thead>
+            <tr><th>Key</th><th>Register</th><th>Purpose</th><th>Used For</th></tr>
+        </thead>
+        <tbody>
+            <tr><td><strong>IA</strong></td><td>APIAKey_EL1</td><td>Instruction Address, Key A</td><td>Return addresses, function pointers (primary)</td></tr>
+            <tr><td><strong>IB</strong></td><td>APIBKey_EL1</td><td>Instruction Address, Key B</td><td>Cross-DSO calls, secondary code pointers</td></tr>
+            <tr><td><strong>DA</strong></td><td>APDAKey_EL1</td><td>Data Address, Key A</td><td>C++ vtable pointers, ObjC isa pointers</td></tr>
+            <tr><td><strong>DB</strong></td><td>APDBKey_EL1</td><td>Data Address, Key B</td><td>Reserved / future use</td></tr>
+            <tr><td><strong>GA</strong></td><td>APGAKey_EL1</td><td>Generic Authentication</td><td>Arbitrary data signing (not pointers)</td></tr>
+        </tbody>
+    </table>
+
+    <h3>3.3 PAC Instructions</h3>
+
+    <table>
+        <thead>
+            <tr><th>Instruction</th><th>Operation</th><th>Example</th></tr>
+        </thead>
+        <tbody>
+            <tr><td><code>PACIA</code></td><td>Sign pointer with IA key + context</td><td><code>pacia x30, sp</code> — sign return address with SP as context</td></tr>
+            <tr><td><code>AUTIA</code></td><td>Authenticate pointer with IA key</td><td><code>autia x30, sp</code> — verify return address before ret</td></tr>
+            <tr><td><code>PACIB</code></td><td>Sign pointer with IB key + context</td><td>Cross-DSO function pointers</td></tr>
+            <tr><td><code>AUTIB</code></td><td>Authenticate pointer with IB key</td><td>Verify cross-DSO pointers</td></tr>
+            <tr><td><code>PACDA</code></td><td>Sign data pointer with DA key</td><td>vtable / isa pointer signing</td></tr>
+            <tr><td><code>AUTDA</code></td><td>Authenticate data pointer with DA key</td><td>Verify vtable before dispatch</td></tr>
+            <tr><td><code>PACGA</code></td><td>Compute generic PAC (no pointer modification)</td><td>Integrity check on arbitrary data</td></tr>
+            <tr><td><code>RETAA</code></td><td>Authenticate + return (combined)</td><td><code>retaa</code> — AUTIA x30, sp + ret in one instruction</td></tr>
+            <tr><td><code>BRAA</code></td><td>Authenticate + branch (combined)</td><td><code>braa x16, x17</code> — verify then branch</td></tr>
+            <tr><td><code>XPACI</code></td><td>Strip PAC bits (for debugging)</td><td><code>xpaci x0</code> — remove PAC without authenticating</td></tr>
+        </tbody>
+    </table>
+
+    <h3>3.4 Context Diversification</h3>
+
+    <p>The context value is critical for PAC security. Using the <strong>stack pointer (SP)</strong> as context for return addresses means a signed return address is only valid for the specific stack frame that created it. An attacker who captures a signed pointer from one call site cannot replay it at another — the SP will differ, causing authentication to fail.</p>
+
+    <pre><code><span class="comment">// PAC-protected function prologue/epilogue (ARM64e)</span>
+<span class="comment">// Prologue: sign LR with SP as context</span>
+pacibsp                            <span class="comment">// x30 = PACIB(x30, sp)</span>
+stp     x29, x30, [sp, <span class="number">#-16</span>]!   <span class="comment">// save signed LR to stack</span>
+mov     x29, sp
+
+<span class="comment">// ... function body ...</span>
+
+<span class="comment">// Epilogue: authenticate LR before returning</span>
+ldp     x29, x30, [sp], <span class="number">#16</span>     <span class="comment">// restore signed LR</span>
+retab                              <span class="comment">// AUTIB(x30, sp) + ret</span>
+                                   <span class="comment">// if tampered → fault before branch</span></code></pre>
+
+    <h3>3.5 A11 vs A12+ Comparison</h3>
+
+    <table>
+        <thead>
+            <tr><th>Feature</th><th>A11 and Earlier</th><th>A12+ (ARM64e)</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Pointer Authentication</td><td>Not available</td><td>Hardware PAC with QARMA cipher</td></tr>
+            <tr><td>Return address protection</td><td>Stack canary only</td><td>PAC + stack canary (defense in depth)</td></tr>
+            <tr><td>vtable protection</td><td>None (writable __DATA)</td><td>PAC-signed vtable pointers (DA key)</td></tr>
+            <tr><td>ObjC isa protection</td><td>isa pointer masking only</td><td>PAC-signed isa pointers</td></tr>
+            <tr><td>ROP/JOP resistance</td><td>ASLR only (probabilistic)</td><td>ASLR + PAC (cryptographic)</td></tr>
+            <tr><td>ABI</td><td>arm64</td><td>arm64e (not backward compatible)</td></tr>
+            <tr><td>Kernel protection</td><td>KTRR (read-only kernel text)</td><td>KTRR + PAC for kernel pointers</td></tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — ARM64e ABI</div>
+        <p>The arm64e ABI is a separate ABI from arm64. Binaries compiled for arm64e embed PAC signing/authentication instructions that would be illegal on pre-A12 hardware. Apple ships system frameworks as arm64e on supported devices, but third-party apps still target arm64 (the PAC instructions are transparently inserted by the system's arm64e dyld for framework code). Apple has not yet opened the arm64e ABI to third-party developers — your app binary runs as arm64, but all system calls and framework code it invokes run as arm64e with full PAC protection.</p>
+    </div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — PAC Bypass Research</div>
+        <p>PAC is not unbreakable. Researchers have demonstrated bypasses via: (1) PAC forgery using signing gadgets — finding existing code that signs attacker-controlled values; (2) context confusion — using a pointer signed with one context in a location expecting a different context; (3) brute-forcing the PAC (feasible for short PAC widths on some configurations). Apple continuously hardens PAC by increasing context diversity and reducing signing gadget availability in system frameworks.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 4: __DATA_CONST                                             -->
+    <!-- ================================================================== -->
+
+    <h2 id="data-const">4. __DATA_CONST Segment Hardening</h2>
+
+    <p>The <code>__DATA_CONST</code> segment is a Mach-O segment that contains data which must be writable during process startup (for dyld fixups — rebasing and binding) but is <strong>constant for the rest of the process's lifetime</strong>. After dyld completes its fixups, it marks <code>__DATA_CONST</code> pages as read-only using <code>mprotect()</code>, preventing any further modification.</p>
+
+    <h3>4.1 What Lives in __DATA_CONST</h3>
+
+    <table>
+        <thead>
+            <tr><th>Section</th><th>Contents</th><th>Why It Matters</th></tr>
+        </thead>
+        <tbody>
+            <tr><td><code>__got</code></td><td>Global Offset Table entries</td><td>GOT overwrites redirect function calls to attacker code</td></tr>
+            <tr><td><code>__const</code></td><td>Constant initialized data</td><td>Prevents modification of compile-time constants</td></tr>
+            <tr><td><code>__cfstring</code></td><td>CoreFoundation string objects</td><td>Prevents string replacement attacks</td></tr>
+            <tr><td><code>__objc_classlist</code></td><td>ObjC class list pointers</td><td>Prevents class substitution</td></tr>
+            <tr><td><code>__objc_protolist</code></td><td>ObjC protocol list pointers</td><td>Prevents protocol hijacking</td></tr>
+        </tbody>
+    </table>
+
+    <h3>4.2 __DATA_CONST vs __DATA</h3>
+
+    <div class="diagram">
+Mach-O Segment Layout (Simplified)
+
+┌─────────────────────────────────────────────────────────────┐
+│  __TEXT          │  r-x  │  Always read-only + executable    │
+│                  │       │  Code, string literals, const data │
+├──────────────────┼───────┼───────────────────────────────────┤
+│  __DATA_CONST    │  rw-  │  Writable during dyld fixup ONLY  │
+│                  │→ r--  │  Then mprotect'd to read-only      │
+│                  │       │  GOT, const data, ObjC metadata    │
+├──────────────────┼───────┼───────────────────────────────────┤
+│  __DATA          │  rw-  │  Always writable                   │
+│                  │       │  Global vars, ObjC ivar storage,   │
+│                  │       │  non-const statics, __bss          │
+├──────────────────┼───────┼───────────────────────────────────┤
+│  __LINKEDIT      │  r--  │  Always read-only                  │
+│                  │       │  Symbol tables, code signatures     │
+└──────────────────┴───────┴───────────────────────────────────┘
+
+Timeline:
+  dyld load → fixup rebases/binds (__DATA_CONST is rw-) → mprotect(r--) → main()
+                                                              ↑
+                                                    GOT is now immutable
+    </div>
+
+    <h3>4.3 Security Impact</h3>
+
+    <p>Before <code>__DATA_CONST</code>, the GOT lived in <code>__DATA</code> and was writable for the entire process lifetime. A memory corruption bug could overwrite a GOT entry to redirect any function call — a classic exploitation primitive. With <code>__DATA_CONST</code>:</p>
+
+    <ul>
+        <li><strong>GOT overwrites</strong> trigger a <code>SIGBUS</code> (writing to read-only memory) instead of silently succeeding</li>
+        <li><strong>ObjC class metadata</strong> can't be modified after launch, preventing runtime class injection</li>
+        <li><strong>vtable pointers</strong> for C++ objects in __DATA_CONST are immutable, defeating vtable hijacking</li>
+    </ul>
+
+    <pre><code><span class="comment">// Inspecting __DATA_CONST with otool</span>
+$ otool -l MyApp | grep -A5 __DATA_CONST
+  segname __DATA_CONST
+   vmaddr <span class="number">0x0000000100008000</span>
+   vmsize <span class="number">0x0000000000004000</span>
+  fileoff <span class="number">32768</span>
+ filesize <span class="number">16384</span>
+  maxprot <span class="number">0x00000003</span>    <span class="comment">// rw- (max allowed)</span>
+ initprot <span class="number">0x00000003</span>    <span class="comment">// rw- (initial, before dyld hardens)</span>
+
+<span class="comment">// After dyld fixups, the kernel enforces r-- via mprotect()</span></code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Minimize __DATA Usage</div>
+        <p>Move as much data as possible into <code>__DATA_CONST</code> by declaring globals as <code>let</code> (Swift) or <code>const</code> (C/ObjC). The linker automatically places constant-after-init data in <code>__DATA_CONST</code>. Audit your binary with <code>otool -l</code> or <code>size -m</code> to verify that sensitive metadata (GOT entries, class lists) resides in <code>__DATA_CONST</code> rather than <code>__DATA</code>.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 5: MTE                                                      -->
+    <!-- ================================================================== -->
+
+    <h2 id="mte">5. Memory Tagging Extension (MTE)</h2>
+
+    <p>ARM Memory Tagging Extension (MTE), introduced in ARMv8.5-A, is a hardware feature that assigns a 4-bit tag to every 16-byte granule of memory and to every pointer. On every memory access, the hardware checks that the pointer's tag matches the memory's tag. A mismatch indicates a spatial (buffer overflow) or temporal (use-after-free) memory safety violation.</p>
+
+    <h3>5.1 How MTE Works</h3>
+
+    <div class="diagram">
+MTE Pointer Format
+
+ 63  60 59                                                 0
+┌──────┬──────────────────────────────────────────────────────┐
+│ TAG  │              Virtual Address (60 bits)                │
+│4 bits│                                                       │
+└──┬───┴──────────────────────────────────────────────────────┘
+   │
+   │    Memory Granules (each 16 bytes has a 4-bit tag)
+   │    ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+   │    │ T=3 │ T=3 │ T=3 │ T=7 │ T=7 │ T=2 │ T=2 │ T=2 │
+   │    └─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+   │      ↑                  ↑
+   │      │                  │
+   └──────┘                  │
+   Tag=3 matches T=3 ✓      Tag=3 vs T=7 ✗ → FAULT
+
+Buffer Overflow Detection:
+  malloc(48) → returns ptr with tag=3, memory tagged [3,3,3,7,7,...]
+  ptr[48] → tag=3 vs memory tag=7 → TAG MISMATCH → fault
+
+Use-After-Free Detection:
+  ptr = malloc(32) → tag=5
+  free(ptr)        → memory re-tagged to 9
+  *ptr             → tag=5 vs memory tag=9 → TAG MISMATCH → fault
+    </div>
+
+    <h3>5.2 MTE Modes</h3>
+
+    <table>
+        <thead>
+            <tr><th>Mode</th><th>Behavior</th><th>Performance</th><th>Use Case</th></tr>
+        </thead>
+        <tbody>
+            <tr><td><strong>Synchronous</strong></td><td>Immediate fault on tag mismatch</td><td>~3-5% overhead</td><td>Development, testing, security-critical code</td></tr>
+            <tr><td><strong>Asynchronous</strong></td><td>Tag mismatches logged, checked at next context switch</td><td>~1-2% overhead</td><td>Production deployment, telemetry</td></tr>
+            <tr><td><strong>Asymmetric</strong></td><td>Sync for reads, async for writes</td><td>~2-3% overhead</td><td>Balance of detection speed and performance</td></tr>
+        </tbody>
+    </table>
+
+    <h3>5.3 MTE vs PAC — Comparison</h3>
+
+    <table>
+        <thead>
+            <tr><th>Aspect</th><th>MTE</th><th>PAC</th></tr>
+        </thead>
+        <tbody>
+            <tr><td><strong>What it protects</strong></td><td>All memory accesses (spatial + temporal)</td><td>Code pointers and data pointers</td></tr>
+            <tr><td><strong>Attack class</strong></td><td>Buffer overflow, use-after-free, double-free</td><td>ROP, JOP, pointer tampering</td></tr>
+            <tr><td><strong>Mechanism</strong></td><td>4-bit tag comparison on every load/store</td><td>Cryptographic signature in pointer upper bits</td></tr>
+            <tr><td><strong>Tag/PAC bits</strong></td><td>4 bits (1 in 16 chance of collision)</td><td>~16 bits (1 in 65,536 chance of forgery)</td></tr>
+            <tr><td><strong>Granularity</strong></td><td>16-byte memory granules</td><td>Per-pointer</td></tr>
+            <tr><td><strong>Performance cost</strong></td><td>1-5% (mode dependent)</td><td>Negligible (~0.5%)</td></tr>
+            <tr><td><strong>Memory overhead</strong></td><td>~3% (tag storage)</td><td>None (reuses unused pointer bits)</td></tr>
+            <tr><td><strong>Apple adoption</strong></td><td>Not yet (as of 2025)</td><td>A12+ (since 2018)</td></tr>
+            <tr><td><strong>Probabilistic?</strong></td><td>Yes (4-bit tag = 6.25% collision)</td><td>Yes but much stronger (16-bit PAC)</td></tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Why Apple Hasn't Adopted MTE</div>
+        <p>As of 2025, Apple's A-series and M-series chips implement ARMv8.6-A but do not enable MTE. Likely reasons: (1) MTE's 4-bit tag provides weaker probabilistic guarantees than PAC's ~16-bit signature; (2) MTE requires additional memory for tag storage (~3% overhead), which is significant on memory-constrained iPhones; (3) Apple's investment in PAC, __DATA_CONST, and Swift's memory safety may provide sufficient coverage; (4) MTE is primarily valuable for detecting bugs during development — Android has adopted it for this purpose via the Scudo allocator. Apple may adopt MTE in future chips for defense-in-depth, especially as the memory overhead becomes less significant.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 6: SWIFT VS OBJC RUNTIME SECURITY                           -->
+    <!-- ================================================================== -->
+
+    <h2 id="swift-vs-objc">6. Swift vs ObjC Runtime Security</h2>
+
+    <p>The choice of language runtime has profound security implications. Objective-C's dynamic runtime — while powerful for flexibility — exposes a large attack surface. Swift's design choices (static dispatch, value types, bounds checking) eliminate entire classes of vulnerabilities.</p>
+
+    <h3>6.1 Objective-C Runtime Attack Surface</h3>
+
+    <h4>Dynamic Dispatch via objc_msgSend</h4>
+
+    <p>Every ObjC method call goes through <code>objc_msgSend</code>, which performs a runtime lookup: read the object's <code>isa</code> pointer → find the class → walk the method cache/list → jump to the IMP (function pointer). Each step is an attack opportunity:</p>
+
+    <pre><code><span class="comment">// What happens when you call [obj doSomething]:</span>
+<span class="comment">// 1. Read obj->isa to get the Class</span>
+<span class="comment">// 2. Look up "doSomething" in class's method cache</span>
+<span class="comment">// 3. If miss, walk method_list, superclass chain</span>
+<span class="comment">// 4. Jump to the IMP (function pointer)</span>
+
+<span class="comment">// Attack vectors:</span>
+<span class="comment">// - Corrupt isa → redirect to fake class with attacker's method table</span>
+<span class="comment">// - Corrupt method cache → point selector to attacker's function</span>
+<span class="comment">// - Swizzle method → replace IMP at runtime (legitimate API!)</span>
+
+<span class="comment">// Method swizzling — a "feature" that's also an attack vector</span>
+<span class="keyword">@implementation</span> NSURLSession (Intercept)
++ (<span class="keyword">void</span>)load {
+    Method original = class_getInstanceMethod(
+        <span class="keyword">self</span>, <span class="keyword">@selector</span>(dataTaskWithURL:completionHandler:));
+    Method swizzled = class_getInstanceMethod(
+        <span class="keyword">self</span>, <span class="keyword">@selector</span>(evil_dataTaskWithURL:completionHandler:));
+    method_exchangeImplementations(original, swizzled);
+    <span class="comment">// All network requests now go through attacker's code</span>
+}
+<span class="keyword">@end</span></code></pre>
+
+    <h4>isa Pointer Manipulation</h4>
+
+    <p>Every ObjC object's first word is the <code>isa</code> pointer — a pointer to its class. Corrupting this pointer redirects all method dispatch for that object. On pre-A12 devices without PAC, this is a single 8-byte write. On A12+, the isa is PAC-signed with the DA key, making corruption detectable.</p>
+
+    <h4>Runtime Method Resolution</h4>
+
+    <p>ObjC provides <code>+resolveInstanceMethod:</code>, <code>-forwardInvocation:</code>, and <code>-forwardingTargetForSelector:</code> — mechanisms that let objects dynamically add or redirect methods at runtime. While powerful, these create an unpredictable control flow that static analysis tools cannot fully reason about.</p>
+
+    <h3>6.2 Swift Runtime Security Advantages</h3>
+
+    <h4>Static and VTable Dispatch</h4>
+
+    <pre><code><span class="comment">// Swift dispatch mechanisms (from most to least secure):</span>
+
+<span class="comment">// 1. Static/Direct dispatch — compile-time resolved, inlined</span>
+<span class="keyword">struct</span> <span class="type">Calculator</span> {
+    <span class="keyword">func</span> <span class="func">add</span>(_ a: <span class="type">Int</span>, _ b: <span class="type">Int</span>) -> <span class="type">Int</span> { a + b }
+    <span class="comment">// Compiled to a direct function call — no indirection, no attack surface</span>
+}
+
+<span class="comment">// 2. VTable dispatch — class methods (not @objc)</span>
+<span class="keyword">class</span> <span class="type">Renderer</span> {
+    <span class="keyword">func</span> <span class="func">draw</span>() { }
+    <span class="comment">// Dispatched via vtable (like C++), NOT objc_msgSend</span>
+    <span class="comment">// vtable is in __DATA_CONST → read-only after launch</span>
+}
+
+<span class="comment">// 3. Witness table dispatch — protocol conformance</span>
+<span class="keyword">protocol</span> <span class="type">Drawable</span> { <span class="keyword">func</span> <span class="func">draw</span>() }
+<span class="comment">// Protocol witness table is also in __DATA_CONST</span>
+
+<span class="comment">// 4. ObjC-compatible dispatch — only when explicitly requested</span>
+<span class="keyword">class</span> <span class="type">ViewController</span>: <span class="type">UIViewController</span> {
+    <span class="keyword">@objc</span> <span class="keyword">dynamic</span> <span class="keyword">func</span> <span class="func">handleTap</span>() { }
+    <span class="comment">// Only this method uses objc_msgSend</span>
+}</code></pre>
+
+    <h4>Value Types on Stack</h4>
+
+    <p>Swift structs and enums are value types allocated on the stack (or inline in their container). They have no heap allocation, no reference counting, no isa pointer — eliminating heap corruption, use-after-free, and isa manipulation for these types entirely.</p>
+
+    <h4>Bounds Checking</h4>
+
+    <pre><code><span class="comment">// Swift arrays have bounds checking by default</span>
+<span class="keyword">let</span> array = [<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>]
+<span class="keyword">let</span> value = array[<span class="number">5</span>]  <span class="comment">// → fatal error: Index out of range</span>
+                       <span class="comment">// Process is killed, NOT undefined behavior</span>
+
+<span class="comment">// In C/ObjC:</span>
+<span class="keyword">int</span> arr[<span class="number">3</span>] = {<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>};
+<span class="keyword">int</span> value = arr[<span class="number">5</span>];  <span class="comment">// → undefined behavior, reads garbage</span>
+                      <span class="comment">// Attacker can use this to leak memory</span></code></pre>
+
+    <h3>6.3 Comprehensive Comparison</h3>
+
+    <table>
+        <thead>
+            <tr><th>Security Aspect</th><th>Objective-C</th><th>Swift</th></tr>
+        </thead>
+        <tbody>
+            <tr><td><strong>Method dispatch</strong></td><td>Dynamic (objc_msgSend) — attackable via isa/cache corruption</td><td>Static/vtable — resolved at compile time or via read-only tables</td></tr>
+            <tr><td><strong>isa pointer</strong></td><td>Present on every object, writable (pre-PAC)</td><td>Only on class instances; structs/enums have no isa</td></tr>
+            <tr><td><strong>Method swizzling</strong></td><td>Built-in API (method_exchangeImplementations)</td><td>Not possible for pure Swift methods</td></tr>
+            <tr><td><strong>Runtime method resolution</strong></td><td>+resolveInstanceMethod:, forwarding</td><td>No equivalent — all methods resolved at compile time</td></tr>
+            <tr><td><strong>Buffer overflows</strong></td><td>C arrays have no bounds checking</td><td>All collections bounds-checked (trap on violation)</td></tr>
+            <tr><td><strong>Use-after-free</strong></td><td>Manual retain/release errors, dangling pointers</td><td>ARC + value types eliminate most cases; no manual memory management</td></tr>
+            <tr><td><strong>Null pointer deref</strong></td><td>Messaging nil returns zero (silent failure)</td><td>Optionals force explicit nil handling at compile time</td></tr>
+            <tr><td><strong>Format string attacks</strong></td><td>NSLog(@"%@", userInput) can be exploited</td><td>String interpolation is type-safe, no format specifiers</td></tr>
+            <tr><td><strong>Integer overflow</strong></td><td>Wraps silently (undefined in C)</td><td>Traps in debug, wraps with &amp;+ operator (explicit)</td></tr>
+            <tr><td><strong>Type confusion</strong></td><td>id type bypasses compile-time checks</td><td>Strong static typing, generics prevent type confusion</td></tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Maximize Swift, Minimize @objc</div>
+        <p>For security-critical code paths (authentication, encryption, payment processing), use pure Swift with structs and protocols. Avoid <code>@objc dynamic</code> unless required for UIKit interop. Every <code>@objc</code> annotation re-introduces the ObjC runtime attack surface for that method. Use <code>final</code> on classes to enable static dispatch and prevent subclass-based attacks.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 7: HARDENED RUNTIME                                         -->
+    <!-- ================================================================== -->
+
+    <h2 id="hardened-runtime">7. Hardened Runtime</h2>
+
+    <p>The Hardened Runtime is a set of security policies that restrict what a process can do at runtime. While primarily a macOS feature (required for notarization since macOS 10.14.5), many of its protections are the <em>default and mandatory</em> behavior on iOS. Understanding the Hardened Runtime is essential for cross-platform development and for understanding why iOS is more locked down than macOS.</p>
+
+    <h3>7.1 Hardened Runtime Protections</h3>
+
+    <table>
+        <thead>
+            <tr><th>Protection</th><th>What It Does</th><th>macOS</th><th>iOS</th></tr>
+        </thead>
+        <tbody>
+            <tr><td><strong>Library Validation</strong></td><td>Only load libraries signed by Apple or the same Team ID</td><td>Opt-in (entitlement)</td><td>Always enforced</td></tr>
+            <tr><td><strong>Debugging Restriction</strong></td><td>Prevent other processes from attaching a debugger</td><td>Opt-in</td><td>Always enforced (except dev builds)</td></tr>
+            <tr><td><strong>DYLD Env Var Restriction</strong></td><td>Ignore DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH, etc.</td><td>Opt-in</td><td>Always enforced</td></tr>
+            <tr><td><strong>Code Signing Enforcement</strong></td><td>All executable pages must be signed</td><td>Opt-in</td><td>Always enforced (kernel-level)</td></tr>
+            <tr><td><strong>JIT Prevention</strong></td><td>Cannot map W+X pages (no JIT)</td><td>Opt-in</td><td>Always enforced (except WebKit)</td></tr>
+            <tr><td><strong>Resource Access</strong></td><td>Camera, microphone, location require entitlements</td><td>Opt-in</td><td>Always enforced</td></tr>
+        </tbody>
+    </table>
+
+    <h3>7.2 Exception Entitlements</h3>
+
+    <p>On macOS, apps can request exceptions to Hardened Runtime restrictions via entitlements. On iOS, most of these exceptions are not available to third-party apps:</p>
+
+    <pre><code><span class="comment">&lt;!-- macOS Hardened Runtime exception entitlements --&gt;</span>
+<span class="comment">&lt;!-- These weaken security and should be used sparingly --&gt;</span>
+
+<span class="comment">&lt;!-- Allow loading unsigned/third-party libraries --&gt;</span>
+&lt;<span class="keyword">key</span>&gt;com.apple.security.cs.disable-library-validation&lt;/<span class="keyword">key</span>&gt;
+&lt;<span class="keyword">true</span>/&gt;
+
+<span class="comment">&lt;!-- Allow DYLD environment variables --&gt;</span>
+&lt;<span class="keyword">key</span>&gt;com.apple.security.cs.allow-dyld-environment-variables&lt;/<span class="keyword">key</span>&gt;
+&lt;<span class="keyword">true</span>/&gt;
+
+<span class="comment">&lt;!-- Allow JIT compilation (W+X pages) --&gt;</span>
+&lt;<span class="keyword">key</span>&gt;com.apple.security.cs.allow-jit&lt;/<span class="keyword">key</span>&gt;
+&lt;<span class="keyword">true</span>/&gt;
+
+<span class="comment">&lt;!-- Allow unsigned executable memory --&gt;</span>
+&lt;<span class="keyword">key</span>&gt;com.apple.security.cs.allow-unsigned-executable-memory&lt;/<span class="keyword">key</span>&gt;
+&lt;<span class="keyword">true</span>/&gt;
+
+<span class="comment">&lt;!-- Allow debugging by other processes --&gt;</span>
+&lt;<span class="keyword">key</span>&gt;com.apple.security.cs.debugger&lt;/<span class="keyword">key</span>&gt;
+&lt;<span class="keyword">true</span>/&gt;</code></pre>
+
+    <h3>7.3 Relationship to iOS Security Model</h3>
+
+    <div class="diagram">
+Security Policy Comparison
+
+macOS (without Hardened Runtime):
+┌─────────────────────────────────────────────────────┐
+│  ✗ Can load any library          (DYLD_INSERT_*)    │
+│  ✗ Can attach debugger           (task_for_pid)     │
+│  ✗ Can map W+X memory            (mmap PROT_WRITE|  │
+│  ✗ Can use DYLD env vars          PROT_EXEC)        │
+│  ✗ Can load unsigned code                           │
+└─────────────────────────────────────────────────────┘
+
+macOS (with Hardened Runtime):
+┌─────────────────────────────────────────────────────┐
+│  ✓ Library validation enforced                       │
+│  ✓ Debugger restriction enforced                     │
+│  ✓ W^X enforced (no JIT without entitlement)         │
+│  ✓ DYLD env vars ignored                             │
+│  ✓ Code signing enforced                             │
+│  ~ Exceptions available via entitlements              │
+└─────────────────────────────────────────────────────┘
+
+iOS (always):
+┌─────────────────────────────────────────────────────┐
+│  ✓ Library validation — MANDATORY, no exceptions     │
+│  ✓ Debugger restriction — MANDATORY (release builds) │
+│  ✓ W^X — MANDATORY (only WebKit gets JIT)            │
+│  ✓ DYLD env vars — ALWAYS ignored                    │
+│  ✓ Code signing — kernel-enforced, every page         │
+│  ✗ No exception entitlements for third-party apps     │
+└─────────────────────────────────────────────────────┘
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Why iOS Is Stricter</div>
+        <p>iOS was designed as a closed platform from day one. macOS inherited decades of UNIX openness and had to retrofit security via opt-in mechanisms. The Hardened Runtime on macOS is essentially "make this app behave like an iOS app." On iOS, there's no opt-in — the kernel enforces these policies for all processes. This is why iOS has never had a widespread malware problem despite being the world's most targeted platform: the attack surface is fundamentally smaller.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 8: W^X                                                      -->
+    <!-- ================================================================== -->
+
+    <h2 id="wxe">8. W^X (Write XOR Execute)</h2>
+
+    <p><strong>W^X</strong> (Write XOR Execute) is a memory protection policy that ensures no memory page is simultaneously writable and executable. A page can be <code>r-x</code> (readable + executable) or <code>rw-</code> (readable + writable), but never <code>rwx</code>. This prevents an attacker who achieves a write primitive from injecting and executing shellcode in the same memory region.</p>
+
+    <h3>8.1 How iOS Enforces W^X</h3>
+
+    <p>On iOS, W^X is enforced at the <strong>kernel level</strong> by XNU. The <code>mmap()</code> and <code>mprotect()</code> system calls reject any request that would create a page with both <code>PROT_WRITE</code> and <code>PROT_EXEC</code>:</p>
+
+    <pre><code><span class="comment">// This FAILS on iOS (returns MAP_FAILED / EPERM):</span>
+<span class="keyword">void</span> *page = mmap(<span class="type">NULL</span>, <span class="number">4096</span>,
+    PROT_READ | PROT_WRITE | PROT_EXEC,  <span class="comment">// ← W+X rejected</span>
+    MAP_ANON | MAP_PRIVATE, -<span class="number">1</span>, <span class="number">0</span>);
+
+<span class="comment">// This also FAILS — can't add EXEC to a writable page:</span>
+<span class="keyword">void</span> *page = mmap(<span class="type">NULL</span>, <span class="number">4096</span>,
+    PROT_READ | PROT_WRITE,
+    MAP_ANON | MAP_PRIVATE, -<span class="number">1</span>, <span class="number">0</span>);
+<span class="comment">// Write shellcode to page...</span>
+mprotect(page, <span class="number">4096</span>, PROT_READ | PROT_EXEC);  <span class="comment">// ← DENIED</span>
+
+<span class="comment">// The ONLY way to get executable memory on iOS:</span>
+<span class="comment">// 1. Load a signed Mach-O (dyld verifies code signature per-page)</span>
+<span class="comment">// 2. WebKit's JIT (com.apple.jit entitlement — Apple-only)</span></code></pre>
+
+    <h3>8.2 The JIT Exception — WebKit Only</h3>
+
+    <p>Just-In-Time compilation requires generating machine code at runtime and executing it — inherently violating W^X. On iOS, Apple grants a special exception <em>only</em> to WebKit (Safari's JavaScript engine, JavaScriptCore):</p>
+
+    <ul>
+        <li>WebKit uses the <code>com.apple.jit</code> private entitlement</li>
+        <li>It uses a dual-mapping technique: the JIT region is mapped twice at different virtual addresses — one mapping is <code>rw-</code> (for writing generated code) and the other is <code>r-x</code> (for executing it). The same physical page backs both mappings</li>
+        <li>The writable mapping is accessible only from a dedicated JIT compilation thread, and its address is randomized</li>
+        <li>Third-party browsers on iOS must use WebKit (WKWebView) — they cannot ship their own JS engine with JIT. This is why Chrome on iOS uses WebKit, not V8</li>
+    </ul>
+
+    <div class="diagram">
+WebKit JIT Dual-Mapping (Simplified)
+
+Physical Memory:
+┌──────────────────────────────────┐
+│  JIT-compiled JavaScript code     │
+│  (machine instructions)           │
+└──────────────┬───────────────────┘
+               │
+    ┌──────────┴──────────┐
+    │                     │
+    ▼                     ▼
+Virtual Mapping A      Virtual Mapping B
+┌──────────────┐    ┌──────────────┐
+│  rw- (write) │    │  r-x (exec)  │
+│  0x2800...   │    │  0x1A00...   │
+│              │    │              │
+│  JIT thread  │    │  JS execution│
+│  writes here │    │  runs here   │
+└──────────────┘    └──────────────┘
+
+W^X is technically maintained: no single virtual page is both W and X.
+The write mapping address is randomized and restricted to the JIT thread.
+    </div>
+
+    <h3>8.3 Implications for App Developers</h3>
+
+    <table>
+        <thead>
+            <tr><th>Scenario</th><th>Impact</th><th>Alternative</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Custom scripting engine with JIT</td><td>Cannot JIT-compile on iOS</td><td>Use interpreter mode (Lua, Python interpreters work fine)</td></tr>
+            <tr><td>Dynamic code generation</td><td>Cannot generate and execute code at runtime</td><td>Use code generation at build time, or ship pre-compiled variants</td></tr>
+            <tr><td>Hot-patching / code injection</td><td>Completely blocked</td><td>Use server-driven UI, feature flags, remote config</td></tr>
+            <tr><td>Game engines with shader JIT</td><td>Metal shaders are compiled by Apple's driver, not your code</td><td>Use Metal shader precompilation (MTLBinaryArchive)</td></tr>
+            <tr><td>Emulators</td><td>Cannot JIT-compile guest code</td><td>Interpreter-only mode (very slow)</td></tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — App Review and Dynamic Code</div>
+        <p>Apple's App Review guidelines (section 2.5.2) explicitly prohibit downloading and executing code. Even if you could somehow bypass W^X (you can't on non-jailbroken devices), doing so would result in App Store rejection. The only exceptions are: (1) WebKit JavaScript execution, (2) JavaScriptCore's interpreter mode. React Native and Flutter work because they either interpret JS (React Native in debug) or compile to native ARM64 ahead of time (Flutter, React Native Hermes).</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 9: ARCHITECT                                                -->
+    <!-- ================================================================== -->
+
+    <h2 id="architect">9. Architect: Defense-in-Depth Security Architecture</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>At Staff/L6 level, you must understand how all runtime security mechanisms compose into a layered defense. No single mechanism is sufficient — ASLR can be bypassed with an info leak, PAC can be bypassed with signing gadgets, stack canaries don't protect the heap, W^X doesn't prevent code reuse. The architect's job is to design systems that require an attacker to chain multiple bypasses, making exploitation exponentially harder.</p>
+    </div>
+
+    <h3>9.1 The Full Defense Stack</h3>
+
+    <div class="diagram">
+iOS Runtime Security — Defense-in-Depth Architecture
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                        APPLICATION LAYER                             │
+│                                                                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────────┐ │
+│  │ Swift Memory  │  │ App Attest / │  │ Certificate Pinning /      │ │
+│  │ Safety        │  │ DeviceCheck  │  │ Runtime Integrity Checks   │ │
+│  │ (bounds check,│  │              │  │                            │ │
+│  │ optionals,    │  │              │  │                            │ │
+│  │ ARC)          │  │              │  │                            │ │
+│  └──────────────┘  └──────────────┘  └────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────────┤
+│                        COMPILER LAYER                                │
+│                                                                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────────┐ │
+│  │ Stack         │  │ CFI (Control │  │ Fortified Source            │ │
+│  │ Canaries      │  │ Flow         │  │ (_FORTIFY_SOURCE)          │ │
+│  │ (-fstack-     │  │ Integrity)   │  │ Bounds-checked libc funcs  │ │
+│  │ protector-    │  │              │  │                            │ │
+│  │ strong)       │  │              │  │                            │ │
+│  └──────────────┘  └──────────────┘  └────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────────┤
+│                        HARDWARE LAYER                                │
+│                                                                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────────┐ │
+│  │ PAC           │  │ ASLR         │  │ W^X Enforcement            │ │
+│  │ (A12+)        │  │ (all iOS)    │  │ (kernel-level)             │ │
+│  │ Pointer auth  │  │ Randomized   │  │ No W+X pages               │ │
+│  │ for code/data │  │ layout       │  │                            │ │
+│  │ pointers      │  │              │  │                            │ │
+│  └──────────────┘  └──────────────┘  └────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────────┤
+│                        KERNEL / OS LAYER                             │
+│                                                                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────────┐ │
+│  │ Code Signing  │  │ Sandbox      │  │ Secure Boot Chain          │ │
+│  │ (per-page     │  │ (TrustedBSD  │  │ (BootROM → iBoot → XNU)   │ │
+│  │ verification) │  │ MAC)         │  │                            │ │
+│  └──────────────┘  └──────────────┘  └────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────────┤
+│                        SILICON LAYER                                 │
+│                                                                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────────┐ │
+│  │ Secure        │  │ SEP          │  │ KTRR / CTRR               │ │
+│  │ Enclave       │  │ (Secure      │  │ (Kernel Text Read-only     │ │
+│  │ Processor     │  │ Enclave      │  │ Region — hardware lockdown │ │
+│  │              │  │ Processor)   │  │ of kernel code pages)      │ │
+│  └──────────────┘  └──────────────┘  └────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────┘
+
+Attack must bypass ALL layers:
+  Info leak (defeat ASLR)
+  → Signing gadget (defeat PAC)
+  → Heap spray (defeat canaries)
+  → Code reuse (defeat W^X)
+  → Sandbox escape (defeat MAC)
+  → Kernel exploit (defeat code signing)
+  → SEP bypass (defeat hardware)
+  = 7+ independent bypasses required for full compromise
+    </div>
+
+    <h3>9.2 Threat Modeling for Security-Critical Apps</h3>
+
+    <p>When designing a financial, health, or government app, the architect must consider threats beyond what the OS provides:</p>
+
+    <table>
+        <thead>
+            <tr><th>Threat</th><th>OS Mitigation</th><th>App-Level Mitigation</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Jailbroken device</td><td>Secure Boot (prevents persistent jailbreak)</td><td>App Attest API, environment checks, server-side validation</td></tr>
+            <tr><td>Debugger attachment</td><td>Hardened Runtime, code signing</td><td>ptrace(PT_DENY_ATTACH), sysctl checks, timing-based detection</td></tr>
+            <tr><td>Method swizzling</td><td>PAC on isa pointers (A12+)</td><td>Use pure Swift, avoid @objc dynamic, integrity checks on critical methods</td></tr>
+            <tr><td>Memory inspection</td><td>ASLR, sandbox isolation</td><td>Zero sensitive data after use, use Data with resetBytes, avoid String for secrets</td></tr>
+            <tr><td>Network interception</td><td>ATS (App Transport Security)</td><td>Certificate pinning, mutual TLS, encrypted payloads</td></tr>
+            <tr><td>Binary analysis</td><td>Code signing, FairPlay DRM</td><td>Symbol stripping, control flow obfuscation, integrity checksums</td></tr>
+            <tr><td>Keychain extraction</td><td>SEP-backed keychain, Data Protection</td><td>Use kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly, biometric binding</td></tr>
+        </tbody>
+    </table>
+
+    <h3>9.3 Runtime Integrity Verification</h3>
+
+    <pre><code><span class="keyword">import</span> <span class="type">Foundation</span>
+<span class="keyword">import</span> <span class="type">DeviceCheck</span>
+<span class="keyword">import</span> <span class="type">CryptoKit</span>
+
+<span class="keyword">enum</span> <span class="type">RuntimeIntegrity</span> {
+
+    <span class="keyword">static</span> <span class="keyword">func</span> <span class="func">performChecks</span>() -> [<span class="type">String</span>: <span class="type">Bool</span>] {
+        <span class="keyword">var</span> results: [<span class="type">String</span>: <span class="type">Bool</span>] = [:]
+
+        results[<span class="string">"debugger"</span>] = !isDebuggerAttached()
+        results[<span class="string">"sandbox"</span>] = isSandboxIntact()
+        results[<span class="string">"codeSignature"</span>] = isCodeSignatureValid()
+        results[<span class="string">"dynamicLibraries"</span>] = !hasInjectedLibraries()
+
+        <span class="keyword">return</span> results
+    }
+
+    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">func</span> <span class="func">isDebuggerAttached</span>() -> <span class="type">Bool</span> {
+        <span class="keyword">var</span> info = kinfo_proc()
+        <span class="keyword">var</span> size = MemoryLayout&lt;<span class="type">kinfo_proc</span>&gt;.stride
+        <span class="keyword">var</span> mib: [<span class="type">Int32</span>] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+        <span class="keyword">let</span> result = sysctl(&amp;mib, <span class="type">UInt32</span>(mib.count), &amp;info, &amp;size, <span class="keyword">nil</span>, <span class="number">0</span>)
+        <span class="keyword">guard</span> result == <span class="number">0</span> <span class="keyword">else</span> { <span class="keyword">return</span> <span class="keyword">false</span> }
+        <span class="keyword">return</span> (info.kp_proc.p_flag &amp; P_TRACED) != <span class="number">0</span>
+    }
+
+    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">func</span> <span class="func">isSandboxIntact</span>() -> <span class="type">Bool</span> {
+        <span class="keyword">let</span> jailbreakPaths = [
+            <span class="string">"/Applications/Cydia.app"</span>,
+            <span class="string">"/usr/sbin/sshd"</span>,
+            <span class="string">"/bin/bash"</span>,
+            <span class="string">"/etc/apt"</span>,
+            <span class="string">"/private/var/lib/apt"</span>
+        ]
+        <span class="keyword">for</span> path <span class="keyword">in</span> jailbreakPaths {
+            <span class="keyword">if</span> <span class="type">FileManager</span>.<span class="keyword">default</span>.fileExists(atPath: path) {
+                <span class="keyword">return</span> <span class="keyword">false</span>
+            }
+        }
+        <span class="comment">// Verify sandbox by attempting a forbidden operation</span>
+        <span class="keyword">let</span> canWrite = <span class="type">FileManager</span>.<span class="keyword">default</span>
+            .isWritableFile(atPath: <span class="string">"/private/var/mobile"</span>)
+        <span class="keyword">return</span> !canWrite
+    }
+
+    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">func</span> <span class="func">isCodeSignatureValid</span>() -> <span class="type">Bool</span> {
+        <span class="keyword">guard</span> <span class="keyword">let</span> executableURL = <span class="type">Bundle</span>.main.executableURL,
+              <span class="keyword">let</span> data = <span class="keyword">try</span>? <span class="type">Data</span>(contentsOf: executableURL) <span class="keyword">else</span> {
+            <span class="keyword">return</span> <span class="keyword">false</span>
+        }
+        <span class="keyword">let</span> hash = <span class="type">SHA256</span>.hash(data: data)
+        <span class="keyword">let</span> expected = expectedExecutableHash()
+        <span class="keyword">return</span> hash.description == expected
+    }
+
+    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">func</span> <span class="func">hasInjectedLibraries</span>() -> <span class="type">Bool</span> {
+        <span class="keyword">let</span> expectedCount = expectedDylibCount()
+        <span class="keyword">let</span> actualCount = _dyld_image_count()
+        <span class="keyword">if</span> actualCount > expectedCount { <span class="keyword">return</span> <span class="keyword">true</span> }
+
+        <span class="keyword">for</span> i <span class="keyword">in</span> <span class="number">0</span>..&lt;actualCount {
+            <span class="keyword">guard</span> <span class="keyword">let</span> name = _dyld_get_image_name(i) <span class="keyword">else</span> { <span class="keyword">continue</span> }
+            <span class="keyword">let</span> path = <span class="type">String</span>(cString: name)
+            <span class="keyword">if</span> path.contains(<span class="string">"MobileSubstrate"</span>) ||
+               path.contains(<span class="string">"cycript"</span>) ||
+               path.contains(<span class="string">"frida"</span>) ||
+               path.contains(<span class="string">"SSLKillSwitch"</span>) {
+                <span class="keyword">return</span> <span class="keyword">true</span>
+            }
+        }
+        <span class="keyword">return</span> <span class="keyword">false</span>
+    }
+
+    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">func</span> <span class="func">expectedExecutableHash</span>() -> <span class="type">String</span> {
+        <span class="comment">// In production: fetch from server or embed encrypted</span>
+        <span class="keyword">return</span> <span class="string">"..."</span>
+    }
+
+    <span class="keyword">private</span> <span class="keyword">static</span> <span class="keyword">func</span> <span class="func">expectedDylibCount</span>() -> <span class="type">UInt32</span> {
+        <span class="comment">// Baseline dylib count for your app — update per release</span>
+        <span class="keyword">return</span> <span class="number">250</span>
+    }
+}</code></pre>
+
+    <h3>9.4 App Attest — Hardware-Backed Integrity</h3>
+
+    <pre><code><span class="keyword">import</span> <span class="type">DeviceCheck</span>
+
+<span class="keyword">class</span> <span class="type">AppAttestService</span> {
+    <span class="keyword">private</span> <span class="keyword">let</span> service = <span class="type">DCAppAttestService</span>.shared
+
+    <span class="keyword">func</span> <span class="func">attestDevice</span>() <span class="keyword">async</span> <span class="keyword">throws</span> -> <span class="type">String</span> {
+        <span class="keyword">guard</span> service.isSupported <span class="keyword">else</span> {
+            <span class="keyword">throw</span> <span class="type">AttestError</span>.unsupported
+        }
+
+        <span class="keyword">let</span> keyId = <span class="keyword">try</span> <span class="keyword">await</span> service.generateKey()
+
+        <span class="keyword">let</span> challenge = <span class="keyword">try</span> <span class="keyword">await</span> fetchChallengeFromServer()
+        <span class="keyword">let</span> challengeHash = <span class="type">Data</span>(<span class="type">SHA256</span>.hash(data: challenge))
+
+        <span class="keyword">let</span> attestation = <span class="keyword">try</span> <span class="keyword">await</span> service.attestKey(
+            keyId, clientDataHash: challengeHash
+        )
+
+        <span class="keyword">try</span> <span class="keyword">await</span> sendAttestationToServer(
+            keyId: keyId, attestation: attestation
+        )
+
+        <span class="keyword">return</span> keyId
+    }
+
+    <span class="keyword">func</span> <span class="func">generateAssertion</span>(
+        keyId: <span class="type">String</span>,
+        requestData: <span class="type">Data</span>
+    ) <span class="keyword">async</span> <span class="keyword">throws</span> -> <span class="type">Data</span> {
+        <span class="keyword">let</span> hash = <span class="type">Data</span>(<span class="type">SHA256</span>.hash(data: requestData))
+        <span class="keyword">return</span> <span class="keyword">try</span> <span class="keyword">await</span> service.generateAssertion(
+            keyId, clientDataHash: hash
+        )
+    }
+
+    <span class="keyword">private</span> <span class="keyword">func</span> <span class="func">fetchChallengeFromServer</span>() <span class="keyword">async</span> <span class="keyword">throws</span> -> <span class="type">Data</span> {
+        <span class="comment">// Server generates a unique, single-use challenge nonce</span>
+        <span class="keyword">let</span> (data, _) = <span class="keyword">try</span> <span class="keyword">await</span> <span class="type">URLSession</span>.shared.data(
+            from: <span class="type">URL</span>(string: <span class="string">"https://api.example.com/attest/challenge"</span>)!
+        )
+        <span class="keyword">return</span> data
+    }
+
+    <span class="keyword">private</span> <span class="keyword">func</span> <span class="func">sendAttestationToServer</span>(
+        keyId: <span class="type">String</span>, attestation: <span class="type">Data</span>
+    ) <span class="keyword">async</span> <span class="keyword">throws</span> {
+        <span class="comment">// Server validates the attestation against Apple's servers</span>
+        <span class="comment">// and stores the public key for future assertion verification</span>
+    }
+}</code></pre>
+
+    <h3>9.5 Designing for Financial / Health Apps</h3>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect — Security Architecture for Regulated Apps</div>
+        <p>For apps handling financial transactions (PCI-DSS), health data (HIPAA), or government data (FedRAMP), the runtime security architecture must address:</p>
+        <ul>
+            <li><strong>Device integrity</strong>: Use App Attest to verify the device hasn't been compromised. Fall back to heuristic checks (sandbox integrity, dylib count, debugger detection) on older devices. Never trust client-side checks alone — validate server-side.</li>
+            <li><strong>Memory hygiene</strong>: Zero sensitive data (keys, tokens, PII) immediately after use. Use <code>Data</code> with <code>resetBytes(in:)</code> instead of <code>String</code> for secrets (String may be interned or copied by the runtime). Consider using <code>UnsafeMutableRawBufferPointer</code> with explicit zeroing for cryptographic keys.</li>
+            <li><strong>Anti-tampering</strong>: Verify the executable hash at launch. Monitor for injected dylibs. Use server-driven feature gating so compromised clients can be remotely disabled.</li>
+            <li><strong>Secure communication</strong>: Certificate pinning (via <code>URLSessionDelegate</code> or <code>NSPinnedDomains</code>), mutual TLS for high-value endpoints, encrypted payloads for defense-in-depth against TLS interception.</li>
+            <li><strong>Assume breach</strong>: Design server APIs so that even a fully compromised client cannot cause unauthorized transactions. Use server-side validation, rate limiting, anomaly detection, and step-up authentication for sensitive operations.</li>
+        </ul>
+    </div>
+
+    <h3>9.6 Complete Security Checklist</h3>
+
+    <table>
+        <thead>
+            <tr><th>Layer</th><th>Mechanism</th><th>Defeats</th><th>Bypass Requires</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Hardware</td><td>PAC (A12+)</td><td>ROP, JOP, pointer tampering</td><td>Signing gadget or PAC oracle</td></tr>
+            <tr><td>Hardware</td><td>SEP / Secure Enclave</td><td>Key extraction, biometric spoofing</td><td>Hardware fault injection</td></tr>
+            <tr><td>Hardware</td><td>KTRR / CTRR</td><td>Kernel code patching</td><td>Hardware-level attack</td></tr>
+            <tr><td>Kernel</td><td>ASLR</td><td>Hardcoded addresses, gadget reuse</td><td>Info leak vulnerability</td></tr>
+            <tr><td>Kernel</td><td>W^X</td><td>Shellcode injection</td><td>Code reuse (ROP/JOP)</td></tr>
+            <tr><td>Kernel</td><td>Code signing</td><td>Unsigned code execution</td><td>Kernel exploit or signing bypass</td></tr>
+            <tr><td>Kernel</td><td>Sandbox (MAC)</td><td>Unauthorized resource access</td><td>Sandbox escape exploit</td></tr>
+            <tr><td>Compiler</td><td>Stack canaries</td><td>Stack buffer overflow → RIP control</td><td>Non-linear write or canary leak</td></tr>
+            <tr><td>Compiler</td><td>CFI</td><td>Indirect call/jump hijacking</td><td>CFI-compatible target</td></tr>
+            <tr><td>Runtime</td><td>__DATA_CONST</td><td>GOT/vtable overwrite</td><td>Write before mprotect or kernel bug</td></tr>
+            <tr><td>Language</td><td>Swift memory safety</td><td>Buffer overflow, use-after-free, type confusion</td><td>Unsafe code or ObjC interop</td></tr>
+            <tr><td>App</td><td>App Attest</td><td>Device tampering, replay attacks</td><td>SEP compromise</td></tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — The 80/20 of Runtime Security</div>
+        <p>For most apps, the highest-impact security decisions are: (1) Write in Swift, not ObjC — this alone eliminates most memory corruption vulnerabilities; (2) Use the latest deployment target — this ensures your users' devices have PAC, latest ASLR entropy, and current kernel mitigations; (3) Don't disable compiler protections — leave <code>-fstack-protector-strong</code> enabled, don't use <code>-Ounchecked</code> in release builds; (4) Use App Attest for server communication — hardware-backed device integrity is far more reliable than client-side jailbreak detection. The OS provides an extraordinary security baseline — your job is to not weaken it.</p>
+    </div>
+
+    <!-- ============================================================ -->
+
+    <div class="nav-footer">
+        <a href="05-code-signing.html">← Previous: Code Signing</a>
+        <a href="07-interview-qa.html">Next: Interview Q&amp;A →</a>
+    </div>
+</div>
+</body>
+</html>

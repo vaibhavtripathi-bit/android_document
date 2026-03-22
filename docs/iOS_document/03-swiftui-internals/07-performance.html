@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Performance Optimization — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">SwiftUI Internals</a><span class="sep">›</span>
+        Performance
+    </nav>
+
+    <h1>SwiftUI Performance Optimization</h1>
+    <p class="subtitle">A Staff-level deep dive into lazy layout, <code>equatable()</code>, identity stability, recomputation boundaries, Instruments, <code>_printChanges()</code>, and <code>.task</code> lifecycles — the material interviewers use to distinguish “I built a SwiftUI screen” from “I can reason about update graphs under load.”</p>
+    <p>
+        <span class="tag tag-l6">L6</span>
+        <span class="tag tag-senior">Senior+</span>
+        <span class="tag tag-architect">Performance</span>
+    </p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#lazy-containers">1. Lazy Containers (<code>LazyVStack</code>, <code>LazyHStack</code>, <code>LazyVGrid</code>)</a></li>
+            <li><a href="#equatable-modifier">2. The <code>equatable()</code> Modifier &amp; <code>EquatableView</code></a></li>
+            <li><a href="#identity-stability">3. View Identity Stability for Performance</a></li>
+            <li><a href="#body-recomputation">4. Reducing Body Recomputation</a></li>
+            <li><a href="#instruments">5. Instruments: SwiftUI Profiling Template</a></li>
+            <li><a href="#print-changes">6. <code>Self._printChanges()</code></a></li>
+            <li><a href="#task-lifecycle">7. <code>.task</code> Modifier Lifecycle</a></li>
+            <li><a href="#audit-checklist">8. Performance Audit Checklist (Large Apps)</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="lazy-containers">1. Lazy Containers (<code>LazyVStack</code>, <code>LazyHStack</code>, <code>LazyVGrid</code>)</h2>
+
+    <p>SwiftUI’s eager stacks (<code>VStack</code>, <code>HStack</code>, <code>ZStack</code>) ask every child for its ideal size and layout participation during layout passes that traverse the subtree. For hundreds or thousands of rows, that work is wasted if only a small viewport is visible. <strong>Lazy</strong> containers defer child view construction and measurement until the child’s region becomes <em>near</em> the visible bounds — a scroll-driven, demand-oriented pipeline.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Mental Model for Interviews</div>
+        <p>“Lazy” is not “free.” It shifts costs from <em>up-front full-tree layout</em> to <em>incremental work while scrolling</em> and introduces subtleties: prefetch buffers, identity of off-screen cells, pinned headers, and memory retention of previously realized views.</p>
+    </div>
+
+    <h3>1.1 How lazy loading works (on-demand view realization)</h3>
+
+    <p>Conceptually, a lazy container maintains a <strong>window</strong> of realized children around the visible rect. As the user scrolls, new indices enter the window: SwiftUI evaluates the corresponding closure / <code>View</code> values, runs layout for those items, and attaches platform representations. Items that scroll far away may be <em>unloaded from the screen</em> but their SwiftUI graph nodes and associated state are not guaranteed to be eagerly destroyed — behavior is implementation-dependent and influenced by reuse, caching, and navigation.</p>
+
+    <div class="diagram">
+ScrollView + LazyVStack
+ ┌──────────────── viewport ────────────────┐
+ │  [ realized: row 12 .. row 18 ]          │
+ └──────────────────────────────────────────┘
+        ↑ prefetch / buffer region
+ [ latent: closures not yet evaluated for row 0..11, row 19..N ]
+
+On scroll down:
+  - New rows enter buffer → body evaluated for those indices
+  - Far rows may leave viewport → platform layers recycled (conceptually)
+  - @State on row views may persist while identity is stable
+    </div>
+
+    <h3>1.2 <code>LazyVStack</code> vs <code>VStack</code>: decision matrix</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th><code>VStack</code></th>
+                <th><code>LazyVStack</code></th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Child evaluation</td>
+                <td>All children participate in layout each pass (within parent constraints).</td>
+                <td>Children near the visible region are prioritized; distant children are deferred.</td>
+            </tr>
+            <tr>
+                <td>Best for</td>
+                <td>Small, bounded content (forms, toolbars, ≤ few dozen views).</td>
+                <td>Long lists, feeds, large grids inside <code>ScrollView</code>.</td>
+            </tr>
+            <tr>
+                <td>Layout surprises</td>
+                <td>Predictable intrinsic sizing; easier mental model.</td>
+                <td>Spacing distribution can differ; flexible children need explicit sizing hints.</td>
+            </tr>
+            <tr>
+                <td>Animation / measurement</td>
+                <td>Global stack height known if children report sizes.</td>
+                <td>Total content height may be estimated; some animations need explicit frames.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <p><strong>Rule of thumb:</strong> If the child count scales with server data and the subtree is scrollable, default to lazy. If the subtree is static and short, eager stacks reduce cognitive overhead and avoid scroll-specific edge cases.</p>
+
+    <h3>1.3 <code>LazyVGrid</code> and <code>GridItem</code> sizing modes</h3>
+
+    <p><code>GridItem</code> describes column (or row) track sizing. The three common constructors encode different performance and flexibility tradeoffs:</p>
+
+    <ul>
+        <li><strong><code>.fixed(CGFloat)</code></strong> — deterministic track size; cheapest to resolve; ideal for icon grids and thumbnails with known dimensions.</li>
+        <li><strong><code>.flexible(min:max:)</code></strong> — shares remaining space among flexible tracks; good for responsive columns with bounds.</li>
+        <li><strong><code>.adaptive(minimum:)</code></strong> — pack as many tracks as fit above a minimum; powerful for responsive galleries but can change track count when width changes, affecting diffing and animation stability.</li>
+    </ul>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">AdaptiveGallery</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> items: [<span class="type">Photo</span>]
+
+    <span class="keyword">private</span> <span class="keyword">let</span> columns = [
+        <span class="type">GridItem</span>(.<span class="func">adaptive</span>(minimum: <span class="number">120</span>, maximum: <span class="number">180</span>), spacing: <span class="number">8</span>),
+    ]
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">ScrollView</span> {
+            <span class="type">LazyVGrid</span>(columns: columns, spacing: <span class="number">8</span>) {
+                <span class="type">ForEach</span>(items) { item <span class="keyword">in</span>
+                    <span class="type">PhotoCell</span>(photo: item)
+                        .<span class="func">aspectRatio</span>(<span class="number">1</span>, contentMode: .fill)
+                }
+            }
+            .<span class="func">padding</span>()
+        }
+    }
+}</code></pre>
+
+    <h3>1.4 Memory behavior: created vs destroyed</h3>
+
+    <p>Engineers often assume off-screen lazy children are immediately deallocated. In practice, SwiftUI may <strong>retain realized view values and their <code>@State</code></strong> for reuse — similar in spirit to table view cell reuse, but not identical. The critical interview point: <strong>do not rely on disappearance to reclaim heavy resources</strong> unless you pair lazy containers with explicit lifecycle hooks (<code>.onDisappear</code>, <code>.task</code> cancellation, clearing caches in models).</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Heavy Row Payloads</div>
+        <p>Image decoding, attributed string building, and attributed layout should move to asynchronous pipelines or view models. A lazy row that “disappeared” may still have triggered expensive work while scrolling fast if bodies recompute often or identities thrash.</p>
+    </div>
+
+    <h3>1.5 Pinned section headers</h3>
+
+    <p><code>Section</code> headers inside lazy stacks can be pinned during scroll (APIs vary by SDK; the interview concept is <strong>sticky chrome</strong>). Pinned views participate in a different layout negotiation path: they must remain visible while content scrolls beneath. That implies additional layout constraints and sometimes more frequent measurement of sibling content. Prefer shallow header hierarchies and avoid heavy work in pinned header bodies.</p>
+
+    <h3>1.6 Code: eager vs lazy rough cost shape</h3>
+
+    <pre><code><span class="comment">// EAGER: O(n) child layout participation each update affecting the stack</span>
+<span class="keyword">struct</span> <span class="type">EagerDashboard</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> rows: <span class="type">Range</span>&lt;<span class="type">Int</span>&gt;
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">ScrollView</span> {
+            <span class="type">VStack</span>(spacing: <span class="number">0</span>) {
+                <span class="type">ForEach</span>(<span class="type">Array</span>(rows), id: \.<span class="keyword">self</span>) { i <span class="keyword">in</span>
+                    <span class="type">HeavyRow</span>(index: i) <span class="comment">// evaluated for all i in range</span>
+                }
+            }
+        }
+    }
+}
+
+<span class="comment">// LAZY: work scales with visible window + prefetch, not full N every pass</span>
+<span class="keyword">struct</span> <span class="type">LazyDashboard</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> rows: <span class="type">Range</span>&lt;<span class="type">Int</span>&gt;
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">ScrollView</span> {
+            <span class="type">LazyVStack</span>(spacing: <span class="number">0</span>, pinnedViews: [.sectionHeaders]) {
+                <span class="type">Section</span>(header: <span class="type">Text</span>(<span class="string">"Pinned"</span>)) {
+                    <span class="type">ForEach</span>(<span class="type">Array</span>(rows), id: \.<span class="keyword">self</span>) { i <span class="keyword">in</span>
+                        <span class="type">HeavyRow</span>(index: i)
+                    }
+                }
+            }
+        }
+    }
+}</code></pre>
+
+    <p>For interview storytelling, contrast <strong>CPU time during initial render</strong> vs <strong>CPU time while scrolling</strong>: lazy reduces the former for large <code>N</code> but can introduce jank if each newly visible row does synchronous heavy layout.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="equatable-modifier">2. The <code>equatable()</code> Modifier &amp; <code>EquatableView</code></h2>
+
+    <p>By default, when a parent’s body re-executes, SwiftUI revisits child subtrees to decide what changed. For expensive child bodies — rich text, charts, complex layout — you may know that <strong>logically nothing material changed</strong> even though the parent refreshed. The <code>equatable()</code> path (backed by the <code>EquatableView</code> wrapper type) lets you supply a value-level equality gate: if the gate says “equal,” SwiftUI can skip reinvoking the child’s <code>body</code>.</p>
+
+    <h3>2.1 How <code>equatable()</code> prevents unnecessary <code>body</code> calls</h3>
+
+    <p><code>EquatableView</code> stores the child view and compares a projected <code>Equatable</code> value across updates. On inequality, the child body runs as usual. On equality, SwiftUI treats the subtree as unchanged for rendering purposes, avoiding redundant reconstruction work.</p>
+
+    <div class="diagram">
+Parent body runs
+      │
+      ▼
+ Child: EquatableView&lt;Content&gt;
+      │  compare old.equatableValue == new.equatableValue
+      ├─ equal ───────► skip Content.body (fast path)
+      └─ not equal ───► evaluate Content.body (slow path)
+    </div>
+
+    <h3>2.2 When to use <code>equatable()</code></h3>
+
+    <ul>
+        <li>Child layout is <strong>CPU-heavy</strong> or allocates large transient structures.</li>
+        <li>Inputs are <strong>value types</strong> or small reference tokens that meaningfully summarize state.</li>
+        <li>You can define equality that matches <strong>semantic UI equivalence</strong>, not just pointer identity.</li>
+    </ul>
+
+    <h3>2.3 Comparison with manual <code>Equatable</code> on <code>View</code> structs</h3>
+
+    <p>Making a <code>struct MyView: View, Equatable</code> is related but not identical ergonomically: SwiftUI’s <code>View</code> protocol does not require <code>Equatable</code>, and not all compositions expose easy automatic synthesis. The <code>equatable()</code> modifier localizes the optimization to a subtree and pairs it with an explicit compared value, which is often clearer in code review.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Approach</th>
+                <th>Pros</th>
+                <th>Cons</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>.equatable()</code></td>
+                <td>Explicit compared value; minimal protocol gymnastics; easy to apply to third-party views via wrapper.</td>
+                <td>Easy to compare the wrong fields and hide real updates (stale UI bugs).</td>
+            </tr>
+            <tr>
+                <td><code>struct Row: View, Equatable</code></td>
+                <td>Encourages modeling equality with the view type itself.</td>
+                <td>Synthesis limits; harder with closures; still need discipline on what “equal” means.</td>
+            </tr>
+            <tr>
+                <td>Extract subview + narrow <code>@State</code></td>
+                <td>Reduces invalidation fan-out without custom equality.</td>
+                <td>Does not help if parent state still forces child invalidation frequently.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">ArticleSummary</span>: <span class="type">View</span>, <span class="type">Equatable</span> {
+    <span class="keyword">let</span> title: <span class="type">String</span>
+    <span class="keyword">let</span> subtitle: <span class="type">String</span>
+    <span class="keyword">let</span> metrics: <span class="type">ArticleMetrics</span> <span class="comment">// Equatable aggregate</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span>(alignment: .leading, spacing: <span class="number">6</span>) {
+            <span class="type">Text</span>(title).<span class="func">font</span>(.title3)
+            <span class="type">Text</span>(subtitle).<span class="func">foregroundStyle</span>(.secondary)
+            <span class="type">MetricsRibbon</span>(metrics: metrics)
+        }
+        .<span class="func">equatable</span>() <span class="comment">// EquatableView&lt;Self&gt;; skips body when self == old self</span>
+    }
+}</code></pre>
+
+    <pre><code><span class="comment">// Digest gate: small Equatable shell compares only what should invalidate the chart.</span>
+<span class="keyword">struct</span> <span class="type">ChartGate</span>: <span class="type">View</span>, <span class="type">Equatable</span> {
+    <span class="keyword">let</span> digest: <span class="type">ChartDigest</span>
+    <span class="keyword">let</span> snapshot: <span class="type">DashboardSnapshot</span>
+
+    <span class="keyword">static</span> <span class="keyword">func</span> == (lhs: <span class="type">ChartGate</span>, rhs: <span class="type">ChartGate</span>) -&gt; <span class="type">Bool</span> {
+        lhs.digest == rhs.digest
+    }
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">ExpensiveChart</span>(snapshot: snapshot)
+    }
+}
+
+<span class="keyword">struct</span> <span class="type">DashboardShell</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> tick = <span class="number">0</span>
+    <span class="keyword">let</span> snapshot: <span class="type">DashboardSnapshot</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span> {
+            <span class="type">Text</span>(<span class="string">"Clock: \(tick)"</span>) <span class="comment">// changes every second</span>
+            <span class="type">ChartGate</span>(digest: snapshot.chartDigest, snapshot: snapshot)
+                .<span class="func">equatable</span>()
+        }
+        .<span class="func">onReceive</span>(<span class="type">Timer</span>.<span class="func">publish</span>(every: <span class="number">1</span>, on: .main, <span class="keyword">in</span>: .common).<span class="func">autoconnect</span>()) { _ <span class="keyword">in</span>
+            tick += <span class="number">1</span>
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Staff-Level Talking Point</div>
+        <p>Treat <code>equatable()</code> as a <strong>semantic cache key</strong>. If your key is too coarse, users see stale visuals; if too fine, you defeat the optimization. Pair with stable model identifiers and hashed digests for large blobs.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="identity-stability">3. View Identity Stability for Performance</h2>
+
+    <p>Performance and correctness intersect at <strong>identity</strong>. When identity is unstable, SwiftUI discards old nodes and builds new ones: <code>@State</code> resets, animations restart, platform views re-instantiate, and caches go cold. Even when state appears preserved, thrashing identity increases diffing and layout work.</p>
+
+    <h3>3.1 Why stable identity avoids unnecessary recreation</h3>
+
+    <p>Identity tells the runtime which persistent storage slot to update. Stable identity means: “this row is still <em>that</em> row,” not merely “there is still <em>a</em> row here.” Structural identity (position in the builder) is fragile when inserting, deleting, or reordering without stable keys.</p>
+
+    <div class="diagram">
+ForEach without stable ids (model array reorder):
+  old: [A, B, C]   positions: 0 1 2
+  new: [C, A, B]
+  structural slots still 0 1 2 but SEMANTICS permuted
+  Without id: rows may reuse wrong @State / wrong animations
+
+ForEach(ids: model.id):
+  A always maps to node keyed by id(A)
+  Reorder becomes move operations, not destroy/create
+    </div>
+
+    <h3>3.2 <code>AnyView</code> performance cost</h3>
+
+    <p><code>AnyView</code> type-erases dynamic view types into a single concrete wrapper. That erasure defeats much of the compile-time specialization that makes SwiftUI’s generic trees efficient. Use of <code>AnyView</code> can:</p>
+    <ul>
+        <li>Increase allocation and indirection.</li>
+        <li>Obscure identity relationships across branches.</li>
+        <li>Complicate diffing by collapsing distinct generic types into one erased container.</li>
+    </ul>
+    <p>Prefer <code>Group</code>, <code>@ViewBuilder</code> generics, or <code>TupleView</code>-preserving conditionals. Reach for <code>AnyView</code> only at boundaries (plugin systems) where dynamism is unavoidable.</p>
+
+    <h3>3.3 Conditional view pitfalls</h3>
+
+    <p>Switching between different view types in the same structural slot via <code>if/else</code> resets subtree state. Even when performance is acceptable, UX suffers. From a performance angle, flipping branches forces new platform elements and re-establishes constraints — measurable as spikes in View Body and Core Animation commits in Instruments.</p>
+
+    <h3>3.4 <code>ForEach</code> with stable IDs — example</h3>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">MessageThread</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> messages: [<span class="type">Message</span>]
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">ScrollViewReader</span> { proxy <span class="keyword">in</span>
+            <span class="type">LazyVStack</span>(alignment: .leading, spacing: <span class="number">8</span>) {
+                <span class="type">ForEach</span>(messages) { msg <span class="keyword">in</span> <span class="comment">// Identifiable: stable id</span>
+                    <span class="type">MessageBubble</span>(message: msg)
+                        .<span class="func">id</span>(msg.<span class="type">id</span>)
+                }
+            }
+        }
+    }
+}</code></pre>
+
+    <pre><code><span class="comment">// Anti-pattern: array index as id when list is mutable / reorderable</span>
+<span class="type">ForEach</span>(items.<span class="func">indices</span>, id: \.<span class="keyword">self</span>) { idx <span class="keyword">in</span>
+    <span class="type">Row</span>(item: items[idx]) <span class="comment">// identity tracks index, not model entity</span>
+}</code></pre>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Scenario</th>
+                <th>Preferred identity</th>
+                <th>Failure mode</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Stable insert-only feed</td>
+                <td>Server <code>id</code> or content hash</td>
+                <td>Duplicate ids cause diffing ambiguity.</td>
+            </tr>
+            <tr>
+                <td>Reorderable list</td>
+                <td>Persistent model UUID</td>
+                <td>Index ids produce wrong state reuse.</td>
+            </tr>
+            <tr>
+                <td>Ephemeral UI blocks</td>
+                <td>Explicit <code>.id(uuid)</code> when forcing reset</td>
+                <td>Overusing changing ids causes thrash.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="body-recomputation">4. Reducing Body Recomputation</h2>
+
+    <p>SwiftUI invalidates views when their dependencies change. A dependency is any <code>@State</code>, <code>@Binding</code>, <code>@Observable</code> field read, environment value, and more. Large <code>body</code> functions magnify the cost of each invalidation because Swift constructs fresh view values for the entire subtree unless optimizations apply.</p>
+
+    <h3>4.1 Extract subviews to limit recomputation scope</h3>
+
+    <p>Child structs act as <strong>invalidation boundaries</strong> when their inputs are narrow. If only <code>HeaderView</code> depends on <code>title</code>, factoring it out prevents <code>FooterView</code> from being re-evaluated when <code>title</code> flips — the parent may still run, but SwiftUI’s dependency tracking can avoid redundant work deeper in the tree for unchanged inputs.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Interview Nuance</div>
+        <p>Extraction is not magic: if you pass a whole <code>ObservableObject</code> or a binding to a huge model, children still subscribe broadly. Narrow the surface area: pass immutable snapshots, primitives, or scoped bindings.</p>
+    </div>
+
+    <h3>4.2 <code>@State</code> vs <code>@Binding</code> scope</h3>
+
+    <p><code>@State</code> creates storage owned by the view. <code>@Binding</code> propagates mutations upward. Deep binding chains can cause wide invalidation when the bound value changes. Prefer storing transient UI state close to where it is read, and push shared state to a dedicated observable model with selective observation (<code>@Observable</code> macros, scoped sub-stores).</p>
+
+    <h3>4.3 Avoid computed properties that allocate new objects each body</h3>
+
+    <p>Patterns like <code>var tokens: [Token] { text.split(...) }</code> inside the view struct run whenever the body is evaluated, producing fresh arrays and triggering downstream diffs. Hoist to <code>let</code> in an initializer, cache in model layer, or memoize with explicit invalidation keys.</p>
+
+    <h3>4.4 <code>let</code> vs computed properties in view structs</h3>
+
+    <p>Stored <code>let</code> properties are fixed at construction; computed properties re-run on each access during <code>body</code>. Move expensive derived values to the initializer of a child view so they are computed once per identity update, not on every intermediate access.</p>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">ProfileHeader</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> displayName: <span class="type">String</span>
+    <span class="keyword">let</span> avatarURL: <span class="type">URL</span>?
+
+    <span class="comment">// BAD: runs every time body is evaluated</span>
+    <span class="keyword">private</span> <span class="keyword">var</span> initials: <span class="type">String</span> {
+        <span class="type">InitialsGenerator</span>.<span class="func">make</span>(from: displayName) <span class="comment">// allocates / uppercases</span>
+    }
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">HStack</span> {
+            <span class="type">AvatarView</span>(url: avatarURL, initials: initials)
+            <span class="type">Text</span>(displayName)
+        }
+    }
+}</code></pre>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">ProfileHeaderOptimized</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> displayName: <span class="type">String</span>
+    <span class="keyword">let</span> avatarURL: <span class="type">URL</span>?
+    <span class="keyword">private</span> <span class="keyword">let</span> initials: <span class="type">String</span>
+
+    <span class="func">init</span>(displayName: <span class="type">String</span>, avatarURL: <span class="type">URL</span>?) {
+        <span class="keyword">self</span>.displayName = displayName
+        <span class="keyword">self</span>.avatarURL = avatarURL
+        <span class="keyword">self</span>.initials = <span class="type">InitialsGenerator</span>.<span class="func">make</span>(from: displayName)
+    }
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">HStack</span> {
+            <span class="type">AvatarView</span>(url: avatarURL, initials: initials)
+            <span class="type">Text</span>(displayName)
+        }
+    }
+}</code></pre>
+
+    <h3>4.5 Sample <code>_printChanges()</code> narrative (preview of section 6)</h3>
+
+    <p>When a parent timer fires, you might see:</p>
+    <pre><code><span class="type">DashboardShell</span>: @self changed.
+<span class="type">ExpensiveChart</span>: @self changed. <span class="comment">// without equatable gate</span></code></pre>
+    <p>After narrowing dependencies or wrapping the chart in an <code>Equatable</code> gate (for example <code>ChartGate</code> comparing only <code>chartDigest</code> plus <code>.equatable()</code>), the chart line should disappear from the log when only <code>tick</code> changes, indicating the subtree skipped re-evaluation.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="instruments">5. Instruments: SwiftUI Profiling Template</h2>
+
+    <p>Xcode’s SwiftUI instrument surfaces the framework’s internal phases without requiring you to guess from NSLog timing alone. For Staff interviews, name the major tracks and what suspicious patterns look like.</p>
+
+    <h3>5.1 Launching the SwiftUI profiling template</h3>
+
+    <ol>
+        <li>Product → Profile (<kbd>⌘I</kbd>) → choose the <strong>SwiftUI</strong> template (availability depends on Xcode version).</li>
+        <li>Reproduce the jank on device; simulators lie about GPU and some animation timings.</li>
+        <li>Correlate spikes with user actions (scroll bursts, navigation transitions, state toggles).</li>
+    </ol>
+
+    <h3>5.2 Key tracks: View Body, View Properties, Core Animation commits</h3>
+
+    <ul>
+        <li><strong>View Body</strong> — time spent evaluating SwiftUI bodies; tall bars point to hot views or overly broad invalidation.</li>
+        <li><strong>View Properties</strong> — work updating layout-affecting properties; overlaps with expensive layout or preference propagation.</li>
+        <li><strong>Core Animation commits</strong> — bridging to render server; spikes imply large layer tree diffs, off-main-thread content not actually isolated, or excessive implicit animations.</li>
+    </ul>
+
+    <div class="diagram">
+Timeline (conceptual)
+ |--user scroll--|
+      ^                 ^
+      |                 |
+   View Body spike    CA commit spike
+   (new rows)         (many layer updates)
+
+Ideal: smooth, low-amplitude View Body activity
+       CA commits clustered at frame boundaries
+    </div>
+
+    <h3>5.3 Reading the timeline</h3>
+
+    <p>Zoom until individual frames align with display refresh. If View Body work routinely crosses frame boundaries, you are CPU-bound on the main actor. If bodies are cheap but CA commits are huge, investigate layer flattening, opacity groups, shadows, and mask usage.</p>
+
+    <h3>5.4 Identifying slow body computations</h3>
+
+    <p>Drill into the heaviest symbols / view types (names are demangled). Cross-check with source: Are models mapped to views in <code>body</code>? Is sorting or filtering applied inline? Are images decoded synchronously?</p>
+
+    <h3>5.5 Identifying excessive recomputations</h3>
+
+    <p>Frequent narrow spikes on simple views often mean upstream state churn — a timer, a global store, or an environment object publishing too often. Combine Instruments with <code>_printChanges()</code> to attribute the dependency edge.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Instrument signal</th>
+                <th>Likely cause</th>
+                <th>First remediation</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Repeated View Body on static UI</td>
+                <td>Observable object not granular; timer on parent</td>
+                <td>Split store, move timer down, use equatable gates</td>
+            </tr>
+            <tr>
+                <td>Spikes on scroll</td>
+                <td>Heavy row body; synchronous image decode</td>
+                <td>Lazy container + async image + pre-sized frames</td>
+            </tr>
+            <tr>
+                <td>CA commit storms</td>
+                <td>Shadows, masks, animated <code>cornerRadius</code></td>
+                <td>Flatten layers, pre-render assets, reduce implicit animation fan-out</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="print-changes">6. <code>Self._printChanges()</code></h2>
+
+    <p>Apple provides a debug-only helper — subject to change — that logs why SwiftUI decided a given <code>body</code> ran. It is invaluable for turning vague “my list is slow” reports into concrete dependency graphs.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Private API Adjacency</div>
+        <p>Treat <code>_printChanges()</code> as a <strong>debugging tool</strong>, not a shipping feature. Names and output evolve across SDKs; interviews still reward knowing it exists and how to interpret categories.</p>
+    </div>
+
+    <h3>6.1 Using <code>_printChanges()</code> inside <code>body</code></h3>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">InstrumentedRow</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> title: <span class="type">String</span>
+    <span class="keyword">@Environment</span>(\.colorScheme) <span class="keyword">private</span> <span class="keyword">var</span> colorScheme
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="keyword">let</span> _ = <span class="keyword">Self</span>._<span class="func">printChanges</span>()
+        <span class="type">HStack</span> {
+            <span class="type">Text</span>(title)
+            <span class="type">Spacer</span>()
+        }
+        .<span class="func">padding</span>()
+    }
+}</code></pre>
+
+    <h3>6.2 Interpreting output categories</h3>
+
+    <ul>
+        <li><strong><code>@self</code></strong> — a field on the view value itself changed (e.g., a <code>let</code> property or the synthesized memberwise container).</li>
+        <li><strong><code>@identity</code></strong> — identity-driving inputs changed (structural or explicit <code>.id</code> changes).</li>
+        <li><strong><code>@dependency</code></strong> — dynamic dependencies such as environment, bindings, or observable reads triggered invalidation.</li>
+    </ul>
+
+    <h3>6.3 Finding unnecessary recomputations</h3>
+
+    <p>Log noise while toggling a single feature flag. If unrelated views log changes, trace which shared environment or object they read. Remove the read (inject values instead of whole environment), split the view, or replace a broad <code>ObservableObject</code> with scoped observation.</p>
+
+    <pre><code><span class="comment">// Illustrative console fragments (not guaranteed exact across SDKs)</span>
+<span class="type">InstrumentedRow</span>: @self changed.
+<span class="type">ThemedCard</span>: @dependency @environment(\.colorScheme) changed.
+<span class="type">AvatarView</span>: @identity changed.</code></pre>
+
+    <p>Pair these lines with code reads: a card that should be theme-independent should not depend on <code>colorScheme</code> directly if only a subtree needs adaptation — push theme into a lightweight child or use semantic asset catalogs.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="task-lifecycle">7. <code>.task</code> Modifier Lifecycle</h2>
+
+    <p>The <code>.task</code> modifier attaches an asynchronous task to a view’s lifetime. Unlike fire-and-forget <code>Task {}</code> in <code>onAppear</code>, <code>.task</code> is designed to cooperate with SwiftUI’s appearance system and structured cancellation.</p>
+
+    <h3>7.1 Lifecycle tied to view identity</h3>
+
+    <p>When a view appears, SwiftUI starts the task. When the view disappears <em>or</em> is torn down due to identity changes, SwiftUI cancels the task. This binding is why <code>.task</code> is preferable for network fetches tied to on-screen UI.</p>
+
+    <div class="diagram">
+View identity stable + on screen:
+  .task runs ─────────────────────────────►
+  until cancelled (disappear / id change)
+
+.task(id: selection.id):
+  id changes ──► cancel old task ──► start new task
+    </div>
+
+    <h3>7.2 <code>.task(id:)</code> for re-triggering</h3>
+
+    <p>When inputs must reload work — selected conversation, pagination cursor — use the <code>id</code> parameter so SwiftUI cancels prior work automatically when the id changes, reducing race conditions.</p>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">ConversationPane</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> conversationId: <span class="type">UUID</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">MessagesList</span>(conversationId: conversationId)
+            .<span class="func">task</span>(id: conversationId) {
+                <span class="keyword">await</span> <span class="type">Store</span>.<span class="func">shared</span>.<span class="func">loadMessages</span>(conversationId)
+            }
+    }
+}</code></pre>
+
+    <h3>7.3 Cancellation on disappear</h3>
+
+    <p>Async functions should use <code>try Task.checkCancellation()</code> or cancellation-aware APIs (<code>URLSession</code> tasks tied to <code>URLRequest</code> with task cancellation in cooperative code). UI state updates after await must confirm the view is still relevant.</p>
+
+    <h3>7.4 Common mistakes</h3>
+
+    <ul>
+        <li>Ignoring cancellation → stale responses overwrite fresh UI.</li>
+        <li>Performing heavy synchronous work before first await → main-thread jank.</li>
+        <li>Using <code>.task</code> on a high-churn identity → perpetual cancel/start thrash.</li>
+    </ul>
+
+    <h3>7.5 <code>.task</code> vs <code>.onAppear</code></h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Concern</th>
+                <th><code>onAppear</code></th>
+                <th><code>task</code></th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Structured async</td>
+                <td>Manual <code>Task</code>; easy to leak</td>
+                <td>Built-in; tied to lifetime</td>
+            </tr>
+            <tr>
+                <td>Cancellation</td>
+                <td>Must wire manually</td>
+                <td>Automatic on teardown / id change</td>
+            </tr>
+            <tr>
+                <td>Re-entrancy</td>
+                <td>Can fire more than expected across navigation quirks</td>
+                <td>Generally tracks appearance + id parameter</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">BadAppearFetch</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> data: <span class="type">String</span>?
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">Text</span>(data ?? <span class="string">"loading"</span>)
+            .<span class="func">onAppear</span> {
+                <span class="type">Task</span> {
+                    <span class="keyword">let</span> value = <span class="keyword">await</span> <span class="func">slowNetwork</span>()
+                    data = value <span class="comment">// may run after disappear</span>
+                }
+            }
+    }
+}</code></pre>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">GoodTaskFetch</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> data: <span class="type">String</span>?
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">Text</span>(data ?? <span class="string">"loading"</span>)
+            .<span class="func">task</span> {
+                <span class="keyword">do</span> {
+                    <span class="keyword">let</span> value = <span class="keyword">try</span> <span class="keyword">await</span> <span class="func">slowNetworkCancellable</span>()
+                    data = value
+                } <span class="keyword">catch</span> <span class="keyword">is</span> <span class="type">CancellationError</span> {
+                    <span class="comment">// optional: log / ignore</span>
+                } <span class="keyword">catch</span> {
+                    <span class="comment">// handle real failures</span>
+                }
+            }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="audit-checklist">8. Performance Audit Checklist (Large SwiftUI Apps)</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect / Staff Framing</div>
+        <p>Performance audits are not hero optimizations; they are <strong>repeatable inspections</strong> that connect metrics (launch, scroll FPS, memory residency, hang rate) to view invalidation graphs. The goal is to shrink <em>how much of the tree re-evaluates per unit of user-visible change</em> while preserving product fidelity.</p>
+    </div>
+
+    <h3>8.1 Step-by-step audit process</h3>
+
+    <ol>
+        <li><strong>Define scenarios</strong> — cold start, resume, feed scroll, keyboard-driven forms, offline mode, low power mode.</li>
+        <li><strong>Instrument baseline</strong> — SwiftUI template + Time Profiler + Allocations for representative devices.</li>
+        <li><strong>Attribute invalidation</strong> — sprinkle <code>_printChanges()</code> on suspicious hotspots; correlate with store events.</li>
+        <li><strong>Classify work</strong> — CPU-bound bodies vs GPU-bound effects vs network contention vs disk I/O on main thread.</li>
+        <li><strong>Apply bounded fixes</strong> — lazy containers, equatable gates, identity fixes, task cancellation, image pipelines.</li>
+        <li><strong>Verify with A/B metrics</strong> — hang rate, scroll hitch metrics (where available), power, thermal.</li>
+    </ol>
+
+    <h3>8.2 Common anti-patterns</h3>
+
+    <ul>
+        <li>Monolithic <code>ObservableObject</code> publishing on any field change.</li>
+        <li>Whole-list <code>ForEach</code> over unbounded arrays without virtualization.</li>
+        <li>Using <code>AnyView</code> or type-punning to appease generics.</li>
+        <li>Unstable <code>ForEach</code> ids during merges / sync.</li>
+        <li>Heavy <code>body</code> work: sorting, JSON parsing, image decoding.</li>
+        <li>Uncancelled async work causing stale UI and wasted network.</li>
+    </ul>
+
+    <h3>8.3 Metrics to track</h3>
+
+    <ul>
+        <li>Scroll smoothness (hitches per minute; Instruments FPS)</li>
+        <li>Main-thread hang signatures (&gt;250ms blocks)</li>
+        <li>Memory high-water after long sessions (image caches)</li>
+        <li>Energy impact during animated screens</li>
+        <li>Time-to-interactive after navigation pushes</li>
+    </ul>
+
+    <h3>8.4 Before / after optimization patterns</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Before</th>
+                <th>After</th>
+                <th>Expected win</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>VStack</code> of 2k rows</td>
+                <td><code>LazyVStack</code> + stable ids</td>
+                <td>Large reduction in initial CPU &amp; memory spikes</td>
+            </tr>
+            <tr>
+                <td>Global timer invalidates root</td>
+                <td>Timer scoped subview + narrowed state</td>
+                <td>Fewer body recomputations downstream</td>
+            </tr>
+            <tr>
+                <td><code>onAppear { Task { … } }</code></td>
+                <td><code>.task(id:)</code> + cancellation checks</td>
+                <td>Fewer races; less wasted work</td>
+            </tr>
+            <tr>
+                <td>Chart reads entire model</td>
+                <td>Digest-based <code>Equatable</code> gate + <code>.equatable()</code></td>
+                <td>Stable frames when unrelated fields change</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>8.5 Complete checklist table</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Area</th>
+                <th>Check</th>
+                <th>Pass criteria</th>
+                <th>Tooling</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Lists</td>
+                <td>Long collections use lazy stacks/grids</td>
+                <td>No unbounded eager stacks in scrollers</td>
+                <td>Code review, SwiftUI instrument</td>
+            </tr>
+            <tr>
+                <td>Identity</td>
+                <td><code>ForEach</code> ids are stable across edits</td>
+                <td>No index-only ids for mutable models</td>
+                <td>UI tests + diff logs</td>
+            </tr>
+            <tr>
+                <td>Equality</td>
+                <td>Heavy subtrees use <code>equatable</code> gates</td>
+                <td>Body skips when digest matches</td>
+                <td><code>_printChanges()</code></td>
+            </tr>
+            <tr>
+                <td>State scope</td>
+                <td>High-frequency state is leaf-local</td>
+                <td>Timers/notifications don’t invalidate roots</td>
+                <td>Instruments View Body</td>
+            </tr>
+            <tr>
+                <td>Async</td>
+                <td><code>.task</code> used for screen-bound work</td>
+                <td>Cancellation prevents stale updates</td>
+                <td>Breakpoints + integration tests</td>
+            </tr>
+            <tr>
+                <td>Images</td>
+                <td>Decoded off hot paths; sizes known</td>
+                <td>No giant synchronous decode in <code>body</code></td>
+                <td>Time Profiler + Allocations</td>
+            </tr>
+            <tr>
+                <td>Layout</td>
+                <td>Expensive effects isolated</td>
+                <td>Shadows/masks not applied to massive lists accidentally</td>
+                <td>Core Animation instrument</td>
+            </tr>
+            <tr>
+                <td>Type erasure</td>
+                <td><code>AnyView</code> rare and justified</td>
+                <td>Hot paths use concrete generics</td>
+                <td>Code search, architecture review</td>
+            </tr>
+            <tr>
+                <td>Navigation</td>
+                <td>Large representables scoped</td>
+                <td>Maps/web views not duplicated per row</td>
+                <td>Memory graph debugger</td>
+            </tr>
+            <tr>
+                <td>Telemetry</td>
+                <td>Perf metrics tied to scenarios</td>
+                <td>Dashboards show regressions in RC builds</td>
+                <td>CI perf tests / field metrics</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Closing Interview Sound Bite</div>
+        <p>SwiftUI performance is mostly <strong>invalidation economics</strong>: make expensive work rare, identities stable, async work cancellable, and verify with Instruments plus <code>_printChanges()</code> when theory and reality disagree.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="06-navigation-evolution.html">← Navigation</a>
+        <a href="08-interop.html">Next: Interop →</a>
+    </div>
+</div>
+</body>
+</html>

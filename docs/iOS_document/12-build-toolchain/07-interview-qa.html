@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Build &amp; Toolchain Interview Q&amp;A — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Build &amp; Toolchain</a><span class="sep">›</span>
+        Interview Q&amp;A
+    </nav>
+
+    <h1>Build &amp; Toolchain — Interview Q&amp;A</h1>
+    <p class="subtitle">48 Staff-level interview questions covering the Xcode build system, Swift compiler pipeline, linker and dyld internals, SPM dependency resolution, binary size optimization, and advanced debugging tools. Each question is tagged by difficulty and includes a detailed answer.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">How to Use</div>
+        <p>Click any question to reveal its answer. Questions are tagged: <span class="tag tag-senior">Senior</span> for L5-level, <span class="tag tag-l6">L6</span> for Staff-level, and <span class="tag tag-architect">Architect</span> for system design depth. Try answering each question before revealing the answer.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Xcode Build System (Questions 1–8)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>1. Walk through the complete xcodebuild pipeline from pressing Cmd+B to a running app.</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>The pipeline proceeds through these phases:</p>
+                <ol>
+                    <li><strong>Resolve Package Dependencies</strong>: SPM resolves and checks out package dependencies using the PubGrub algorithm.</li>
+                    <li><strong>Create Build Description</strong>: The build system evaluates all build settings (resolving <code>$(inherited)</code>, <code>$(SRCROOT)</code>, xcconfig layering), computes file lists, and generates a DAG (directed acyclic graph) of all build tasks.</li>
+                    <li><strong>Compile Sources</strong>: Swift files are compiled by <code>swiftc</code> (incremental or whole-module mode), ObjC files by <code>clang</code>, storyboards by <code>ibtool</code>. Each produces <code>.o</code> object files.</li>
+                    <li><strong>Link Binary</strong>: The linker (<code>ld64</code> or <code>ld-prime</code>) combines all <code>.o</code> files with framework/library references into a Mach-O executable.</li>
+                    <li><strong>Copy Bundle Resources</strong>: Asset catalogs are compiled by <code>actool</code> into <code>Assets.car</code>, storyboards are compiled, and other resources are copied into the app bundle.</li>
+                    <li><strong>Run Script Phases</strong>: Custom scripts execute (SwiftLint, code generation, etc.).</li>
+                    <li><strong>Embed Frameworks</strong>: Dynamic frameworks are copied into the <code>Frameworks/</code> directory of the app bundle.</li>
+                    <li><strong>Code Sign</strong>: <code>codesign</code> signs the app with the appropriate identity and entitlements.</li>
+                </ol>
+                <p>The new build system (llbuild) executes these as a task graph, running independent tasks in parallel. Target dependencies are built first, and within a target, tasks execute as soon as their inputs are ready.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>2. Explain build settings inheritance. If the same setting is defined at multiple levels, which wins?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Build settings resolve through a strict precedence chain (highest to lowest):</p>
+                <ol>
+                    <li><strong>Command-line overrides</strong> (<code>xcodebuild FOO=bar</code>) — always wins</li>
+                    <li><strong>Target-level settings</strong> (Build Settings tab in Xcode)</li>
+                    <li><strong>Target-level xcconfig file</strong></li>
+                    <li><strong>Project-level settings</strong> (Build Settings tab)</li>
+                    <li><strong>Project-level xcconfig file</strong></li>
+                    <li><strong>Xcode default values</strong></li>
+                </ol>
+                <p>The <code>$(inherited)</code> macro walks UP this chain, collecting values from each level. For list-type settings (like <code>OTHER_LDFLAGS</code>), forgetting <code>$(inherited)</code> silently replaces parent values instead of appending — this is the #1 xcconfig debugging issue. Use the "Levels" view in Xcode's Build Settings tab to see exactly where each value comes from.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>3. What is the difference between SWIFT_COMPILATION_MODE incremental and wholemodule? When would you use each?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Incremental mode</strong>: The Swift driver launches separate compilation jobs for each file. Each job receives one "primary" file plus all other files for type information. The driver tracks cross-file dependencies and only recompiles files affected by changes. This is fast for iterative development.</p>
+                <p><strong>Whole module mode</strong>: A single compiler invocation processes all files together. This enables cross-file optimizations (inlining, devirtualization, generic specialization) but means any change recompiles everything.</p>
+                <p><strong>When to use each</strong>:</p>
+                <ul>
+                    <li><strong>Debug builds</strong>: Incremental — fast iteration, only changed files recompile</li>
+                    <li><strong>Release builds</strong>: Whole module — enables 2-5x runtime performance improvements from cross-file optimization</li>
+                    <li><strong>CI builds</strong>: Whole module for release/archive, incremental for PR validation (speed)</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>4. Why do script phases without input/output files slow down builds? How do you fix this?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Without input/output file lists, the build system has no way to determine if a script phase's output is up-to-date. It must run the script on <strong>every single build</strong>, even when nothing has changed. With input/output files, the build system compares timestamps: if all outputs exist and are newer than all inputs, the phase is skipped.</p>
+                <p><strong>Fix</strong>: Add input files (the files the script reads) and output files (the files the script produces) to the script phase. For phases with many files, use <code>.xcfilelist</code> files. In Xcode 14+, enable "Based on dependency analysis" to allow the build system to reorder the script phase for better parallelism. For scripts that don't produce files (like linters), write a dummy output file that serves as a timestamp marker.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>5. What is derived data? Describe its structure and how you'd configure it for CI caching.</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Derived data is where Xcode stores all build artifacts. Located at <code>~/Library/Developer/Xcode/DerivedData/</code>, each project gets a subdirectory with a hash suffix. Key subdirectories:</p>
+                <ul>
+                    <li><code>Build/Intermediates.noindex/</code> — Object files, Swift modules, dependency info</li>
+                    <li><code>Build/Products/</code> — Final .app, .framework, .xctest bundles</li>
+                    <li><code>Index.noindex/</code> — Source index for code completion (machine-specific, don't cache)</li>
+                    <li><code>Logs/Build/</code> — Build logs in .xcactivitylog format</li>
+                </ul>
+                <p><strong>CI caching strategy</strong>: Use <code>-derivedDataPath ./build/DerivedData</code> to place derived data in a known location. Cache <code>Build/Intermediates.noindex/</code> keyed by a hash of source files + build settings. Also cache SPM packages separately with <code>-clonedSourcePackagesDirPath</code> keyed by <code>Package.resolved</code> hash. Disable index-while-building on CI with <code>COMPILER_INDEX_STORE_ENABLE=NO</code> to save time.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>6. How does the new build system (llbuild) differ from the legacy build system?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>The new build system (default since Xcode 10, only option since Xcode 14) is built on <strong>llbuild</strong>, an open-source build engine. Key differences:</p>
+                <ul>
+                    <li><strong>Dependency-based scheduling</strong>: Tasks execute as soon as dependencies are satisfied, not in fixed order. This enables higher parallelism.</li>
+                    <li><strong>Deterministic builds</strong>: Same inputs always produce the same task ordering.</li>
+                    <li><strong>Cycle detection</strong>: Detects dependency cycles at build description time, not at runtime.</li>
+                    <li><strong>Build description caching</strong>: Reuses build descriptions across builds when project structure hasn't changed.</li>
+                    <li><strong>Separate process</strong>: Runs as XCBBuildService (XPC service), isolated from Xcode IDE.</li>
+                </ul>
+                <p>The legacy system used a simpler make-like approach with less parallelism and no cycle detection. The new system's DAG-based scheduling typically results in 10-30% faster builds for multi-target projects.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>7. Design the build configuration architecture for a multi-target app with debug, staging, and release environments.</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p>Use a layered xcconfig architecture:</p>
+                <ol>
+                    <li><strong>Base.xcconfig</strong>: Shared settings (deployment target, Swift version, warning flags)</li>
+                    <li><strong>Warnings.xcconfig</strong>: All warning flags isolated for easy management</li>
+                    <li><strong>Debug/Staging/Release.xcconfig</strong>: Each includes Base + Warnings, overrides optimization level, compilation mode, and defines environment-specific flags via <code>SWIFT_ACTIVE_COMPILATION_CONDITIONS</code></li>
+                    <li><strong>Per-target xcconfigs</strong>: App.xcconfig, Tests.xcconfig, Framework-X.xcconfig — target-specific bundle IDs, entitlements, signing</li>
+                    <li><strong>Local.xcconfig</strong>: .gitignored, developer-specific overrides</li>
+                </ol>
+                <p>For feature flags, use <code>SWIFT_ACTIVE_COMPILATION_CONDITIONS</code> for compile-time flags and a runtime feature flag system (backed by remote config) for dynamic flags. Each environment gets a separate bundle ID and provisioning profile. CI builds use command-line overrides to select the configuration. The key principle: all build settings in diffable xcconfig files, nothing in the opaque .pbxproj.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>8. What are the levels of build parallelism in Xcode, and how do you maximize them?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Three levels of parallelism:</p>
+                <ol>
+                    <li><strong>Target parallelism</strong>: Independent targets build simultaneously. Maximize by keeping the dependency graph wide and shallow — extract shared code into a Core module, keep feature modules independent.</li>
+                    <li><strong>File parallelism</strong>: In incremental mode, each Swift file compiles in a separate process. Maximize by using incremental mode for debug and splitting large targets into smaller modules.</li>
+                    <li><strong>Compiler-internal parallelism</strong>: Single swiftc uses multiple threads for type checking, SIL optimization, and LLVM codegen.</li>
+                </ol>
+                <p><strong>Maximizing parallelism</strong>: Flatten dependency graphs, split monolithic targets, use incremental mode for debug, add input/output files to script phases (so they don't block), eliminate bridging headers (they serialize Swift/ObjC compilation), and enable "Parallelize Build" in the scheme editor.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Swift Compiler (Questions 9–16)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>9. Describe the complete Swift compilation pipeline from source code to machine code.</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>The Swift compiler processes code through these stages:</p>
+                <ol>
+                    <li><strong>Lexing</strong>: Source text → tokens (keywords, identifiers, literals, operators)</li>
+                    <li><strong>Parsing</strong>: Tokens → Abstract Syntax Tree (AST). Recursive-descent parser handles Swift's complex grammar including trailing closures and result builders.</li>
+                    <li><strong>Semantic Analysis (Sema)</strong>: Type checking, name resolution, constraint-based type inference, overload resolution, protocol conformance checking. This is the most time-consuming phase.</li>
+                    <li><strong>SILGen</strong>: AST → Raw SIL (Swift Intermediate Language). SIL preserves Swift semantics like ARC, protocol dispatch, and value types.</li>
+                    <li><strong>Mandatory SIL Passes</strong>: Definite initialization, ownership verification, exclusivity enforcement. Run at all optimization levels.</li>
+                    <li><strong>Optimization SIL Passes</strong> (with -O/-Osize): ARC optimization, devirtualization, generic specialization, inlining, dead code elimination.</li>
+                    <li><strong>IRGen</strong>: SIL → LLVM IR. Lowers Swift concepts to LLVM's representation.</li>
+                    <li><strong>LLVM Passes</strong>: Standard optimizations — instruction combining, loop optimization, vectorization, register allocation.</li>
+                    <li><strong>Backend</strong>: LLVM IR → machine code (.o object file).</li>
+                </ol>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>10. What is SIL and why does Swift need it? Why not go directly from AST to LLVM IR?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>SIL (Swift Intermediate Language) is Swift's unique IR that sits between the AST and LLVM IR. It exists because LLVM IR is too low-level to represent Swift semantics:</p>
+                <ul>
+                    <li><strong>ARC operations</strong>: In LLVM IR, retain/release become opaque function calls that LLVM can't optimize. In SIL, they're first-class instructions (<code>strong_retain</code>, <code>strong_release</code>) that the SIL optimizer can analyze and eliminate redundant pairs.</li>
+                    <li><strong>Protocol dispatch</strong>: LLVM sees indirect calls it can't devirtualize. SIL has <code>witness_method</code> and <code>class_method</code> instructions with type information, enabling devirtualization.</li>
+                    <li><strong>Value semantics</strong>: SIL preserves copy-on-write semantics, allowing the optimizer to eliminate unnecessary copies.</li>
+                    <li><strong>Generics</strong>: SIL represents generic functions with explicit type metadata parameters, enabling specialization for concrete types.</li>
+                    <li><strong>Ownership</strong>: SIL has a formal ownership model (@owned, @guaranteed, @unowned) that enables proving ARC operations are redundant.</li>
+                </ul>
+                <p>Without SIL, Swift would lose 30-50% of its optimization potential, particularly for ARC-heavy code.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>11. Explain the key SIL optimization passes and what each accomplishes.</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Key SIL optimization passes (run with -O/-Osize):</p>
+                <ul>
+                    <li><strong>ARC Optimization</strong>: Eliminates redundant retain/release pairs by proving objects stay alive. Can remove 50-80% of ARC traffic in optimized builds.</li>
+                    <li><strong>Devirtualization</strong>: Replaces indirect calls (witness_method, class_method) with direct function calls when the concrete type is known. Eliminates vtable/witness table lookup overhead.</li>
+                    <li><strong>Generic Specialization</strong>: Creates type-specific versions of generic functions (e.g., <code>swap&lt;Int&gt;</code> instead of <code>swap&lt;T&gt;</code>). Eliminates type metadata passing and enables further optimization.</li>
+                    <li><strong>Function Inlining</strong>: Substitutes function bodies at call sites based on cost heuristics. Eliminates call overhead and enables further optimization of the combined code.</li>
+                    <li><strong>Stack Promotion</strong>: Moves heap allocations to the stack when escape analysis proves the object doesn't outlive the function.</li>
+                    <li><strong>Closure Specialization</strong>: Specializes functions that take closures for specific closure bodies, eliminating indirect call overhead.</li>
+                    <li><strong>Dead Code Elimination</strong>: Removes unreachable code and unused computations.</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>12. What does @inlinable do? What are the ABI implications?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>@inlinable</code> exposes a function's body in the module's <code>.swiftinterface</code> file, allowing the compiler to inline it across module boundaries. Without it, cross-module calls are always indirect.</p>
+                <p><strong>ABI implications</strong>: Once marked <code>@inlinable</code>, the function body becomes part of the module's ABI contract. Client modules may have inlined the old body, so changing the implementation without recompiling clients can lead to inconsistent behavior — some call sites use the old body, others use the new one.</p>
+                <p><code>@usableFromInline</code> is the companion attribute that makes <code>internal</code> declarations accessible from <code>@inlinable</code> functions without making them <code>public</code>.</p>
+                <p><strong>Best practices</strong>: Only use for small, stable, performance-critical functions (like stdlib's arithmetic operators). Never use for complex or evolving APIs. The binary size tradeoff is that inlined bodies are duplicated in every client module.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>13. Why does the Swift type checker sometimes take exponentially long? How do you diagnose and fix it?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Swift uses a <strong>constraint solver</strong> for type inference. For each expression, it generates type constraints and solves them simultaneously. The worst case is exponential when many overloaded operators interact in a single expression.</p>
+                <p><strong>Common culprits</strong>:</p>
+                <ul>
+                    <li>Long chains of <code>+</code> on numeric literals (each <code>+</code> has multiple overloads)</li>
+                    <li>Complex dictionary literals with <code>[String: Any]</code></li>
+                    <li>Deeply nested closures without type annotations</li>
+                    <li>Ternary expressions mixing different literal types</li>
+                </ul>
+                <p><strong>Diagnosis</strong>: Add <code>-Xfrontend -warn-long-expression-type-checking=100</code> to OTHER_SWIFT_FLAGS. This warns on any expression taking more than 100ms to type-check.</p>
+                <p><strong>Fixes</strong>: Break long expressions into named sub-expressions, add explicit type annotations to closures and complex expressions, use typed structs instead of <code>[String: Any]</code>, and add return type annotations to functions.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>14. Compare generics, opaque types (some Protocol), and existentials (any Protocol) in terms of compile time, runtime cost, and binary size.</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <table>
+                    <thead>
+                        <tr><th>Aspect</th><th>Generic &lt;T: P&gt;</th><th>Opaque (some P)</th><th>Existential (any P)</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>Compile time</td><td>Moderate (constraint checking)</td><td>Fast</td><td>Fast</td></tr>
+                        <tr><td>Runtime dispatch</td><td>Static (with WMO specialization)</td><td>Static (specialized)</td><td>Dynamic (witness table)</td></tr>
+                        <tr><td>Binary size</td><td>Larger (one specialization per type)</td><td>Moderate</td><td>Smallest (no specialization)</td></tr>
+                        <tr><td>Heap allocation</td><td>No (value types stay on stack)</td><td>No</td><td>Yes (if > 3 words, boxed)</td></tr>
+                    </tbody>
+                </table>
+                <p><strong>Recommendation</strong>: Use <code>some Protocol</code> for return types and function parameters on hot paths. Use generics when you need the type parameter in multiple places. Use <code>any Protocol</code> for heterogeneous collections and cold paths where the boxing overhead doesn't matter.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>15. How would you establish coding guidelines that keep Swift compile times fast across a large team?</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p>Key guidelines:</p>
+                <ol>
+                    <li><strong>Explicit return types on public functions</strong> — eliminates type inference for the most-imported declarations</li>
+                    <li><strong>Type annotations on complex closures</strong> — especially in map/filter/reduce chains</li>
+                    <li><strong>Break long expressions</strong> — no more than 3-4 operators in a single expression</li>
+                    <li><strong>Use <code>final</code> on classes</strong> — enables devirtualization without WMO</li>
+                    <li><strong>Avoid <code>[String: Any]</code></strong> — use typed structs (Codable) instead</li>
+                    <li><strong>Module architecture</strong> — wide and shallow dependency graph for parallel builds</li>
+                </ol>
+                <p><strong>Enforcement</strong>: Add <code>-warn-long-function-bodies=200 -warn-long-expression-type-checking=200</code> to CI builds. Track build times per module over time. Use <code>xclogparser</code> to identify the slowest-compiling files. Set up a build time dashboard that alerts on regressions.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>16. What LLVM optimizations apply after SIL is lowered to LLVM IR?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>After IRGen lowers SIL to LLVM IR, standard LLVM optimization passes run:</p>
+                <ul>
+                    <li><strong>Instruction combining</strong>: Simplifies instruction sequences (e.g., multiply by power of 2 → shift)</li>
+                    <li><strong>Loop optimizations</strong>: Unrolling, vectorization (NEON on ARM), loop-invariant code motion, strength reduction</li>
+                    <li><strong>Global value numbering</strong>: Eliminates redundant computations</li>
+                    <li><strong>Register allocation</strong>: Maps virtual registers to physical registers, minimizing spills</li>
+                    <li><strong>Instruction scheduling</strong>: Reorders instructions for pipeline efficiency</li>
+                    <li><strong>Auto-vectorization</strong>: Uses SIMD instructions for data-parallel operations</li>
+                    <li><strong>Tail call optimization</strong>: Converts tail calls to jumps, eliminating stack frame overhead</li>
+                    <li><strong>Constant folding/propagation</strong>: Evaluates constant expressions at compile time</li>
+                </ul>
+                <p>These are architecture-independent optimizations followed by target-specific ones for ARM64 (iOS devices) or x86_64 (simulator).</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Linker &amp; dyld (Questions 17–26)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>17. Compare static libraries, static frameworks, and dynamic frameworks. When would you choose each?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Static library (.a)</strong>: Archive of .o files. Code is copied into the executable at link time. No bundle, so resources need separate handling. Dead code stripping applies. Best for: internal modules without resources.</p>
+                <p><strong>Static framework</strong>: A .framework bundle containing a static library. Has a bundle for resources. Code is still copied into the executable. Best for: internal modules that need bundled resources.</p>
+                <p><strong>Dynamic framework</strong>: A .framework bundle containing a dynamic library (Mach-O dylib). Loaded by dyld at runtime. Can be shared between app and extensions. No dead code stripping (entire framework loaded). Best for: code shared with app extensions, or when using mergeable libraries.</p>
+                <p><strong>Decision rule</strong>: Default to static. Use dynamic only when you need code sharing with extensions or when the shared code is large enough that duplication would significantly increase total binary size.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>18. How does dyld4 load an app at launch? What determines pre-main time?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>dyld4's launch sequence:</p>
+                <ol>
+                    <li><strong>Load closure from cache</strong>: dyld4 pre-computes a "launch closure" containing the dependency graph and symbol bindings. This is cached on disk or in the shared cache.</li>
+                    <li><strong>Map dylibs</strong>: Each dynamic library is mmap'd into the process address space. System frameworks are already in the shared cache (near-zero cost).</li>
+                    <li><strong>Apply fixups</strong>: Rebase pointers for ASLR slide, bind external symbol references. dyld4 uses chained fixups (iOS 15+) which are more compact and faster.</li>
+                    <li><strong>Run initializers</strong>: C++ static constructors, ObjC +load methods, Swift type metadata initialization.</li>
+                    <li><strong>Jump to main()</strong>.</li>
+                </ol>
+                <p><strong>Pre-main time factors</strong>: Number of embedded dynamic frameworks (~2-5ms each), number of ObjC classes registered, number of +load methods, C++ static initializers, and total fixup count. Measure with <code>DYLD_PRINT_STATISTICS=1</code>. Target: under 400ms total pre-main time.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>19. Explain @rpath, @executable_path, and @loader_path. When is each used?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>These are path variables in Mach-O load commands for locating dynamic libraries:</p>
+                <ul>
+                    <li><strong>@executable_path</strong>: Resolves to the directory containing the main executable. Used for frameworks embedded directly in the app bundle: <code>@executable_path/Frameworks/MyLib.framework/MyLib</code></li>
+                    <li><strong>@loader_path</strong>: Resolves to the directory containing the Mach-O that references the library. Used when a framework depends on another framework: <code>@loader_path/Frameworks/Helper.framework/Helper</code></li>
+                    <li><strong>@rpath</strong>: Searched against the runpath search path list (<code>LD_RUNPATH_SEARCH_PATHS</code>). Most flexible — the same framework binary works in different contexts because the rpath is set by the consumer, not the framework.</li>
+                </ul>
+                <p><strong>@rpath</strong> is the standard for modern iOS development. Frameworks set their install name to <code>@rpath/MyFramework.framework/MyFramework</code>, and the app sets <code>LD_RUNPATH_SEARCH_PATHS = @executable_path/Frameworks</code>.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>20. What is dead code stripping? Why doesn't it work with dynamic frameworks?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Dead code stripping is a linker optimization that removes unreachable code and data. The linker starts from entry points (main(), ObjC class references, symbols marked no-dead-strip) and traces all reachable symbols. Everything not reachable is removed.</p>
+                <p><strong>Why it doesn't work with dynamic frameworks</strong>: Dynamic frameworks are self-contained Mach-O binaries. The linker that builds the app doesn't modify the framework's binary — it just records a reference. dyld loads the entire framework at runtime. The framework's own linker already stripped dead code <em>within</em> the framework, but it can't know which symbols the app will use, so it keeps everything that's exported.</p>
+                <p>This is a major argument for static linking: when you statically link a library, the linker can see exactly which symbols the app uses and strip everything else. A framework with 10,000 functions where you use 100 will include all 10,000 when dynamically linked, but only ~100 when statically linked.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>21. What are mergeable libraries in Xcode 15? How do they solve the static/dynamic tradeoff?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Mergeable libraries are a new linking mode where frameworks are built as dynamic frameworks but can be <strong>merged into the executable</strong> at link time, like static libraries. The build system automatically switches modes based on configuration:</p>
+                <ul>
+                    <li><strong>Debug</strong>: Frameworks stay dynamic (fast incremental linking)</li>
+                    <li><strong>Release</strong>: Frameworks are merged into the executable (fast launch, dead code stripping)</li>
+                </ul>
+                <p>This solves the classic tradeoff: static linking gives fast launch but slow debug builds (re-linking everything), while dynamic gives fast debug builds but slow launch. Mergeable libraries give you both.</p>
+                <p><strong>Enable</strong>: Set <code>MERGEABLE_LIBRARY = YES</code> on frameworks and <code>MERGED_BINARY_TYPE = automatic</code> on the app. Requires Xcode 15+ and benefits most with iOS 17+ deployment target.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>22. What are two-level namespaces and why are they important?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Two-level namespaces are a Mach-O feature where each undefined symbol records <strong>which library</strong> it expects to find the symbol in. This is the default on macOS/iOS.</p>
+                <p><strong>Without two-level namespaces (flat namespace)</strong>: Symbol "parse" is searched in ALL loaded libraries in load order. If both JSONKit and XMLKit export "parse", the first one loaded wins — potentially the wrong one.</p>
+                <p><strong>With two-level namespaces</strong>: The binding says "parse from JSONKit" and "parse from XMLKit" — no ambiguity. This provides correctness (no accidental symbol interposition), faster lookup (direct library lookup vs linear search), and deterministic behavior regardless of load order.</p>
+                <p>Flat namespace is rarely used but can be forced with <code>-flat_namespace</code> linker flag or <code>DYLD_FORCE_FLAT_NAMESPACE=1</code> environment variable. Some legacy Unix porting scenarios require it.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>23. Explain weak linking. How does Swift's #available relate to it?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Weak linking allows referencing symbols that may not exist at runtime. The linker marks the reference as "weak import" in the Mach-O. At runtime, dyld sets weak symbols to NULL if the providing library doesn't have them, instead of crashing.</p>
+                <p>Swift's <code>#available</code> check generates weak imports under the hood. When you write <code>if #available(iOS 17, *) { ... }</code>, the compiler emits weak references to iOS 17 APIs. On older devices, those symbols resolve to NULL, and the <code>#available</code> check prevents calling them.</p>
+                <p>Framework-level weak linking (marking a framework as "Optional" in Link Binary With Libraries) makes ALL symbols from that framework weak. This is used when an entire framework might not be present (e.g., using SwiftUI on iOS 12 deployment target).</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>24. What is symbol visibility and how does it affect binary size and launch time?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Symbol visibility controls which symbols are exported from a dynamic library. Exported symbols are listed in the symbol table and available for dynamic binding by dyld.</p>
+                <p><strong>Impact on binary size</strong>: Each exported symbol has an entry in the symbol table (name string + metadata). A framework with 10,000 exported symbols has a significantly larger __LINKEDIT segment than one with 100.</p>
+                <p><strong>Impact on launch time</strong>: dyld must process all exported symbols during binding. Fewer exports = faster binding = faster launch.</p>
+                <p><strong>Best practice</strong>: Use an exported symbols file (<code>EXPORTED_SYMBOLS_FILE</code>) to explicitly list only the symbols clients need. In Swift, <code>public</code> maps to exported, <code>internal</code> is exported from dynamic frameworks (for testability), and <code>private</code>/<code>fileprivate</code> are hidden. For C/ObjC, use <code>__attribute__((visibility("hidden")))</code>.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>25. What is the dyld shared cache and why do system frameworks load so fast?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>The dyld shared cache is a single pre-linked file containing ALL system frameworks. It's generated by Apple and stored on device at <code>/System/Library/dyld/</code>. Key properties:</p>
+                <ul>
+                    <li><strong>Pre-linked</strong>: All inter-framework references are already resolved. No binding work needed at launch.</li>
+                    <li><strong>Shared memory</strong>: The cache is mapped into every process's address space at the same virtual address. Pages are shared across processes via copy-on-write.</li>
+                    <li><strong>Optimized layout</strong>: Frequently-used code is placed on the same memory pages for better cache locality.</li>
+                    <li><strong>No per-framework overhead</strong>: Unlike embedded frameworks that each need mmap + fixups, system frameworks in the cache are "free" to load.</li>
+                </ul>
+                <p>This is why linking against UIKit, Foundation, etc. has near-zero launch time cost, while each embedded dynamic framework adds 2-5ms.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>26. Design the linking strategy for an app with 200+ internal modules, 3 app extensions, and 15 third-party SDKs.</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Strategy</strong>:</p>
+                <ol>
+                    <li><strong>Core modules (50+)</strong>: Static libraries. These are used everywhere, so static linking enables dead code stripping and eliminates dyld overhead.</li>
+                    <li><strong>Feature modules (150+)</strong>: Static libraries or mergeable libraries (if targeting iOS 17+). Features are independent, so static linking with dead code stripping removes unused code.</li>
+                    <li><strong>Shared extension code</strong>: Dynamic framework. Code shared between the main app and 3 extensions must be dynamic to avoid duplication. Limit this to one or two "shared" frameworks containing only truly shared code.</li>
+                    <li><strong>Third-party SDKs</strong>: Static where possible (enables dead code stripping of unused SDK features). Some SDKs only ship as dynamic — embed those.</li>
+                </ol>
+                <p><strong>Target</strong>: Maximum 4-6 embedded dynamic frameworks (shared extension code + unavoidable dynamic SDKs). Everything else static. Measure with <code>DYLD_PRINT_STATISTICS</code> — target under 200ms dylib loading time.</p>
+                <p><strong>Build time mitigation</strong>: Use mergeable libraries or maintain separate debug (dynamic) and release (static) configurations. Cache derived data on CI.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>SPM (Questions 27–32)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>27. How does SPM's PubGrub dependency resolution algorithm work?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>PubGrub uses <strong>unit propagation</strong> and <strong>conflict-driven clause learning</strong> (borrowed from SAT solvers):</p>
+                <ol>
+                    <li><strong>Start with root constraints</strong>: The app's direct dependency version requirements.</li>
+                    <li><strong>Unit propagation</strong>: Select a package version, add its transitive dependency constraints to the system.</li>
+                    <li><strong>Constraint intersection</strong>: Compute the intersection of all version ranges for each package.</li>
+                    <li><strong>Conflict detection</strong>: If any intersection is empty (no version satisfies all constraints), a conflict is detected.</li>
+                    <li><strong>Conflict analysis</strong>: Analyze the conflict to find the root cause — which decision led to the impossible state.</li>
+                    <li><strong>Learn a "nogood" clause</strong>: Record the incompatibility so it's never explored again.</li>
+                    <li><strong>Backjump</strong>: Jump back to the decision that caused the conflict (not just one step back like simple backtracking).</li>
+                </ol>
+                <p>This is much more efficient than naive backtracking because it learns from conflicts and avoids re-exploring dead-end solution spaces. The result is stored in <code>Package.resolved</code> as a lockfile.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>28. What is BUILD_LIBRARY_FOR_DISTRIBUTION and when must you enable it?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>BUILD_LIBRARY_FOR_DISTRIBUTION</code> enables <strong>module stability</strong> by generating <code>.swiftinterface</code> files instead of <code>.swiftmodule</code> files. Swift interface files are textual and forward-compatible, meaning binaries built with Swift 5.8 can be used by projects using Swift 5.9.</p>
+                <p><strong>Must enable when</strong>:</p>
+                <ul>
+                    <li>Creating XCFramework binary targets for distribution</li>
+                    <li>Distributing pre-built frameworks to other teams</li>
+                    <li>Publishing binary SPM packages</li>
+                </ul>
+                <p><strong>Don't enable for</strong>: Internal source-based modules (adds compile time overhead and restricts some language features like <code>@_specialize</code>).</p>
+                <p>When enabled, the compiler also enforces stricter rules: all public API must use types that are themselves available in the module interface, and some compiler-internal attributes are forbidden.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>29. Explain SPM build tool plugins vs command plugins. Give a use case for each.</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Build tool plugins</strong> run automatically during the build process:</p>
+                <ul>
+                    <li><code>.prebuildCommand</code>: Runs before compilation, every build. Use for code generation that needs to run always (e.g., generating build info).</li>
+                    <li><code>.buildCommand</code>: Runs during build when input files change. Use for incremental code generation (e.g., SwiftGen from asset catalogs).</li>
+                </ul>
+                <p>Build tool plugins are sandboxed and have read-only access to source files. They produce output files that become part of the build.</p>
+                <p><strong>Command plugins</strong> run on-demand when the user invokes them:</p>
+                <ul>
+                    <li>Invoked via <code>swift package plugin &lt;name&gt;</code> or Xcode context menu.</li>
+                    <li>Can request write access to modify source files.</li>
+                    <li>Use for: code formatting, linting with auto-fix, documentation generation.</li>
+                </ul>
+                <p><strong>Example</strong>: SwiftGen as a build tool plugin (generates Swift code from assets on every build), swift-format as a command plugin (formats code on demand).</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>30. How do resources work in SPM? What's the difference between .process and .copy?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>SPM bundles resources with targets and generates a <code>Bundle.module</code> accessor.</p>
+                <p><strong>.process</strong>: Applies platform-specific processing. Asset catalogs are compiled by actool, storyboards by ibtool, strings files are compiled. The directory structure may be flattened.</p>
+                <p><strong>.copy</strong>: Copies files as-is, preserving the directory structure. Use for files that shouldn't be processed (HTML templates, JSON fixtures, custom file formats).</p>
+                <p><strong>Access</strong>: Always use <code>Bundle.module</code> in library code, never <code>Bundle.main</code>. In tests, <code>Bundle.module</code> points to the test bundle's copy of resources. SPM generates a <code>resource_bundle_accessor.swift</code> file that provides the <code>Bundle.module</code> extension.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>31. What are SPM package registries and how do they differ from Git-based resolution?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Package registries (SE-0292, Swift 5.7) allow resolving packages from an HTTP registry server instead of Git repositories.</p>
+                <p><strong>Key differences</strong>:</p>
+                <ul>
+                    <li><strong>Speed</strong>: Registry downloads only metadata + source archives for the needed version. Git clones the entire repository history.</li>
+                    <li><strong>Disk usage</strong>: Registry stores only needed versions. Git stores full history.</li>
+                    <li><strong>Security</strong>: Registry supports signed manifests and checksums. Git relies on commit hashes.</li>
+                    <li><strong>Identity</strong>: Registry uses scoped identifiers (<code>company.package-name</code>) instead of URLs.</li>
+                </ul>
+                <p>Configure in <code>.swiftpm/configuration/registries.json</code>. In Package.swift, use <code>.package(id: "scope.name", from: "1.0.0")</code> instead of URL-based dependencies. Registries can coexist with Git-based dependencies.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>32. Design the SPM package architecture for a mono-repo with 100+ modules and multiple apps.</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Structure</strong>: Each module is its own Package.swift with local path dependencies. Modules are organized in layers:</p>
+                <ul>
+                    <li><strong>Shared layer</strong>: DesignSystem, TestHelpers — no dependencies on other layers</li>
+                    <li><strong>Core layer</strong>: Networking, Storage, Analytics — depend only on Shared</li>
+                    <li><strong>Feature layer</strong>: Home, Search, Profile — depend on Core, never on other Features</li>
+                    <li><strong>App layer</strong>: MainApp, InternalApp — depend on Features</li>
+                </ul>
+                <p><strong>Key patterns</strong>:</p>
+                <ul>
+                    <li><strong>Interface/Implementation split</strong>: Each feature exposes a <code>FeatureInterface</code> target (protocols + models only) and a <code>Feature</code> target (implementation). Other features depend on interfaces, not implementations. This breaks dependency cycles.</li>
+                    <li><strong>Dependency validation</strong>: Custom CI tool that parses all Package.swift files and validates no cross-feature dependencies exist.</li>
+                    <li><strong>CI caching</strong>: Cache SourcePackages keyed by Package.resolved hash.</li>
+                    <li><strong>Build tool plugins</strong>: Shared code generation plugins instead of per-module script phases.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Binary Size (Questions 33–38)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>33. What is app thinning? Describe its three components.</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>App thinning reduces the size of the app delivered to each device:</p>
+                <ol>
+                    <li><strong>App Slicing</strong>: The App Store creates device-specific variants. Each variant contains only the architecture (arm64 vs arm64e), asset scale (@2x vs @3x), and GPU resources for that device. Savings: 30-50% for most apps.</li>
+                    <li><strong>On-Demand Resources (ODR)</strong>: Assets tagged for on-demand download. Not included in the initial install — downloaded when the app requests them. Hosted on Apple's CDN for free. Use for: game levels, tutorials, rarely-used features. Limit: 20GB total, 512MB initial install.</li>
+                    <li><strong>Bitcode</strong>: (Deprecated in Xcode 14) Was an LLVM IR representation that allowed Apple to recompile for each architecture server-side. No longer used.</li>
+                </ol>
+                <p>The size users see on the App Store is the <strong>thinned</strong> size for their specific device, not your archive size. Use <code>-exportOptionsPlist</code> with <code>thinning</code> key to generate local size reports.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>34. What is the __TEXT segment and why is it usually the largest part of an iOS binary?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>The __TEXT segment contains all read-only, executable content:</p>
+                <ul>
+                    <li><code>__text</code>: Machine code instructions (typically 60-70% of __TEXT)</li>
+                    <li><code>__stubs</code> / <code>__stub_helper</code>: Lazy binding stubs for dynamic symbol resolution</li>
+                    <li><code>__cstring</code>: C string literals</li>
+                    <li><code>__swift5_typeref</code>: Swift type reference strings for reflection</li>
+                    <li><code>__swift5_reflstr</code>: Swift field name strings for Mirror</li>
+                    <li><code>__swift5_proto</code>: Swift protocol conformance records</li>
+                    <li><code>__objc_methname</code>: ObjC method name strings</li>
+                    <li><code>__const</code>: Constant data</li>
+                </ul>
+                <p>It's the largest because it contains ALL executable code plus all string constants and metadata. Analyze with <code>size -m MyApp</code> and target the largest sections for optimization. The __text section (machine code) is usually the biggest target — reduce it with <code>-Osize</code>, dead code stripping, and reducing generic specializations.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>35. How does Swift metadata contribute to binary size? How can you reduce it?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Every Swift type generates metadata: type descriptors (~100-200 bytes per type), type reference strings (~50-100 bytes), field metadata (property names and types), and protocol conformance records (~12 bytes each). Generic specializations also generate separate function bodies and metadata.</p>
+                <p><strong>Reduction strategies</strong>:</p>
+                <ul>
+                    <li><strong>Fewer types</strong>: Consolidate small wrapper types into larger structs</li>
+                    <li><strong>Fewer generic specializations</strong>: Use existentials (<code>any Protocol</code>) for cold paths instead of generics</li>
+                    <li><strong>Disable reflection names</strong>: <code>-Xfrontend -disable-reflection-names</code> saves 5-15% of Swift code size but breaks Mirror</li>
+                    <li><strong>Disable full reflection metadata</strong>: <code>-Xfrontend -disable-reflection-metadata</code> (more aggressive, test thoroughly)</li>
+                    <li><strong>Use @_specialize selectively</strong>: Control which specializations are generated instead of letting the compiler decide</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>36. Compare -O and -Osize. When would you use each?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>-O</code> optimizes for speed: aggressive inlining, loop unrolling, and generic specialization. Code is duplicated where it helps performance.</p>
+                <p><code>-Osize</code> optimizes for size: conservative inlining, minimal unrolling, selective specialization. Typically 10-30% smaller than <code>-O</code> with 0-5% speed reduction.</p>
+                <p><strong>Strategy</strong>: Use <code>-O</code> for performance-critical modules (image processing, data parsing, animation) and <code>-Osize</code> for everything else (settings screens, onboarding, rarely-used features). In SPM, you can set per-target optimization via <code>swiftSettings: [.unsafeFlags(["-Osize"])]</code>.</p>
+                <p>For most apps, using <code>-Osize</code> globally is the right default — the size savings are significant and the performance difference is negligible for typical app code. Only switch specific hot-path modules to <code>-O</code> if profiling shows a measurable difference.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>37. What is Link-Time Optimization (LTO)? Compare monolithic and thin LTO.</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>LTO allows the compiler to optimize across translation unit boundaries during the link phase. Instead of .o files containing machine code, they contain LLVM bitcode. The linker merges this bitcode and runs optimization passes on the combined module.</p>
+                <p><strong>Monolithic LTO</strong>: Merges ALL bitcode into one giant module and optimizes as a single unit. Best optimization but very slow (single-threaded, high memory usage).</p>
+                <p><strong>Thin LTO</strong>: Each module includes a summary of its contents. The linker reads all summaries to build a cross-module call graph, then optimizes each module in parallel with cross-module information. 80-90% of monolithic LTO's benefit with much faster build times.</p>
+                <p><strong>Typical savings</strong>: 5-15% of __TEXT segment size. <strong>Build time cost</strong>: 20-50% longer for Thin LTO, 2-5x for Monolithic. <strong>Recommendation</strong>: Use Thin LTO (<code>LLVM_LTO = YES_THIN</code>) for release builds.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>38. You need to reduce a 200MB app to under 50MB. Walk through your systematic approach.</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Phase 1 — Measure (Week 1)</strong>: Generate link maps, analyze segment sizes with <code>size -m</code>, inspect Assets.car with <code>assetutil</code>, list all bundle files by size, check for duplicate resources.</p>
+                <p><strong>Phase 2 — Quick Wins (Week 2-3)</strong>:</p>
+                <ul>
+                    <li>Enable <code>-Osize</code> (10-20% code reduction)</li>
+                    <li>Enable dead code stripping + Thin LTO (5-15%)</li>
+                    <li>Switch to static linking (10-30% from dead code stripping)</li>
+                    <li>Compress/optimize images (30-60% of asset size)</li>
+                    <li>Remove unused assets (10-20%)</li>
+                    <li>Strip symbols (5-10%)</li>
+                </ul>
+                <p><strong>Phase 3 — Structural Changes (Week 4-8)</strong>: Move large assets to on-demand resources, download ML models on first use instead of bundling, replace bundled configs with server-fetched ones, use SF Symbols instead of custom icons.</p>
+                <p><strong>Phase 4 — Advanced (Week 8+)</strong>: Audit generic specializations, disable reflection metadata, use existentials for cold paths, set up CI size tracking to prevent regressions.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Debugging Tools (Questions 39–48)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>39. Explain the difference between po, v, and p in LLDB. When should you use each?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>v (frame variable)</strong>: Reads variable values directly from DWARF debug info and process memory. No code compilation or execution. Instant, no side effects. Use as your default for inspecting local variables.</p>
+                <p><strong>p (expression)</strong>: Compiles your input as a Swift expression, injects the compiled code into the debuggee, executes it, and reads back the result. Slow (compiler warm-up on first use), can have side effects. Use when you need to evaluate expressions (call methods, compute values).</p>
+                <p><strong>po (expression -O)</strong>: Like <code>p</code> but additionally calls <code>debugDescription</code> (or <code>description</code>) on the result. Slowest. Use when you want custom string output.</p>
+                <p><strong>Rule of thumb</strong>: Start with <code>v</code>. If you need to call a method or compute something, use <code>p</code>. If you want the custom description, use <code>po</code>.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>40. What are symbolic breakpoints? Name five essential ones every iOS developer should have.</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Symbolic breakpoints break on function names rather than file/line locations. They work even without source code and catch issues in system frameworks.</p>
+                <p><strong>Five essential symbolic breakpoints</strong>:</p>
+                <ol>
+                    <li><code>UIViewAlertForUnsatisfiableConstraints</code> — Catches Auto Layout conflicts. Add action: <code>po [[UIWindow keyWindow] _autolayoutTrace]</code></li>
+                    <li><code>objc_exception_throw</code> — Catches ObjC exceptions at the throw site, before the stack unwinds</li>
+                    <li><code>swift_willThrow</code> — Catches Swift errors at the throw site</li>
+                    <li><code>-[NSObject doesNotRecognizeSelector:]</code> — Catches unrecognized selector crashes</li>
+                    <li><code>malloc_error_break</code> — Catches malloc heap corruption</li>
+                </ol>
+                <p>Add these as user breakpoints in Xcode (shared across all projects). They cost nothing when not hit and save hours of debugging when they are.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>41. How does Address Sanitizer (ASan) work? What's the performance overhead?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>ASan instruments every memory access with bounds checking using a <strong>shadow memory</strong> scheme:</p>
+                <ol>
+                    <li>Each 8 bytes of application memory maps to 1 byte of shadow memory</li>
+                    <li>"Redzones" (poisoned memory) are placed around every allocation</li>
+                    <li>Before every memory access, ASan checks the shadow byte: <code>shadow = (addr >> 3) + offset</code></li>
+                    <li>If the shadow byte indicates poisoned memory → report error with full stack trace</li>
+                    <li>Freed memory is quarantined (not immediately reused) to catch use-after-free</li>
+                </ol>
+                <p><strong>Overhead</strong>: ~2x memory usage (shadow memory), 2-3x CPU slowdown. Not suitable for production. Can be combined with UBSan but NOT with TSan.</p>
+                <p><strong>Detects</strong>: Heap/stack buffer overflow, use-after-free, use-after-return, double free, memory leaks (with LeakSanitizer).</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>42. How does Thread Sanitizer (TSan) detect data races? What are its limitations?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>TSan records metadata for every memory access: thread ID, address, access type (read/write), and a logical timestamp. For each access, it checks if there's a concurrent access from another thread without a happens-before relationship (synchronization).</p>
+                <p>TSan understands synchronization primitives: locks, dispatch queues, semaphores, atomic operations, and Swift actors. If two accesses to the same location have no synchronization path between them, it's a data race.</p>
+                <p><strong>Limitations</strong>:</p>
+                <ul>
+                    <li><strong>Simulator only</strong> — not supported on physical devices</li>
+                    <li><strong>Cannot combine with ASan</strong> — mutually exclusive</li>
+                    <li><strong>5-15x CPU slowdown, 5-10x memory</strong> — tests run much slower</li>
+                    <li><strong>False negatives possible</strong> — TSan only detects races that actually occur during the test run. A race that doesn't manifest won't be caught.</li>
+                    <li><strong>Some false positives</strong> — rare, usually with custom synchronization primitives TSan doesn't understand</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>43. What is Chisel? Name five useful Chisel commands for UI debugging.</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Chisel is Facebook's collection of LLDB Python scripts that add powerful debugging commands, especially for UI work.</p>
+                <ol>
+                    <li><code>pviews</code> — Prints the entire view hierarchy with frames, hidden state, and alpha. Much more readable than <code>po view.recursiveDescription()</code>.</li>
+                    <li><code>pvc</code> — Prints the view controller hierarchy showing presented and child controllers.</li>
+                    <li><code>fv UILabel</code> — Finds all instances of a view class in the hierarchy. Returns addresses you can inspect.</li>
+                    <li><code>border 0x7f8b2c --color red</code> — Adds a colored border to a view for visual identification. Use with <code>caflush</code> to update the screen.</li>
+                    <li><code>presponder 0x7f8b2c</code> — Prints the responder chain from a given view, showing the path events travel.</li>
+                </ol>
+                <p>Install with <code>brew install chisel</code> and add <code>command script import /opt/homebrew/opt/chisel/libexec/fbchisellldb.py</code> to <code>~/.lldbinit</code>.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>44. What is malloc scribble and guard malloc? When would you use each?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Malloc Scribble</strong>: Fills freed memory with <code>0x55</code> and newly allocated memory with <code>0xAA</code>. This makes use-after-free bugs crash immediately with recognizable patterns instead of silently corrupting data. Low overhead — suitable for regular debug builds. Enable via Xcode diagnostics or <code>MallocScribble=1</code> environment variable.</p>
+                <p><strong>Guard Malloc</strong>: Places each allocation on its own virtual memory page with guard pages (inaccessible) before and after. Any buffer overflow or underflow immediately triggers a hardware exception (EXC_BAD_ACCESS) with a precise stack trace. Extremely high overhead (each allocation uses at least one 16KB page) — only for targeted debugging of specific memory corruption issues.</p>
+                <p><strong>Use malloc scribble</strong> as a lightweight always-on diagnostic in debug builds. <strong>Use guard malloc</strong> when you have a specific memory corruption bug you're trying to isolate and can tolerate the extreme memory overhead.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>45. How does the Memory Graph Debugger detect retain cycles?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>The Memory Graph Debugger captures a snapshot of all live objects and their references by:</p>
+                <ol>
+                    <li><strong>Pausing the process</strong> and scanning all heap allocations</li>
+                    <li><strong>Tracing references</strong>: For each object, scanning its memory for pointers to other objects. It understands Swift/ObjC object layouts, including stored properties and captured variables in closures.</li>
+                    <li><strong>Building a reference graph</strong>: Nodes are objects, edges are strong references.</li>
+                    <li><strong>Detecting cycles</strong>: Finding strongly-connected components in the graph that have no external references (unreachable from root objects like UIApplication).</li>
+                </ol>
+                <p>With malloc stack logging enabled, it also shows the allocation backtrace for each object, making it easy to identify where the leaking objects were created. The graph can be exported for offline analysis with <code>leaks --outputGraph</code>.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>46. What is UBSan and why is it less relevant for pure Swift code?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>UBSan (Undefined Behavior Sanitizer) detects undefined behavior at runtime: signed integer overflow, null pointer dereference, misaligned memory access, invalid enum values, and more.</p>
+                <p><strong>Less relevant for pure Swift because</strong>: Swift prevents most UB by design — integer overflow traps in debug mode, optionals prevent null dereference, array bounds are checked, and enum exhaustiveness is enforced at compile time.</p>
+                <p><strong>Still valuable for</strong>: Projects with C/ObjC interop, code using UnsafePointer/UnsafeRawPointer, bridged C libraries, and ObjC code that does manual memory management or pointer arithmetic. UBSan has minimal overhead (5-20% CPU, negligible memory) and can be combined with ASan, making it a good addition to CI.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>47. How would you use LLDB to debug a crash that only reproduces in release builds?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Release build crashes are harder because optimizations change code layout and debug info may be stripped. Approach:</p>
+                <ol>
+                    <li><strong>Symbolicate the crash log</strong>: Use the dSYM file with <code>atos</code> or Xcode's crash log viewer to get function names and line numbers.</li>
+                    <li><strong>Reproduce with debug info</strong>: Build with <code>-O</code> optimization but keep <code>DEBUG_INFORMATION_FORMAT = dwarf-with-dsym</code>. This gives you optimized code with debug symbols.</li>
+                    <li><strong>Use LLDB with dSYM</strong>: <code>lldb MyApp</code>, then <code>target symbols add MyApp.dSYM</code>. Set breakpoints and step through optimized code.</li>
+                    <li><strong>Check for optimization-related issues</strong>: Race conditions (more likely with optimized code), uninitialized memory (optimizer may reorder), and assumptions about evaluation order.</li>
+                    <li><strong>Use ASan with optimization</strong>: <code>-O -fsanitize=address</code> gives you optimized code with memory checking.</li>
+                    <li><strong>Register inspection</strong>: In optimized code, variables may be in registers. Use <code>register read</code> and <code>image lookup -a</code> to correlate addresses with symbols.</li>
+                </ol>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>48. Design a CI pipeline that uses sanitizers for continuous safety checking. What are the tradeoffs?</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Pipeline design</strong>:</p>
+                <ul>
+                    <li><strong>Every PR</strong>: Regular tests (fast feedback) + ASan tests (memory safety) + TSan tests (thread safety) — run in parallel CI jobs</li>
+                    <li><strong>Nightly</strong>: UBSan tests + extended test suite with ASan + performance regression tests</li>
+                    <li><strong>Weekly</strong>: Full sanitizer suite with comprehensive UI tests</li>
+                </ul>
+                <p><strong>Tradeoffs</strong>:</p>
+                <ul>
+                    <li><strong>CI cost</strong>: ASan adds 2-3x test time, TSan adds 5-15x. Budget for 3 parallel jobs per PR.</li>
+                    <li><strong>ASan + TSan mutual exclusion</strong>: Must be separate jobs — can't run both simultaneously.</li>
+                    <li><strong>TSan simulator-only</strong>: Can't test device-specific code paths.</li>
+                    <li><strong>False positives</strong>: Rare but possible, especially with third-party code. Use suppression files with tracking tickets.</li>
+                    <li><strong>Developer friction</strong>: Longer CI times. Mitigate by running sanitizer jobs in parallel with regular tests and making them required but not blocking initial feedback.</li>
+                </ul>
+                <p><strong>Key principle</strong>: Make sanitizer failures blocking for merge. A data race or memory error that ships to production costs 100x more than the CI time to catch it.</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    document.querySelectorAll('.qa-question').forEach(function(q) {
+        q.addEventListener('click', function() {
+            this.nextElementSibling.classList.toggle('open');
+        });
+    });
+    </script>
+
+    <div class="nav-footer">
+        <a href="06-debugging-tools.html">← Debugging Tools</a>
+        <a href="index.html">Back to Build &amp; Toolchain →</a>
+    </div>
+</div>
+</body>
+</html>

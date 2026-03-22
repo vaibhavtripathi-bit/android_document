@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Objective-C Runtime Deep Dive — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">System Frameworks</a><span class="sep">›</span>
+        Objective-C Runtime
+    </nav>
+
+    <p style="margin-bottom: 12px;">
+        <span class="tag tag-l6">L6</span>
+        <span class="tag tag-architect">Architect</span>
+        <span class="tag tag-senior">Staff+</span>
+    </p>
+    <h1>Objective-C Runtime Deep Dive</h1>
+    <p class="subtitle">Message dispatch, classes and metaclasses, dynamic resolution, KVO/KVC machinery, and the runtime APIs that still shape Swift interop and crash analysis. Written for Staff-level depth: you should be able to explain <em>what the CPU does</em>, <em>what the runtime guarantees</em>, and <em>where implementation details end</em>.</p>
+
+    <div class="toc">
+        <h3>On This Page</h3>
+        <ul>
+            <li><a href="#objc-msgsend">objc_msgSend: Full Flow (arm64)</a></li>
+            <li><a href="#dispatch-comparison">Dispatch: Message vs Vtable vs Witness</a></li>
+            <li><a href="#isa-chain">isa, Classes, Metaclasses</a></li>
+            <li><a href="#swizzling">Method Swizzling</a></li>
+            <li><a href="#associated">Associated Objects</a></li>
+            <li><a href="#nsproxy">NSProxy</a></li>
+            <li><a href="#nsinvocation">NSInvocation</a></li>
+            <li><a href="#kvo">KVO Internals (isa-swizzling)</a></li>
+            <li><a href="#kvc">Key-Value Coding</a></li>
+            <li><a href="#dynamic-synthesize">@dynamic vs @synthesize</a></li>
+            <li><a href="#resolution-chain">Method Resolution Chain</a></li>
+            <li><a href="#swift-bridge">Why Swift Developers Still Need This</a></li>
+        </ul>
+    </div>
+
+    <h2 id="objc-msgsend">1. objc_msgSend: Full Flow</h2>
+
+    <p>Every <code>[receiver message]</code> compiles to a call to <code class="func">objc_msgSend</code> (or a variant). Understanding this path is the single highest-leverage Objective-C runtime topic in senior interviews: it connects compiler lowering, CPU calling conventions, cache behavior, and the class hierarchy walk.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Not a “function call” in the C sense</div>
+        <p><code class="func">objc_msgSend</code> is implemented in hand-tuned assembly because the ABI varies by architecture and return-type class (integer/pointer vs. floating-point vs. struct). The runtime must preserve registers exactly as the callee expects while still performing lookup work. That is why you will not find a portable C implementation of the fast path in shipping Apple runtimes.</p>
+    </div>
+
+    <h3>arm64 calling convention (conceptual)</h3>
+    <p>On arm64, the first integer/pointer arguments go in <code>x0</code>, <code>x1</code>, <code>x2</code>, … For <code class="func">objc_msgSend</code>, <code>x0</code> is <code>self</code>, <code>x1</code> is <code>_cmd</code> (the selector), and user arguments start at <code>x2</code>. The implementation must branch to the resolved <code>IMP</code> without disturbing argument registers the callee will read—hence careful tail-calling and specialized entry points.</p>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│  objc_msgSend(self, _cmd, arg2, …)  —  arm64 fast path (concept) │
+└─────────────────────────────────────────────────────────────────┘
+  x0 = self          x1 = _cmd (SEL)
+         │
+         ▼
+  Load class from self->isa (may need masking for non-pointer isa)
+         │
+         ▼
+  class->cache  lookup  (bucket chain / open addressing — implementation detail)
+         │
+    hit? ├──yes──► IMP in register ──tail branch (b / br)──► callee
+         │
+         no
+         │
+         ▼
+  __objc_msgSend_uncached / slow path:
+  search method list on class, then superclass chain,
+  attach to cache, then tail-call IMP
+    </div>
+
+    <h3>Method cache (why it feels “instant”)</h3>
+    <p>Each <code>Class</code> owns a <strong>method cache</strong>: a hash table mapping <code>(SEL → IMP)</code> (plus associated metadata the runtime uses for correctness and invalidation). On a cache hit, dispatch is a small constant amount of work: a few loads, a compare, and an indirect branch. Interviewers often probe <em>why</em> this is fast:</p>
+    <ul>
+        <li><strong>Locality</strong> — cache data sits on the class object; repeated messages to the same receiver/class touch hot cache lines.</li>
+        <li><strong>No virtual C++-style vtable indirection for the common case</strong> — once warm, you avoid scanning method lists.</li>
+        <li><strong>Tail-call / branch-to-IMP</strong> — after resolution, control transfers directly to the implementation without extra frames on the fast path.</li>
+    </ul>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — How to talk about “hash table in class”</div>
+        <p>Say: <em>per-class cache, keyed by selector, storing the resolved IMP; probing uses a fixed strategy; on miss the runtime searches the class’s method list then superclasses, may need dynamic resolution, then fills the cache.</em> Avoid claiming a specific open-addressing prime size unless you have read the exact runtime version—behavior is stable in <em>meaning</em>, not always in <em>layout</em>.</p>
+    </div>
+
+    <h3>Cache miss → method lookup</h3>
+    <p>When the selector is not cached, the runtime walks <strong>method lists</strong> attached to the class, then repeats up the <strong>superclass chain</strong>. Method lists can be lazily realized (categories, loaded images, runtime edits), so the first miss can be more expensive than steady-state. If no implementation is found, you enter the <strong>dynamic resolution chain</strong> (<code>resolveInstanceMethod:</code>, forwarding, etc.—covered later).</p>
+
+    <h3>Tail-call optimization and the “no extra frame” story</h3>
+    <p>Conceptually, <code class="func">objc_msgSend</code> wants to end as: “jump to IMP with the same register state as if the caller had invoked IMP directly.” That is why the fast path is implemented as a branch (tail call) to the target function once <code>IMP</code> is known. Stack depth stays flat for the dispatch stub itself—important for microbenchmark narratives and for understanding backtraces (you may see <code>objc_msgSend</code> frames only when still inside the stub or uncached paths).</p>
+
+    <h3>objc_msgSend variants</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Symbol (family)</th>
+                <th>When used</th>
+                <th>Staff-level note</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code class="func">objc_msgSend</code></td>
+                <td>Most returns that fit in integer/pointer registers per ABI</td>
+                <td>Default lowering for <code>id</code> returns and many ObjC methods</td>
+            </tr>
+            <tr>
+                <td><code class="func">objc_msgSend_fpret</code></td>
+                <td>Legacy x86; floating-point return ABI quirks</td>
+                <td>Rarely relevant on modern arm64 interviews; mention for cross-platform literacy</td>
+            </tr>
+            <tr>
+                <td><code class="func">objc_msgSend_stret</code></td>
+                <td>Large struct returns (ABI passes hidden sret pointer)</td>
+                <td>On arm64 many structs are handled differently—know it as “ABI special case,” verify platform</td>
+            </tr>
+            <tr>
+                <td><code class="func">objc_msgSendSuper</code> / <code class="func">objc_msgSendSuper2</code></td>
+                <td><code>super</code> calls: start lookup at superclass</td>
+                <td><code>super2</code> uses receiver to get class but still begins search at super—compiler/runtime pairing detail</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// ObjC — [super doWork] lowers to objc_msgSendSuper2(&amp;objc_super, _cmd)</span>
+<span class="comment">// objc_super holds { receiver, super_class } so lookup starts at the superclass.</span>
+<span class="keyword">@implementation</span> <span class="type">Child</span>
+- (<span class="keyword">void</span>)<span class="func">doWork</span> {
+    [<span class="keyword">super</span> <span class="func">doWork</span>];
+}
+<span class="keyword">@end</span></code></pre>
+
+    <pre><code><span class="comment">// Swift — explicit super to ObjC requires @objc inheritance context</span>
+<span class="keyword">import</span> Foundation
+
+<span class="keyword">class</span> <span class="type">Child</span>: <span class="type">Parent</span> {
+    <span class="keyword">override</span> <span class="keyword">func</span> <span class="func">doWork</span>() {
+        <span class="keyword">super</span>.<span class="func">doWork</span>()
+    }
+}</code></pre>
+
+    <h2 id="dispatch-comparison">2. Method Dispatch: “Vtable” vs Message Dispatch</h2>
+
+    <p>Objective-C methods are <strong>dynamically bound</strong> by name (<code>SEL</code>) at send time (modulo compiler devirtualization optimizations). This differs materially from typical C++ virtual dispatch through a fixed vtable slot chosen at compile time for a given override layout.</p>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>ObjC <em>can</em> use vtable-style fast paths for certain <code>objc_msgSend</code> optimizations in recent runtimes (e.g., some <code>alloc</code>/<code>init</code> fastpaths)—treat those as transparent optimizations. The <strong>semantic model</strong> interviewers expect is still message passing with swizzling, categories, and dynamic resolution.</p>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Mechanism</th>
+                <th>Binding time</th>
+                <th>Mutation</th>
+                <th>Interop story</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>ObjC message send</td>
+                <td>At send (selector → IMP resolution)</td>
+                <td>Categories, swizzling, +load order, runtime APIs</td>
+                <td>Central to Apple frameworks; dynamic</td>
+            </tr>
+            <tr>
+                <td>C++ virtual (vtable)</td>
+                <td>Compile-time slot + runtime vptr</td>
+                <td>UB to mutate vtables; layout is ABI</td>
+                <td>Deterministic; fragile across libraries</td>
+            </tr>
+            <tr>
+                <td>Swift protocol witness tables</td>
+                <td>Static + runtime for existentials/generics</td>
+                <td>Resilience via metadata; not “swizzle friendly”</td>
+                <td>Optimization-friendly; different debugging story</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Method lists and resolution order</h3>
+    <p>Each class stores lists of <code>struct method_t</code> entries (name, types, IMP). <strong>Categories</strong> append methods; if a category defines a method already on the class, the category’s implementation typically <strong>wins</strong> (last loaded / runtime ordering rules)—this is a classic interview pitfall when debugging “wrong method ran.”</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — Category collisions</div>
+        <p>Two categories implementing the same selector on the same class: which IMP wins is <strong>undefined unless you control +load order</strong> and linkage. In production, avoid duplicate selectors across categories; use prefixes or composition.</p>
+    </div>
+
+    <h3>“Does ObjC use a vtable?”</h3>
+    <p>Precise answer for Staff: <strong>not in the C++ sense for arbitrary methods</strong>. The runtime uses <strong>class-relative method lists + cache</strong>. Some internal paths may resemble vtables for speed, but you should not rely on that as an API. Compare with Swift’s devirtualization and witness tables—Swift prefers static dispatch when proven safe.</p>
+
+    <h2 id="isa-chain">3. isa Pointer and Class Hierarchy</h2>
+
+    <p>An Objective-C object is a C struct whose first field is <code>isa</code> (historically a direct class pointer; on modern runtimes often a <strong>non-pointer isa</strong> bitfield that must be masked to reach the <code>Class</code>).</p>
+
+    <h3>Non-pointer isa (arm64)</h3>
+    <p>The low bits of <code>isa</code> may encode:</p>
+    <ul>
+        <li><strong>Pointer authentication</strong> or tagging schemes (platform/version dependent)</li>
+        <li><strong>Extra refcount / side-table flags</strong> in some configurations—interviewers may ask conceptually “why not always store a raw Class*?”</li>
+    </ul>
+    <p>Always use <code class="func">object_getClass</code> / runtime APIs instead of manually poking <code>isa</code> in production code.</p>
+
+    <h3>Class layout (conceptual)</h3>
+    <ul>
+        <li><strong>superclass</strong> pointer — linearization of inheritance</li>
+        <li><strong>cache</strong> — selector fast path</li>
+        <li><strong>method list</strong> — instance methods for instances; class methods live on metaclass</li>
+        <li><strong>protocol list</strong> — adopted protocols</li>
+        <li><strong>ivar layout</strong> — offsets, for ivar access and KVC/KVO</li>
+    </ul>
+
+    <div class="diagram">
+Instance: myObject
+┌──────────────────┐
+│ isa ─────────────┼──► ┌─────────────────────┐
+│ ivar storage…    │    │ class object        │
+└──────────────────┘    │  name: MyWidget     │
+                        │  superclass ────────┼──► … ──► NSObject
+                        │  instance methods   │
+                        │  ivar layout        │
+                        │  isa ───────────────┼──► metaclass(MyWidget)
+                        └─────────────────────┘
+
+Metaclass: metaclass(MyWidget)
+┌─────────────────────┐
+│ isa ────────────────┼──► root metaclass (NSObject’s metaclass chain)
+│ superclass ─────────┼──► metaclass(superclass of MyWidget)
+│ class methods here  │
+└─────────────────────┘
+
+Rule of thumb:
+  “Instance messages” → class object’s method list
+  “Class messages”    → metaclass’s method list
+  “[NSObject class]”  → oddity: NSObject class methods terminate via root metaclass ↔ NSObject pairing
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Why metaclasses exist</div>
+        <p>Classes are objects too (<code>+[SomeClass load]</code> is a message to the class object). The metaclass’s <code>isa</code> chain ensures class objects respond to <code>+alloc</code>, <code>+new</code>, etc., while instance methods live on the class object for instances. The NSObject root pairing is a common whiteboard checkpoint.</p>
+    </div>
+
+    <pre><code><span class="comment">// Runtime introspection (ObjC)</span>
+<span class="keyword">#import</span> <span class="string">&lt;objc/runtime.h&gt;</span>
+
+<span class="type">Class</span> cls = <span class="func">objc_getClass</span>(<span class="string">"NSString"</span>);
+<span class="func">NSLog</span>(<span class="string">"%p"</span>, cls);
+<span class="type">Class</span> meta = <span class="func">object_getClass</span>((<span class="keyword">id</span>)cls);
+<span class="func">NSLog</span>(<span class="string">"metaclass %p"</span>, meta);</code></pre>
+
+    <pre><code><span class="comment">// Swift — type and object introspection bridge to ObjC runtime for @objc types</span>
+<span class="keyword">import</span> Foundation
+
+<span class="keyword">let</span> obj: <span class="type">AnyObject</span> = <span class="type">NSObject</span>()
+<span class="keyword">let</span> c: <span class="type">AnyClass</span>? = <span class="func">object_getClass</span>(obj)
+<span class="func">print</span>(<span class="type">String</span>(describing: c))</code></pre>
+
+    <h2 id="swizzling">4. Method Swizzling</h2>
+
+    <p><code class="func">method_exchangeImplementations</code> swaps two <code>IMP</code> pointers in the runtime’s method list. After exchange, selectors point to the opposite implementations—so each IMP often calls the “other” selector to retain original behavior (classic pattern).</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — Ordering and +load</div>
+        <p>Swizzling in <code>+load</code> runs early, but <strong>order across classes/categories is not a stable long-term contract</strong> for app logic. Multiple frameworks swizzling the same method create Heisenbugs. Prefer instrumentation hooks provided by the framework (e.g., URLSession delegate wrappers) when available.</p>
+    </div>
+
+    <h3>class_addMethod + exchange pattern</h3>
+    <p>If the target class does not yet expose a method entry (e.g., you add a stub), use <code class="func">class_addMethod</code> to install an IMP, then exchange. This avoids crashing when <code class="func">class_getInstanceMethod</code> would return <code>NULL</code> for missing selectors.</p>
+
+    <pre><code><span class="keyword">#import</span> <span class="string">&lt;objc/runtime.h&gt;</span>
+
+<span class="keyword">static</span> <span class="keyword">void</span> <span class="func">orig_doThing</span>(<span class="keyword">id</span> <span class="keyword">self</span>, <span class="type">SEL</span> _cmd) {
+    <span class="func">NSLog</span>(<span class="string">"before"</span>);
+    <span class="comment">// call “original” by messaging the swapped name:</span>
+    ((<span class="keyword">void</span>(*)(<span class="keyword">id</span>,<span class="type">SEL</span>))<span class="func">objc_msgSend</span>)(<span class="keyword">self</span>, <span class="func">sel_registerName</span>(<span class="string">"orig_doThing:"</span>));
+}
+
+<span class="keyword">void</span> <span class="func">SwizzleDoThing</span>(<span class="type">Class</span> cls) {
+    <span class="type">SEL</span> orig = <span class="func">@selector</span>(doThing);
+    <span class="type">SEL</span> alias = <span class="func">sel_registerName</span>(<span class="string">"orig_doThing:"</span>);
+    <span class="type">Method</span> m = <span class="func">class_getInstanceMethod</span>(cls, orig);
+    <span class="keyword">const</span> <span class="keyword">char</span> *types = <span class="func">method_getTypeEncoding</span>(m);
+    <span class="func">class_addMethod</span>(cls, alias, <span class="func">method_getImplementation</span>(m), types);
+    <span class="type">Method</span> m1 = <span class="func">class_getInstanceMethod</span>(cls, orig);
+    <span class="type">Method</span> m2 = <span class="func">class_getInstanceMethod</span>(cls, alias);
+    <span class="func">method_exchangeImplementations</span>(m1, m2);
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Thread safety</div>
+        <p>Perform swizzles <strong>once</strong> under a lock, before concurrent use. Swapping IMPs while messages are in flight on other threads can theoretically race with first-time cache fills—treat swizzling as process-wide mutation done at startup.</p>
+    </div>
+
+    <h3>Swizzling in Swift</h3>
+    <p>Swift methods are not naturally dynamic unless marked <code>@objc dynamic</code> (or exposed in ways that force dispatch through the ObjC runtime). Swizzling Swift-defined methods without <code>dynamic</code> is fragile or ineffective because dispatch may be direct. For Staff interviews: <strong>prefer composition, protocols, and wrappers</strong>; treat runtime swizzling in Swift as a red-flag maintenance cost.</p>
+
+    <h2 id="associated">5. Associated Objects</h2>
+
+    <p><code class="func">objc_setAssociatedObject</code> / <code class="func">objc_getAssociatedObject</code> attach arbitrary key/value pairs to an object via a global side table (conceptually <code>AssociationsManager</code>: a hash map from object address to property map). This enables “stored properties” on categories—something the language otherwise forbids.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Policy</th>
+                <th>Meaning</th>
+                <th>Memory semantics</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>OBJC_ASSOCIATION_ASSIGN</code></td>
+                <td>Raw pointer; no retention</td>
+                <td>Unsafe with ObjC objects—dangling unless weak-safe patterns used</td>
+            </tr>
+            <tr>
+                <td><code>OBJC_ASSOCIATION_RETAIN_NONATOMIC</code></td>
+                <td>Strong, nonatomic</td>
+                <td>Common default for object storage</td>
+            </tr>
+            <tr>
+                <td><code>OBJC_ASSOCIATION_RETAIN</code></td>
+                <td>Strong, atomic</td>
+                <td>Synchronizes setter-like behavior; not a substitute for your own model locks</td>
+            </tr>
+            <tr>
+                <td><code>OBJC_ASSOCIATION_COPY_NONATOMIC</code></td>
+                <td>Copy, nonatomic</td>
+                <td>Matches “copy” property semantics for immutable snapshots</td>
+            </tr>
+            <tr>
+                <td><code>OBJC_ASSOCIATION_COPY</code></td>
+                <td>Copy, atomic</td>
+                <td>Rare; know it exists for completeness</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — Lifetimes and zombies</div>
+        <p>Associated objects are released when the host object is deallocated (after <code>dealloc</code> / Swift deinit for ObjC objects). Using <code>ASSIGN</code> for ObjC object pointers captures unsafe-unretained references—treat like a weak reference without automatic nil-ing.</p>
+    </div>
+
+    <pre><code><span class="keyword">import</span> ObjectiveC
+
+<span class="keyword">private</span> <span class="keyword">var</span> kToken: <span class="type">UInt8</span> = <span class="number">0</span>
+
+<span class="keyword">extension</span> <span class="type">UIView</span> {
+    <span class="keyword">var</span> auditTag: <span class="type">String</span>? {
+        <span class="keyword">get</span> {
+            <span class="func">objc_getAssociatedObject</span>(<span class="keyword">self</span>, &amp;kToken) <span class="keyword">as</span>? <span class="type">String</span>
+        }
+        <span class="keyword">set</span> {
+            <span class="func">objc_setAssociatedObject</span>(
+                <span class="keyword">self</span>, &amp;kToken, newValue,
+                .retainNonatomic
+            )
+        }
+    }
+}</code></pre>
+
+    <h2 id="nsproxy">6. NSProxy</h2>
+
+    <p><code class="type">NSProxy</code> is a root class (not a subclass of <code class="type">NSObject</code>) designed for <strong>pure forwarding</strong>. It implements minimal instance behavior and raises on most selectors unless you override forwarding methods.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Topic</th>
+                <th>NSObject</th>
+                <th>NSProxy</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Typical initialization</td>
+                <td>Rich initializer graph</td>
+                <td><code>init</code> is not the usual NSObject pattern—often custom</td>
+            </tr>
+            <tr>
+                <td>Forwarding path</td>
+                <td>Works, but NSObject carries many default methods</td>
+                <td>Minimal surface → encourages forwarder design</td>
+            </tr>
+            <tr>
+                <td>Use cases</td>
+                <td>General base</td>
+                <td>Lazy stand-ins, RPC stubs, test doubles, indirection</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Why NSProxy still appears</div>
+        <p>Certain designs want an object that is <em>obviously</em> not an <code>NSObject</code> for method existence tests and forwarding. In modern Swift, many patterns migrate to protocols + structs, but Apple frameworks and legacy code still reference <code>NSProxy</code> concepts in interviews.</p>
+    </div>
+
+    <h2 id="nsinvocation">7. NSInvocation</h2>
+
+    <p><code class="type">NSInvocation</code> packages a target, selector, arguments, and return value into an object. It is the backbone of <code>forwardInvocation:</code> once you have decided (via <code>methodSignatureForSelector:</code>) that a selector can be forwarded, you can mutate an <code>NSInvocation</code> and dispatch it to another object.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — Performance</div>
+        <p><code>NSInvocation</code> is flexible but expensive: boxing arguments, retaining targets, and indirect calls defeat static optimization. Use for compatibility layers, not inner loops.</p>
+    </div>
+
+    <pre><code><span class="keyword">@implementation</span> <span class="type">ProxyThing</span>
+- (<span class="keyword">void</span>)<span class="func">forwardInvocation</span>:(<span class="type">NSInvocation</span> *)inv {
+    [inv <span class="func">invokeWithTarget</span>:<span class="keyword">self</span>.realObject];
+}
+- (<span class="type">NSMethodSignature</span> *)<span class="func">methodSignatureForSelector</span>:(<span class="type">SEL</span>)sel {
+    <span class="keyword">return</span> [<span class="keyword">self</span>.realObject <span class="func">methodSignatureForSelector</span>:sel];
+}
+<span class="keyword">@end</span></code></pre>
+
+    <h2 id="kvo">8. KVO Internals (isa-swizzling)</h2>
+
+    <p>When you register an observer with <code>addObserver:forKeyPath:…</code>, the runtime may create a <strong>dynamic subclass</strong> of your object’s class, e.g. <code>NSKVONotifying_MyWidget</code>, and point the instance’s <code>isa</code> to that subclass (<strong>isa-swizzling</strong>). The subclass overrides accessors to emit <code>willChangeValueForKey:</code> / <code>didChangeValueForKey:</code> around the original implementation.</p>
+
+    <div class="diagram">
+Before KVO:
+  object.isa ──► MyWidget (real class)
+
+After observing "foo":
+  object.isa ──► NSKVONotifying_MyWidget
+                      │
+                      ├─ override -setFoo:  ──► calls super + KVO hooks
+                      │
+                      └─ class method +class may report MyWidget (hiding swizzle)
+
+Detection:
+  object_getClass(obj)  vs  [obj class]
+  often diverge under KVO — use runtime introspection in debugging
+    </div>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — KVO compliance</div>
+        <p>Ensure <strong>accessor symmetry</strong>: paired getters/setters or explicit KVC support; document dependent keys; avoid modifying collections without KVC mutation methods if you want array/order observers to behave.</p>
+    </div>
+
+    <h3>Manual KVO</h3>
+    <p>Wrap changes with <code>willChange</code>/<code>didChange</code> for computed or non-ivar-backed properties when automatic swizzling cannot see writes.</p>
+
+    <h3>KVO in Swift</h3>
+    <p>Requires <code>@objc</code> exposure and <code>dynamic</code> for Swift-defined properties so the runtime can swizzle accessors. For value types or non-ObjC dispatch, use other observation patterns (<code>Observable</code>, Combine, etc.).</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">Model</span>: <span class="type">NSObject</span> {
+    <span class="keyword">@objc</span> <span class="keyword">dynamic</span> <span class="keyword">var</span> title: <span class="type">String</span> = <span class="string">""</span>
+}</code></pre>
+
+    <h2 id="kvc">9. KVC (Key-Value Coding)</h2>
+
+    <p>KVC routes string keys to accessors or ivars through a documented search order—critical for Core Data, bindings-era patterns, and debugging mysterious <code>valueForKey:</code> crashes.</p>
+
+    <h3>valueForKey: search path (instance)</h3>
+    <ol>
+        <li>Accessors in order: <code>getKey</code>, <code>key</code>, <code>isKey</code>, <code>_key</code> (if enabled)</li>
+        <li>Instance variable access if <code>+accessInstanceVariablesDirectly</code> returns <code>YES</code> (default <code>YES</code> for NSObject subclasses—surprises many)</li>
+        <li><code>valueForUndefinedKey:</code> (raises by default)</li>
+    </ol>
+
+    <h3>setValue:forKey:</h3>
+    <ol>
+        <li>Setters: <code>setKey:</code>, <code>_setKey:</code></li>
+        <li>Ivar direct assignment under the same <code>accessInstanceVariablesDirectly</code> gate</li>
+        <li><code>setValue:forUndefinedKey:</code></li>
+    </ol>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know — Security &amp; encapsulation</div>
+        <p>KVC can bypass <code>private</code> Swift access if an ObjC header exposes selectors and the object is <code>id</code>-messaged through KVC. Treat KVC as <strong>capability</strong>, not “reflection is safe.”</p>
+    </div>
+
+    <h3>Collection operators</h3>
+    <p>Keys like <code>@avg.amount</code> apply array/set operators (<code>@count</code>, <code>@sum</code>, <code>@avg</code>, <code>@min</code>, <code>@max</code>, <code>@unionOfObjects</code>, etc.) across collections—handy in bindings-era code, rare in modern SwiftUI but still fair game for legacy interviews.</p>
+
+    <h3>KVC and Swift</h3>
+    <p>Swift property names must be visible to ObjC (<code>@objc</code>) for KVC paths unless using NSObject KVC overrides. Swift-only structs are outside this mechanism.</p>
+
+    <h2 id="dynamic-synthesize">10. @dynamic vs @synthesize</h2>
+
+    <ul>
+        <li><code>@synthesize</code> — instructs the compiler to synthesize ivar + accessor implementations (historically explicit; modern ObjC defaults often synthesize properties automatically).</li>
+        <li><code>@dynamic</code> — promises accessors exist at <strong>runtime</strong> without compile-time synthesis—used by Core Data <code>NSManagedObject</code> (properties resolved via dynamic method resolution or generated subclasses).</li>
+    </ul>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Version drift</div>
+        <p>Default property synthesis behavior changed across Clang/ObjC eras. In interviews, emphasize: <strong>@dynamic shifts responsibility to the runtime or framework</strong>; mismatches manifest as unrecognized selectors until Core Data machinery loads.</p>
+    </div>
+
+    <h2 id="resolution-chain">11. Method Resolution Chain</h2>
+
+    <p>When messaging finds no IMP, the runtime walks a structured recovery pipeline—each step trades flexibility for cost.</p>
+
+    <div class="diagram">
+objc_msgSend ──► cache / method list ──► IMP?
+                         │ miss / nil
+                         ▼
+              +resolveInstanceMethod: / +resolveClassMethod:
+                         │ dynamic method install?
+                         ▼
+              -forwardingTargetForSelector:  (fast forward)
+                         │ returns another object?
+                         ▼
+              -methodSignatureForSelector:  + -forwardInvocation:
+                         │ full NSInvocation boxing
+                         ▼
+              -doesNotRecognizeSelector:   (abort by default)
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Stage</th>
+                <th>Typical use</th>
+                <th>Cost</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>resolveInstanceMethod:</code></td>
+                <td>Add methods with <code>class_addMethod</code> (Core Data, message proxies)</td>
+                <td>Moderate; runs before forwarding</td>
+            </tr>
+            <tr>
+                <td><code>forwardingTargetForSelector:</code></td>
+                <td>Lightweight delegate to another object</td>
+                <td>Low; no NSInvocation yet</td>
+            </tr>
+            <tr>
+                <td><code>methodSignatureForSelector:</code> + <code>forwardInvocation:</code></td>
+                <td>Full proxying, RPC marshaling</td>
+                <td>High; builds invocation object</td>
+            </tr>
+            <tr>
+                <td><code>doesNotRecognizeSelector:</code></td>
+                <td>Last-chance logging / crash customization</td>
+                <td>Terminal unless handled</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Choose the cheapest hop</div>
+        <p>If you only need to redirect to a helper object, implement <code>forwardingTargetForSelector:</code> and avoid <code>forwardInvocation:</code> unless you must inspect arguments.</p>
+    </div>
+
+    <pre><code><span class="keyword">@implementation</span> <span class="type">Router</span>
+- (<span class="keyword">id</span>)<span class="func">forwardingTargetForSelector</span>:(<span class="type">SEL</span>)aSelector {
+    <span class="keyword">if</span> ([<span class="keyword">self</span>.backend <span class="func">respondsToSelector</span>:aSelector]) {
+        <span class="keyword">return</span> <span class="keyword">self</span>.backend;
+    }
+    <span class="keyword">return</span> [<span class="keyword">super</span> <span class="func">forwardingTargetForSelector</span>:aSelector];
+}
+<span class="keyword">@end</span></code></pre>
+
+    <h2 id="swift-bridge">12. When ObjC Runtime Knowledge Is Critical for Swift Developers</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Perspective — Swift is not a clean room</div>
+        <p>Even “pure Swift” apps link Foundation and UIKit, which are ObjC objects under the hood. Staff engineers use runtime knowledge to:</p>
+        <ul>
+            <li><strong>Bridge</strong> — <code>@objc</code>, <code>dynamic</code>, selectors in UIKit/SwiftUI glue, and Clang module boundaries.</li>
+            <li><strong>Debug</strong> — distinguish KVO isa-swizzling, swizzled methods, and unrecognized selector stacks.</li>
+            <li><strong>Crash analysis</strong> — read <code>objc_msgSend</code> traps, corrupted isa, zombie messaging patterns.</li>
+            <li><strong>Interop</strong> — expose Swift APIs to notifications, KVC, performSelector, and third-party ObjC SDKs.</li>
+            <li><strong>Performance</strong> — reason about dynamic dispatch vs. devirtualization, and why “just make it NSObject” changes ABI costs.</li>
+        </ul>
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Interview narrative</div>
+        <p>Close with tradeoffs: dynamism enables Apple’s evolution of frameworks but complicates static reasoning. Strong Staff answers propose <em>measurement</em> (Instruments, objc runtime logging flags in debug), <em>containment</em> (no duplicate swizzles), and <em>alternatives</em> (composition, protocol witnesses in Swift) rather than clever runtime hacks.</p>
+    </div>
+
+    <h3>Summary comparison — Messaging vs forwarding</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Path</th>
+                <th>Latency</th>
+                <th>Flexibility</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Cached <code class="func">objc_msgSend</code></td>
+                <td>Lowest stable cost</td>
+                <td>Standard method dispatch</td>
+            </tr>
+            <tr>
+                <td>Uncached first lookup</td>
+                <td>Higher one-time</td>
+                <td>Same semantics, fills cache</td>
+            </tr>
+            <tr>
+                <td><code>forwardingTargetForSelector:</code></td>
+                <td>Extra message overhead</td>
+                <td>Redirect without boxing</td>
+            </tr>
+            <tr>
+                <td><code>forwardInvocation:</code></td>
+                <td>Highest generic cost</td>
+                <td>Full introspection of arguments</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <p style="margin-top: 32px; color: var(--text-secondary); font-size: 0.95rem;">You now have the skeleton to defend message passing end-to-end: from arm64 registers through caches and method lists, into dynamic resolution, KVO/KVC machinery, and the Swift boundary. In interviews, anchor claims to <em>observable behavior</em> and <em>stable runtime contracts</em>, and label version-specific layout as implementation detail unless a question explicitly targets it.</p>
+
+    <div class="nav-footer">
+        <a href="01-darwin-xnu-basics.html">← Darwin &amp; XNU Basics</a>
+        <a href="03-swift-runtime.html">Swift Runtime →</a>
+    </div>
+</div>
+</body>
+</html>

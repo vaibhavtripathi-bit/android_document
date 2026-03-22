@@ -1,0 +1,1471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Core Data — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Networking &amp; Data</a><span class="sep">›</span>
+        Core Data
+    </nav>
+
+    <h1>Core Data</h1>
+    <p class="subtitle">Apple's object-graph persistence framework — architecture, concurrency, migration, and production-scale patterns for L6/Staff-level interviews.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#stack-architecture">1. Core Data Stack Architecture</a></li>
+            <li><a href="#context-deep-dive">2. NSManagedObjectContext Deep Dive</a></li>
+            <li><a href="#concurrency-model">3. Concurrency Model</a></li>
+            <li><a href="#fetched-results-controller">4. NSFetchedResultsController</a></li>
+            <li><a href="#migration">5. Lightweight vs Heavyweight Migration</a></li>
+            <li><a href="#batch-operations">6. Batch Operations</a></li>
+            <li><a href="#merge-policies">7. NSMergePolicy Types</a></li>
+            <li><a href="#faulting-uniquing">8. Faulting &amp; Uniquing</a></li>
+            <li><a href="#cloudkit-sync">9. CloudKit Sync</a></li>
+            <li><a href="#architect-scale">10. Architect: Core Data Stack for 1M+ Records</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 1: Core Data Stack Architecture                      -->
+    <!-- ============================================================ -->
+    <h2 id="stack-architecture">1. Core Data Stack Architecture</h2>
+
+    <p>Core Data is <strong>not</strong> a database. It is an <em>object-graph management and persistence framework</em>. The stack is composed of four primary objects that collaborate to move managed objects between memory and the persistent store.</p>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────┐
+│                  NSPersistentContainer                   │
+│  (Convenience wrapper — owns the entire stack)          │
+│                                                         │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │          NSManagedObjectModel (.xcdatamodeld)     │  │
+│  │  Entities, Attributes, Relationships, Fetch Reqs  │  │
+│  └──────────────────────┬────────────────────────────┘  │
+│                         │                               │
+│  ┌──────────────────────▼────────────────────────────┐  │
+│  │       NSPersistentStoreCoordinator                │  │
+│  │  Mediates between context(s) and store(s)         │  │
+│  │  Serializes read/write to the backing store       │  │
+│  └──────────┬───────────────────────┬────────────────┘  │
+│             │                       │                   │
+│  ┌──────────▼──────────┐ ┌─────────▼───────────────┐   │
+│  │ NSPersistentStore   │ │ NSPersistentStore       │   │
+│  │ (SQLite — default)  │ │ (Binary / In-Memory)    │   │
+│  └─────────────────────┘ └─────────────────────────┘   │
+│                                                         │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │  viewContext (NSManagedObjectContext)              │  │
+│  │  Main-queue context for UI reads                  │  │
+│  └───────────────────────────────────────────────────┘  │
+│                                                         │
+│  newBackgroundContext() → private-queue contexts         │
+└─────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>Component Breakdown</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Component</th>
+                <th>Responsibility</th>
+                <th>Key Details</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>NSManagedObjectModel</code></td>
+                <td>Schema definition</td>
+                <td>Compiled from <code>.xcdatamodeld</code>. Entities, attributes, relationships, fetch request templates, configurations.</td>
+            </tr>
+            <tr>
+                <td><code>NSPersistentStoreCoordinator</code></td>
+                <td>Store broker</td>
+                <td>Serializes context requests to the store. Supports multiple stores (e.g., one SQLite + one in-memory). Thread-safe internally via its own lock.</td>
+            </tr>
+            <tr>
+                <td><code>NSPersistentStore</code></td>
+                <td>Storage backend</td>
+                <td>SQLite (default, recommended), Binary, In-Memory. SQLite uses WAL mode by default for concurrent reads.</td>
+            </tr>
+            <tr>
+                <td><code>NSManagedObjectContext</code></td>
+                <td>Scratchpad / staging area</td>
+                <td>Tracks insertions, updates, deletions. Must be used on its designated queue. Supports undo.</td>
+            </tr>
+            <tr>
+                <td><code>NSPersistentContainer</code></td>
+                <td>Convenience wrapper (iOS 10+)</td>
+                <td>Creates and owns the model, coordinator, and a <code>viewContext</code>. Factory for background contexts.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Modern Stack Setup</h3>
+
+<pre><code><span class="keyword">import</span> <span class="type">CoreData</span>
+
+<span class="keyword">final class</span> <span class="type">PersistenceController</span> {
+
+    <span class="keyword">static let</span> shared = <span class="type">PersistenceController</span>()
+
+    <span class="keyword">let</span> container: <span class="type">NSPersistentContainer</span>
+
+    <span class="keyword">var</span> viewContext: <span class="type">NSManagedObjectContext</span> {
+        container.<span class="func">viewContext</span>
+    }
+
+    <span class="keyword">init</span>(inMemory: <span class="type">Bool</span> = <span class="keyword">false</span>) {
+        container = <span class="type">NSPersistentContainer</span>(name: <span class="string">"Model"</span>)
+
+        <span class="keyword">if</span> inMemory {
+            container.persistentStoreDescriptions.first?.url =
+                <span class="type">URL</span>(fileURLWithPath: <span class="string">"/dev/null"</span>)
+        }
+
+        <span class="comment">// Enable persistent history tracking for background merging</span>
+        <span class="keyword">let</span> description = container.persistentStoreDescriptions.first
+        description?.<span class="func">setOption</span>(
+            <span class="keyword">true</span> <span class="keyword">as</span> <span class="type">NSNumber</span>,
+            forKey: <span class="type">NSPersistentHistoryTrackingKey</span>
+        )
+        description?.<span class="func">setOption</span>(
+            <span class="keyword">true</span> <span class="keyword">as</span> <span class="type">NSNumber</span>,
+            forKey: <span class="type">NSPersistentStoreRemoteChangeNotificationPostOptionKey</span>
+        )
+
+        container.<span class="func">loadPersistentStores</span> { storeDescription, error <span class="keyword">in</span>
+            <span class="keyword">if let</span> error = error <span class="keyword">as</span> <span class="type">NSError</span>? {
+                <span class="func">fatalError</span>(<span class="string">"Unresolved error \(error)"</span>)
+            }
+        }
+
+        container.viewContext.<span class="func">automaticallyMergesChangesFromParent</span> = <span class="keyword">true</span>
+        container.viewContext.mergePolicy = <span class="type">NSMergeByPropertyObjectTrumpMergePolicy</span>
+        container.viewContext.name = <span class="string">"viewContext"</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">newBackgroundContext</span>() -> <span class="type">NSManagedObjectContext</span> {
+        <span class="keyword">let</span> context = container.<span class="func">newBackgroundContext</span>()
+        context.mergePolicy = <span class="type">NSMergeByPropertyObjectTrumpMergePolicy</span>
+        context.undoManager = <span class="keyword">nil</span>
+        <span class="keyword">return</span> context
+    }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Store Types</div>
+        <p><strong>SQLite</strong> is the only store type that supports faulting, making it suitable for large datasets. Binary stores load the entire object graph into memory. In-Memory stores are useful for unit tests and caches. You can attach multiple stores to one coordinator using <em>configurations</em> — for example, a transient cache in-memory and persistent data in SQLite.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 2: NSManagedObjectContext Deep Dive                  -->
+    <!-- ============================================================ -->
+    <h2 id="context-deep-dive">2. NSManagedObjectContext Deep Dive</h2>
+
+    <p>An <code>NSManagedObjectContext</code> is a <strong>scratchpad</strong> — an in-memory staging area where you create, fetch, modify, and delete managed objects. Nothing touches the persistent store until you call <code>save()</code>.</p>
+
+    <h3>Internal State Tracking</h3>
+
+    <div class="diagram">
+NSManagedObjectContext
+├── registeredObjects   ← all objects this context knows about
+├── insertedObjects     ← newly created, not yet saved
+├── updatedObjects      ← existing objects with pending changes
+├── deletedObjects      ← marked for deletion on next save
+└── hasChanges          ← true if any of the above are non-empty
+    </div>
+
+    <p>Every managed object has an <code>objectID</code> (<code>NSManagedObjectID</code>). Temporary IDs are assigned at insertion and become permanent after the first save. You can force permanent IDs early with <code>obtainPermanentIDs(for:)</code> — essential when passing object references across contexts.</p>
+
+    <h3>save() Mechanics</h3>
+
+    <ol>
+        <li><strong>Validation</strong> — Core Data calls <code>validateForInsert()</code>, <code>validateForUpdate()</code>, or <code>validateForDelete()</code> on each changed object.</li>
+        <li><strong>Will-save notification</strong> — <code>NSManagedObjectContextWillSaveNotification</code> fires. Objects receive <code>willSave()</code>.</li>
+        <li><strong>Conflict detection</strong> — If the store version differs from the snapshot, the merge policy resolves conflicts.</li>
+        <li><strong>Push to coordinator</strong> — The coordinator serializes the save to the SQLite store.</li>
+        <li><strong>Did-save notification</strong> — <code>NSManagedObjectContextDidSaveNotification</code> fires with inserted/updated/deleted object IDs.</li>
+        <li><strong>Reset change tracking</strong> — <code>insertedObjects</code>, <code>updatedObjects</code>, <code>deletedObjects</code> are cleared.</li>
+    </ol>
+
+    <h3>Undo Manager Integration</h3>
+
+<pre><code><span class="keyword">let</span> context = <span class="type">NSManagedObjectContext</span>(concurrencyType: .<span class="func">mainQueueConcurrencyType</span>)
+context.undoManager = <span class="type">UndoManager</span>()
+
+<span class="comment">// Group a set of changes</span>
+context.undoManager?.<span class="func">beginUndoGrouping</span>()
+user.name = <span class="string">"Alice"</span>
+user.email = <span class="string">"alice@example.com"</span>
+context.undoManager?.<span class="func">endUndoGrouping</span>()
+
+<span class="comment">// Undo reverts both changes atomically</span>
+context.undoManager?.<span class="func">undo</span>()
+
+<span class="comment">// Redo re-applies them</span>
+context.undoManager?.<span class="func">redo</span>()</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice</div>
+        <p>Set <code>undoManager = nil</code> on background contexts. Undo tracking adds memory overhead and is only useful for UI-driven editing contexts. The <code>viewContext</code> should have an undo manager only if your app supports undo (e.g., document-based apps).</p>
+    </div>
+
+    <h3>Context Creation Patterns</h3>
+
+<pre><code><span class="comment">// 1. Via NSPersistentContainer (preferred)</span>
+<span class="keyword">let</span> bgContext = container.<span class="func">newBackgroundContext</span>()
+
+<span class="comment">// 2. Via performBackgroundTask (auto-creates and auto-releases)</span>
+container.<span class="func">performBackgroundTask</span> { context <span class="keyword">in</span>
+    <span class="comment">// Already on the correct queue</span>
+    <span class="keyword">let</span> user = <span class="type">User</span>(context: context)
+    user.name = <span class="string">"Bob"</span>
+    <span class="keyword">try</span>? context.<span class="func">save</span>()
+}
+
+<span class="comment">// 3. Child context (pushes to parent, not to store)</span>
+<span class="keyword">let</span> childContext = <span class="type">NSManagedObjectContext</span>(concurrencyType: .<span class="func">mainQueueConcurrencyType</span>)
+childContext.parent = container.viewContext</code></pre>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 3: Concurrency Model                                 -->
+    <!-- ============================================================ -->
+    <h2 id="concurrency-model">3. Concurrency Model</h2>
+
+    <p>Core Data contexts are <strong>not thread-safe</strong>. Each context is bound to a specific queue, and all access must happen on that queue. The two concurrency types are:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Concurrency Type</th>
+                <th>Queue</th>
+                <th>Usage</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>.mainQueueConcurrencyType</code></td>
+                <td>Main thread</td>
+                <td>UI reads, <code>viewContext</code></td>
+            </tr>
+            <tr>
+                <td><code>.privateQueueConcurrencyType</code></td>
+                <td>Private serial queue</td>
+                <td>Background imports, syncing, heavy fetches</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>perform vs performAndWait</h3>
+
+<pre><code><span class="keyword">let</span> bgContext = container.<span class="func">newBackgroundContext</span>()
+
+<span class="comment">// Asynchronous — enqueues block on context's queue</span>
+bgContext.<span class="func">perform</span> {
+    <span class="keyword">let</span> request = <span class="type">User</span>.<span class="func">fetchRequest</span>()
+    <span class="keyword">let</span> users = <span class="keyword">try</span>? bgContext.<span class="func">fetch</span>(request)
+    <span class="comment">// Process on background queue</span>
+}
+
+<span class="comment">// Synchronous — blocks calling thread until complete</span>
+<span class="comment">// Safe to call from any thread; re-entrant on the context's own queue</span>
+bgContext.<span class="func">performAndWait</span> {
+    <span class="keyword">let</span> count = <span class="keyword">try</span>? bgContext.<span class="func">count</span>(for: <span class="type">User</span>.<span class="func">fetchRequest</span>())
+    <span class="func">print</span>(<span class="string">"User count: \(count ?? 0)"</span>)
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Warning — Thread Violation</div>
+        <p>Accessing a context or its managed objects from the wrong thread causes <strong>undefined behavior</strong> — crashes, data corruption, or silent data loss. Enable <code>-com.apple.CoreData.ConcurrencyDebug 1</code> in your scheme's launch arguments during development. This triggers an assertion on any illegal cross-thread access.</p>
+    </div>
+
+    <h3>Parent-Child Context Architecture</h3>
+
+    <div class="diagram">
+┌──────────────────────────────────┐
+│  Persistent Store (SQLite)       │
+└──────────────┬───────────────────┘
+               │  save()
+┌──────────────▼───────────────────┐
+│  Root Context (private queue)    │
+│  parent: nil                     │
+│  persistentStoreCoordinator: PSC │
+└──────────────┬───────────────────┘
+               │  save() pushes up
+┌──────────────▼───────────────────┐
+│  Main Context (main queue)       │
+│  parent: Root Context            │
+│  Used for UI binding             │
+└──────────────┬───────────────────┘
+               │  save() pushes up
+┌──────────────▼───────────────────┐
+│  Editing Context (main queue)    │
+│  parent: Main Context            │
+│  Used for modal editing screens  │
+└──────────────────────────────────┘
+    </div>
+
+    <p>When a child context calls <code>save()</code>, changes are <strong>pushed to the parent context in memory</strong> — they do not hit the persistent store. Only when the root context (the one connected to the coordinator) calls <code>save()</code> do changes reach SQLite. This gives you a transactional editing pattern: discard the child context to cancel, or save up the chain to commit.</p>
+
+    <h3>Multi-Context Architecture Code</h3>
+
+<pre><code><span class="keyword">final class</span> <span class="type">CoreDataStack</span> {
+
+    <span class="keyword">private let</span> container: <span class="type">NSPersistentContainer</span>
+
+    <span class="comment">// Root context writes to store on a private queue</span>
+    <span class="keyword">private lazy var</span> writerContext: <span class="type">NSManagedObjectContext</span> = {
+        <span class="keyword">let</span> ctx = <span class="type">NSManagedObjectContext</span>(concurrencyType: .<span class="func">privateQueueConcurrencyType</span>)
+        ctx.persistentStoreCoordinator = container.persistentStoreCoordinator
+        ctx.mergePolicy = <span class="type">NSMergeByPropertyObjectTrumpMergePolicy</span>
+        ctx.undoManager = <span class="keyword">nil</span>
+        ctx.name = <span class="string">"writerContext"</span>
+        <span class="keyword">return</span> ctx
+    }()
+
+    <span class="comment">// Main-queue context for UI — child of writer</span>
+    <span class="keyword">lazy var</span> mainContext: <span class="type">NSManagedObjectContext</span> = {
+        <span class="keyword">let</span> ctx = <span class="type">NSManagedObjectContext</span>(concurrencyType: .<span class="func">mainQueueConcurrencyType</span>)
+        ctx.parent = writerContext
+        ctx.automaticallyMergesChangesFromParent = <span class="keyword">true</span>
+        ctx.name = <span class="string">"mainContext"</span>
+        <span class="keyword">return</span> ctx
+    }()
+
+    <span class="keyword">init</span>() {
+        container = <span class="type">NSPersistentContainer</span>(name: <span class="string">"Model"</span>)
+        container.<span class="func">loadPersistentStores</span> { _, error <span class="keyword">in</span>
+            <span class="keyword">if let</span> error { <span class="func">fatalError</span>(<span class="string">"Store load failed: \(error)"</span>) }
+        }
+    }
+
+    <span class="comment">// Editing context for modal forms — child of main</span>
+    <span class="keyword">func</span> <span class="func">newEditingContext</span>() -> <span class="type">NSManagedObjectContext</span> {
+        <span class="keyword">let</span> ctx = <span class="type">NSManagedObjectContext</span>(concurrencyType: .<span class="func">mainQueueConcurrencyType</span>)
+        ctx.parent = mainContext
+        ctx.undoManager = <span class="type">UndoManager</span>()
+        ctx.name = <span class="string">"editingContext"</span>
+        <span class="keyword">return</span> ctx
+    }
+
+    <span class="comment">// Background import context — child of writer</span>
+    <span class="keyword">func</span> <span class="func">newImportContext</span>() -> <span class="type">NSManagedObjectContext</span> {
+        <span class="keyword">let</span> ctx = <span class="type">NSManagedObjectContext</span>(concurrencyType: .<span class="func">privateQueueConcurrencyType</span>)
+        ctx.parent = writerContext
+        ctx.undoManager = <span class="keyword">nil</span>
+        ctx.name = <span class="string">"importContext"</span>
+        <span class="keyword">return</span> ctx
+    }
+
+    <span class="keyword">func</span> <span class="func">saveAll</span>() {
+        mainContext.<span class="func">performAndWait</span> {
+            <span class="keyword">guard</span> mainContext.hasChanges <span class="keyword">else</span> { <span class="keyword">return</span> }
+            <span class="keyword">try</span>? mainContext.<span class="func">save</span>()
+        }
+        writerContext.<span class="func">perform</span> {
+            <span class="keyword">guard</span> <span class="keyword">self</span>.writerContext.hasChanges <span class="keyword">else</span> { <span class="keyword">return</span> }
+            <span class="keyword">try</span>? <span class="keyword">self</span>.writerContext.<span class="func">save</span>()
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Why Parent-Child?</div>
+        <p>The parent-child pattern avoids merge conflicts entirely for editing workflows. A child context's <code>save()</code> is a fast in-memory push — no disk I/O. The root writer context batches disk writes on its private queue, keeping the main thread free. This is the classic pattern for document-based apps and complex editing flows. However, for simple CRUD apps, <code>NSPersistentContainer</code>'s <code>viewContext</code> + <code>newBackgroundContext()</code> with <code>automaticallyMergesChangesFromParent</code> is simpler and sufficient.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 4: NSFetchedResultsController                        -->
+    <!-- ============================================================ -->
+    <h2 id="fetched-results-controller">4. NSFetchedResultsController</h2>
+
+    <p><code>NSFetchedResultsController</code> (FRC) bridges Core Data and UIKit by monitoring a fetch request and notifying its delegate of changes. It provides:</p>
+
+    <ul>
+        <li><strong>Sections</strong> — automatic grouping via <code>sectionNameKeyPath</code></li>
+        <li><strong>Caching</strong> — optional on-disk section cache (keyed by a name you provide)</li>
+        <li><strong>Efficient updates</strong> — only reports inserted/deleted/moved/updated index paths</li>
+    </ul>
+
+    <h3>Complete UITableView Binding</h3>
+
+<pre><code><span class="keyword">final class</span> <span class="type">UsersViewController</span>: <span class="type">UITableViewController</span> {
+
+    <span class="keyword">private lazy var</span> fetchedResultsController: <span class="type">NSFetchedResultsController</span>&lt;<span class="type">User</span>&gt; = {
+        <span class="keyword">let</span> request = <span class="type">User</span>.<span class="func">fetchRequest</span>()
+        request.sortDescriptors = [
+            <span class="type">NSSortDescriptor</span>(keyPath: \<span class="type">User</span>.lastName, ascending: <span class="keyword">true</span>),
+            <span class="type">NSSortDescriptor</span>(keyPath: \<span class="type">User</span>.firstName, ascending: <span class="keyword">true</span>)
+        ]
+        request.fetchBatchSize = <span class="number">20</span>
+
+        <span class="keyword">let</span> frc = <span class="type">NSFetchedResultsController</span>(
+            fetchRequest: request,
+            managedObjectContext: <span class="type">PersistenceController</span>.shared.viewContext,
+            sectionNameKeyPath: <span class="string">"sectionLetter"</span>,
+            cacheName: <span class="string">"UsersCache"</span>
+        )
+        frc.delegate = <span class="keyword">self</span>
+        <span class="keyword">return</span> frc
+    }()
+
+    <span class="keyword">override func</span> <span class="func">viewDidLoad</span>() {
+        <span class="keyword">super</span>.<span class="func">viewDidLoad</span>()
+        <span class="keyword">try</span>? fetchedResultsController.<span class="func">performFetch</span>()
+    }
+
+    <span class="comment">// MARK: - UITableViewDataSource</span>
+
+    <span class="keyword">override func</span> <span class="func">numberOfSections</span>(in tableView: <span class="type">UITableView</span>) -> <span class="type">Int</span> {
+        fetchedResultsController.sections?.count ?? <span class="number">0</span>
+    }
+
+    <span class="keyword">override func</span> <span class="func">tableView</span>(
+        _ tableView: <span class="type">UITableView</span>,
+        numberOfRowsInSection section: <span class="type">Int</span>
+    ) -> <span class="type">Int</span> {
+        fetchedResultsController.sections?[section].numberOfObjects ?? <span class="number">0</span>
+    }
+
+    <span class="keyword">override func</span> <span class="func">tableView</span>(
+        _ tableView: <span class="type">UITableView</span>,
+        cellForRowAt indexPath: <span class="type">IndexPath</span>
+    ) -> <span class="type">UITableViewCell</span> {
+        <span class="keyword">let</span> cell = tableView.<span class="func">dequeueReusableCell</span>(
+            withIdentifier: <span class="string">"UserCell"</span>,
+            for: indexPath
+        )
+        <span class="keyword">let</span> user = fetchedResultsController.<span class="func">object</span>(at: indexPath)
+        cell.textLabel?.text = <span class="string">"\(user.firstName ?? "") \(user.lastName ?? "")"</span>
+        cell.detailTextLabel?.text = user.email
+        <span class="keyword">return</span> cell
+    }
+
+    <span class="keyword">override func</span> <span class="func">tableView</span>(
+        _ tableView: <span class="type">UITableView</span>,
+        titleForHeaderInSection section: <span class="type">Int</span>
+    ) -> <span class="type">String</span>? {
+        fetchedResultsController.sections?[section].name
+    }
+}</code></pre>
+
+    <h3>FRC Delegate — Classic Approach</h3>
+
+<pre><code><span class="keyword">extension</span> <span class="type">UsersViewController</span>: <span class="type">NSFetchedResultsControllerDelegate</span> {
+
+    <span class="keyword">func</span> <span class="func">controllerWillChangeContent</span>(
+        _ controller: <span class="type">NSFetchedResultsController</span>&lt;<span class="type">NSFetchRequestResult</span>&gt;
+    ) {
+        tableView.<span class="func">beginUpdates</span>()
+    }
+
+    <span class="keyword">func</span> <span class="func">controller</span>(
+        _ controller: <span class="type">NSFetchedResultsController</span>&lt;<span class="type">NSFetchRequestResult</span>&gt;,
+        didChange anObject: <span class="type">Any</span>,
+        at indexPath: <span class="type">IndexPath</span>?,
+        for type: <span class="type">NSFetchedResultsChangeType</span>,
+        newIndexPath: <span class="type">IndexPath</span>?
+    ) {
+        <span class="keyword">switch</span> type {
+        <span class="keyword">case</span> .insert:
+            <span class="keyword">guard let</span> newIndexPath <span class="keyword">else</span> { <span class="keyword">return</span> }
+            tableView.<span class="func">insertRows</span>(at: [newIndexPath], with: .automatic)
+        <span class="keyword">case</span> .delete:
+            <span class="keyword">guard let</span> indexPath <span class="keyword">else</span> { <span class="keyword">return</span> }
+            tableView.<span class="func">deleteRows</span>(at: [indexPath], with: .automatic)
+        <span class="keyword">case</span> .update:
+            <span class="keyword">guard let</span> indexPath <span class="keyword">else</span> { <span class="keyword">return</span> }
+            tableView.<span class="func">reloadRows</span>(at: [indexPath], with: .automatic)
+        <span class="keyword">case</span> .move:
+            <span class="keyword">guard let</span> indexPath, <span class="keyword">let</span> newIndexPath <span class="keyword">else</span> { <span class="keyword">return</span> }
+            tableView.<span class="func">moveRow</span>(at: indexPath, to: newIndexPath)
+        @unknown <span class="keyword">default</span>:
+            tableView.<span class="func">reloadData</span>()
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">controllerDidChangeContent</span>(
+        _ controller: <span class="type">NSFetchedResultsController</span>&lt;<span class="type">NSFetchRequestResult</span>&gt;
+    ) {
+        tableView.<span class="func">endUpdates</span>()
+    }
+}</code></pre>
+
+    <h3>Modern Diffable Data Source Integration (iOS 13+)</h3>
+
+<pre><code><span class="keyword">extension</span> <span class="type">UsersViewController</span>: <span class="type">NSFetchedResultsControllerDelegate</span> {
+
+    <span class="keyword">func</span> <span class="func">controller</span>(
+        _ controller: <span class="type">NSFetchedResultsController</span>&lt;<span class="type">NSFetchRequestResult</span>&gt;,
+        didChangeContentWith snapshot: <span class="type">NSDiffableDataSourceSnapshotReference</span>
+    ) {
+        <span class="keyword">let</span> snapshot = snapshot <span class="keyword">as</span> <span class="type">NSDiffableDataSourceSnapshot</span>&lt;<span class="type">String</span>, <span class="type">NSManagedObjectID</span>&gt;
+        dataSource.<span class="func">apply</span>(snapshot, animatingDifferences: <span class="keyword">true</span>)
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice</div>
+        <p>Prefer the <code>didChangeContentWith snapshot:</code> delegate method over the classic begin/end updates pattern. It eliminates the common "invalid update" crashes caused by simultaneous inserts and deletes. The snapshot-based approach also works naturally with <code>UICollectionViewDiffableDataSource</code>.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 5: Lightweight vs Heavyweight Migration              -->
+    <!-- ============================================================ -->
+    <h2 id="migration">5. Lightweight vs Heavyweight Migration</h2>
+
+    <p>When your data model changes between app versions, Core Data must <em>migrate</em> the existing store to match the new schema. The two strategies differ dramatically in complexity.</p>
+
+    <h3>Lightweight Migration (Automatic)</h3>
+
+    <p>Core Data can infer the mapping automatically for these changes:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Change</th>
+                <th>Supported?</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Add attribute</td>
+                <td>Yes</td>
+                <td>Must have a default value or be optional</td>
+            </tr>
+            <tr>
+                <td>Remove attribute</td>
+                <td>Yes</td>
+                <td>Data is dropped silently</td>
+            </tr>
+            <tr>
+                <td>Add entity</td>
+                <td>Yes</td>
+                <td>New table created</td>
+            </tr>
+            <tr>
+                <td>Remove entity</td>
+                <td>Yes</td>
+                <td>Table dropped</td>
+            </tr>
+            <tr>
+                <td>Rename attribute/entity</td>
+                <td>Yes</td>
+                <td>Set <em>Renaming ID</em> in model inspector</td>
+            </tr>
+            <tr>
+                <td>Add relationship</td>
+                <td>Yes</td>
+                <td>Must be optional or have a default</td>
+            </tr>
+            <tr>
+                <td>Change optional ↔ required</td>
+                <td>Yes</td>
+                <td>Existing nils may cause failures</td>
+            </tr>
+            <tr>
+                <td>Add/remove index</td>
+                <td>Yes</td>
+                <td>Transparent</td>
+            </tr>
+            <tr>
+                <td>Change attribute type</td>
+                <td>No</td>
+                <td>Requires heavyweight migration</td>
+            </tr>
+            <tr>
+                <td>Split/merge entities</td>
+                <td>No</td>
+                <td>Requires heavyweight migration</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h4>Enabling Lightweight Migration</h4>
+
+<pre><code><span class="keyword">let</span> description = <span class="type">NSPersistentStoreDescription</span>()
+description.url = storeURL
+description.shouldMigrateStoreAutomatically = <span class="keyword">true</span>
+description.shouldInferMappingModelAutomatically = <span class="keyword">true</span>
+
+<span class="comment">// These are the defaults — shown here for clarity</span>
+container.persistentStoreDescriptions = [description]</code></pre>
+
+    <h3>Heavyweight (Custom) Migration</h3>
+
+    <p>When lightweight migration cannot handle the transformation, you must provide an explicit <code>NSMappingModel</code> and optionally a custom <code>NSEntityMigrationPolicy</code>.</p>
+
+<pre><code><span class="keyword">class</span> <span class="type">UserToProfileMigrationPolicy</span>: <span class="type">NSEntityMigrationPolicy</span> {
+
+    <span class="keyword">override func</span> <span class="func">createDestinationInstances</span>(
+        forSource sInstance: <span class="type">NSManagedObject</span>,
+        in mapping: <span class="type">NSEntityMapping</span>,
+        manager: <span class="type">NSMigrationManager</span>
+    ) <span class="keyword">throws</span> {
+        <span class="comment">// Create the destination "Profile" entity from the source "User"</span>
+        <span class="keyword">let</span> profile = <span class="type">NSEntityDescription</span>.<span class="func">insertNewObject</span>(
+            forEntityName: <span class="string">"Profile"</span>,
+            into: manager.destinationContext
+        )
+
+        <span class="comment">// Map old fields to new structure</span>
+        <span class="keyword">let</span> firstName = sInstance.<span class="func">value</span>(forKey: <span class="string">"firstName"</span>) <span class="keyword">as</span>? <span class="type">String</span> ?? <span class="string">""</span>
+        <span class="keyword">let</span> lastName = sInstance.<span class="func">value</span>(forKey: <span class="string">"lastName"</span>) <span class="keyword">as</span>? <span class="type">String</span> ?? <span class="string">""</span>
+        profile.<span class="func">setValue</span>(<span class="string">"\(firstName) \(lastName)"</span>, forKey: <span class="string">"fullName"</span>)
+
+        <span class="comment">// Carry over unchanged fields</span>
+        profile.<span class="func">setValue</span>(
+            sInstance.<span class="func">value</span>(forKey: <span class="string">"email"</span>),
+            forKey: <span class="string">"email"</span>
+        )
+        profile.<span class="func">setValue</span>(
+            sInstance.<span class="func">value</span>(forKey: <span class="string">"createdAt"</span>),
+            forKey: <span class="string">"createdAt"</span>
+        )
+
+        manager.<span class="func">associate</span>(
+            sourceInstance: sInstance,
+            withDestinationInstance: profile,
+            for: mapping
+        )
+    }
+}</code></pre>
+
+    <h4>Programmatic Migration Manager</h4>
+
+<pre><code><span class="keyword">func</span> <span class="func">migrateStore</span>(
+    at sourceURL: <span class="type">URL</span>,
+    sourceModel: <span class="type">NSManagedObjectModel</span>,
+    destinationModel: <span class="type">NSManagedObjectModel</span>,
+    mappingModel: <span class="type">NSMappingModel</span>
+) <span class="keyword">throws</span> {
+    <span class="keyword">let</span> manager = <span class="type">NSMigrationManager</span>(
+        sourceModel: sourceModel,
+        destinationModel: destinationModel
+    )
+
+    <span class="keyword">let</span> destinationURL = sourceURL
+        .<span class="func">deletingLastPathComponent</span>()
+        .<span class="func">appendingPathComponent</span>(<span class="string">"Model_migrated.sqlite"</span>)
+
+    <span class="keyword">try</span> manager.<span class="func">migrateStore</span>(
+        from: sourceURL,
+        type: <span class="type">NSSQLiteStoreType</span>,
+        mapping: mappingModel,
+        to: destinationURL,
+        type: <span class="type">NSSQLiteStoreType</span>
+    )
+
+    <span class="comment">// Swap files atomically</span>
+    <span class="keyword">let</span> fm = <span class="type">FileManager</span>.default
+    <span class="keyword">try</span> fm.<span class="func">removeItem</span>(at: sourceURL)
+    <span class="keyword">try</span> fm.<span class="func">moveItem</span>(at: destinationURL, to: sourceURL)
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Warning — Migration Pitfalls</div>
+        <p><strong>1)</strong> Heavyweight migration loads the <em>entire</em> store into memory. For large databases (100k+ rows), this can cause OOM crashes. Consider staged migration or progressive lazy migration instead.<br>
+        <strong>2)</strong> Never delete old model versions from your bundle. Core Data needs the source model to detect which migration path to take.<br>
+        <strong>3)</strong> Test migrations with production-sized data. A migration that works on 100 rows may fail or take minutes on 500k rows.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 6: Batch Operations                                  -->
+    <!-- ============================================================ -->
+    <h2 id="batch-operations">6. Batch Operations</h2>
+
+    <p>Batch operations execute <strong>directly against the SQLite store</strong>, bypassing the managed object context entirely. This makes them orders of magnitude faster for bulk operations but requires explicit merging back to in-memory contexts.</p>
+
+    <div class="diagram">
+Normal save():
+  Context → Coordinator → SQLite   (one row at a time, fires KVO, validations)
+
+Batch operation:
+  Request → Coordinator → SQLite   (direct SQL, no context involvement)
+  ↓
+  Must manually merge changes back into context(s)
+    </div>
+
+    <h3>NSBatchInsertRequest (iOS 13+)</h3>
+
+<pre><code><span class="keyword">func</span> <span class="func">importUsers</span>(_ records: [<span class="type">UserDTO</span>]) <span class="keyword">throws</span> {
+    <span class="keyword">let</span> context = <span class="type">PersistenceController</span>.shared.<span class="func">newBackgroundContext</span>()
+
+    <span class="keyword">try</span> context.<span class="func">performAndWait</span> {
+        <span class="keyword">var</span> index = <span class="number">0</span>
+
+        <span class="keyword">let</span> batchInsert = <span class="type">NSBatchInsertRequest</span>(
+            entity: <span class="type">User</span>.<span class="func">entity</span>(),
+            managedObjectHandler: { managedObject <span class="keyword">in</span>
+                <span class="keyword">guard</span> index &lt; records.count <span class="keyword">else</span> { <span class="keyword">return true</span> }
+
+                <span class="keyword">let</span> user = managedObject <span class="keyword">as!</span> <span class="type">User</span>
+                <span class="keyword">let</span> record = records[index]
+                user.id = record.id
+                user.firstName = record.firstName
+                user.lastName = record.lastName
+                user.email = record.email
+                user.createdAt = record.createdAt
+
+                index += <span class="number">1</span>
+                <span class="keyword">return false</span>  <span class="comment">// false = continue inserting</span>
+            }
+        )
+
+        batchInsert.resultType = .statusOnly
+
+        <span class="keyword">let</span> result = <span class="keyword">try</span> context.<span class="func">execute</span>(batchInsert) <span class="keyword">as!</span> <span class="type">NSBatchInsertResult</span>
+
+        <span class="keyword">if let</span> success = result.result <span class="keyword">as</span>? <span class="type">Bool</span>, success {
+            <span class="func">print</span>(<span class="string">"Batch insert of \(records.count) records succeeded"</span>)
+        }
+    }
+}</code></pre>
+
+    <h3>NSBatchDeleteRequest</h3>
+
+<pre><code><span class="keyword">func</span> <span class="func">deleteOldUsers</span>(olderThan date: <span class="type">Date</span>) <span class="keyword">throws</span> {
+    <span class="keyword">let</span> fetchRequest: <span class="type">NSFetchRequest</span>&lt;<span class="type">NSFetchRequestResult</span>&gt; = <span class="type">User</span>.<span class="func">fetchRequest</span>()
+    fetchRequest.predicate = <span class="type">NSPredicate</span>(
+        format: <span class="string">"lastActiveAt &lt; %@"</span>,
+        date <span class="keyword">as</span> <span class="type">NSDate</span>
+    )
+
+    <span class="keyword">let</span> batchDelete = <span class="type">NSBatchDeleteRequest</span>(fetchRequest: fetchRequest)
+    batchDelete.resultType = .resultTypeObjectIDs
+
+    <span class="keyword">let</span> context = <span class="type">PersistenceController</span>.shared.viewContext
+    <span class="keyword">let</span> result = <span class="keyword">try</span> context.<span class="func">execute</span>(batchDelete) <span class="keyword">as!</span> <span class="type">NSBatchDeleteResult</span>
+    <span class="keyword">let</span> objectIDs = result.result <span class="keyword">as</span>? [<span class="type">NSManagedObjectID</span>] ?? []
+
+    <span class="comment">// Merge deletions into the view context</span>
+    <span class="type">NSManagedObjectContext</span>.<span class="func">mergeChanges</span>(
+        fromRemoteContextSave: [<span class="type">NSDeletedObjectsKey</span>: objectIDs],
+        into: [context]
+    )
+}</code></pre>
+
+    <h3>NSBatchUpdateRequest</h3>
+
+<pre><code><span class="keyword">func</span> <span class="func">markAllUsersInactive</span>() <span class="keyword">throws</span> {
+    <span class="keyword">let</span> batchUpdate = <span class="type">NSBatchUpdateRequest</span>(entityName: <span class="string">"User"</span>)
+    batchUpdate.propertiesToUpdate = [<span class="string">"isActive"</span>: <span class="keyword">false</span>]
+    batchUpdate.resultType = .updatedObjectIDsResultType
+
+    <span class="keyword">let</span> context = <span class="type">PersistenceController</span>.shared.viewContext
+    <span class="keyword">let</span> result = <span class="keyword">try</span> context.<span class="func">execute</span>(batchUpdate) <span class="keyword">as!</span> <span class="type">NSBatchUpdateResult</span>
+    <span class="keyword">let</span> objectIDs = result.result <span class="keyword">as</span>? [<span class="type">NSManagedObjectID</span>] ?? []
+
+    <span class="type">NSManagedObjectContext</span>.<span class="func">mergeChanges</span>(
+        fromRemoteContextSave: [<span class="type">NSUpdatedObjectsKey</span>: objectIDs],
+        into: [context]
+    )
+}</code></pre>
+
+    <h3>Importing 100k Records — Production Pattern</h3>
+
+<pre><code><span class="keyword">func</span> <span class="func">importLargeDataset</span>(_ records: [<span class="type">UserDTO</span>]) <span class="keyword">async throws</span> {
+    <span class="keyword">let</span> container = <span class="type">PersistenceController</span>.shared.container
+    <span class="keyword">let</span> batchSize = <span class="number">5000</span>
+
+    <span class="keyword">try await</span> container.<span class="func">performBackgroundTask</span> { context <span class="keyword">in</span>
+        context.mergePolicy = <span class="type">NSMergeByPropertyObjectTrumpMergePolicy</span>
+        context.undoManager = <span class="keyword">nil</span>
+
+        <span class="keyword">for</span> chunk <span class="keyword">in</span> <span class="func">stride</span>(from: <span class="number">0</span>, to: records.count, by: batchSize) {
+            <span class="keyword">let</span> end = <span class="func">min</span>(chunk + batchSize, records.count)
+            <span class="keyword">let</span> slice = <span class="type">Array</span>(records[chunk..&lt;end])
+
+            <span class="keyword">var</span> idx = <span class="number">0</span>
+            <span class="keyword">let</span> request = <span class="type">NSBatchInsertRequest</span>(
+                entity: <span class="type">User</span>.<span class="func">entity</span>(),
+                managedObjectHandler: { obj <span class="keyword">in</span>
+                    <span class="keyword">guard</span> idx &lt; slice.count <span class="keyword">else</span> { <span class="keyword">return true</span> }
+                    <span class="keyword">let</span> user = obj <span class="keyword">as!</span> <span class="type">User</span>
+                    user.id = slice[idx].id
+                    user.firstName = slice[idx].firstName
+                    user.lastName = slice[idx].lastName
+                    user.email = slice[idx].email
+                    idx += <span class="number">1</span>
+                    <span class="keyword">return false</span>
+                }
+            )
+            request.resultType = .statusOnly
+            <span class="keyword">try</span> context.<span class="func">execute</span>(request)
+        }
+
+        <span class="comment">// Notify view context of all changes</span>
+        <span class="keyword">try</span> context.<span class="func">save</span>()
+    }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Why Bypass the Context?</div>
+        <p>A normal <code>context.save()</code> for 100k objects would: (1) create 100k <code>NSManagedObject</code> instances in memory, (2) run validation on each, (3) fire KVO for every property change, (4) generate change notifications. Batch operations skip all of this and execute raw SQL against the store. The trade-off: no validation, no KVO, no relationship cascade, and no automatic context refresh. You must merge changes manually.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 7: NSMergePolicy Types                               -->
+    <!-- ============================================================ -->
+    <h2 id="merge-policies">7. NSMergePolicy Types</h2>
+
+    <p>Merge conflicts occur when two contexts modify the same object and one saves before the other. The merge policy determines how Core Data resolves these conflicts.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Policy</th>
+                <th>Behavior</th>
+                <th>Use Case</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>NSErrorMergePolicy</code></td>
+                <td>Throws an error on conflict. No automatic resolution.</td>
+                <td>Default. Use when you want full control over conflict resolution.</td>
+            </tr>
+            <tr>
+                <td><code>NSMergeByPropertyStoreTrumpMergePolicy</code></td>
+                <td>Store wins on a per-property basis. Unchanged in-memory properties are preserved.</td>
+                <td>Background sync where server data should take precedence.</td>
+            </tr>
+            <tr>
+                <td><code>NSMergeByPropertyObjectTrumpMergePolicy</code></td>
+                <td>In-memory object wins on a per-property basis. Unchanged store properties are preserved.</td>
+                <td>User edits that should override background imports. <strong>Most commonly used.</strong></td>
+            </tr>
+            <tr>
+                <td><code>NSOverwriteMergePolicy</code></td>
+                <td>In-memory object wins entirely. All store values are overwritten.</td>
+                <td>Full-replace sync patterns (e.g., re-downloading entire records).</td>
+            </tr>
+            <tr>
+                <td><code>NSRollbackMergePolicy</code></td>
+                <td>Store wins entirely. All in-memory changes are discarded.</td>
+                <td>Read-only contexts that should always reflect the latest store state.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Per-Property Resolution Example</h3>
+
+    <div class="diagram">
+Object in Store:    { name: "Alice",  email: "old@mail.com",  age: 30 }
+Object in Context:  { name: "Bob",    email: "old@mail.com",  age: 30 }
+                      ↑ changed        ↑ unchanged             ↑ unchanged
+
+NSMergeByPropertyObjectTrumpMergePolicy result:
+                    { name: "Bob",    email: "old@mail.com",  age: 30 }
+                      ↑ context wins   ↑ no conflict           ↑ no conflict
+
+NSMergeByPropertyStoreTrumpMergePolicy result:
+                    { name: "Alice",  email: "old@mail.com",  age: 30 }
+                      ↑ store wins     ↑ no conflict           ↑ no conflict
+    </div>
+
+<pre><code><span class="comment">// Setting merge policy on contexts</span>
+<span class="keyword">let</span> viewContext = container.viewContext
+viewContext.mergePolicy = <span class="type">NSMergeByPropertyObjectTrumpMergePolicy</span>
+
+<span class="keyword">let</span> syncContext = container.<span class="func">newBackgroundContext</span>()
+syncContext.mergePolicy = <span class="type">NSMergeByPropertyStoreTrumpMergePolicy</span>
+
+<span class="comment">// Custom merge policy (advanced)</span>
+<span class="keyword">class</span> <span class="type">TimestampMergePolicy</span>: <span class="type">NSMergePolicy</span> {
+    <span class="keyword">override func</span> <span class="func">resolve</span>(
+        constraintConflicts list: [<span class="type">NSConstraintConflict</span>]
+    ) <span class="keyword">throws</span> {
+        <span class="keyword">for</span> conflict <span class="keyword">in</span> list {
+            <span class="keyword">guard let</span> dbObject = conflict.databaseObject,
+                  <span class="keyword">let</span> conflicting = conflict.conflictingObjects.first
+            <span class="keyword">else</span> { <span class="keyword">continue</span> }
+
+            <span class="keyword">let</span> dbDate = dbObject.<span class="func">value</span>(forKey: <span class="string">"updatedAt"</span>) <span class="keyword">as</span>? <span class="type">Date</span> ?? .distantPast
+            <span class="keyword">let</span> newDate = conflicting.<span class="func">value</span>(forKey: <span class="string">"updatedAt"</span>) <span class="keyword">as</span>? <span class="type">Date</span> ?? .distantPast
+
+            <span class="keyword">if</span> dbDate > newDate {
+                <span class="comment">// Store is newer — discard in-memory changes</span>
+                conflicting.<span class="func">setValuesForKeys</span>(dbObject.<span class="func">dictionaryWithValues</span>(
+                    forKeys: conflict.constraint
+                ))
+            }
+        }
+        <span class="keyword">try super</span>.<span class="func">resolve</span>(constraintConflicts: list)
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Warning — Default Merge Policy</div>
+        <p>The default merge policy is <code>NSErrorMergePolicy</code>, which throws on any conflict. If you have multiple contexts writing to the same store (which is common), you <strong>must</strong> set an explicit merge policy or your saves will fail silently when you catch the error without handling it. Always set <code>NSMergeByPropertyObjectTrumpMergePolicy</code> as a baseline.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 8: Faulting & Uniquing                               -->
+    <!-- ============================================================ -->
+    <h2 id="faulting-uniquing">8. Faulting &amp; Uniquing</h2>
+
+    <p>Faulting and uniquing are Core Data's two primary memory optimization strategies. Understanding them is critical for performance tuning.</p>
+
+    <h3>What Are Faults?</h3>
+
+    <p>A <strong>fault</strong> is a placeholder object that represents a managed object whose attribute data has not been loaded from the store. It has the correct <code>objectID</code> and class, but accessing any attribute triggers a <em>fault fire</em> — a trip to the store to load the data.</p>
+
+    <div class="diagram">
+Fault (unfired):
+┌──────────────────────────────┐
+│  NSManagedObject (User)      │
+│  objectID: 0x...4a2          │
+│  isFault: true               │
+│  name: ??? (not loaded)      │
+│  email: ??? (not loaded)     │
+└──────────────────────────────┘
+         │ access .name
+         ▼
+Materialized (fault fired):
+┌──────────────────────────────┐
+│  NSManagedObject (User)      │
+│  objectID: 0x...4a2          │
+│  isFault: false              │
+│  name: "Alice"               │
+│  email: "alice@example.com"  │
+└──────────────────────────────┘
+    </div>
+
+    <h3>The N+1 Query Problem</h3>
+
+    <p>If you fetch 100 <code>User</code> objects (1 query) and then iterate to access each user's <code>department</code> relationship, Core Data fires a separate fault for each department — 100 additional queries. This is the classic N+1 problem.</p>
+
+<pre><code><span class="comment">// BAD: N+1 queries — 1 fetch + N fault fires</span>
+<span class="keyword">let</span> users = <span class="keyword">try</span> context.<span class="func">fetch</span>(<span class="type">User</span>.<span class="func">fetchRequest</span>())
+<span class="keyword">for</span> user <span class="keyword">in</span> users {
+    <span class="func">print</span>(user.department?.name ?? <span class="string">"None"</span>)  <span class="comment">// fires fault each time</span>
+}
+
+<span class="comment">// GOOD: Prefetch relationships to avoid N+1</span>
+<span class="keyword">let</span> request = <span class="type">User</span>.<span class="func">fetchRequest</span>()
+request.relationshipKeyPathsForPrefetching = [<span class="string">"department"</span>]
+<span class="keyword">let</span> users = <span class="keyword">try</span> context.<span class="func">fetch</span>(request)
+<span class="keyword">for</span> user <span class="keyword">in</span> users {
+    <span class="func">print</span>(user.department?.name ?? <span class="string">"None"</span>)  <span class="comment">// already loaded</span>
+}</code></pre>
+
+    <h3>Batch Faulting</h3>
+
+<pre><code><span class="keyword">let</span> request = <span class="type">User</span>.<span class="func">fetchRequest</span>()
+
+<span class="comment">// fetchBatchSize causes Core Data to fault objects in batches</span>
+<span class="comment">// instead of materializing the entire result set at once</span>
+request.fetchBatchSize = <span class="number">20</span>
+
+<span class="comment">// Only fetch specific properties (partial faulting)</span>
+request.propertiesToFetch = [<span class="string">"firstName"</span>, <span class="string">"lastName"</span>]
+
+<span class="comment">// Return faults instead of materialized objects</span>
+request.returnsObjectsAsFaults = <span class="keyword">true</span>  <span class="comment">// default</span>
+
+<span class="keyword">let</span> users = <span class="keyword">try</span> context.<span class="func">fetch</span>(request)
+<span class="comment">// Only 20 objects are materialized at a time as you iterate</span></code></pre>
+
+    <h3>Uniquing</h3>
+
+    <p><strong>Uniquing</strong> guarantees that within a single context, there is only ever <em>one</em> object instance per row in the store. If you fetch the same user twice, you get the same Swift object reference.</p>
+
+<pre><code><span class="keyword">let</span> request1 = <span class="type">User</span>.<span class="func">fetchRequest</span>()
+request1.predicate = <span class="type">NSPredicate</span>(format: <span class="string">"id == %@"</span>, userId)
+<span class="keyword">let</span> user1 = <span class="keyword">try</span> context.<span class="func">fetch</span>(request1).first
+
+<span class="keyword">let</span> request2 = <span class="type">User</span>.<span class="func">fetchRequest</span>()
+request2.predicate = <span class="type">NSPredicate</span>(format: <span class="string">"id == %@"</span>, userId)
+<span class="keyword">let</span> user2 = <span class="keyword">try</span> context.<span class="func">fetch</span>(request2).first
+
+<span class="comment">// Uniquing guarantees identity</span>
+<span class="func">assert</span>(user1 === user2)  <span class="comment">// same object in memory</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Warning — Faulting Pitfalls</div>
+        <p><strong>1)</strong> Accessing a fault's properties on the wrong thread fires the fault on that thread, causing a concurrency violation.<br>
+        <strong>2)</strong> Calling <code>refreshObject(_:mergeChanges: false)</code> turns a materialized object back into a fault, releasing its memory — but any unsaved changes are lost.<br>
+        <strong>3)</strong> Uniquing only applies within a single context. The same row in two different contexts produces two distinct object instances with different lifecycles.</p>
+    </div>
+
+    <h3>Advanced Prefetching for Table Views</h3>
+
+<pre><code><span class="keyword">final class</span> <span class="type">OptimizedFRC</span> {
+
+    <span class="keyword">static func</span> <span class="func">makeUserFRC</span>(
+        context: <span class="type">NSManagedObjectContext</span>
+    ) -> <span class="type">NSFetchedResultsController</span>&lt;<span class="type">User</span>&gt; {
+        <span class="keyword">let</span> request = <span class="type">User</span>.<span class="func">fetchRequest</span>()
+
+        <span class="comment">// Sort for sections + ordering</span>
+        request.sortDescriptors = [
+            <span class="type">NSSortDescriptor</span>(keyPath: \<span class="type">User</span>.department?.name, ascending: <span class="keyword">true</span>),
+            <span class="type">NSSortDescriptor</span>(keyPath: \<span class="type">User</span>.lastName, ascending: <span class="keyword">true</span>)
+        ]
+
+        <span class="comment">// Prefetch the department relationship to avoid N+1</span>
+        request.relationshipKeyPathsForPrefetching = [<span class="string">"department"</span>]
+
+        <span class="comment">// Batch fault 50 at a time for smooth scrolling</span>
+        request.fetchBatchSize = <span class="number">50</span>
+
+        <span class="keyword">return</span> <span class="type">NSFetchedResultsController</span>(
+            fetchRequest: request,
+            managedObjectContext: context,
+            sectionNameKeyPath: <span class="string">"department.name"</span>,
+            cacheName: <span class="keyword">nil</span>
+        )
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice</div>
+        <p>Always set <code>fetchBatchSize</code> on fetch requests used with table/collection views. A batch size of 2× the visible row count is a good starting point. Combine with <code>relationshipKeyPathsForPrefetching</code> for any relationships displayed in cells. Profile with Instruments → Core Data template to verify fault-firing patterns.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 9: CloudKit Sync                                     -->
+    <!-- ============================================================ -->
+    <h2 id="cloudkit-sync">9. CloudKit Sync</h2>
+
+    <p><code>NSPersistentCloudKitContainer</code> (iOS 13+) mirrors your Core Data store to a CloudKit database, providing automatic sync across devices with minimal code.</p>
+
+    <h3>How It Works</h3>
+
+    <div class="diagram">
+┌──────────────────┐         ┌──────────────────────────┐
+│  Local SQLite     │ ◄─────► │  NSPersistentCloudKit-   │
+│  Store            │  sync   │  Container               │
+└──────────────────┘         └────────────┬─────────────┘
+                                          │
+                                          │ CKDatabaseSubscription
+                                          │ CKModifyRecordsOperation
+                                          │ CKFetchRecordZoneChangesOp
+                                          ▼
+                              ┌──────────────────────────┐
+                              │  CloudKit (CKDatabase)   │
+                              │  Private / Shared / Public│
+                              └──────────────────────────┘
+                                          │
+                              ┌───────────┴───────────┐
+                              ▼                       ▼
+                         Device B                Device C
+    </div>
+
+    <h3>Setup Code</h3>
+
+<pre><code><span class="keyword">import</span> <span class="type">CoreData</span>
+
+<span class="keyword">final class</span> <span class="type">CloudPersistenceController</span> {
+
+    <span class="keyword">static let</span> shared = <span class="type">CloudPersistenceController</span>()
+
+    <span class="keyword">let</span> container: <span class="type">NSPersistentCloudKitContainer</span>
+
+    <span class="keyword">init</span>() {
+        container = <span class="type">NSPersistentCloudKitContainer</span>(name: <span class="string">"Model"</span>)
+
+        <span class="keyword">guard let</span> description = container.persistentStoreDescriptions.first
+        <span class="keyword">else</span> { <span class="func">fatalError</span>(<span class="string">"No store description"</span>) }
+
+        <span class="comment">// Enable history tracking (required for CloudKit sync)</span>
+        description.<span class="func">setOption</span>(
+            <span class="keyword">true</span> <span class="keyword">as</span> <span class="type">NSNumber</span>,
+            forKey: <span class="type">NSPersistentHistoryTrackingKey</span>
+        )
+        description.<span class="func">setOption</span>(
+            <span class="keyword">true</span> <span class="keyword">as</span> <span class="type">NSNumber</span>,
+            forKey: <span class="type">NSPersistentStoreRemoteChangeNotificationPostOptionKey</span>
+        )
+
+        <span class="comment">// Configure CloudKit container</span>
+        description.cloudKitContainerOptions = <span class="type">NSPersistentCloudKitContainerOptions</span>(
+            containerIdentifier: <span class="string">"iCloud.com.example.myapp"</span>
+        )
+
+        container.<span class="func">loadPersistentStores</span> { description, error <span class="keyword">in</span>
+            <span class="keyword">if let</span> error {
+                <span class="func">fatalError</span>(<span class="string">"CloudKit store failed: \(error)"</span>)
+            }
+        }
+
+        container.viewContext.automaticallyMergesChangesFromParent = <span class="keyword">true</span>
+        container.viewContext.mergePolicy = <span class="type">NSMergeByPropertyObjectTrumpMergePolicy</span>
+
+        <span class="comment">// Listen for remote changes</span>
+        <span class="type">NotificationCenter</span>.default.<span class="func">addObserver</span>(
+            <span class="keyword">self</span>,
+            selector: #selector(<span class="func">remoteStoreDidChange</span>),
+            name: .<span class="type">NSPersistentStoreRemoteChange</span>,
+            object: container.persistentStoreCoordinator
+        )
+    }
+
+    @objc <span class="keyword">private func</span> <span class="func">remoteStoreDidChange</span>(_ notification: <span class="type">Notification</span>) {
+        <span class="comment">// Process persistent history to update UI</span>
+        <span class="comment">// viewContext auto-merges if automaticallyMergesChangesFromParent is true</span>
+    }
+}</code></pre>
+
+    <h3>Schema Initialization for Development</h3>
+
+<pre><code><span class="comment">// Initialize CloudKit schema during development only</span>
+<span class="comment">// This creates the CKRecord types in the CloudKit dashboard</span>
+#<span class="keyword">if</span> DEBUG
+<span class="keyword">do</span> {
+    <span class="keyword">try</span> container.<span class="func">initializeCloudKitSchema</span>(options: [])
+} <span class="keyword">catch</span> {
+    <span class="func">print</span>(<span class="string">"CloudKit schema init failed: \(error)"</span>)
+}
+#endif</code></pre>
+
+    <h3>Sharing with CKShare (iOS 15+)</h3>
+
+<pre><code><span class="keyword">func</span> <span class="func">shareRecord</span>(
+    _ object: <span class="type">NSManagedObject</span>,
+    in container: <span class="type">NSPersistentCloudKitContainer</span>
+) <span class="keyword">async throws</span> -> <span class="type">CKShare</span> {
+    <span class="keyword">let</span> (_, share, _) = <span class="keyword">try await</span> container.<span class="func">share</span>(
+        [object],
+        to: <span class="keyword">nil</span>  <span class="comment">// creates a new CKShare</span>
+    )
+    share[<span class="type">CKShare</span>.<span class="type">SystemFieldKey</span>.title] = <span class="string">"Shared Document"</span>
+    <span class="keyword">return</span> share
+}</code></pre>
+
+    <h3>Limitations</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Limitation</th>
+                <th>Impact</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Unique constraints not supported</td>
+                <td>Cannot use <code>uniquenessConstraints</code> with CloudKit</td>
+            </tr>
+            <tr>
+                <td>Undefined attribute types not synced</td>
+                <td>Only standard types (String, Int, Date, Binary, etc.)</td>
+            </tr>
+            <tr>
+                <td>Deny delete rules not supported</td>
+                <td>Must use Nullify or Cascade</td>
+            </tr>
+            <tr>
+                <td>Required relationships not supported</td>
+                <td>All relationships must be optional</td>
+            </tr>
+            <tr>
+                <td>No ordered relationships</td>
+                <td>Use a sort index attribute instead</td>
+            </tr>
+            <tr>
+                <td>Eventual consistency</td>
+                <td>Sync is not real-time; may take seconds to minutes</td>
+            </tr>
+            <tr>
+                <td>CloudKit quotas</td>
+                <td>Storage and request limits per user/app</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — History Tracking</div>
+        <p><code>NSPersistentCloudKitContainer</code> relies on <strong>persistent history tracking</strong> (<code>NSPersistentHistoryTransaction</code>) to detect local changes that need syncing. This creates a transaction log in the SQLite store. You should periodically purge old history to prevent unbounded growth. Use <code>NSPersistentHistoryChangeRequest.deleteHistory(before:)</code> to clean up transactions older than the last successful sync token.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- SECTION 10: Architect — Core Data at Scale                   -->
+    <!-- ============================================================ -->
+    <h2 id="architect-scale">10. Core Data Stack for 1M+ Records</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know — Production-Scale Core Data</div>
+        <p>At L6/Staff level, you must be able to design a Core Data stack that handles millions of records without degrading UI responsiveness. This requires combining batch operations, background contexts, fetch optimization, and denormalization into a cohesive architecture.</p>
+    </div>
+
+    <h3>Architecture Principles for Large Datasets</h3>
+
+    <ol>
+        <li><strong>Never fetch all records</strong> — Use <code>fetchLimit</code>, <code>fetchOffset</code>, and <code>fetchBatchSize</code> to paginate.</li>
+        <li><strong>Import on background contexts</strong> — Use <code>NSBatchInsertRequest</code> for bulk imports, never insert one-by-one on the main context.</li>
+        <li><strong>Denormalize for read performance</strong> — Store computed/derived values (e.g., <code>fullName</code>, <code>sectionLetter</code>) as attributes to avoid expensive predicate computations.</li>
+        <li><strong>Index aggressively</strong> — Add indexes on any attribute used in predicates or sort descriptors.</li>
+        <li><strong>Minimize context memory</strong> — Use <code>refreshObject(_:mergeChanges:)</code> to re-fault objects after processing. Set <code>stalenessInterval</code> on background contexts.</li>
+        <li><strong>Profile with Instruments</strong> — Use the Core Data template to identify excessive faulting, slow fetches, and memory bloat.</li>
+    </ol>
+
+    <h3>Production Stack — Complete Implementation</h3>
+
+<pre><code><span class="keyword">import</span> <span class="type">CoreData</span>
+<span class="keyword">import</span> <span class="type">os</span>
+
+<span class="keyword">final class</span> <span class="type">ProductionCoreDataStack</span> {
+
+    <span class="keyword">static let</span> shared = <span class="type">ProductionCoreDataStack</span>()
+
+    <span class="keyword">private let</span> logger = <span class="type">Logger</span>(
+        subsystem: <span class="string">"com.example.app"</span>,
+        category: <span class="string">"CoreData"</span>
+    )
+
+    <span class="keyword">let</span> container: <span class="type">NSPersistentContainer</span>
+
+    <span class="keyword">var</span> viewContext: <span class="type">NSManagedObjectContext</span> {
+        container.viewContext
+    }
+
+    <span class="keyword">private init</span>() {
+        container = <span class="type">NSPersistentContainer</span>(name: <span class="string">"Model"</span>)
+
+        <span class="keyword">guard let</span> description = container.persistentStoreDescriptions.first
+        <span class="keyword">else</span> { <span class="func">fatalError</span>(<span class="string">"Missing store description"</span>) }
+
+        <span class="comment">// Enable WAL checkpoint for better read concurrency</span>
+        description.<span class="func">setValue</span>(
+            <span class="string">"WAL"</span> <span class="keyword">as</span> <span class="type">NSString</span>,
+            forPragmaNamed: <span class="string">"journal_mode"</span>
+        )
+
+        <span class="comment">// History tracking for background merge awareness</span>
+        description.<span class="func">setOption</span>(
+            <span class="keyword">true</span> <span class="keyword">as</span> <span class="type">NSNumber</span>,
+            forKey: <span class="type">NSPersistentHistoryTrackingKey</span>
+        )
+        description.<span class="func">setOption</span>(
+            <span class="keyword">true</span> <span class="keyword">as</span> <span class="type">NSNumber</span>,
+            forKey: <span class="type">NSPersistentStoreRemoteChangeNotificationPostOptionKey</span>
+        )
+
+        container.<span class="func">loadPersistentStores</span> { [logger] desc, error <span class="keyword">in</span>
+            <span class="keyword">if let</span> error {
+                logger.<span class="func">critical</span>(<span class="string">"Store load failed: \(error.localizedDescription)"</span>)
+                <span class="func">fatalError</span>(<span class="string">"Store load failed: \(error)"</span>)
+            }
+            logger.<span class="func">info</span>(<span class="string">"Store loaded: \(desc.url?.lastPathComponent ?? "unknown")"</span>)
+        }
+
+        <span class="comment">// Configure view context for UI</span>
+        container.viewContext.automaticallyMergesChangesFromParent = <span class="keyword">true</span>
+        container.viewContext.mergePolicy = <span class="type">NSMergeByPropertyObjectTrumpMergePolicy</span>
+        container.viewContext.undoManager = <span class="keyword">nil</span>
+        container.viewContext.shouldDeleteInaccessibleFaults = <span class="keyword">true</span>
+        container.viewContext.name = <span class="string">"viewContext"</span>
+    }
+
+    <span class="comment">// MARK: - Background Contexts</span>
+
+    <span class="keyword">func</span> <span class="func">newBackgroundContext</span>() -> <span class="type">NSManagedObjectContext</span> {
+        <span class="keyword">let</span> context = container.<span class="func">newBackgroundContext</span>()
+        context.mergePolicy = <span class="type">NSMergeByPropertyObjectTrumpMergePolicy</span>
+        context.undoManager = <span class="keyword">nil</span>
+        context.name = <span class="string">"backgroundContext"</span>
+        <span class="keyword">return</span> context
+    }
+
+    <span class="comment">// MARK: - Batch Import</span>
+
+    <span class="keyword">func</span> <span class="func">batchImport</span>&lt;<span class="type">T</span>&gt;(
+        entity: <span class="type">NSEntityDescription</span>,
+        records: [<span class="type">T</span>],
+        batchSize: <span class="type">Int</span> = <span class="number">5000</span>,
+        configure: @<span class="keyword">escaping</span> (<span class="type">NSManagedObject</span>, <span class="type">T</span>) -> <span class="type">Void</span>
+    ) <span class="keyword">async throws</span> {
+        <span class="keyword">let</span> total = records.count
+        logger.<span class="func">info</span>(<span class="string">"Starting batch import of \(total) records"</span>)
+
+        <span class="keyword">try await</span> container.<span class="func">performBackgroundTask</span> { [logger] context <span class="keyword">in</span>
+            context.mergePolicy = <span class="type">NSMergeByPropertyObjectTrumpMergePolicy</span>
+            context.undoManager = <span class="keyword">nil</span>
+
+            <span class="keyword">for</span> chunkStart <span class="keyword">in</span> <span class="func">stride</span>(from: <span class="number">0</span>, to: total, by: batchSize) {
+                <span class="keyword">let</span> chunkEnd = <span class="func">min</span>(chunkStart + batchSize, total)
+                <span class="keyword">let</span> chunk = <span class="type">Array</span>(records[chunkStart..&lt;chunkEnd])
+
+                <span class="keyword">var</span> idx = <span class="number">0</span>
+                <span class="keyword">let</span> request = <span class="type">NSBatchInsertRequest</span>(
+                    entity: entity,
+                    managedObjectHandler: { obj <span class="keyword">in</span>
+                        <span class="keyword">guard</span> idx &lt; chunk.count <span class="keyword">else</span> { <span class="keyword">return true</span> }
+                        <span class="func">configure</span>(obj, chunk[idx])
+                        idx += <span class="number">1</span>
+                        <span class="keyword">return false</span>
+                    }
+                )
+                request.resultType = .statusOnly
+                <span class="keyword">try</span> context.<span class="func">execute</span>(request)
+
+                logger.<span class="func">debug</span>(<span class="string">"Imported chunk \(chunkStart)-\(chunkEnd)"</span>)
+            }
+
+            <span class="keyword">try</span> context.<span class="func">save</span>()
+            logger.<span class="func">info</span>(<span class="string">"Batch import complete: \(total) records"</span>)
+        }
+    }
+
+    <span class="comment">// MARK: - Optimized Fetch</span>
+
+    <span class="keyword">func</span> <span class="func">fetchPage</span>&lt;<span class="type">T</span>: <span class="type">NSManagedObject</span>&gt;(
+        _ type: <span class="type">T</span>.<span class="type">Type</span>,
+        predicate: <span class="type">NSPredicate</span>? = <span class="keyword">nil</span>,
+        sortDescriptors: [<span class="type">NSSortDescriptor</span>],
+        page: <span class="type">Int</span>,
+        pageSize: <span class="type">Int</span> = <span class="number">50</span>,
+        propertiesToFetch: [<span class="type">String</span>]? = <span class="keyword">nil</span>
+    ) <span class="keyword">throws</span> -> [<span class="type">T</span>] {
+        <span class="keyword">let</span> request = <span class="type">T</span>.<span class="func">fetchRequest</span>()
+        request.predicate = predicate
+        request.sortDescriptors = sortDescriptors
+        request.fetchLimit = pageSize
+        request.fetchOffset = page * pageSize
+        request.fetchBatchSize = pageSize
+        request.returnsObjectsAsFaults = <span class="keyword">false</span>
+
+        <span class="keyword">if let</span> properties = propertiesToFetch {
+            request.propertiesToFetch = properties
+        }
+
+        <span class="keyword">return try</span> viewContext.<span class="func">fetch</span>(request) <span class="keyword">as</span>? [<span class="type">T</span>] ?? []
+    }
+
+    <span class="comment">// MARK: - Count Without Loading</span>
+
+    <span class="keyword">func</span> <span class="func">count</span>&lt;<span class="type">T</span>: <span class="type">NSManagedObject</span>&gt;(
+        _ type: <span class="type">T</span>.<span class="type">Type</span>,
+        predicate: <span class="type">NSPredicate</span>? = <span class="keyword">nil</span>
+    ) <span class="keyword">throws</span> -> <span class="type">Int</span> {
+        <span class="keyword">let</span> request = <span class="type">T</span>.<span class="func">fetchRequest</span>()
+        request.predicate = predicate
+        <span class="keyword">return try</span> viewContext.<span class="func">count</span>(for: request)
+    }
+
+    <span class="comment">// MARK: - History Cleanup</span>
+
+    <span class="keyword">func</span> <span class="func">purgeHistory</span>(before date: <span class="type">Date</span>) <span class="keyword">throws</span> {
+        <span class="keyword">let</span> purgeRequest = <span class="type">NSPersistentHistoryChangeRequest</span>.<span class="func">deleteHistory</span>(
+            before: date
+        )
+        <span class="keyword">let</span> bgContext = <span class="func">newBackgroundContext</span>()
+        <span class="keyword">try</span> bgContext.<span class="func">performAndWait</span> {
+            <span class="keyword">try</span> bgContext.<span class="func">execute</span>(purgeRequest)
+        }
+        logger.<span class="func">info</span>(<span class="string">"Purged history before \(date)"</span>)
+    }
+}</code></pre>
+
+    <h3>Fetch Request Optimization Checklist</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Optimization</th>
+                <th>API</th>
+                <th>Effect</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Limit results</td>
+                <td><code>fetchLimit</code></td>
+                <td>Adds <code>LIMIT</code> to SQL — stops scanning after N rows</td>
+            </tr>
+            <tr>
+                <td>Paginate</td>
+                <td><code>fetchOffset</code></td>
+                <td>Adds <code>OFFSET</code> — skip rows for pagination</td>
+            </tr>
+            <tr>
+                <td>Batch faulting</td>
+                <td><code>fetchBatchSize</code></td>
+                <td>Materializes objects in batches as you iterate</td>
+            </tr>
+            <tr>
+                <td>Partial fetch</td>
+                <td><code>propertiesToFetch</code></td>
+                <td>Only loads specified columns — reduces memory</td>
+            </tr>
+            <tr>
+                <td>Count only</td>
+                <td><code>context.count(for:)</code></td>
+                <td>Executes <code>SELECT COUNT(*)</code> — no objects created</td>
+            </tr>
+            <tr>
+                <td>Dictionary result</td>
+                <td><code>resultType = .dictionaryResultType</code></td>
+                <td>Returns dictionaries instead of managed objects — no faulting overhead</td>
+            </tr>
+            <tr>
+                <td>Prefetch relations</td>
+                <td><code>relationshipKeyPathsForPrefetching</code></td>
+                <td>Batch-loads related objects — eliminates N+1</td>
+            </tr>
+            <tr>
+                <td>Distinct results</td>
+                <td><code>returnsDistinctResults</code></td>
+                <td>Adds <code>SELECT DISTINCT</code> — useful with <code>propertiesToFetch</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Denormalization Strategy</h3>
+
+<pre><code><span class="comment">// Instead of computing "sectionLetter" from "lastName" in a predicate,</span>
+<span class="comment">// store it as a denormalized attribute updated on save.</span>
+
+<span class="keyword">extension</span> <span class="type">User</span> {
+
+    <span class="keyword">public override func</span> <span class="func">willSave</span>() {
+        <span class="keyword">super</span>.<span class="func">willSave</span>()
+
+        <span class="keyword">let</span> newLetter = lastName?.prefix(<span class="number">1</span>)
+            .<span class="func">uppercased</span>() ?? <span class="string">"#"</span>
+
+        <span class="keyword">if</span> sectionLetter != newLetter {
+            sectionLetter = newLetter
+        }
+    }
+}
+
+<span class="comment">// Now FRC can use sectionNameKeyPath: "sectionLetter"</span>
+<span class="comment">// with a simple indexed attribute instead of a derived expression</span></code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Memory Management at Scale</div>
+        <p>When processing large result sets in a background context, call <code>context.reset()</code> after processing each batch to release all registered objects. Alternatively, use <code>refreshObject(_:mergeChanges: false)</code> on individual objects to re-fault them. For truly massive imports (1M+), use <code>NSBatchInsertRequest</code> exclusively — it never creates managed objects in memory at all.</p>
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know — Interview Talking Points</div>
+        <p>When discussing Core Data at scale in an L6 interview, demonstrate understanding of these trade-offs:</p>
+        <ul>
+            <li><strong>Context-per-operation vs shared contexts</strong> — Creating a new background context per import operation provides isolation but increases coordinator contention. A pooled approach with 2–3 reusable background contexts reduces overhead.</li>
+            <li><strong>SQLite WAL mode</strong> — Core Data uses WAL by default, enabling concurrent reads during writes. However, long-running read transactions can prevent WAL checkpointing, growing the WAL file unboundedly.</li>
+            <li><strong>Batch operations vs context saves</strong> — Batch operations are 10–100× faster for bulk mutations but skip validation, KVO, and relationship cascades. Use them for imports; use context saves for user-driven edits.</li>
+            <li><strong>Denormalization vs normalization</strong> — Normalized schemas reduce storage but increase join complexity. For read-heavy apps (most iOS apps), denormalize frequently-accessed computed values into indexed attributes.</li>
+            <li><strong>When to move beyond Core Data</strong> — If you need full-text search (consider SQLite FTS5 via GRDB), complex aggregate queries, or cross-platform sync (consider CRDTs), Core Data may not be the right tool. Know its boundaries.</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="01-urlsession-internals.html">&larr; URLSession Internals</a>
+        <a href="03-swift-data.html">Next: SwiftData &rarr;</a>
+    </div>
+</div>
+</body>
+</html>

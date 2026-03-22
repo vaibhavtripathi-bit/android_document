@@ -1,0 +1,816 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>View Hierarchy Internals — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">UIKit View System</a><span class="sep">›</span>
+        View Hierarchy Internals
+    </nav>
+
+    <h1>View Hierarchy Internals</h1>
+    <p class="subtitle">UIView/CALayer duality, the AppKit history behind the split, UIWindow tree structure, hitTest reverse pre-order traversal, coordinate systems, and z-ordering — the foundation of everything in UIKit.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#uiview-calayer-duality">1. UIView / CALayer Duality</a></li>
+            <li><a href="#appkit-history">2. The AppKit History</a></li>
+            <li><a href="#uiwindow-tree">3. UIWindow → UIView Tree Structure</a></li>
+            <li><a href="#hit-testing">4. Hit Testing: hitTest(_:with:) &amp; point(inside:with:)</a></li>
+            <li><a href="#coordinate-systems">5. UIView vs CALayer Coordinate Systems</a></li>
+            <li><a href="#subview-ordering">6. Subview Ordering &amp; Z-Index</a></li>
+            <li><a href="#view-lifecycle">7. View Lifecycle Methods</a></li>
+            <li><a href="#performance">8. Performance Implications</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="uiview-calayer-duality">1. UIView / CALayer Duality</h2>
+    <!-- ============================================================ -->
+
+    <p>Every <code>UIView</code> in iOS has a backing <code>CALayer</code>. This is not optional — it's a fundamental architectural decision baked into UIKit since iPhone OS 2.0. The view owns the layer, and the layer is responsible for all visual content: drawing, compositing, and animations.</p>
+
+    <h3>The Relationship</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────┐
+│                  UIView                      │
+│  ┌─────────────────────────────────────┐    │
+│  │  Event Handling                      │    │
+│  │  • touchesBegan/Moved/Ended          │    │
+│  │  • hitTest(_:with:)                  │    │
+│  │  • gestureRecognizers                │    │
+│  ├─────────────────────────────────────┤    │
+│  │  Layout                              │    │
+│  │  • Auto Layout constraints           │    │
+│  │  • layoutSubviews()                  │    │
+│  │  • intrinsicContentSize              │    │
+│  ├─────────────────────────────────────┤    │
+│  │  Backing Layer (CALayer)             │    │
+│  │  ┌─────────────────────────────┐    │    │
+│  │  │  Visual Content              │    │    │
+│  │  │  • contents (CGImage)        │    │    │
+│  │  │  • backgroundColor           │    │    │
+│  │  │  • borderWidth/Color         │    │    │
+│  │  │  • cornerRadius              │    │    │
+│  │  │  • shadow*                   │    │    │
+│  │  │  • transform (CATransform3D) │    │    │
+│  │  │  • opacity                   │    │    │
+│  │  │  • Animations                │    │    │
+│  │  └─────────────────────────────┘    │    │
+│  └─────────────────────────────────────┘    │
+└─────────────────────────────────────────────┘
+    </div>
+
+    <p>The <code>UIView</code> is the layer's <strong>delegate</strong>. When you access <code>view.layer</code>, you get the backing <code>CALayer</code>. The view sets itself as <code>layer.delegate</code> and responds to delegate methods like <code>display(_:)</code> and <code>draw(_:in:)</code>.</p>
+
+    <pre><code><span class="comment">// UIView owns its layer — you can access it directly</span>
+<span class="keyword">let</span> view = <span class="type">UIView</span>(frame: .<span class="func">init</span>(x: <span class="number">0</span>, y: <span class="number">0</span>, width: <span class="number">200</span>, height: <span class="number">200</span>))
+
+<span class="comment">// The layer is always non-nil and created automatically</span>
+<span class="keyword">let</span> layer = view.<span class="func">layer</span>  <span class="comment">// CALayer</span>
+
+<span class="comment">// The view IS the layer's delegate</span>
+<span class="func">print</span>(layer.delegate === view)  <span class="comment">// true</span>
+
+<span class="comment">// Many UIView properties are just pass-throughs to the layer</span>
+view.backgroundColor = .<span class="func">red</span>
+<span class="comment">// Equivalent to: view.layer.backgroundColor = UIColor.red.cgColor</span>
+
+view.alpha = <span class="number">0.5</span>
+<span class="comment">// Equivalent to: view.layer.opacity = 0.5</span>
+
+view.frame = <span class="type">CGRect</span>(x: <span class="number">10</span>, y: <span class="number">10</span>, width: <span class="number">100</span>, height: <span class="number">100</span>)
+<span class="comment">// Sets layer.frame, which is derived from layer.position, layer.bounds, layer.anchorPoint, layer.transform</span></code></pre>
+
+    <h3>Properties That Live on CALayer Only</h3>
+
+    <p>Several visual properties exist <strong>only</strong> on <code>CALayer</code> with no <code>UIView</code> wrapper:</p>
+
+    <pre><code><span class="comment">// Shadow — no UIView equivalent</span>
+view.layer.shadowColor = <span class="type">UIColor</span>.black.cgColor
+view.layer.shadowOffset = <span class="type">CGSize</span>(width: <span class="number">0</span>, height: <span class="number">2</span>)
+view.layer.shadowRadius = <span class="number">4</span>
+view.layer.shadowOpacity = <span class="number">0.3</span>
+
+<span class="comment">// Border — no UIView equivalent</span>
+view.layer.borderWidth = <span class="number">1</span>
+view.layer.borderColor = <span class="type">UIColor</span>.gray.cgColor
+
+<span class="comment">// Corner radius — no UIView equivalent (until iOS 13 layer.cornerCurve)</span>
+view.layer.cornerRadius = <span class="number">12</span>
+view.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+
+<span class="comment">// 3D transforms — UIView only exposes CGAffineTransform (2D)</span>
+view.layer.transform = <span class="type">CATransform3DMakeRotation</span>(.pi / <span class="number">4</span>, <span class="number">1</span>, <span class="number">0</span>, <span class="number">0</span>)
+
+<span class="comment">// Contents — direct bitmap assignment</span>
+view.layer.contents = someImage.cgImage
+view.layer.contentsGravity = .resizeAspectFill
+view.layer.contentsScale = <span class="type">UIScreen</span>.main.scale</code></pre>
+
+    <h3>The Layer Class Override</h3>
+
+    <p>You can customize which <code>CALayer</code> subclass a view uses by overriding the class property:</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">GradientView</span>: <span class="type">UIView</span> {
+    <span class="comment">// Override layerClass to use a specialized layer</span>
+    <span class="keyword">override class var</span> layerClass: <span class="type">AnyClass</span> {
+        <span class="keyword">return</span> <span class="type">CAGradientLayer</span>.<span class="keyword">self</span>
+    }
+
+    <span class="keyword">var</span> gradientLayer: <span class="type">CAGradientLayer</span> {
+        <span class="keyword">return</span> layer <span class="keyword">as</span>! <span class="type">CAGradientLayer</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">configure</span>() {
+        gradientLayer.colors = [
+            <span class="type">UIColor</span>.systemBlue.cgColor,
+            <span class="type">UIColor</span>.systemPurple.cgColor
+        ]
+        gradientLayer.startPoint = <span class="type">CGPoint</span>(x: <span class="number">0</span>, y: <span class="number">0</span>)
+        gradientLayer.endPoint = <span class="type">CGPoint</span>(x: <span class="number">1</span>, y: <span class="number">1</span>)
+    }
+}
+
+<span class="comment">// Common specialized layer classes:</span>
+<span class="comment">// CAShapeLayer     — vector path rendering</span>
+<span class="comment">// CAGradientLayer  — gradient fills</span>
+<span class="comment">// CATextLayer      — text rendering</span>
+<span class="comment">// CAScrollLayer    — scrollable content</span>
+<span class="comment">// CAReplicatorLayer — duplicated sublayers</span>
+<span class="comment">// CAEmitterLayer   — particle effects</span>
+<span class="comment">// AVPlayerLayer    — video playback</span>
+<span class="comment">// CAMetalLayer     — Metal rendering</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive</div>
+        <p><strong>Why override <code>layerClass</code> instead of adding a sublayer?</strong> When you override <code>layerClass</code>, the specialized layer <em>is</em> the view's backing layer. This means it participates directly in Auto Layout sizing, the view's <code>draw(_:)</code> cycle, and implicit animations triggered by UIView animation blocks. A manually-added sublayer requires you to manage its frame manually in <code>layoutSubviews()</code> and won't get UIView animation block support.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="appkit-history">2. The AppKit History</h2>
+    <!-- ============================================================ -->
+
+    <p>To truly understand why every <code>UIView</code> has a <code>CALayer</code>, you need to understand the macOS (AppKit) history that preceded iOS.</p>
+
+    <h3>The NSView Problem</h3>
+
+    <p>In the original AppKit (macOS), <code>NSView</code> was responsible for <strong>everything</strong>: event handling, layout, <em>and</em> drawing. Drawing happened via <code>drawRect:</code> which was called by the display system whenever a region was invalidated. This had several problems:</p>
+
+    <ul>
+        <li><strong>No hardware acceleration</strong> — All drawing was CPU-based via Quartz 2D (Core Graphics)</li>
+        <li><strong>No implicit animations</strong> — Animating required manual timer-based redrawing</li>
+        <li><strong>Expensive redraws</strong> — Any property change required a full <code>drawRect:</code> pass</li>
+        <li><strong>No compositing tree</strong> — The window server composited flat bitmaps, not a tree of layers</li>
+    </ul>
+
+    <h3>Core Animation's Introduction (macOS 10.5 Leopard, 2007)</h3>
+
+    <p>Apple introduced Core Animation as a <strong>separate framework</strong> that could optionally back <code>NSView</code>. On macOS, you had to explicitly opt in:</p>
+
+    <pre><code><span class="comment">// macOS — layer-backing is OPT-IN</span>
+<span class="keyword">let</span> nsView = <span class="type">NSView</span>()
+nsView.wantsLayer = <span class="keyword">true</span>  <span class="comment">// Now has a CALayer</span>
+
+<span class="comment">// Or in Interface Builder: check "Core Animation Layer" checkbox</span>
+
+<span class="comment">// Without wantsLayer, NSView draws directly via drawRect:</span>
+<span class="comment">// With wantsLayer, NSView draws into a CALayer bitmap</span></code></pre>
+
+    <h3>UIKit's Clean-Sheet Design (iPhone OS 2.0, 2008)</h3>
+
+    <p>When Apple built UIKit for the iPhone, they had a clean sheet. They made a critical architectural decision: <strong>every UIView always has a CALayer</strong>. There's no opt-in. This was driven by the iPhone's constraints:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Constraint</th>
+                <th>Why CALayer Helps</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Limited CPU (412 MHz ARM)</td>
+                <td>GPU compositing offloads work from CPU</td>
+            </tr>
+            <tr>
+                <td>Touch-driven UI</td>
+                <td>60fps animations are essential for touch feedback</td>
+            </tr>
+            <tr>
+                <td>Battery constraints</td>
+                <td>GPU compositing is more power-efficient than CPU drawing</td>
+            </tr>
+            <tr>
+                <td>No mouse cursor</td>
+                <td>Direct manipulation requires smooth, low-latency rendering</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="diagram">
+macOS (AppKit) Evolution:
+═══════════════════════════════════════════════════════
+
+Pre-10.5:   NSView ──────────────────────▶ Window Server
+            (CPU drawRect:)                (flat compositing)
+
+10.5+:      NSView ──opt-in──▶ CALayer ──▶ Window Server
+            (wantsLayer=true)              (layer tree compositing)
+
+iOS (UIKit) — Clean Sheet:
+═══════════════════════════════════════════════════════
+
+Always:     UIView ──always──▶ CALayer ──▶ Render Server
+            (events+layout)    (drawing)   (backboardd → GPU)
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p><strong>Why this history matters for performance at scale:</strong> The UIView/CALayer split means you can manipulate visual properties (opacity, transform, position) <em>without</em> triggering CPU-side <code>draw(_:)</code> calls. These are "compositing-only" changes handled entirely by the GPU. At scale (complex UIs with hundreds of views), understanding which property changes are compositing-only vs. which require CPU drawing is the difference between 120fps and jank.</p>
+        <p><strong>Compositing-only properties</strong> (GPU, no CPU draw): <code>opacity</code>, <code>transform</code>, <code>position</code>, <code>bounds</code>, <code>backgroundColor</code> (solid colors), <code>hidden</code>, <code>zPosition</code></p>
+        <p><strong>Properties requiring CPU draw</strong>: <code>contents</code> (new bitmap), custom <code>draw(_:)</code>, <code>cornerRadius</code> + <code>masksToBounds</code> (off-screen render), <code>shadow</code> without <code>shadowPath</code></p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="uiwindow-tree">3. UIWindow → UIView Tree Structure</h2>
+    <!-- ============================================================ -->
+
+    <p>The view hierarchy is a strict tree (not a graph). Every view has exactly one superview (or none, if it's a root window). The tree starts with <code>UIWindow</code>.</p>
+
+    <h3>The Full Hierarchy</h3>
+
+    <div class="diagram">
+UIScreen
+  └── UIWindowScene
+        └── UIWindow (key window)
+              ├── UITransitionView (system-managed)
+              │     └── UIDropShadowView
+              │           └── UIViewController.view (root VC)
+              │                 ├── UINavigationBar
+              │                 ├── Content View
+              │                 │     ├── UILabel
+              │                 │     ├── UIButton
+              │                 │     └── Custom UIView
+              │                 │           ├── CALayer (backing)
+              │                 │           ├── Sublayer 1
+              │                 │           └── Sublayer 2
+              │                 └── UITabBar
+              └── UITextEffectsWindow (keyboard, system)
+    </div>
+
+    <h3>UIWindow Internals</h3>
+
+    <p><code>UIWindow</code> is a subclass of <code>UIView</code>. It serves as the root of the view hierarchy and has special responsibilities:</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">UIWindow</span>: <span class="type">UIView</span> {
+    <span class="comment">// The window level determines z-ordering among windows</span>
+    <span class="keyword">var</span> windowLevel: <span class="type">UIWindow</span>.<span class="type">Level</span>  <span class="comment">// .normal, .alert, .statusBar</span>
+
+    <span class="comment">// The root view controller — setting this adds its view as a subview</span>
+    <span class="keyword">var</span> rootViewController: <span class="type">UIViewController</span>?
+
+    <span class="comment">// The window scene (iOS 13+)</span>
+    <span class="keyword">var</span> windowScene: <span class="type">UIWindowScene</span>?
+
+    <span class="comment">// Key window receives keyboard events and is the default target</span>
+    <span class="keyword">var</span> isKeyWindow: <span class="type">Bool</span> { <span class="keyword">get</span> }
+    <span class="keyword">func</span> <span class="func">makeKeyAndVisible</span>()
+
+    <span class="comment">// Touch dispatch entry point</span>
+    <span class="keyword">func</span> <span class="func">sendEvent</span>(_ event: <span class="type">UIEvent</span>)
+}</code></pre>
+
+    <h3>View Tree Traversal</h3>
+
+    <pre><code><span class="comment">// Walking up the tree</span>
+<span class="keyword">var</span> current: <span class="type">UIView</span>? = someDeepView
+<span class="keyword">while let</span> view = current {
+    <span class="func">print</span>(<span class="func">type</span>(of: view))  <span class="comment">// Walk from leaf to root</span>
+    current = view.superview
+}
+
+<span class="comment">// Walking down the tree (depth-first)</span>
+<span class="keyword">func</span> <span class="func">traverseSubviews</span>(_ view: <span class="type">UIView</span>, depth: <span class="type">Int</span> = <span class="number">0</span>) {
+    <span class="keyword">let</span> indent = <span class="type">String</span>(repeating: <span class="string">"  "</span>, count: depth)
+    <span class="func">print</span>(<span class="string">"\(indent)\(type(of: view)) frame=\(view.frame)"</span>)
+    <span class="keyword">for</span> subview <span class="keyword">in</span> view.subviews {
+        <span class="func">traverseSubviews</span>(subview, depth: depth + <span class="number">1</span>)
+    }
+}
+
+<span class="comment">// Finding the window</span>
+<span class="keyword">let</span> window = view.window  <span class="comment">// nil if view is not in a window hierarchy</span>
+
+<span class="comment">// View controller relationship</span>
+<span class="keyword">extension</span> <span class="type">UIView</span> {
+    <span class="keyword">var</span> parentViewController: <span class="type">UIViewController</span>? {
+        <span class="keyword">var</span> responder: <span class="type">UIResponder</span>? = <span class="keyword">self</span>
+        <span class="keyword">while let</span> next = responder?.next {
+            <span class="keyword">if let</span> vc = next <span class="keyword">as</span>? <span class="type">UIViewController</span> {
+                <span class="keyword">return</span> vc
+            }
+            responder = next
+        }
+        <span class="keyword">return nil</span>
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall</div>
+        <p><strong>Don't confuse the view hierarchy with the layer hierarchy.</strong> They are parallel trees but not identical. A <code>UIView</code>'s backing layer is a sublayer of its superview's backing layer. But you can add <code>CALayer</code> sublayers directly to a view's layer without corresponding <code>UIView</code>s. These "orphan" layers won't receive touch events or participate in Auto Layout.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="hit-testing">4. Hit Testing: hitTest(_:with:) &amp; point(inside:with:)</h2>
+    <!-- ============================================================ -->
+
+    <p>Hit testing is the process of determining which view should receive a touch event. It uses a <strong>reverse pre-order depth-first traversal</strong> of the view tree — starting from the last subview (topmost visually) and working backwards.</p>
+
+    <h3>The Algorithm</h3>
+
+    <p>Here is the default implementation of <code>hitTest(_:with:)</code>, reconstructed from UIKit's behavior:</p>
+
+    <pre><code><span class="comment">// Reconstructed default implementation of UIView.hitTest(_:with:)</span>
+<span class="keyword">extension</span> <span class="type">UIView</span> {
+    <span class="keyword">open func</span> <span class="func">hitTest</span>(_ point: <span class="type">CGPoint</span>, with event: <span class="type">UIEvent</span>?) -> <span class="type">UIView</span>? {
+        <span class="comment">// 1. Check if this view can receive touches at all</span>
+        <span class="keyword">guard</span> isUserInteractionEnabled,
+              !isHidden,
+              alpha > <span class="number">0.01</span> <span class="keyword">else</span> {
+            <span class="keyword">return nil</span>
+        }
+
+        <span class="comment">// 2. Check if the point is inside this view's bounds</span>
+        <span class="keyword">guard</span> <span class="func">point</span>(inside: point, with: event) <span class="keyword">else</span> {
+            <span class="keyword">return nil</span>
+        }
+
+        <span class="comment">// 3. Traverse subviews in REVERSE order (back to front → last to first)</span>
+        <span class="comment">// This ensures the topmost (visually) view is tested first</span>
+        <span class="keyword">for</span> subview <span class="keyword">in</span> subviews.reversed() {
+            <span class="comment">// Convert the point to the subview's coordinate space</span>
+            <span class="keyword">let</span> convertedPoint = subview.<span class="func">convert</span>(point, from: <span class="keyword">self</span>)
+            <span class="comment">// Recursively hit test the subview</span>
+            <span class="keyword">if let</span> hitView = subview.<span class="func">hitTest</span>(convertedPoint, with: event) {
+                <span class="keyword">return</span> hitView
+            }
+        }
+
+        <span class="comment">// 4. No subview claimed the touch — this view is the hit</span>
+        <span class="keyword">return self</span>
+    }
+}</code></pre>
+
+    <h3>Traversal Visualization</h3>
+
+    <div class="diagram">
+View Hierarchy:                    Hit Test Order:
+                                   (numbers = testing order)
+
+      ┌──────────A──────────┐
+      │                     │            A is tested LAST (step 7)
+      │  ┌───B───┐ ┌───C───┐│           because it checks children first
+      │  │       │ │       ││
+      │  │ ┌─D─┐ │ │ ┌─E─┐ ││     Traversal (reverse pre-order):
+      │  │ └───┘ │ │ │   │ ││       1. C (last subview of A)
+      │  │       │ │ │┌F┐│ ││       2.   E (last subview of C)
+      │  └───────┘ │ │└─┘│ ││       3.     F (last subview of E)
+      │            │ └───┘ ││       4.     F fails → E checks itself
+      │            └───────┘│       5.   E fails → C checks itself
+      └─────────────────────┘       6. B (first subview of A)
+                                    7.   D (last subview of B)
+  Touch at point P                  8.   D fails → B checks itself
+  inside D's bounds                 9. B fails → A checks itself
+  → D is returned!
+    </div>
+
+    <h3>Why Reverse Order?</h3>
+
+    <p>The <code>subviews</code> array is ordered by addition time — the last-added subview is at the highest index and is drawn <strong>on top</strong>. By iterating in reverse, hit testing checks the visually topmost view first. This matches user expectation: tapping on an overlapping view should hit the one that appears on top.</p>
+
+    <h3>Common hitTest Overrides</h3>
+
+    <pre><code><span class="comment">// 1. Expanding touch area beyond bounds</span>
+<span class="keyword">class</span> <span class="type">ExpandedTouchView</span>: <span class="type">UIView</span> {
+    <span class="keyword">var</span> touchInsets = <span class="type">UIEdgeInsets</span>(top: -<span class="number">10</span>, left: -<span class="number">10</span>, bottom: -<span class="number">10</span>, right: -<span class="number">10</span>)
+
+    <span class="keyword">override func</span> <span class="func">point</span>(inside point: <span class="type">CGPoint</span>, with event: <span class="type">UIEvent</span>?) -> <span class="type">Bool</span> {
+        <span class="keyword">return</span> bounds.<span class="func">inset</span>(by: touchInsets).<span class="func">contains</span>(point)
+    }
+}
+
+<span class="comment">// 2. Pass-through view (transparent to touches)</span>
+<span class="keyword">class</span> <span class="type">PassthroughView</span>: <span class="type">UIView</span> {
+    <span class="keyword">override func</span> <span class="func">hitTest</span>(_ point: <span class="type">CGPoint</span>, with event: <span class="type">UIEvent</span>?) -> <span class="type">UIView</span>? {
+        <span class="keyword">let</span> hitView = <span class="keyword">super</span>.<span class="func">hitTest</span>(point, with: event)
+        <span class="comment">// If the hit view is self, return nil to pass through</span>
+        <span class="keyword">return</span> hitView == <span class="keyword">self</span> ? <span class="keyword">nil</span> : hitView
+    }
+}
+
+<span class="comment">// 3. Forwarding touches to a sibling view</span>
+<span class="keyword">class</span> <span class="type">ForwardingView</span>: <span class="type">UIView</span> {
+    <span class="keyword">weak var</span> forwardTarget: <span class="type">UIView</span>?
+
+    <span class="keyword">override func</span> <span class="func">hitTest</span>(_ point: <span class="type">CGPoint</span>, with event: <span class="type">UIEvent</span>?) -> <span class="type">UIView</span>? {
+        <span class="keyword">guard let</span> target = forwardTarget <span class="keyword">else</span> {
+            <span class="keyword">return super</span>.<span class="func">hitTest</span>(point, with: event)
+        }
+        <span class="keyword">let</span> convertedPoint = target.<span class="func">convert</span>(point, from: <span class="keyword">self</span>)
+        <span class="keyword">return</span> target.<span class="func">hitTest</span>(convertedPoint, with: event)
+    }
+}
+
+<span class="comment">// 4. Allowing touches on subviews outside bounds (clipsToBounds = false)</span>
+<span class="keyword">class</span> <span class="type">OverflowTouchView</span>: <span class="type">UIView</span> {
+    <span class="keyword">override func</span> <span class="func">hitTest</span>(_ point: <span class="type">CGPoint</span>, with event: <span class="type">UIEvent</span>?) -> <span class="type">UIView</span>? {
+        <span class="comment">// Don't check point(inside:) for self — check all subviews regardless</span>
+        <span class="keyword">guard</span> isUserInteractionEnabled, !isHidden, alpha > <span class="number">0.01</span> <span class="keyword">else</span> {
+            <span class="keyword">return nil</span>
+        }
+        <span class="keyword">for</span> subview <span class="keyword">in</span> subviews.reversed() {
+            <span class="keyword">let</span> convertedPoint = subview.<span class="func">convert</span>(point, from: <span class="keyword">self</span>)
+            <span class="keyword">if let</span> hitView = subview.<span class="func">hitTest</span>(convertedPoint, with: event) {
+                <span class="keyword">return</span> hitView
+            }
+        }
+        <span class="keyword">return</span> <span class="func">point</span>(inside: point, with: event) ? <span class="keyword">self</span> : <span class="keyword">nil</span>
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall</div>
+        <p><strong>Subviews outside bounds don't receive touches by default.</strong> If <code>clipsToBounds</code> is <code>false</code>, a subview can be <em>visible</em> outside its parent's bounds but still won't receive touches. The parent's <code>point(inside:with:)</code> returns <code>false</code> for points outside its bounds, so the subview's <code>hitTest</code> is never called. You must override <code>hitTest</code> on the parent (as shown in example 4 above) to fix this.</p>
+    </div>
+
+    <h3>hitTest and Transforms</h3>
+
+    <pre><code><span class="comment">// When a view has a transform, hitTest automatically accounts for it.</span>
+<span class="comment">// The point is converted through the inverse transform.</span>
+
+<span class="keyword">let</span> button = <span class="type">UIButton</span>()
+button.transform = <span class="type">CGAffineTransform</span>(rotationAngle: .pi / <span class="number">4</span>)  <span class="comment">// 45° rotation</span>
+
+<span class="comment">// hitTest converts the touch point through the inverse rotation,</span>
+<span class="comment">// so the touch area matches the visual rotation.</span>
+
+<span class="comment">// HOWEVER: If the transform is not invertible (e.g., scale to 0),</span>
+<span class="comment">// hitTest returns nil — the view can't receive touches.</span>
+button.transform = <span class="type">CGAffineTransform</span>(scaleX: <span class="number">0</span>, y: <span class="number">0</span>)
+<span class="comment">// hitTest always returns nil for this view</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="coordinate-systems">5. UIView vs CALayer Coordinate Systems</h2>
+    <!-- ============================================================ -->
+
+    <p>UIView and CALayer use subtly different coordinate concepts, which is a common source of confusion.</p>
+
+    <h3>UIView: frame, bounds, center</h3>
+
+    <pre><code><span class="comment">// frame: position and size in SUPERVIEW's coordinate space</span>
+<span class="comment">// bounds: position and size in OWN coordinate space</span>
+<span class="comment">// center: center point in SUPERVIEW's coordinate space</span>
+
+<span class="keyword">let</span> view = <span class="type">UIView</span>()
+view.frame = <span class="type">CGRect</span>(x: <span class="number">50</span>, y: <span class="number">100</span>, width: <span class="number">200</span>, height: <span class="number">150</span>)
+
+<span class="comment">// These are now set automatically:</span>
+view.bounds   <span class="comment">// CGRect(x: 0, y: 0, width: 200, height: 150)</span>
+view.center   <span class="comment">// CGPoint(x: 150, y: 175)  — center of frame</span>
+
+<span class="comment">// Changing bounds.origin scrolls the content (like UIScrollView)</span>
+view.bounds.origin = <span class="type">CGPoint</span>(x: <span class="number">0</span>, y: <span class="number">50</span>)
+<span class="comment">// Subviews shift up by 50 points — this is how UIScrollView works!</span></code></pre>
+
+    <h3>CALayer: position, anchorPoint, bounds</h3>
+
+    <pre><code><span class="comment">// CALayer uses position + anchorPoint instead of center</span>
+<span class="keyword">let</span> layer = <span class="type">CALayer</span>()
+
+<span class="comment">// anchorPoint is in UNIT coordinates (0,0 to 1,1)</span>
+<span class="comment">// Default is (0.5, 0.5) — the center</span>
+layer.anchorPoint = <span class="type">CGPoint</span>(x: <span class="number">0.5</span>, y: <span class="number">0.5</span>)
+
+<span class="comment">// position is the anchorPoint's location in SUPERLAYER coordinates</span>
+layer.position = <span class="type">CGPoint</span>(x: <span class="number">150</span>, y: <span class="number">175</span>)
+
+<span class="comment">// frame is DERIVED from position, bounds, anchorPoint, and transform</span>
+<span class="comment">// frame = f(position, bounds.size, anchorPoint, transform)</span>
+
+<span class="comment">// The relationship:</span>
+<span class="comment">// frame.origin.x = position.x - bounds.size.width * anchorPoint.x</span>
+<span class="comment">// frame.origin.y = position.y - bounds.size.height * anchorPoint.y</span></code></pre>
+
+    <h3>The anchorPoint Trap</h3>
+
+    <pre><code><span class="comment">// Changing anchorPoint moves the view visually because position stays fixed</span>
+<span class="keyword">let</span> view = <span class="type">UIView</span>(frame: <span class="type">CGRect</span>(x: <span class="number">100</span>, y: <span class="number">100</span>, width: <span class="number">200</span>, height: <span class="number">200</span>))
+
+<span class="comment">// Before: anchorPoint = (0.5, 0.5), position = (200, 200)</span>
+view.layer.anchorPoint = <span class="type">CGPoint</span>(x: <span class="number">0</span>, y: <span class="number">0</span>)
+<span class="comment">// After: position is still (200, 200), but now that's the top-left</span>
+<span class="comment">// The view visually jumps! frame is now (200, 200, 200, 200)</span>
+
+<span class="comment">// To change anchorPoint without visual movement:</span>
+<span class="keyword">extension</span> <span class="type">UIView</span> {
+    <span class="keyword">func</span> <span class="func">setAnchorPoint</span>(_ anchorPoint: <span class="type">CGPoint</span>) {
+        <span class="keyword">let</span> oldOrigin = frame.origin
+        layer.anchorPoint = anchorPoint
+        <span class="keyword">let</span> newOrigin = frame.origin
+        <span class="keyword">let</span> translation = <span class="type">CGPoint</span>(
+            x: newOrigin.x - oldOrigin.x,
+            y: newOrigin.y - oldOrigin.y
+        )
+        center = <span class="type">CGPoint</span>(
+            x: center.x - translation.x,
+            y: center.y - translation.y
+        )
+    }
+}</code></pre>
+
+    <h3>Coordinate Conversion</h3>
+
+    <pre><code><span class="comment">// UIView coordinate conversion</span>
+<span class="keyword">let</span> pointInA = <span class="type">CGPoint</span>(x: <span class="number">50</span>, y: <span class="number">50</span>)
+<span class="keyword">let</span> pointInB = viewA.<span class="func">convert</span>(pointInA, to: viewB)
+<span class="keyword">let</span> pointInA2 = viewB.<span class="func">convert</span>(pointInB, to: viewA)
+
+<span class="comment">// Rect conversion</span>
+<span class="keyword">let</span> rectInWindow = view.<span class="func">convert</span>(view.bounds, to: <span class="keyword">nil</span>)  <span class="comment">// nil = window</span>
+
+<span class="comment">// CALayer coordinate conversion</span>
+<span class="keyword">let</span> pointInLayer = layerA.<span class="func">convert</span>(point, to: layerB)
+
+<span class="comment">// IMPORTANT: These conversions walk up the view/layer tree</span>
+<span class="comment">// They account for transforms at each level</span>
+<span class="comment">// They do NOT work across different windows</span></code></pre>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Concept</th>
+                <th>UIView</th>
+                <th>CALayer</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Position reference</td>
+                <td><code>center</code> (always center)</td>
+                <td><code>position</code> (at <code>anchorPoint</code>)</td>
+            </tr>
+            <tr>
+                <td>Anchor</td>
+                <td>Implicit (0.5, 0.5)</td>
+                <td><code>anchorPoint</code> (configurable)</td>
+            </tr>
+            <tr>
+                <td>Transform</td>
+                <td><code>CGAffineTransform</code> (2D)</td>
+                <td><code>CATransform3D</code> (3D)</td>
+            </tr>
+            <tr>
+                <td>Origin</td>
+                <td>Top-left (0,0)</td>
+                <td>Top-left (0,0) on iOS</td>
+            </tr>
+            <tr>
+                <td>Frame</td>
+                <td>Settable directly</td>
+                <td>Derived (don't set when transformed)</td>
+            </tr>
+            <tr>
+                <td>Content scrolling</td>
+                <td><code>bounds.origin</code></td>
+                <td><code>bounds.origin</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="subview-ordering">6. Subview Ordering &amp; Z-Index</h2>
+    <!-- ============================================================ -->
+
+    <h3>UIView Subview Order</h3>
+
+    <p>The <code>subviews</code> array determines draw order: index 0 is drawn first (back), last index is drawn last (front). This is the default z-ordering.</p>
+
+    <pre><code><span class="comment">// Adding subviews — each new subview goes on top</span>
+parentView.<span class="func">addSubview</span>(viewA)  <span class="comment">// index 0 — back</span>
+parentView.<span class="func">addSubview</span>(viewB)  <span class="comment">// index 1 — front</span>
+
+<span class="comment">// Reordering</span>
+parentView.<span class="func">bringSubviewToFront</span>(viewA)   <span class="comment">// viewA moves to front</span>
+parentView.<span class="func">sendSubviewToBack</span>(viewB)      <span class="comment">// viewB moves to back</span>
+parentView.<span class="func">insertSubview</span>(viewC, at: <span class="number">1</span>)   <span class="comment">// insert at specific index</span>
+parentView.<span class="func">insertSubview</span>(viewC, aboveSubview: viewA)
+parentView.<span class="func">insertSubview</span>(viewC, belowSubview: viewA)
+parentView.<span class="func">exchangeSubview</span>(at: <span class="number">0</span>, withSubviewAt: <span class="number">2</span>)
+
+<span class="comment">// Removing</span>
+viewA.<span class="func">removeFromSuperview</span>()  <span class="comment">// removes from parent's subviews array</span></code></pre>
+
+    <h3>CALayer.zPosition</h3>
+
+    <p><code>zPosition</code> overrides the default subview-order-based z-ordering. It's a <code>CGFloat</code> that determines the layer's position on the z-axis.</p>
+
+    <pre><code><span class="comment">// zPosition overrides subview order for DRAWING only</span>
+viewA.layer.zPosition = <span class="number">1</span>   <span class="comment">// draws on top</span>
+viewB.layer.zPosition = <span class="number">0</span>   <span class="comment">// draws behind viewA</span>
+
+<span class="comment">// CRITICAL: zPosition affects DRAWING ORDER, not HIT TESTING</span>
+<span class="comment">// Hit testing still uses the subviews array order!</span>
+<span class="comment">// If viewB is later in subviews but has lower zPosition,</span>
+<span class="comment">// viewB draws behind viewA but receives touches OVER viewA</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall</div>
+        <p><strong><code>zPosition</code> and hit testing are disconnected.</strong> This is a frequent source of bugs. If you use <code>zPosition</code> to visually reorder views, the touch target order doesn't change. A view that appears behind another can still "steal" touches because it's later in the <code>subviews</code> array. Always reorder the <code>subviews</code> array (via <code>bringSubviewToFront</code> etc.) if you need both visual and touch ordering to match.</p>
+    </div>
+
+    <h3>Layer Tree vs View Tree</h3>
+
+    <pre><code><span class="comment">// The view tree and layer tree are parallel but not identical</span>
+
+<span class="comment">// Every UIView has a backing layer</span>
+<span class="comment">// view.subviews[i].layer == view.layer.sublayers[j] (for some j)</span>
+
+<span class="comment">// But you can add layers without views</span>
+<span class="keyword">let</span> shapeLayer = <span class="type">CAShapeLayer</span>()
+shapeLayer.path = <span class="type">UIBezierPath</span>(ovalIn: bounds).cgPath
+view.layer.<span class="func">addSublayer</span>(shapeLayer)
+<span class="comment">// shapeLayer has no UIView — no touch events, no Auto Layout</span>
+
+<span class="comment">// Layer sublayers include both view-backing layers AND standalone layers</span>
+<span class="comment">// view.layer.sublayers?.count >= view.subviews.count</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="view-lifecycle">7. View Lifecycle Methods</h2>
+    <!-- ============================================================ -->
+
+    <pre><code><span class="keyword">class</span> <span class="type">CustomView</span>: <span class="type">UIView</span> {
+
+    <span class="comment">// Called when view is added to a window hierarchy</span>
+    <span class="keyword">override func</span> <span class="func">didMoveToWindow</span>() {
+        <span class="keyword">super</span>.<span class="func">didMoveToWindow</span>()
+        <span class="keyword">if</span> window != <span class="keyword">nil</span> {
+            <span class="comment">// View is now visible — start animations, observers</span>
+        } <span class="keyword">else</span> {
+            <span class="comment">// View removed from window — clean up</span>
+        }
+    }
+
+    <span class="comment">// Called when superview changes</span>
+    <span class="keyword">override func</span> <span class="func">didMoveToSuperview</span>() {
+        <span class="keyword">super</span>.<span class="func">didMoveToSuperview</span>()
+    }
+
+    <span class="comment">// Called before superview/window changes</span>
+    <span class="keyword">override func</span> <span class="func">willMove</span>(toWindow newWindow: <span class="type">UIWindow</span>?) {
+        <span class="keyword">super</span>.<span class="func">willMove</span>(toWindow: newWindow)
+    }
+
+    <span class="keyword">override func</span> <span class="func">willMove</span>(toSuperview newSuperview: <span class="type">UIView</span>?) {
+        <span class="keyword">super</span>.<span class="func">willMove</span>(toSuperview: newSuperview)
+    }
+
+    <span class="comment">// Layout cycle</span>
+    <span class="keyword">override func</span> <span class="func">layoutSubviews</span>() {
+        <span class="keyword">super</span>.<span class="func">layoutSubviews</span>()
+        <span class="comment">// Called after Auto Layout resolves constraints</span>
+        <span class="comment">// Subview frames are set — do manual adjustments here</span>
+    }
+
+    <span class="comment">// Trait changes (dark mode, size class, etc.)</span>
+    <span class="keyword">override func</span> <span class="func">traitCollectionDidChange</span>(
+        _ previousTraitCollection: <span class="type">UITraitCollection</span>?
+    ) {
+        <span class="keyword">super</span>.<span class="func">traitCollectionDidChange</span>(previousTraitCollection)
+        <span class="keyword">if</span> traitCollection.<span class="func">hasDifferentColorAppearance</span>(
+            comparedTo: previousTraitCollection
+        ) {
+            <span class="comment">// Update colors for dark/light mode</span>
+        }
+    }
+
+    <span class="comment">// Safe area changes</span>
+    <span class="keyword">override func</span> <span class="func">safeAreaInsetsDidChange</span>() {
+        <span class="keyword">super</span>.<span class="func">safeAreaInsetsDidChange</span>()
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="performance">8. Performance Implications</h2>
+    <!-- ============================================================ -->
+
+    <h3>View Count Impact</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>View Count</th>
+                <th>Impact</th>
+                <th>Mitigation</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>&lt; 100</td>
+                <td>Negligible</td>
+                <td>None needed</td>
+            </tr>
+            <tr>
+                <td>100–500</td>
+                <td>Layout passes slow down</td>
+                <td>Flatten hierarchy, use layers</td>
+            </tr>
+            <tr>
+                <td>500–1000</td>
+                <td>Noticeable frame drops</td>
+                <td>Cell reuse, lazy loading</td>
+            </tr>
+            <tr>
+                <td>&gt; 1000</td>
+                <td>Severe performance issues</td>
+                <td>Virtualization (UICollectionView), custom drawing</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Flattening the Hierarchy</h3>
+
+    <pre><code><span class="comment">// Instead of deeply nested views for a complex cell:</span>
+<span class="comment">// BAD: 20+ views per cell × 50 visible cells = 1000+ views</span>
+
+<span class="comment">// GOOD: Use CALayer sublayers for non-interactive elements</span>
+<span class="keyword">class</span> <span class="type">OptimizedCell</span>: <span class="type">UICollectionViewCell</span> {
+    <span class="keyword">private let</span> titleLayer = <span class="type">CATextLayer</span>()
+    <span class="keyword">private let</span> avatarLayer = <span class="type">CALayer</span>()
+    <span class="keyword">private let</span> separatorLayer = <span class="type">CALayer</span>()
+
+    <span class="keyword">override init</span>(frame: <span class="type">CGRect</span>) {
+        <span class="keyword">super</span>.<span class="keyword">init</span>(frame: frame)
+        <span class="comment">// Layers are cheaper than views — no event handling overhead</span>
+        contentView.layer.<span class="func">addSublayer</span>(titleLayer)
+        contentView.layer.<span class="func">addSublayer</span>(avatarLayer)
+        contentView.layer.<span class="func">addSublayer</span>(separatorLayer)
+    }
+
+    <span class="keyword">override func</span> <span class="func">layoutSubviews</span>() {
+        <span class="keyword">super</span>.<span class="func">layoutSubviews</span>()
+        <span class="comment">// Manual frame calculation — faster than Auto Layout for cells</span>
+        <span class="type">CATransaction</span>.<span class="func">begin</span>()
+        <span class="type">CATransaction</span>.<span class="func">setDisableActions</span>(<span class="keyword">true</span>)
+        avatarLayer.frame = <span class="type">CGRect</span>(x: <span class="number">16</span>, y: <span class="number">12</span>, width: <span class="number">40</span>, height: <span class="number">40</span>)
+        titleLayer.frame = <span class="type">CGRect</span>(x: <span class="number">68</span>, y: <span class="number">16</span>,
+            width: bounds.width - <span class="number">84</span>, height: <span class="number">20</span>)
+        separatorLayer.frame = <span class="type">CGRect</span>(x: <span class="number">68</span>, y: bounds.height - <span class="number">0.5</span>,
+            width: bounds.width - <span class="number">68</span>, height: <span class="number">0.5</span>)
+        <span class="type">CATransaction</span>.<span class="func">commit</span>()
+    }
+
+    <span class="keyword">required init</span>?(coder: <span class="type">NSCoder</span>) { <span class="func">fatalError</span>() }
+}
+
+<span class="comment">// BEST: For truly performance-critical cells, draw everything in draw(_:)</span>
+<span class="comment">// Single bitmap, zero subviews/sublayers</span>
+<span class="keyword">class</span> <span class="type">DrawnCell</span>: <span class="type">UICollectionViewCell</span> {
+    <span class="keyword">override func</span> <span class="func">draw</span>(_ rect: <span class="type">CGRect</span>) {
+        <span class="comment">// Draw avatar, title, subtitle, separator all in one pass</span>
+        <span class="comment">// Most efficient but hardest to maintain</span>
+    }
+}</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p><strong>Understanding the UIView/CALayer split is the key to performance at scale.</strong> In a large app with complex UIs:</p>
+        <ul>
+            <li><strong>Use views</strong> for interactive elements that need touch handling or Auto Layout</li>
+            <li><strong>Use layers</strong> for decorative elements (separators, badges, shadows) that don't need events</li>
+            <li><strong>Use custom drawing</strong> (<code>draw(_:)</code>) for the most performance-critical cells where even layers are too many</li>
+            <li><strong>Profile with Instruments</strong> — the "View Debugging" tool shows the full view/layer hierarchy and highlights excessive nesting</li>
+        </ul>
+        <p>The trade-off is always: <strong>maintainability vs performance</strong>. Auto Layout with views is the most maintainable. Manual layer layout is faster. Custom drawing is fastest but hardest to maintain. Choose based on your actual performance requirements.</p>
+    </div>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice</div>
+        <p>Use Xcode's <strong>View Hierarchy Debugger</strong> (Debug → View Debugging → Capture View Hierarchy) regularly. It shows the 3D exploded view of your hierarchy, highlights clipped views, ambiguous layouts, and views that are off-screen but still in the hierarchy (wasting memory and layout time).</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="index.html">← Series Overview</a>
+        <a href="02-touch-event-flow.html">Touch &amp; Event Flow →</a>
+    </div>
+</div>
+</body>
+</html>

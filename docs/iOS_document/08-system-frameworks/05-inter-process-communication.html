@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inter-Process Communication — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">System Frameworks</a><span class="sep">›</span>
+        Inter-Process Communication
+    </nav>
+
+    <p style="margin-bottom: 12px;">
+        <span class="tag tag-l6">L6</span>
+        <span class="tag tag-architect">Architect</span>
+        <span class="tag tag-senior">Staff+</span>
+    </p>
+
+    <h1>Inter-Process Communication (IPC)</h1>
+    <p class="subtitle">XPC on Mach messages, port rights, CFMessagePort, app groups, keychain sharing, document handoff, share sheets, URL schemes, universal links, and Darwin notifications—at the depth Staff interviewers expect when probing boundaries, security, and failure modes.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#xpc">1. XPC Services &amp; NSXPCConnection</a></li>
+            <li><a href="#mach">2. Mach Ports for IPC</a></li>
+            <li><a href="#cfmessageport">3. CFMessagePort</a></li>
+            <li><a href="#app-groups">4. App Groups for Data Sharing</a></li>
+            <li><a href="#userdefaults-suite">5. UserDefaults(suiteName:)</a></li>
+            <li><a href="#keychain-sharing">6. Keychain Sharing</a></li>
+            <li><a href="#document-interaction">7. UIDocumentInteractionController</a></li>
+            <li><a href="#activity-view">8. UIActivityViewController</a></li>
+            <li><a href="#url-schemes">9. URL Schemes</a></li>
+            <li><a href="#universal-links">10. Universal Links</a></li>
+            <li><a href="#darwin-notify">11. Darwin Notifications</a></li>
+            <li><a href="#architect-matrix">12. Choosing the Right IPC Mechanism</a></li>
+        </ul>
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Why IPC Dominates Staff Conversations</div>
+        <p>On iOS, every meaningful interaction outside your process—Keychain, Photo Library, extensions, Siri intents, background downloads—crosses a trust boundary. Interviewers want you to name the mechanism, describe serialization and lifecycle, and reason about sandboxing, entitlements, and what happens when the remote side dies mid-flight.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="xpc">1. XPC Services &amp; NSXPCConnection</h2>
+
+    <p><strong>XPC</strong> (Cross-Process Communication) is Apple’s structured IPC layer. Conceptually it sits above raw Mach messaging: connections are authenticated, messages are typed, and the runtime can enforce interface contracts. <code>NSXPCConnection</code> exposes this to Cocoa as an object-oriented API built on Objective-C protocols and proxies.</p>
+
+    <div class="diagram">
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         NSXPCConnection lifecycle                       │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   Client (e.g. app)                    Service (XPC service / helper)    │
+│        │                                        │                        │
+│        │  1. Create connection                  │                        │
+│        │     (named Mach service or             │                        │
+│        │      anonymous listener)               │                        │
+│        ├──────────────────────────────────────►│                        │
+│        │  2. Mach-level handshake +             │                        │
+│        │     audit token / code signature      │                        │
+│        │◄──────────────────────────────────────┤                        │
+│        │  3. Export remoteObjectInterface      │                        │
+│        │     (client → server protocol)        │                        │
+│        │     remoteObjectProxy                 │                        │
+│        ├ ─ ─ ─ async messages ─ ─ ─ ─ ─ ─ ─ ─►│                        │
+│        │◄─ ─ ─ replies / errors ─ ─ ─ ─ ─ ─ ─ ─┤                        │
+│        │  4. interruptionHandler /             │                        │
+│        │     invalidationHandler               │                        │
+│        ▼                                        ▼                        │
+│   Connection invalidated on crash,             Service may be            │
+│   jetsam, or explicit invalidate()             relaunched by launchd     │
+└──────────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>Exported interface (protocol)</h3>
+    <p>The <em>server</em> advertises an object that conforms to a protocol marked for XPC. The <em>client</em> receives a <strong>proxy</strong> that implements the same protocol; method calls are asynchronous unless you wrap them explicitly. Only types that XPC can serialize cross the boundary: primitives, collections, <code>NSData</code>, <code>NSURL</code>, <code>NSUUID</code>, <code>NSDate</code>, and a small set of toll-free bridged / security types, plus object graphs that satisfy NSSecureCoding when configured.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — NSSecureCoding &amp; Secure Coding Classes</div>
+        <p>Staff-level answers should mention <strong>class allowlists</strong>: without secure coding, a compromised or buggy peer could deserialize attacker-controlled class names. Modern XPC interfaces prefer explicit secure coding on both sides and minimal surface area on the protocol.</p>
+    </div>
+
+    <pre><code><span class="keyword">import</span> Foundation
+
+<span class="comment">// Server-side object must inherit NSObject and use @objc protocol.</span>
+<span class="keyword">@objc</span> <span class="keyword">protocol</span> <span class="type">ImageProcessorXPC</span> {
+    <span class="func">process</span>(data: <span class="type">Data</span>, reply: <span class="keyword">@escaping</span> (<span class="type">Data</span>?, <span class="type">Error</span>?) -&gt; <span class="type">Void</span>)
+}
+
+<span class="keyword">final</span> <span class="keyword">class</span> <span class="type">ImageProcessorService</span>: <span class="type">NSObject</span>, <span class="type">ImageProcessorXPC</span> {
+    <span class="func">func</span> <span class="func">process</span>(data: <span class="type">Data</span>, reply: <span class="keyword">@escaping</span> (<span class="type">Data</span>?, <span class="type">Error</span>?) -&gt; <span class="type">Void</span>) {
+        <span class="comment">// Heavy work on service queue — never block the main thread.</span>
+        <span class="type">DispatchQueue</span>.global(qos: .userInitiated).async {
+            <span class="keyword">let</span> out = data <span class="comment">/* transform */</span>
+            reply(out, <span class="keyword">nil</span>)
+        }
+    }
+}
+
+<span class="comment">// Client: NSXPCConnection(serviceName:) for embedded XPC services.</span>
+<span class="keyword">func</span> <span class="func">makeClientConnection</span>() -&gt; <span class="type">NSXPCConnection</span> {
+    <span class="keyword">let</span> conn = <span class="type">NSXPCConnection</span>(serviceName: <span class="string">"com.example.app.ImageProcessor"</span>)
+    conn.remoteObjectInterface = <span class="type">NSXPCInterface</span>(with: <span class="type">ImageProcessorXPC</span>.<span class="keyword">self</span>)
+    conn.invalidationHandler = {
+        <span class="comment">// Permanent: service gone, connection unusable.</span>
+    }
+    conn.interruptionHandler = {
+        <span class="comment">// Transient: may reconnect (e.g. service restarted).</span>
+    }
+    conn.resume()
+    <span class="keyword">return</span> conn
+}
+
+<span class="keyword">func</span> <span class="func">invokeRemote</span>(connection: <span class="type">NSXPCConnection</span>, payload: <span class="type">Data</span>) {
+    <span class="keyword">let</span> proxy = connection.remoteObjectProxyWithErrorHandler { err <span class="keyword">in</span>
+        <span class="comment">// Delivery or execution failed on remote side.</span>
+    } <span class="keyword">as</span>? <span class="type">ImageProcessorXPC</span>
+    proxy?.process(data: payload) { result, err <span class="keyword">in</span>
+        <span class="comment">// Handle on calling queue unless you hop explicitly.</span>
+    }
+}</code></pre>
+
+    <h3>Connection lifecycle</h3>
+    <ul>
+        <li><strong>Creation</strong> — Named service (<code>init(serviceName:)</code>), Mach service name, or listener for anonymous endpoints.</li>
+        <li><strong>resume()</strong> — Starts the connection; until resumed, no messages flow.</li>
+        <li><strong>invalidate()</strong> — Tears down the connection; proxies become invalid.</li>
+    </ul>
+
+    <h3>Invalidation vs interruption</h3>
+    <p>The <strong>interruption handler</strong> runs when the remote side disappears in a way that <em>might</em> be recoverable—think transient crashes or service recycling. The <strong>invalidation handler</strong> runs when the connection is definitively dead from the client’s perspective. In practice you implement both: interruption for “maybe recreate connection,” invalidation for “drop state and surface error.”</p>
+
+    <h3>Security: entitlements &amp; audit token</h3>
+    <p>XPC peers are not arbitrary processes: the kernel and launchd participate in matching service names to signed bundles and entitlements. The server can inspect the client’s <strong>audit token</strong> (and code signing identity) to authorize operations—this is how system daemons reject unprivileged callers. Your own helper should validate expected bundle IDs and team IDs when exposing sensitive work.</p>
+
+    <h3>XPC in app extensions</h3>
+    <p>Extensions often host or consume XPC to talk to their containing app’s helper services. The same rules apply: minimal protocols, explicit error handling, and awareness that extensions have tighter memory and CPU budgets—large payloads should be file-backed in a shared container rather than inline <code>Data</code>.</p>
+
+    <h3>Anonymous vs named connections</h3>
+    <p><strong>Named</strong> connections resolve through a well-known Mach service name registered with the system (your XPC service bundle). <strong>Anonymous</strong> connections use listener endpoints created at runtime; the server passes a capability to the client through a side channel (often a file descriptor or inherited XPC endpoint). Named is simpler for app-embedded services; anonymous supports tighter coupling when both ends are under your control.</p>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Protocol Shape</div>
+        <p>Keep XPC protocols <em>small</em>, prefer <em>async reply blocks</em> over synchronous RPC, and use <em>file URLs in a shared group</em> for bulk data. Staff interviewers reward this as “understands Jetsam and message size limits.”</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="mach">2. Mach Ports for IPC</h2>
+
+    <p>At the Darwin layer, a <strong>Mach port</strong> is a kernel-managed right to send or receive messages. Everything from XPC to parts of IOKit ultimately reduces to <code>mach_msg()</code> and port rights. Understanding ports explains why “IPC” on Apple platforms is not sockets-first.</p>
+
+    <h3>Port rights</h3>
+    <ul>
+        <li><strong>Receive right</strong> — Owns a queue; only one holder per port.</li>
+        <li><strong>Send right</strong> — Can enqueue messages to that port.</li>
+        <li><strong>Send-once right</strong> — A single-use send right, consumed on first successful send—used for replies.</li>
+    </ul>
+
+    <h3>Port sets</h3>
+    <p>A <strong>port set</strong> multiplexes multiple receive rights: <code>mach_msg</code> can block on the set, which is how run loops and dispatch sources wait on many channels. Higher frameworks hide this, but the model is “wait on many receive queues.”</p>
+
+    <h3>Mach message layout</h3>
+    <p>A Mach message has a fixed <strong>header</strong> (ports, size, id, complexity), a <strong>descriptor section</strong> for out-of-line memory and port attachments, and an inline <strong>body</strong>. Port descriptors transfer send rights to another task atomically—this is how capabilities move between processes.</p>
+
+    <h3>Out-of-line (OOL) data</h3>
+    <p>Large buffers can be sent as OOL memory regions referenced by descriptors rather than copied inline, reducing copies for bulk transfers—subject to policy and sandbox checks. XPC builds structured, typed messages on top of this substrate.</p>
+
+    <h3>Port lifecycle</h3>
+    <p>Ports are reference-counted kernel objects. Dropping the last send right while no messages are queued can destroy the port; receive rights must be deallocated explicitly or leak kernel resources. Bugs here manifest as <em>port leaks</em> in long-running daemons.</p>
+
+    <h3>How CFMessagePort and XPC relate</h3>
+    <p><code>CFMessagePort</code> wraps Mach ports with a run-loop source. XPC uses Mach messaging internally but adds authentication, type information, object serialization, and service management via launchd.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — Raw mach_* in App Store Apps</div>
+        <p>Direct use of <code>mach_port_allocate</code> / <code>mach_msg</code> in third-party iOS apps is rare, tightly sandboxed, and easy to get wrong. Staff answers should emphasize: <strong>prefer NSXPC / higher APIs</strong>; cite Mach when explaining <em>why</em> XPC is fast and kernel-mediated.</p>
+    </div>
+
+    <pre><code><span class="comment">// Illustrative C — not a template for production iOS app code.</span>
+<span class="comment">// Shows the mental model Staff interviewers expect.</span>
+
+<span class="keyword">#include</span> &lt;mach/mach.h&gt;
+<span class="keyword">#include</span> &lt;mach/message.h&gt;
+
+kern_return_t <span class="func">allocate_receive_port</span>(mach_port_t *receive) {
+    <span class="keyword">return</span> mach_port_allocate(mach_task_self(),
+                              MACH_PORT_RIGHT_RECEIVE,
+                              receive);
+}
+
+<span class="comment">// mach_msg: send / receive with complex messages, port descriptors, OOL.</span>
+kern_return_t <span class="func">send_inline</span>(mach_port_t remote,
+                          mach_msg_id_t msg_id,
+                          <span class="keyword">const</span> <span class="keyword">void</span> *payload,
+                          mach_msg_size_t size) {
+    <span class="comment">/* Build mach_msg_header_t + body; call mach_msg(...). */</span>
+    <span class="keyword">return</span> KERN_SUCCESS; <span class="comment">// simplified</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="cfmessageport">3. CFMessagePort</h2>
+
+    <p><code>CFMessagePort</code> is Core Foundation IPC over Mach ports, usually paired with a <strong>local</strong> name (string registered in the bootstrap namespace) or a remote port discovered by name. Callbacks integrate with CFRunLoop.</p>
+
+    <h3>Local vs remote</h3>
+    <ul>
+        <li><strong>Local</strong> — Creates a receive port and registers a name; others create a <strong>remote</strong> port referencing that name.</li>
+        <li><strong>Remote</strong> — Sends <code>CFMessagePortSendRequest</code> to deliver a buffer synchronously (with timeout).</li>
+    </ul>
+
+    <h3>Synchronous messaging &amp; callbacks</h3>
+    <p><code>CFMessagePortSendRequest</code> blocks until a reply or timeout. Alternatively, install a callback on the local port for asynchronous handling. This is simpler than XPC but lacks rich object graphs and secure typing.</p>
+
+    <h3>Limitations on iOS</h3>
+    <p>Sandboxed App Store applications <strong>cannot</strong> use CFMessagePort for arbitrary peer-to-peer IPC the way macOS daemons might. Practical iOS use is narrow—often legacy, internal, or unavailable between unrelated apps. Interviewers want you to state plainly: <strong>prefer App Groups + XPC / file coordination / NSFileCoordinator</strong> for sanctioned cross-target communication.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Same User, Bootstrap Namespace</div>
+        <p>Historically, CFMessagePort names were resolved through bootstrap (launchd). On iOS, the sandbox prevents most interesting registrations between unrelated vendors. When CFMessagePort is “still useful,” it is typically within tightly controlled environments (simulators, tests, or specific internal tools)—not as a general inter-app bus.</p>
+    </div>
+
+    <pre><code><span class="keyword">import</span> CoreFoundation
+
+<span class="keyword">let</span> portName = <span class="string">"com.example.internal.port"</span> <span class="keyword">as</span> <span class="type">CFString</span>
+
+<span class="comment">// Local listener (conceptual — often not viable sandbox-to-sandbox).</span>
+<span class="keyword">var</span> context = <span class="type">CFMessagePortContext</span>(version: <span class="number">0</span>, info: <span class="keyword">nil</span>, retain: <span class="keyword">nil</span>, release: <span class="keyword">nil</span>, copyDescription: <span class="keyword">nil</span>)
+
+<span class="keyword">let</span> callback: <span class="type">CFMessagePortCallBack</span> = { _, msgid, data, info <span class="keyword">in</span>
+    <span class="comment">// Handle message id + CFDataRef payload</span>
+    <span class="keyword">return</span> <span class="keyword">nil</span> <span class="comment">// reply data as Unmanaged&lt;CFData&gt;?</span>
+}
+
+<span class="keyword">if</span> <span class="keyword">let</span> local = <span class="type">CFMessagePortCreateLocal</span>(<span class="keyword">nil</span>, portName, callback, &amp;context, <span class="keyword">nil</span>) {
+    <span class="keyword">let</span> source = <span class="type">CFMessagePortCreateRunLoopSource</span>(<span class="keyword">nil</span>, local, <span class="number">0</span>)
+    <span class="type">CFRunLoopAddSource</span>(<span class="type">CFRunLoopGetMain</span>(), source, <span class="type">CFRunLoopMode</span>.defaultMode)
+}
+
+<span class="comment">// Remote synchronous send (returns Data?)</span>
+<span class="keyword">if</span> <span class="keyword">let</span> remote = <span class="type">CFMessagePortCreateRemote</span>(<span class="keyword">nil</span>, portName) {
+    <span class="keyword">var</span> returnData: <span class="type">Unmanaged</span>&lt;<span class="type">CFData</span>&gt;?
+    <span class="keyword">let</span> status = <span class="type">CFMessagePortSendRequest</span>(
+        remote,
+        <span class="number">1001</span>,
+        <span class="string">"ping"</span>.data(using: .utf8)! <span class="keyword">as</span> <span class="type">CFData</span>,
+        <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">0</span>,
+        &amp;returnData
+    )
+    _ = status
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="app-groups">4. App Groups for Data Sharing</h2>
+
+    <p><strong>App Groups</strong> carve out a shared filesystem container for executables that declare the same group identifier and are signed with the same team. This is the sanctioned way to share files and preferences between an app and its extensions.</p>
+
+    <h3>Entitlement &amp; provisioning</h3>
+    <p>Add the App Groups capability in Xcode for each target; the identifier looks like <code>group.com.company.product</code>. Profiles must include the group or installation fails.</p>
+
+    <h3>Container URL</h3>
+    <pre><code><span class="keyword">import</span> Foundation
+
+<span class="keyword">let</span> groupId = <span class="string">"group.com.example.shared"</span>
+<span class="keyword">let</span> folder = <span class="type">FileManager</span>.default.containerURL(
+    forSecurityApplicationGroupIdentifier: groupId
+)
+<span class="keyword">let</span> sharedDB = folder?.appendingPathComponent(<span class="string">"Library/Application Support/Model.sqlite"</span>)</code></pre>
+
+    <h3>Sharing with extensions</h3>
+    <p>Widgets, share extensions, and notification service extensions read the same SQLite store or exported files. Use atomic writes (write to temp, <code>replaceItemAt</code>) to avoid torn reads.</p>
+
+    <h3>Shared Core Data / SQLite</h3>
+    <p>Point persistent store URLs at the group container. Use a single writer model or SQLite WAL with careful coordination; Core Data can use <code>NSPersistentContainer</code> with a custom store URL.</p>
+
+    <h3>NSFileCoordinator</h3>
+    <p>When multiple processes may touch the same file, <code>NSFileCoordinator</code> and <code>NSFilePresenter</code> coordinate reads/writes and broadcast changes—critical for avoiding corruption when the app and extension are both alive.</p>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Single Source of Truth</div>
+        <p>Treat the group container as a <strong>contract</strong>: version your schema, document file layout, and handle “extension runs while app suspended” as the normal case—not an edge case.</p>
+    </div>
+
+    <pre><code><span class="keyword">import</span> Foundation
+
+<span class="keyword">func</span> <span class="func">coordinateRead</span>(url: <span class="type">URL</span>, completion: <span class="keyword">@escaping</span> (<span class="type">Data</span>?) -&gt; <span class="type">Void</span>) {
+    <span class="keyword">let</span> coordinator = <span class="type">NSFileCoordinator</span>()
+    <span class="keyword">var</span> error: <span class="type">NSError</span>?
+    coordinator.coordinate(readingItemAt: url, options: [], error: &amp;error) { readURL <span class="keyword">in</span>
+        completion(<span class="keyword">try</span>? <span class="type">Data</span>(contentsOf: readURL))
+    }
+    <span class="keyword">if</span> <span class="keyword">let</span> error = error {
+        completion(<span class="keyword">nil</span>)
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="userdefaults-suite">5. UserDefaults(suiteName:)</h2>
+
+    <p>Standard <code>UserDefaults.standard</code> is per-process (per-target). <code>UserDefaults(suiteName:)</code> backed by an App Group plist lives in the shared container, so the app and extensions see the same keys.</p>
+
+    <pre><code><span class="keyword">import</span> Foundation
+
+<span class="keyword">let</span> shared = <span class="type">UserDefaults</span>(suiteName: <span class="string">"group.com.example.shared"</span>)!
+shared.set(<span class="string">"dark"</span>, forKey: <span class="string">"theme"</span>)
+shared.synchronize() <span class="comment">// Usually unnecessary; flush is asynchronous by design.</span>
+
+<span class="keyword">let</span> theme = shared.string(forKey: <span class="string">"theme"</span>)</code></pre>
+
+    <h3>Synchronization considerations</h3>
+    <p>There is <strong>no cross-process KVO</strong> on <code>UserDefaults</code>. Another process may change plist-backed keys while you hold a cached instance; rely on Darwin notifications, polling on <code>UIApplication</code> foreground, or explicit handshake files.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — Assuming Instant Consistency</div>
+        <p>Heavy write churn to shared defaults can be slower than you expect and is a poor substitute for a real datastore. Large blobs belong in files or SQLite, not defaults.</p>
+    </div>
+
+    <h3>Darwin notifications for change signals</h3>
+    <p>Post a Darwin notification (signal-only) after committing important defaults so extensions wake to refresh UI. See <a href="#darwin-notify">§11 Darwin Notifications</a>.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="keychain-sharing">6. Keychain Sharing</h2>
+
+    <p>Keychain items are isolated by default. <strong>Keychain access groups</strong> let multiple executables from the same developer team share credentials when entitlements and provisioning align.</p>
+
+    <h3>kSecAttrAccessGroup</h3>
+    <pre><code><span class="keyword">import</span> Security
+
+<span class="keyword">let</span> group = <span class="string">"TEAMID.com.example.sharedkeychain"</span>
+<span class="keyword">let</span> tokenData = <span class="string">"opaque-token"</span>.data(using: .utf8)!
+<span class="keyword">let</span> query: [<span class="type">String</span>: <span class="type">Any</span>] = [
+    kSecClass <span class="keyword">as</span> <span class="type">String</span>: kSecClassGenericPassword,
+    kSecAttrAccount <span class="keyword">as</span> <span class="type">String</span>: <span class="string">"session"</span>,
+    kSecAttrAccessGroup <span class="keyword">as</span> <span class="type">String</span>: group,
+    kSecValueData <span class="keyword">as</span> <span class="type">String</span>: tokenData,
+    kSecAttrAccessible <span class="keyword">as</span> <span class="type">String</span>: kSecAttrAccessibleAfterFirstUnlock
+]
+
+SecItemAdd(query <span class="keyword">as</span> <span class="type">CFDictionary</span>, <span class="keyword">nil</span>)</code></pre>
+
+    <h3>Keychain sharing vs App Groups</h3>
+    <p>They solve different problems: <strong>App Groups</strong> share files and defaults; <strong>keychain groups</strong> share small secrets with hardware-backed protection. You often use both: tokens in Keychain, bulk state in the group container.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive — Access Group Prefix</div>
+        <p>Xcode may prepend the team ID automatically in entitlements. Mismatched strings between targets are a top cause of “works in app, fails in extension” bugs.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="document-interaction">7. UIDocumentInteractionController</h2>
+
+    <p><code>UIDocumentInteractionController</code> previews documents and offers “Open in …” style actions to other apps that declare compatible UTIs. It is part of the <strong>document interaction</strong> family that predates some modern sharing APIs but remains relevant for file-centric workflows.</p>
+
+    <h3>UTI system</h3>
+    <p><strong>Uniform Type Identifiers</strong> describe file semantics (<code>public.png</code>, <code>com.adobe.pdf</code>). Declare imported/exported types in Info.plist so the system can route documents to your app.</p>
+
+    <h3>Preview &amp; options</h3>
+    <pre><code><span class="keyword">import</span> UIKit
+
+<span class="keyword">final</span> <span class="keyword">class</span> <span class="type">PreviewHost</span>: <span class="type">UIViewController</span>, <span class="type">UIDocumentInteractionControllerDelegate</span> {
+    <span class="keyword">var</span> docController: <span class="type">UIDocumentInteractionController</span>?
+
+    <span class="func">func</span> <span class="func">presentPreview</span>(fileURL: <span class="type">URL</span>) {
+        docController = <span class="type">UIDocumentInteractionController</span>(url: fileURL)
+        docController?.delegate = <span class="keyword">self</span>
+        docController?.presentPreview(animated: <span class="keyword">true</span>)
+    }
+}</code></pre>
+
+    <h3>Modern alternatives</h3>
+    <p>For many flows, <code>UIActivityViewController</code> or drag-and-drop are more appropriate. For in-place editing, <code>UIDocumentPickerViewController</code> / security-scoped bookmarks matter more than document interaction.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — Security-Scoped URLs</div>
+        <p>Files outside your sandbox need appropriate access: open via picker, use security-scoped bookmarks, and stop access when finished.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="activity-view">8. UIActivityViewController</h2>
+
+    <p>The <strong>share sheet</strong> presents activities (AirDrop, Mail, custom share extensions) for arbitrary items described by <code>UIActivityItemSource</code> or plain objects.</p>
+
+    <pre><code><span class="keyword">import</span> UIKit
+<span class="keyword">import</span> UniformTypeIdentifiers
+
+<span class="keyword">func</span> <span class="func">presentShareSheet</span>(from vc: <span class="type">UIViewController</span>, text: <span class="type">String</span>, image: <span class="type">UIImage</span>) {
+    <span class="keyword">let</span> items: [<span class="type">Any</span>] = [text, image]
+    <span class="keyword">let</span> avc = <span class="type">UIActivityViewController</span>(activityItems: items, applicationActivities: <span class="keyword">nil</span>)
+    avc.excludedActivityTypes = [.assignToContact]
+    vc.present(avc, animated: <span class="keyword">true</span>)
+}</code></pre>
+
+    <h3>NSItemProvider &amp; rich data</h3>
+    <pre><code><span class="keyword">import</span> UniformTypeIdentifiers
+
+<span class="keyword">let</span> provider = <span class="type">NSItemProvider</span>(item: image, typeIdentifier: <span class="type">UTType</span>.image.identifier)
+provider.registerDataRepresentation(for: .png, visibility: .all) { completion <span class="keyword">in</span>
+    completion(image.pngData(), <span class="keyword">nil</span>)
+    <span class="keyword">return</span> <span class="keyword">nil</span>
+}</code></pre>
+
+    <h3>Custom UIActivity</h3>
+    <p>Subclass <code>UIActivity</code> for in-app actions that should appear beside system activities—useful for branded workflows that are not full share extensions.</p>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Lazy Providers</div>
+        <p>Large exports should load on demand via <code>NSItemProvider</code> registration blocks so the share sheet opens instantly.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="url-schemes">9. URL Schemes</h2>
+
+    <p>Custom URL schemes (<code>myapp://</code>) register your app as a handler for links. They are simple but coarse: any app can attempt to open them, and users cannot see hostname-level trust like HTTPS.</p>
+
+    <h3>Info.plist registration</h3>
+    <pre><code><span class="comment">&lt;!-- CFBundleURLTypes --&gt;</span>
+<span class="comment">&lt;key&gt;CFBundleURLTypes&lt;/key&gt;</span>
+<span class="comment">&lt;array&gt;</span>
+  <span class="comment">&lt;dict&gt;</span>
+    <span class="comment">&lt;key&gt;CFBundleURLSchemes&lt;/key&gt;</span>
+    <span class="comment">&lt;array&gt;&lt;string&gt;myapp&lt;/string&gt;&lt;/array&gt;</span>
+  <span class="comment">&lt;/dict&gt;</span>
+<span class="comment">&lt;/array&gt;</span></code></pre>
+
+    <h3>canOpenURL &amp; LSApplicationQueriesSchemes</h3>
+    <p>iOS restricts probing for other apps’ schemes. Declare allowed schemes under <code>LSApplicationQueriesSchemes</code> or <code>canOpenURL</code> returns false—even if the app is installed.</p>
+
+    <pre><code><span class="keyword">import</span> UIKit
+
+<span class="keyword">let</span> url = <span class="type">URL</span>(string: <span class="string">"myapp://open/profile?id=42"</span>)!
+<span class="keyword">if</span> <span class="type">UIApplication</span>.shared.canOpenURL(url) {
+    <span class="type">UIApplication</span>.shared.open(url)
+}</code></pre>
+
+    <h3>Security: scheme hijacking</h3>
+    <p>Malicious apps could register the same scheme on jailbroken or misconfigured devices; on stock iOS, collisions are rarer but <strong>universal links are preferred</strong> for domain-bound deep links.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="universal-links">10. Universal Links</h2>
+
+    <p><strong>Universal Links</strong> associate HTTPS URLs with your app via the <strong>Associated Domains</strong> entitlement and an <code>apple-app-site-association</code> (AASA) JSON file served by your domain.</p>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Universal Link resolution (simplified)                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  User taps https://app.example.com/item/7                               │
+│           │                                                              │
+│           ▼                                                              │
+│  iOS fetches AASA from https://app.example.com/.well-known/             │
+│       apple-app-site-association   (or root path; CDN caching applies)   │
+│           │                                                              │
+│           ▼                                                              │
+│  Validate JSON: appIDs, paths, components                               │
+│           │                                                              │
+│      ┌────┴────┐                                                         │
+│      │         │                                                         │
+│   Match     No match                                                     │
+│      │         │                                                         │
+│      ▼         ▼                                                         │
+│  Open app   Fall through to Safari (or continue user activity)           │
+│  (handoff to scene / app delegate)                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>AASA essentials</h3>
+    <ul>
+        <li>Served over HTTPS with a valid certificate.</li>
+        <li><code>application/json</code> or <code>application/pkcs7-mime</code> (signed) formats per Apple docs.</li>
+        <li>Contains <code>applinks</code> details including <code>appID</code> (<code>TEAMID.bundleid</code>) and path rules.</li>
+    </ul>
+
+    <h3>Entitlement</h3>
+    <pre><code><span class="comment">// Associated Domains capability</span>
+<span class="comment">applinks:app.example.com</span></code></pre>
+
+    <h3>CDN &amp; caching</h3>
+    <p>Apple caches AASA aggressively. Use correct <code>Content-Type</code>, avoid redirects when possible, and plan for propagation delay after changes—this is a common production footgun.</p>
+
+    <h3>Debugging</h3>
+    <p>Use the <em>Associated Domains Development</em> workflow, <code>swcd</code> logs, and verify the AASA with <code>curl -v</code>. Mismatched team ID or bundle ID in <code>appID</code> is the #1 misconfiguration.</p>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must Know — Universal Links vs URL Schemes</div>
+        <p>Universal links require domain control, survive app uninstall fallbacks to web, and avoid naked scheme conflicts. They integrate with <strong>NSUserActivity</strong> and scene continuation. Schemes remain useful for narrow in-app triggers but are weak for identity-bound navigation.</p>
+    </div>
+
+    <pre><code><span class="keyword">import</span> UIKit
+
+<span class="keyword">func</span> <span class="func">application</span>(_: <span class="type">UIApplication</span>,
+                   continue userActivity: <span class="type">NSUserActivity</span>,
+                   restorationHandler: <span class="keyword">@escaping</span> ([<span class="type">UIUserActivityRestoring</span>]?) -&gt; <span class="type">Void</span>) -&gt; <span class="type">Bool</span> {
+    <span class="keyword">if</span> userActivity.activityType == <span class="type">NSUserActivityTypeBrowsingWeb</span>,
+       <span class="keyword">let</span> url = userActivity.webpageURL {
+        <span class="comment">// Route url.pathComponents, restore state</span>
+        <span class="keyword">return</span> <span class="keyword">true</span>
+    }
+    <span class="keyword">return</span> <span class="keyword">false</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="darwin-notify">11. Darwin Notifications</h2>
+
+    <p><code>CFNotificationCenterGetDarwinNotifyCenter</code> broadcasts <strong>signal-only</strong> events system-wide to interested observers. There is <strong>no payload</strong>—only the notification name. Pair it with shared files, defaults, or Keychain updates.</p>
+
+    <pre><code><span class="keyword">import</span> Foundation
+
+<span class="keyword">let</span> name = <span class="string">"com.example.shared.refresh"</span> <span class="keyword">as</span> <span class="type">CFString</span>
+
+<span class="comment">// Post (from app or extension)</span>
+<span class="type">CFNotificationCenterPostNotification</span>(
+    <span class="type">CFNotificationCenterGetDarwinNotifyCenter</span>(),
+    <span class="type">CFNotificationName</span>(name),
+    <span class="keyword">nil</span>,
+    <span class="keyword">nil</span>,
+    <span class="keyword">true</span>
+)
+
+<span class="comment">// Observe</span>
+<span class="keyword">let</span> observer = <span class="type">UnsafeMutableRawPointer</span>(Unmanaged.passUnretained(<span class="keyword">self</span>).toOpaque())
+
+<span class="type">CFNotificationCenterAddObserver</span>(
+    <span class="type">CFNotificationCenterGetDarwinNotifyCenter</span>(),
+    observer,
+    { _, _, _, _, _ <span class="keyword">in</span>
+        <span class="comment">// Read updated state from App Group container</span>
+    },
+    name,
+    <span class="keyword">nil</span>,
+    .deliverImmediately
+)</code></pre>
+
+    <h3>notify_post / notify_register_dispatch</h3>
+    <p>The lower-level <code>notify(3)</code> API registers string tokens and can deliver to dispatch queues—useful in daemons and some system-adjacent code. Same constraint: notifications are tiny signals, not data buses.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall — Thundering Herd &amp; Privacy</div>
+        <p>Every observer wakes and must re-read shared state. Names are global strings—choose unique reverse-DNS tokens to avoid accidental collisions with other processes.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architect-matrix">12. Choosing the Right IPC Mechanism</h2>
+
+    <div class="diagram">
+┌──────────────────────────────────────────────────────────────────────────┐
+│            IPC comparison (conceptual — not performance benchmarks)      │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   Need typed RPC inside your bundle?                                     │
+│        └─► NSXPCConnection (+ embedded XPC service)                     │
+│                                                                          │
+│   Need large shared state + extensions?                                  │
+│        └─► App Group container + SQLite/files + NSFileCoordinator         │
+│                                                                          │
+│   Need tiny secret shared across targets?                                │
+│        └─► Keychain access group                                        │
+│                                                                          │
+│   Need “something changed” signal across processes?                      │
+│        └─► Darwin notification + read shared store                      │
+│                                                                          │
+│   Need hand document to arbitrary app?                                   │
+│        └─► UIActivityViewController / document picker / previews          │
+│                                                                          │
+│   Need HTTPS-verified deep link into app?                                │
+│        └─► Universal Links                                              │
+│                                                                          │
+│   Need quick internal callback hook (historical / narrow)?               │
+│        └─► CFMessagePort (often impractical sandbox-to-sandbox)         │
+└──────────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Mechanism</th>
+                <th>Typical data size</th>
+                <th>Security / trust</th>
+                <th>Latency</th>
+                <th>Bidirectional</th>
+                <th>Sandbox-safe pattern</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>NSXPC / XPC</td>
+                <td>Small messages; large via file URLs</td>
+                <td>Strong (signing, entitlements, audit token)</td>
+                <td>Low–medium (kernel + serialization)</td>
+                <td>Yes (with reply blocks / reverse interfaces)</td>
+                <td>Preferred for helper services</td>
+            </tr>
+            <tr>
+                <td>Mach ports (raw)</td>
+                <td>Inline + OOL buffers</td>
+                <td>Kernel-mediated; easy to misuse</td>
+                <td>Very low</td>
+                <td>With reply ports</td>
+                <td>Rare in third-party iOS</td>
+            </tr>
+            <tr>
+                <td>CFMessagePort</td>
+                <td>Small CFData payloads</td>
+                <td>Bootstrap name visibility; sandbox limits</td>
+                <td>Low (sync can block)</td>
+                <td>Request/reply</td>
+                <td>Limited / internal</td>
+            </tr>
+            <tr>
+                <td>App Group files / DB</td>
+                <td>Large (disk-bound)</td>
+                <td>Same team + entitlements</td>
+                <td>IO-bound</td>
+                <td>Implicit (shared store)</td>
+                <td>Canonical for app + extensions</td>
+            </tr>
+            <tr>
+                <td>UserDefaults(suiteName:)</td>
+                <td>Small preferences</td>
+                <td>Group container ACL</td>
+                <td>Very low read</td>
+                <td>N/A (shared read/write)</td>
+                <td>Yes, with sync caveats</td>
+            </tr>
+            <tr>
+                <td>Keychain sharing</td>
+                <td>Small secrets</td>
+                <td>Hardware-backed; access groups</td>
+                <td>Medium (securityd XPC)</td>
+                <td>Read/write shared item</td>
+                <td>Yes</td>
+            </tr>
+            <tr>
+                <td>UIDocumentInteractionController</td>
+                <td>File-backed</td>
+                <td>User-driven; UTIs</td>
+                <td>User-paced</td>
+                <td>No (outbound handoff)</td>
+                <td>Yes (with scoped URLs)</td>
+            </tr>
+            <tr>
+                <td>UIActivityViewController</td>
+                <td>Arbitrary via providers</td>
+                <td>User consent; target app policies</td>
+                <td>User-paced</td>
+                <td>No</td>
+                <td>Yes</td>
+            </tr>
+            <tr>
+                <td>URL schemes</td>
+                <td>URL length (~KB)</td>
+                <td>Weak binding; hijack concerns</td>
+                <td>Low</td>
+                <td>Indirect (return URLs)</td>
+                <td>Yes, with query restrictions</td>
+            </tr>
+            <tr>
+                <td>Universal Links</td>
+                <td>URL + web fallback</td>
+                <td>Domain + AASA + team ID</td>
+                <td>First open may fetch AASA</td>
+                <td>Web ↔ app handoff</td>
+                <td>Yes</td>
+            </tr>
+            <tr>
+                <td>Darwin notifications</td>
+                <td>No payload (signal only)</td>
+                <td>Global name discipline</td>
+                <td>Low</td>
+                <td>One-way signal</td>
+                <td>Yes (pair with shared data)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must Know — Decision Checklist</div>
+        <ol>
+            <li><strong>Data size</strong> — Inline RPC vs file handoff vs database in group container.</li>
+            <li><strong>Security</strong> — Secrets in Keychain; never in URL schemes; universal links for verified navigation.</li>
+            <li><strong>Latency</strong> — XPC for interactive helpers; Darwin notify for wake signals; avoid synchronous CFMessagePort on UI.</li>
+            <li><strong>Directionality</strong> — One-way signals (Darwin), request/reply (XPC), shared mutable state (files + coordination).</li>
+            <li><strong>Process relationship</strong> — Same team App Group + Keychain vs arbitrary apps (share sheet / open URL only).</li>
+        </ol>
+    </div>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice — Defense in Depth</div>
+        <p>Combine mechanisms: store authoritative state in SQLite under App Group, notify via Darwin, expose privileged operations only through an XPC service that checks caller identity, and deep-link users with universal links—not opaque custom schemes—for anything security-sensitive.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="04-notification-push.html">← Notifications &amp; Push</a>
+        <a href="06-accessibility.html">Accessibility →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Core Animation Pipeline — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Rendering &amp; Graphics</a><span class="sep">›</span>
+        Core Animation Pipeline
+    </nav>
+
+    <h1>Core Animation Pipeline</h1>
+    <p class="subtitle">From CATransaction commit to GPU compositing — the complete iOS render pipeline across the process boundary, with ProMotion adaptive frame rates and CADisplayLink internals.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#big-picture">1. The Big Picture: Two-Process Rendering</a></li>
+            <li><a href="#layer-trees">2. The Three Layer Trees</a></li>
+            <li><a href="#render-loop">3. Render Loop Phases</a></li>
+            <li><a href="#catransaction">4. CATransaction: Implicit vs Explicit</a></li>
+            <li><a href="#render-server">5. The Render Server (backboardd)</a></li>
+            <li><a href="#gpu-compositing">6. GPU Compositing</a></li>
+            <li><a href="#promotion">7. ProMotion &amp; Adaptive Frame Rates</a></li>
+            <li><a href="#cadisplaylink">8. CADisplayLink Deep Dive</a></li>
+            <li><a href="#frame-pacing">9. Frame Pacing &amp; Dropped Frames</a></li>
+            <li><a href="#profiling">10. Profiling the Pipeline</a></li>
+            <li><a href="#architect-patterns">11. Architect-Level Patterns</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="big-picture">1. The Big Picture: Two-Process Rendering</h2>
+
+    <p>Unlike many rendering architectures, iOS splits rendering across <strong>two separate processes</strong>. Your app process prepares the layer tree and commits it; a separate system process — the <strong>render server</strong> — performs the actual GPU compositing. This is the single most important architectural fact about iOS rendering.</p>
+
+    <div class="diagram">
+┌────────────────────────────────────┐     ┌────────────────────────────────────┐
+│         APP PROCESS (your app)     │     │     RENDER SERVER (backboardd)     │
+│                                    │     │                                    │
+│  RunLoop tick                      │     │  Receives serialized layer tree    │
+│    ├─ Layout phase                 │     │    ├─ Decodes layer properties     │
+│    ├─ Display phase                │     │    ├─ Builds render tree           │
+│    ├─ Prepare phase                │     │    ├─ Submits GPU commands         │
+│    └─ Commit phase ───────────────────────    └─ Composites to framebuffer   │
+│                                    │     │                                    │
+│  CALayer model tree                │     │  Render tree (private copy)       │
+│  CALayer presentation tree         │     │  GPU command buffers              │
+└────────────────────────────────────┘     └────────────────────────────────────┘
+         │                                              │
+         │         Mach port IPC                        │
+         │    (serialized layer tree)                   │
+         └──────────────────────────────────────────────┘
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p><strong>Why the process boundary matters for performance:</strong></p>
+        <ul>
+            <li>The commit phase serializes your entire layer tree and sends it via Mach port IPC to the render server. Large layer trees = expensive serialization.</li>
+            <li>Once committed, the render server can composite frames <em>independently</em> of your app. This is why simple animations (opacity, transform) continue smoothly even if your main thread is briefly blocked.</li>
+            <li>Off-screen rendering happens in the render server's GPU pass, not in your app process — you can't "fix" it with background threads.</li>
+            <li>The render server is shared across all apps. A misbehaving app's complex layer tree can theoretically impact system-wide rendering.</li>
+        </ul>
+    </div>
+
+    <h3>Why Two Processes?</h3>
+
+    <p>Apple designed this split for several critical reasons:</p>
+
+    <table>
+        <thead>
+            <tr><th>Reason</th><th>Explanation</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Security</strong></td>
+                <td>Apps never get direct GPU access. The render server mediates all GPU operations, preventing one app from reading another's framebuffer.</td>
+            </tr>
+            <tr>
+                <td><strong>Stability</strong></td>
+                <td>If your app crashes, the render server continues running. System UI (SpringBoard) keeps rendering.</td>
+            </tr>
+            <tr>
+                <td><strong>Animation continuity</strong></td>
+                <td>Core Animation animations are executed by the render server. Once committed, they run at full frame rate even if your app's main thread is busy.</td>
+            </tr>
+            <tr>
+                <td><strong>Power efficiency</strong></td>
+                <td>The render server can batch and optimize GPU work across all visible apps, reducing redundant draw calls.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="layer-trees">2. The Three Layer Trees</h2>
+
+    <p>Core Animation maintains three parallel representations of your layer hierarchy. Understanding these is essential for debugging animation glitches and understanding the commit cycle.</p>
+
+    <div class="diagram">
+┌─────────────────┐    ┌─────────────────────┐    ┌─────────────────────┐
+│   MODEL TREE    │    │  PRESENTATION TREE   │    │    RENDER TREE      │
+│                 │    │                      │    │                     │
+│ Your code sets  │    │ Interpolated values  │    │ Private copy in     │
+│ properties on   │    │ during animations.   │    │ render server       │
+│ these layers.   │    │ Read-only snapshot.  │    │ process. Never      │
+│                 │    │                      │    │ directly accessible.│
+│ layer.position  │    │ layer.presentation   │    │                     │
+│ layer.opacity   │    │   .position          │    │ Serialized from     │
+│ layer.transform │    │   .opacity           │    │ model tree at       │
+│                 │    │   .transform         │    │ commit time.        │
+└─────────────────┘    └─────────────────────┘    └─────────────────────┘
+    </div>
+
+    <h3>Model Tree</h3>
+    <p>The model tree reflects the <strong>target values</strong> you set in code. When you write <code>layer.opacity = 0.5</code>, the model tree updates immediately, even if an animation is in flight. After an animation completes, the model tree represents the final state.</p>
+
+    <pre><code><span class="keyword">let</span> layer = <span class="type">CALayer</span>()
+layer.opacity = <span class="number">1.0</span>
+
+<span class="comment">// Start a fade animation</span>
+<span class="keyword">let</span> fade = <span class="type">CABasicAnimation</span>(keyPath: <span class="string">"opacity"</span>)
+fade.fromValue = <span class="number">1.0</span>
+fade.toValue = <span class="number">0.0</span>
+fade.duration = <span class="number">0.3</span>
+layer.<span class="func">add</span>(fade, forKey: <span class="string">"fadeOut"</span>)
+
+<span class="comment">// Model tree: opacity is STILL 1.0 (unless you also set it)</span>
+<span class="comment">// You must set the final value on the model tree:</span>
+layer.opacity = <span class="number">0.0</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall</div>
+        <p>Forgetting to update the model tree when adding explicit <code>CAAnimation</code>s causes the "flash-back" bug: the animation plays, then the layer snaps back to the model tree's old value. Always set the final value on the model layer <em>before</em> adding the animation, or use <code>fillMode</code> + <code>isRemovedOnCompletion = false</code> (less recommended).</p>
+    </div>
+
+    <h3>Presentation Tree</h3>
+    <p>The presentation tree provides a <strong>read-only snapshot</strong> of interpolated values at the current moment during an animation. Access it via <code>layer.presentation()</code>.</p>
+
+    <pre><code><span class="comment">// During an animation, read the current on-screen position:</span>
+<span class="keyword">if let</span> presentationLayer = myLayer.<span class="func">presentation</span>() {
+    <span class="keyword">let</span> currentPosition = presentationLayer.position
+    <span class="keyword">let</span> currentOpacity = presentationLayer.opacity
+    <span class="func">print</span>(<span class="string">"Currently at: \(currentPosition), opacity: \(currentOpacity)"</span>)
+}
+
+<span class="comment">// Common use: hit-testing during animation</span>
+<span class="keyword">override func</span> <span class="func">hitTest</span>(_ point: <span class="type">CGPoint</span>, with event: <span class="type">UIEvent</span>?) -> <span class="type">UIView</span>? {
+    <span class="keyword">guard let</span> presentation = layer.<span class="func">presentation</span>() <span class="keyword">else</span> {
+        <span class="keyword">return super</span>.<span class="func">hitTest</span>(point, with: event)
+    }
+    <span class="keyword">let</span> convertedPoint = layer.<span class="func">convert</span>(point, from: layer.superlayer)
+    <span class="keyword">if</span> presentation.<span class="func">contains</span>(convertedPoint) {
+        <span class="keyword">return self</span>
+    }
+    <span class="keyword">return nil</span>
+}</code></pre>
+
+    <h3>Render Tree</h3>
+    <p>The render tree is a <strong>private copy</strong> maintained by the render server process. You never access it directly. It's created by deserializing the data your app sends during the commit phase. The render server uses this tree to generate GPU commands for compositing.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="render-loop">3. Render Loop Phases</h2>
+
+    <p>Each frame, Core Animation executes four phases within your app process before committing to the render server. These phases run on the main thread as part of the RunLoop.</p>
+
+    <div class="diagram">
+┌──────────────────────────────────────────────────────────────────┐
+│                    ONE FRAME (16.67ms at 60Hz)                   │
+│                                                                  │
+│  ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐        │
+│  │ LAYOUT  │──▶│ DISPLAY │──▶│ PREPARE │──▶│ COMMIT  │        │
+│  │         │   │         │   │         │   │         │        │
+│  │ Auto    │   │ draw()  │   │ Image   │   │ Encode  │        │
+│  │ Layout  │   │ calls   │   │ decode  │   │ &amp; send  │        │
+│  │ resolve │   │ backing │   │ layer   │   │ to      │        │
+│  │         │   │ store   │   │ setup   │   │ render  │        │
+│  │         │   │ render  │   │         │   │ server  │        │
+│  └─────────┘   └─────────┘   └─────────┘   └─────────┘        │
+│                                                                  │
+│  layoutSubviews  drawRect     GPU texture    Mach port IPC      │
+│  updateConstr.   CALayerDel.  preparation    serialization      │
+└──────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>Phase 1: Layout</h3>
+    <p>Auto Layout constraints are resolved, and <code>layoutSubviews()</code> is called on views that have been marked with <code>setNeedsLayout()</code>. This is where the Cassowary simplex solver runs.</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">CustomView</span>: <span class="type">UIView</span> {
+    <span class="keyword">override func</span> <span class="func">layoutSubviews</span>() {
+        <span class="keyword">super</span>.<span class="func">layoutSubviews</span>()
+        <span class="comment">// Called during Layout phase</span>
+        <span class="comment">// Expensive constraint resolution has already happened</span>
+        <span class="comment">// Final frames are available here</span>
+        gradientLayer.frame = bounds
+        shadowLayer.frame = bounds
+    }
+}</code></pre>
+
+    <h3>Phase 2: Display</h3>
+    <p>Layers that have been marked with <code>setNeedsDisplay()</code> get their backing stores rendered. For views that override <code>draw(_:in:)</code>, this is when Core Graphics drawing happens. Most views don't override this — UIKit handles it.</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">ChartView</span>: <span class="type">UIView</span> {
+    <span class="keyword">override func</span> <span class="func">draw</span>(_ rect: <span class="type">CGRect</span>) {
+        <span class="comment">// Called during Display phase</span>
+        <span class="comment">// Creates a backing store bitmap for this layer</span>
+        <span class="keyword">guard let</span> ctx = <span class="type">UIGraphicsGetCurrentContext</span>() <span class="keyword">else</span> { <span class="keyword">return</span> }
+        ctx.<span class="func">setFillColor</span>(<span class="type">UIColor</span>.systemBlue.cgColor)
+        ctx.<span class="func">fill</span>(<span class="type">CGRect</span>(x: <span class="number">0</span>, y: <span class="number">0</span>, width: <span class="number">100</span>, height: <span class="number">50</span>))
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Performance Warning</div>
+        <p>Every layer that has a backing store (from <code>draw(_:)</code>) consumes memory: <code>width × height × 4 bytes × contentsScale²</code>. On a 3x Retina display, a 375×812 full-screen backing store uses <strong>375 × 3 × 812 × 3 × 4 = ~27MB</strong>. Avoid unnecessary <code>draw(_:)</code> overrides.</p>
+    </div>
+
+    <h3>Phase 3: Prepare</h3>
+    <p>Core Animation prepares image data for the GPU. This includes decoding compressed images (JPEG, PNG) into bitmap data if they haven't been decoded yet. This is a hidden performance cost — large images decoded on the main thread during this phase cause frame drops.</p>
+
+    <h3>Phase 4: Commit</h3>
+    <p>The layer tree is serialized and sent to the render server via Mach port IPC. This includes all layer properties, transforms, and backing store data. The cost scales with the number of layers and the amount of changed data.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Commit Transaction Cost</div>
+        <p>The commit phase must serialize every dirty layer property across the process boundary. Factors that increase commit cost:</p>
+        <ul>
+            <li><strong>Layer count</strong> — more layers = more data to serialize</li>
+            <li><strong>Backing store size</strong> — layers with custom <code>draw(_:)</code> send their bitmap data</li>
+            <li><strong>Image data</strong> — newly assigned <code>contents</code> images must be transferred</li>
+            <li><strong>Complex layer hierarchies</strong> — deeply nested trees take longer to traverse</li>
+        </ul>
+        <p>Target: keep the total commit phase under <strong>4-5ms</strong> to leave room for the render server's work within the frame budget.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="catransaction">4. CATransaction: Implicit vs Explicit</h2>
+
+    <p>Every change to a <code>CALayer</code> property happens within a <code>CATransaction</code>. Core Animation creates implicit transactions automatically, but you can also create explicit ones for fine-grained control.</p>
+
+    <h3>Implicit Transactions</h3>
+    <p>When you modify layer properties outside of an explicit transaction, Core Animation wraps them in an implicit transaction that commits at the end of the current RunLoop iteration.</p>
+
+    <pre><code><span class="comment">// These three changes are batched into one implicit transaction</span>
+<span class="comment">// and committed together at the end of the RunLoop cycle</span>
+myLayer.position = <span class="type">CGPoint</span>(x: <span class="number">100</span>, y: <span class="number">200</span>)
+myLayer.opacity = <span class="number">0.5</span>
+myLayer.backgroundColor = <span class="type">UIColor</span>.red.cgColor
+
+<span class="comment">// All three changes are committed in a single transaction</span>
+<span class="comment">// The render server receives them atomically</span></code></pre>
+
+    <h3>Explicit Transactions</h3>
+    <p>Explicit transactions give you control over animation parameters and allow you to disable implicit animations.</p>
+
+    <pre><code><span class="comment">// Disable implicit animations for immediate property changes</span>
+<span class="type">CATransaction</span>.<span class="func">begin</span>()
+<span class="type">CATransaction</span>.<span class="func">setDisableActions</span>(<span class="keyword">true</span>)
+myLayer.position = <span class="type">CGPoint</span>(x: <span class="number">100</span>, y: <span class="number">200</span>)
+myLayer.opacity = <span class="number">0.5</span>
+<span class="type">CATransaction</span>.<span class="func">commit</span>()
+
+<span class="comment">// Custom animation duration for implicit animations</span>
+<span class="type">CATransaction</span>.<span class="func">begin</span>()
+<span class="type">CATransaction</span>.<span class="func">setAnimationDuration</span>(<span class="number">0.5</span>)
+myLayer.cornerRadius = <span class="number">20</span>
+<span class="type">CATransaction</span>.<span class="func">setCompletionBlock</span> {
+    <span class="func">print</span>(<span class="string">"Animation completed"</span>)
+}
+<span class="type">CATransaction</span>.<span class="func">commit</span>()
+
+<span class="comment">// Nested transactions</span>
+<span class="type">CATransaction</span>.<span class="func">begin</span>()
+<span class="type">CATransaction</span>.<span class="func">setAnimationDuration</span>(<span class="number">1.0</span>)
+outerLayer.opacity = <span class="number">0.0</span>
+
+    <span class="type">CATransaction</span>.<span class="func">begin</span>()
+    <span class="type">CATransaction</span>.<span class="func">setAnimationDuration</span>(<span class="number">0.25</span>)
+    innerLayer.opacity = <span class="number">0.0</span>  <span class="comment">// This animates at 0.25s, not 1.0s</span>
+    <span class="type">CATransaction</span>.<span class="func">commit</span>()
+
+<span class="type">CATransaction</span>.<span class="func">commit</span>()</code></pre>
+
+    <h3>UIView Animation Blocks and Transactions</h3>
+    <p><code>UIView.animate(withDuration:)</code> creates an explicit <code>CATransaction</code> under the hood and configures the animation parameters. Inside the block, property changes on UIView animatable properties generate implicit <code>CAAnimation</code> objects.</p>
+
+    <pre><code><span class="comment">// Under the hood, UIView.animate creates a CATransaction</span>
+<span class="type">UIView</span>.<span class="func">animate</span>(withDuration: <span class="number">0.3</span>) {
+    <span class="comment">// CATransaction.begin() has been called</span>
+    <span class="comment">// Animation duration set to 0.3</span>
+    <span class="keyword">self</span>.myView.alpha = <span class="number">0.0</span>  <span class="comment">// Generates CABasicAnimation on opacity</span>
+    <span class="keyword">self</span>.myView.frame = newFrame  <span class="comment">// Generates animations on position + bounds</span>
+    <span class="comment">// CATransaction.commit() happens after block</span>
+}</code></pre>
+
+    <table>
+        <thead>
+            <tr><th>Aspect</th><th>Implicit Transaction</th><th>Explicit Transaction</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Creation</td>
+                <td>Automatic at RunLoop end</td>
+                <td>Manual <code>begin()</code>/<code>commit()</code></td>
+            </tr>
+            <tr>
+                <td>Animation duration</td>
+                <td>0.25s (default)</td>
+                <td>Configurable</td>
+            </tr>
+            <tr>
+                <td>Nesting</td>
+                <td>N/A</td>
+                <td>Supported</td>
+            </tr>
+            <tr>
+                <td>Disable animations</td>
+                <td>N/A</td>
+                <td><code>setDisableActions(true)</code></td>
+            </tr>
+            <tr>
+                <td>Completion callback</td>
+                <td>N/A</td>
+                <td><code>setCompletionBlock</code></td>
+            </tr>
+            <tr>
+                <td>UIView equivalent</td>
+                <td>Direct property sets</td>
+                <td><code>UIView.animate</code> / <code>performWithoutAnimation</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="render-server">5. The Render Server (backboardd)</h2>
+
+    <p>The render server is a system daemon called <code>backboardd</code> (on iOS 6+; previously <code>SpringBoard</code> handled rendering). It runs in a separate process with elevated privileges for GPU access.</p>
+
+    <h3>What the Render Server Does</h3>
+    <ol>
+        <li><strong>Deserializes</strong> the committed layer tree from your app</li>
+        <li><strong>Builds the render tree</strong> — its own optimized representation</li>
+        <li><strong>Executes animations</strong> — interpolates property values each frame</li>
+        <li><strong>Generates GPU commands</strong> — creates Metal command buffers for compositing</li>
+        <li><strong>Submits to GPU</strong> — the GPU composites layers into the framebuffer</li>
+    </ol>
+
+    <div class="diagram">
+                    Render Server Frame Cycle
+                    ─────────────────────────
+
+    ┌──────────────┐
+    │ Receive layer │◀── Mach port message from app
+    │ tree update   │
+    └──────┬───────┘
+           ▼
+    ┌──────────────┐
+    │ Update render │    Apply property changes
+    │ tree          │    Advance animations
+    └──────┬───────┘
+           ▼
+    ┌──────────────┐
+    │ Traverse tree │    For each visible layer:
+    │ generate GPU  │    - Determine compositing order
+    │ commands      │    - Handle opacity, masks, shadows
+    └──────┬───────┘    - Off-screen passes if needed
+           ▼
+    ┌──────────────┐
+    │ Submit to GPU │    Metal command buffer
+    └──────┬───────┘
+           ▼
+    ┌──────────────┐
+    │ GPU composite │    Hardware compositing
+    │ to framebuf.  │    Display controller scanout
+    └──────────────┘
+    </div>
+
+    <h3>Animations in the Render Server</h3>
+    <p>This is why Core Animation animations are "free" from your app's perspective. Once you commit an animation, the render server handles all interpolation. Your app doesn't need to wake up each frame.</p>
+
+    <pre><code><span class="comment">// This animation runs entirely in the render server</span>
+<span class="keyword">let</span> rotation = <span class="type">CABasicAnimation</span>(keyPath: <span class="string">"transform.rotation.z"</span>)
+rotation.fromValue = <span class="number">0</span>
+rotation.toValue = <span class="type">CGFloat</span>.pi * <span class="number">2</span>
+rotation.duration = <span class="number">2.0</span>
+rotation.repeatCount = .infinity
+spinnerLayer.<span class="func">add</span>(rotation, forKey: <span class="string">"spin"</span>)
+
+<span class="comment">// Even if you block the main thread for 1 second,</span>
+<span class="comment">// the spinner continues rotating smoothly because</span>
+<span class="comment">// the render server drives the animation independently.</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="gpu-compositing">6. GPU Compositing</h2>
+
+    <p>The GPU composites layers using a painter's algorithm — back-to-front rendering. Each layer is a textured quad that the GPU draws in order.</p>
+
+    <h3>What the GPU Does Per Layer</h3>
+    <table>
+        <thead>
+            <tr><th>Operation</th><th>GPU Cost</th><th>Notes</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Draw textured quad</td>
+                <td>Low</td>
+                <td>Basic compositing — very fast on modern GPUs</td>
+            </tr>
+            <tr>
+                <td>Apply transform</td>
+                <td>Low</td>
+                <td>Matrix multiplication in vertex shader</td>
+            </tr>
+            <tr>
+                <td>Alpha blending</td>
+                <td>Low-Medium</td>
+                <td>Requires reading destination pixel (blended layers)</td>
+            </tr>
+            <tr>
+                <td>Mask application</td>
+                <td>High</td>
+                <td>Requires off-screen pass to render mask, then composite</td>
+            </tr>
+            <tr>
+                <td>Shadow rendering</td>
+                <td>High</td>
+                <td>Without shadowPath: must compute layer outline first</td>
+            </tr>
+            <tr>
+                <td>Corner radius + clip</td>
+                <td>Medium-High</td>
+                <td>With masksToBounds: off-screen pass for clipping</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Opaque vs Transparent Layers</div>
+        <p>When a layer is marked <code>isOpaque = true</code>, the GPU can skip reading the destination pixel during compositing (no alpha blending needed). This is a significant optimization for layers that cover their entire bounds with content. <code>UIView.backgroundColor</code> with alpha 1.0 automatically sets <code>isOpaque</code>. Transparent backgrounds force blending, which shows up as red in Instruments' "Color Blended Layers" debug option.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="promotion">7. ProMotion &amp; Adaptive Frame Rates</h2>
+
+    <p>ProMotion displays (iPhone 13 Pro+, iPad Pro) support adaptive refresh rates from 10Hz to 120Hz. The system dynamically adjusts based on content.</p>
+
+    <h3>How ProMotion Decides Frame Rate</h3>
+    <table>
+        <thead>
+            <tr><th>Content Type</th><th>Frame Rate</th><th>Rationale</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Static content</td>
+                <td>10Hz</td>
+                <td>Nothing changing — minimum refresh to save power</td>
+            </tr>
+            <tr>
+                <td>Scrolling text</td>
+                <td>80-120Hz</td>
+                <td>Smooth scrolling requires high refresh</td>
+            </tr>
+            <tr>
+                <td>Standard animations</td>
+                <td>60-120Hz</td>
+                <td>Depends on animation complexity</td>
+            </tr>
+            <tr>
+                <td>Apple Pencil input</td>
+                <td>120Hz</td>
+                <td>Maximum responsiveness for drawing</td>
+            </tr>
+            <tr>
+                <td>Video playback (24fps)</td>
+                <td>24Hz</td>
+                <td>Matches content frame rate exactly</td>
+            </tr>
+            <tr>
+                <td>Always-On Display</td>
+                <td>1Hz</td>
+                <td>iPhone 14 Pro+ lock screen</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Requesting Specific Frame Rates</h3>
+    <pre><code><span class="comment">// Request a preferred frame rate range for animations</span>
+<span class="keyword">let</span> animator = <span class="type">UIViewPropertyAnimator</span>(duration: <span class="number">0.5</span>, curve: .easeInOut) {
+    view.frame = targetFrame
+}
+
+<span class="comment">// iOS 15+: Set preferred frame rate range</span>
+<span class="keyword">if</span> #available(iOS <span class="number">15.0</span>, *) {
+    <span class="keyword">let</span> preference = <span class="type">CAFrameRateRange</span>(
+        minimum: <span class="number">60</span>,
+        maximum: <span class="number">120</span>,
+        preferred: <span class="number">120</span>  <span class="comment">// Request highest available</span>
+    )
+    animator.preferredFrameRateRange = preference
+}
+animator.<span class="func">startAnimation</span>()</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="cadisplaylink">8. CADisplayLink Deep Dive</h2>
+
+    <p><code>CADisplayLink</code> is a timer synchronized to the display's refresh rate. It fires a callback before each frame is rendered, making it the correct tool for frame-by-frame animations and custom rendering loops.</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">CustomAnimationController</span> {
+    <span class="keyword">private var</span> displayLink: <span class="type">CADisplayLink</span>?
+    <span class="keyword">private var</span> startTime: <span class="type">CFTimeInterval</span> = <span class="number">0</span>
+
+    <span class="keyword">func</span> <span class="func">startAnimation</span>() {
+        displayLink = <span class="type">CADisplayLink</span>(
+            target: <span class="keyword">self</span>,
+            selector: #selector(tick)
+        )
+
+        <span class="comment">// ProMotion: request specific frame rate range</span>
+        <span class="keyword">if</span> #available(iOS <span class="number">15.0</span>, *) {
+            displayLink?.preferredFrameRateRange = <span class="type">CAFrameRateRange</span>(
+                minimum: <span class="number">30</span>,
+                maximum: <span class="number">120</span>,
+                preferred: <span class="number">120</span>
+            )
+        }
+
+        displayLink?.<span class="func">add</span>(to: .main, forMode: .common)
+        startTime = <span class="type">CACurrentMediaTime</span>()
+    }
+
+    @objc <span class="keyword">private func</span> <span class="func">tick</span>(_ link: <span class="type">CADisplayLink</span>) {
+        <span class="keyword">let</span> elapsed = link.targetTimestamp - startTime
+        <span class="keyword">let</span> frameDuration = link.targetTimestamp - link.timestamp
+
+        <span class="comment">// Use targetTimestamp for when this frame will appear on screen</span>
+        <span class="comment">// Use timestamp for when the previous frame appeared</span>
+        <span class="comment">// frameDuration tells you the actual frame interval</span>
+
+        <span class="func">updateAnimation</span>(progress: elapsed / totalDuration)
+
+        <span class="keyword">if</span> elapsed >= totalDuration {
+            displayLink?.<span class="func">invalidate</span>()
+            displayLink = <span class="keyword">nil</span>
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">stopAnimation</span>() {
+        displayLink?.<span class="func">invalidate</span>()
+        displayLink = <span class="keyword">nil</span>
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">CADisplayLink Pitfalls</div>
+        <ul>
+            <li><strong>Retain cycle</strong>: <code>CADisplayLink</code> strongly retains its target. Use a proxy object or invalidate in <code>deinit</code> (but <code>deinit</code> won't fire if the display link retains you).</li>
+            <li><strong>RunLoop mode</strong>: Adding to <code>.default</code> mode pauses during scrolling. Use <code>.common</code> to fire during scroll tracking.</li>
+            <li><strong>Don't assume frame rate</strong>: On ProMotion displays, the interval varies. Always compute delta time from timestamps.</li>
+        </ul>
+    </div>
+
+    <h3>Proxy Pattern to Avoid Retain Cycles</h3>
+    <pre><code><span class="keyword">class</span> <span class="type">DisplayLinkProxy</span> {
+    <span class="keyword">weak var</span> target: <span class="type">AnyObject</span>?
+    <span class="keyword">let</span> selector: <span class="type">Selector</span>
+
+    <span class="keyword">init</span>(target: <span class="type">AnyObject</span>, selector: <span class="type">Selector</span>) {
+        <span class="keyword">self</span>.target = target
+        <span class="keyword">self</span>.selector = selector
+    }
+
+    @objc <span class="keyword">func</span> <span class="func">tick</span>(_ link: <span class="type">CADisplayLink</span>) {
+        <span class="keyword">guard let</span> target = target <span class="keyword">else</span> {
+            link.<span class="func">invalidate</span>()
+            <span class="keyword">return</span>
+        }
+        _ = target.<span class="func">perform</span>(selector, with: link)
+    }
+}
+
+<span class="comment">// Usage: display link won't retain the view controller</span>
+<span class="keyword">let</span> proxy = <span class="type">DisplayLinkProxy</span>(target: <span class="keyword">self</span>, selector: #selector(handleFrame))
+displayLink = <span class="type">CADisplayLink</span>(target: proxy, selector: #selector(<span class="type">DisplayLinkProxy</span>.tick))</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="frame-pacing">9. Frame Pacing &amp; Dropped Frames</h2>
+
+    <p>A frame is "dropped" when your app doesn't finish its work before the display needs the next frame. Understanding frame budgets is critical.</p>
+
+    <table>
+        <thead>
+            <tr><th>Display</th><th>Refresh Rate</th><th>Frame Budget</th><th>Devices</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Standard</td>
+                <td>60Hz</td>
+                <td>16.67ms</td>
+                <td>iPhone SE, iPhone 11, iPad (non-Pro)</td>
+            </tr>
+            <tr>
+                <td>ProMotion</td>
+                <td>120Hz</td>
+                <td>8.33ms</td>
+                <td>iPhone 13 Pro+, iPad Pro</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="diagram">
+     Frame Budget Breakdown (16.67ms at 60Hz)
+     ──────────────────────────────────────────
+
+     ┌──────────┬──────────┬──────────┬──────────┬──────────┐
+     │  Layout  │ Display  │ Prepare  │  Commit  │ Render   │
+     │  ~2ms    │  ~2ms    │  ~1ms    │  ~2ms    │ Server   │
+     │          │          │          │          │ ~8ms     │
+     └──────────┴──────────┴──────────┴──────────┴──────────┘
+     ◀─── App Process (~7ms) ───▶◀── Render Server (~8ms) ──▶
+
+     If app takes > ~8ms, render server doesn't have enough
+     time → frame drop → visible jank
+    </div>
+
+    <h3>Detecting Dropped Frames</h3>
+    <pre><code><span class="comment">// Monitor for hitches using MetricKit (iOS 14+)</span>
+<span class="keyword">class</span> <span class="type">MetricsSubscriber</span>: <span class="type">NSObject</span>, <span class="type">MXMetricManagerSubscriber</span> {
+    <span class="keyword">func</span> <span class="func">didReceive</span>(_ payloads: [<span class="type">MXMetricPayload</span>]) {
+        <span class="keyword">for</span> payload <span class="keyword">in</span> payloads {
+            <span class="keyword">if let</span> animationMetrics = payload.animationMetrics {
+                <span class="keyword">let</span> scrollHitchRate = animationMetrics.scrollHitchTimeRatio
+                <span class="func">print</span>(<span class="string">"Scroll hitch rate: \(scrollHitchRate)"</span>)
+            }
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">didReceive</span>(_ payloads: [<span class="type">MXDiagnosticPayload</span>]) {
+        <span class="keyword">for</span> payload <span class="keyword">in</span> payloads {
+            <span class="keyword">if let</span> hangDiagnostics = payload.hangDiagnostics {
+                <span class="keyword">for</span> hang <span class="keyword">in</span> hangDiagnostics {
+                    <span class="func">print</span>(<span class="string">"Hang duration: \(hang.hangDuration)"</span>)
+                }
+            }
+        }
+    }
+}
+
+<span class="comment">// Register subscriber</span>
+<span class="keyword">let</span> subscriber = <span class="type">MetricsSubscriber</span>()
+<span class="type">MXMetricManager</span>.shared.<span class="func">add</span>(subscriber)</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="profiling">10. Profiling the Pipeline</h2>
+
+    <h3>Instruments: Core Animation Template</h3>
+    <p>The Core Animation template in Instruments provides real-time metrics on the render pipeline:</p>
+
+    <table>
+        <thead>
+            <tr><th>Metric</th><th>What It Shows</th><th>Target</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>FPS</td>
+                <td>Frames per second</td>
+                <td>Consistent 60/120</td>
+            </tr>
+            <tr>
+                <td>GPU Utilization</td>
+                <td>Percentage of GPU capacity used</td>
+                <td>&lt; 70%</td>
+            </tr>
+            <tr>
+                <td>Color Blended Layers</td>
+                <td>Layers requiring alpha blending (red = blended)</td>
+                <td>Minimize red areas</td>
+            </tr>
+            <tr>
+                <td>Color Offscreen-Rendered</td>
+                <td>Layers requiring off-screen passes (yellow)</td>
+                <td>Eliminate where possible</td>
+            </tr>
+            <tr>
+                <td>Color Misaligned Images</td>
+                <td>Images not pixel-aligned (magenta)</td>
+                <td>Zero misalignment</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Xcode Debug Options</h3>
+    <pre><code><span class="comment">// Enable Core Animation debug options programmatically (debug builds)</span>
+<span class="comment">// These are normally toggled in Instruments or Simulator Debug menu</span>
+
+<span class="comment">// Simulator → Debug menu:</span>
+<span class="comment">// - Color Blended Layers</span>
+<span class="comment">// - Color Offscreen-Rendered Yellow</span>
+<span class="comment">// - Color Misaligned Images</span>
+<span class="comment">// - Color Compositing Fast-Path Blue</span>
+
+<span class="comment">// os_signpost for custom pipeline measurements</span>
+<span class="keyword">import</span> os
+
+<span class="keyword">let</span> renderLog = <span class="type">OSLog</span>(subsystem: <span class="string">"com.app.render"</span>, category: .pointsOfInterest)
+
+<span class="keyword">func</span> <span class="func">measureCommitPhase</span>() {
+    os_signpost(.begin, log: renderLog, name: <span class="string">"Commit Phase"</span>)
+    <span class="comment">// ... layout and commit work ...</span>
+    os_signpost(.end, log: renderLog, name: <span class="string">"Commit Phase"</span>)
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect-patterns">11. Architect-Level Patterns</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: Designing for the Pipeline</div>
+        <p>At Staff level, you should be able to design rendering strategies for an entire app. Key principles:</p>
+        <ol>
+            <li><strong>Minimize layer count</strong> — flatten hierarchies where possible. Use <code>shouldRasterize</code> to collapse complex subtrees into single cached bitmaps.</li>
+            <li><strong>Keep the commit phase lean</strong> — avoid changing thousands of layers per frame. Batch updates.</li>
+            <li><strong>Leverage the render server</strong> — use Core Animation animations (transform, opacity, position) that run in the render server, not frame-by-frame UIView updates.</li>
+            <li><strong>Decode images off the main thread</strong> — the Prepare phase decodes images synchronously. Pre-decode on a background queue.</li>
+            <li><strong>Profile on real hardware</strong> — the Simulator uses the Mac's GPU, which has vastly different performance characteristics.</li>
+        </ol>
+    </div>
+
+    <h3>Layer Flattening Strategy</h3>
+    <pre><code><span class="comment">// For complex cell layouts that don't change often,</span>
+<span class="comment">// rasterize the entire subtree into a single cached bitmap</span>
+<span class="keyword">func</span> <span class="func">configureForPerformance</span>(_ cell: <span class="type">UICollectionViewCell</span>) {
+    cell.layer.shouldRasterize = <span class="keyword">true</span>
+    cell.layer.rasterizationScale = <span class="type">UIScreen</span>.main.scale
+
+    <span class="comment">// Mark all sublayers as opaque where possible</span>
+    cell.contentView.layer.isOpaque = <span class="keyword">true</span>
+    cell.contentView.backgroundColor = .systemBackground
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice Summary</div>
+        <ul>
+            <li>Understand that your app and the render server are separate processes connected by Mach port IPC</li>
+            <li>Keep all four render loop phases (layout, display, prepare, commit) within the frame budget</li>
+            <li>Use explicit <code>CATransaction</code> to batch changes and control animation timing</li>
+            <li>Leverage the render server for animations — prefer <code>CAAnimation</code> over per-frame property updates</li>
+            <li>On ProMotion devices, use <code>CAFrameRateRange</code> to request appropriate frame rates</li>
+            <li>Always profile on real devices — Simulator GPU characteristics are misleading</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="index.html">← Series Overview</a>
+        <a href="02-offscreen-rendering.html">Next: Off-Screen Rendering →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UIKit ↔ SwiftUI Interop — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">SwiftUI Internals</a><span class="sep">›</span>
+        UIKit Interop
+    </nav>
+
+    <p>
+        <span class="tag tag-l6">L6</span>
+        <span class="tag tag-architect">Architect</span>
+        <span class="tag tag-senior">Staff+</span>
+    </p>
+    <h1>UIKit ↔ SwiftUI Interop</h1>
+    <p class="subtitle">
+        Staff-level prep for bridging UIKit into SwiftUI and SwiftUI into UIKit: representables, coordinators,
+        <code>UIHostingController</code>, sizing semantics, and migration strategy at the scale of large legacy codebases.
+        The goal is not “I wrapped a view once”—it is to explain <em>lifecycle contracts</em>, <em>ownership</em>, and
+        <em>where bugs hide</em> when two layout systems meet.
+    </p>
+
+    <nav class="toc" aria-label="On this page">
+        <h3>On this page</h3>
+        <ul>
+            <li><a href="#representable">1. <code>UIViewRepresentable</code> / <code>UIViewControllerRepresentable</code></a></li>
+            <li><a href="#coordinator">2. Coordinator pattern for delegates</a></li>
+            <li><a href="#hosting">3. <code>UIHostingController</code> embedding</a></li>
+            <li><a href="#migration-strategy">4. Incremental adoption (UIKit → SwiftUI)</a></li>
+            <li><a href="#data-flow">5. Two-way data flow across the bridge</a></li>
+            <li><a href="#sizing">6. Sizing challenges &amp; intrinsic content size</a></li>
+            <li><a href="#architect-500k">7. Architect: 500K LOC UIKit → SwiftUI</a></li>
+        </ul>
+    </nav>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Framing for interviews</div>
+        <p>
+            Interop questions often test whether you understand <strong>reference semantics</strong> (UIKit) vs
+            <strong>value-typed descriptions</strong> (SwiftUI), and whether you can reason about <strong>update scheduling</strong>:
+            SwiftUI may call <code>updateUIView</code> frequently; UIKit callbacks must not assume a 1:1 pairing with
+            SwiftUI “renders.”
+        </p>
+    </div>
+
+    <!-- ===================== 1. Representable ===================== -->
+    <h2 id="representable">1. <code>UIViewRepresentable</code> / <code>UIViewControllerRepresentable</code></h2>
+
+    <h3>What a representable is</h3>
+    <p>
+        A representable is SwiftUI’s <em>adapter protocol</em> for embedding UIKit objects inside a SwiftUI hierarchy.
+        SwiftUI owns the <strong>slot</strong> in the layout/render graph; UIKit owns the <strong>UIView</strong> instance’s
+        imperative behavior. Your type’s job is to translate Swift state into UIKit mutations and UIKit events into
+        Swift state—without fighting either framework’s lifecycle.
+    </p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Protocol</th>
+                <th>UIKit object</th>
+                <th>Typical use</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>UIViewRepresentable</code></td>
+                <td><code>UIView</code> (or subclass)</td>
+                <td>Controls: maps, text views, pickers, complex custom views, third-party UIKit SDKs.</td>
+            </tr>
+            <tr>
+                <td><code>UIViewControllerRepresentable</code></td>
+                <td><code>UIViewController</code></td>
+                <td>System controllers (<code>UIImagePickerController</code>), document pickers, share sheets, storyboard-backed flows.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3><code>UIViewRepresentable</code> protocol requirements</h3>
+    <p>
+        The core contract has two required methods. Everything else is optional sugar—until you need delegates, then
+        <code>makeCoordinator()</code> becomes practically required.
+    </p>
+    <ul>
+        <li><code>makeUIView(context:) -&gt; UIViewType</code>: create the view <strong>once</strong> (per representable instance lifecycle).</li>
+        <li><code>updateUIView(_ uiView: UIViewType, context: Context)</code>: synchronize Swift inputs into UIKit state.</li>
+    </ul>
+    <p>
+        Optional hooks you should know cold:
+    </p>
+    <ul>
+        <li><code>static func dismantleUIView(_ uiView: UIViewType, coordinator: Coordinator)</code>: tear down timers, KVO, notification observers, gesture recognizers that outlive the view.</li>
+        <li><code>func makeCoordinator() -&gt; Coordinator</code>: produce a reference type for delegate/target-action storage.</li>
+        <li><code>sizeThatFits(_ proposal: ProposedViewSize, uiView: UIViewType, context: Context) -&gt; CGSize?</code> (iOS 16+): opt into SwiftUI-driven measurement for the wrapped view.</li>
+    </ul>
+
+    <h3><code>UIViewControllerRepresentable</code> protocol requirements</h3>
+    <p>
+        The controller-shaped twin mirrors the same lifecycle split:
+    </p>
+    <ul>
+        <li><code>makeUIViewController(context:) -&gt; UIViewControllerType</code></li>
+        <li><code>updateUIViewController(_:context:)</code></li>
+        <li>Optional: <code>static func dismantleUIViewController(_:coordinator:)</code>, <code>makeCoordinator()</code>, and sizing helpers where applicable.</li>
+    </ul>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common mistake</div>
+        <p>
+            Treating <code>updateUIView</code> as “initialize.” Heavy one-time setup belongs in <code>makeUIView</code> (or the coordinator’s
+            initializer). <code>updateUIView</code> can run often and should be <strong>idempotent</strong> and cheap enough to repeat.
+        </p>
+    </div>
+
+    <h3><code>Context</code>: what you actually get</h3>
+    <p>
+        The <code>Context</code> type is SwiftUI’s bundle of handles for bridging work:
+    </p>
+    <table>
+        <thead>
+            <tr>
+                <th><code>Context</code> surface</th>
+                <th>Why it matters</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>context.coordinator</code></td>
+                <td>Your <code>Coordinator</code> reference; stable across updates for delegate callbacks.</td>
+            </tr>
+            <tr>
+                <td><code>context.transaction</code></td>
+                <td>Animation transaction metadata propagating from SwiftUI (disables animations, duration, etc.).</td>
+            </tr>
+            <tr>
+                <td><code>context.environment</code></td>
+                <td>Bridged environment values (size classes, layout direction, color scheme)—useful for configuring UIKit appearance.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Lifecycle: when each method is called (mental model)</h3>
+    <div class="diagram">SwiftUI inserts Representable in hierarchy
+    |
+    +-- makeUIView / makeUIViewController  (once per backing instance*)
+    |
+    +-- makeCoordinator (if implemented; early in lifecycle)
+    |
+    +-- updateUIView / updateUIViewController (0..N times; state/env changes)
+    |
+    +-- dismantleUIView / dismantleUIViewController (on removal/teardown)
+
+    * Identity churn (e.g. unstable .id) can force recreation—treat as expensive.</div>
+    <p>
+        In interviews, emphasize: <strong>SwiftUI drives the cadence</strong>. UIKit callbacks (e.g. map delegate) are asynchronous
+        with respect to SwiftUI’s update pass; you coordinate through bindings and main-queue discipline.
+    </p>
+
+    <h3>Complete example: wrapping <code>MKMapView</code></h3>
+    <p>
+        This example shows region synchronization SwiftUI → UIKit, and map camera changes UIKit → SwiftUI via
+        <code>MKMapViewDelegate</code>. The coordinator holds the delegate and a weak map reference to avoid retain cycles.
+    </p>
+<pre><code><span class="keyword">import</span> SwiftUI
+<span class="keyword">import</span> MapKit
+
+<span class="keyword">struct</span> <span class="type">MapKitView</span>: <span class="type">UIViewRepresentable</span> {
+    <span class="keyword">@Binding</span> <span class="keyword">var</span> region: <span class="type">MKCoordinateRegion</span>
+    <span class="keyword">var</span> showsUserLocation: <span class="type">Bool</span> = <span class="keyword">false</span>
+
+    <span class="keyword">func</span> <span class="func">makeCoordinator</span>() -&gt; <span class="type">Coordinator</span> {
+        <span class="type">Coordinator</span>(<span class="keyword">self</span>)
+    }
+
+    <span class="keyword">func</span> <span class="func">makeUIView</span>(context: <span class="type">Context</span>) -&gt; <span class="type">MKMapView</span> {
+        <span class="keyword">let</span> map = <span class="type">MKMapView</span>()
+        map.delegate = context.coordinator
+        map.showsUserLocation = showsUserLocation
+        map.setRegion(region, animated: <span class="keyword">false</span>)
+        context.coordinator.mapView = map
+        <span class="keyword">return</span> map
+    }
+
+    <span class="keyword">func</span> <span class="func">updateUIView</span>(_ map: <span class="type">MKMapView</span>, context: <span class="type">Context</span>) {
+        map.showsUserLocation = showsUserLocation
+        <span class="comment">// Avoid feedback loops: only setRegion when SwiftUI region meaningfully changes.</span>
+        <span class="keyword">if</span> !context.coordinator.isDragging,
+           !<span class="func">regionsApproximatelyEqual</span>(map.region, region) {
+            map.setRegion(region, animated: context.transaction.disablesImplicitAnimation ? <span class="keyword">false</span> : <span class="keyword">true</span>)
+        }
+    }
+
+    <span class="keyword">static func</span> <span class="func">dismantleUIView</span>(_ map: <span class="type">MKMapView</span>, coordinator: <span class="type">Coordinator</span>) {
+        map.delegate = <span class="keyword">nil</span>
+        coordinator.mapView = <span class="keyword">nil</span>
+    }
+
+    <span class="keyword">final class</span> <span class="type">Coordinator</span>: <span class="type">NSObject</span>, <span class="type">MKMapViewDelegate</span> {
+        <span class="keyword">var</span> parent: <span class="type">MapKitView</span>
+        <span class="keyword">weak var</span> mapView: <span class="type">MKMapView</span>?
+        <span class="keyword">var</span> isDragging = <span class="keyword">false</span>
+
+        <span class="func">init</span>(_ parent: <span class="type">MapKitView</span>) {
+            <span class="keyword">self</span>.parent = parent
+        }
+
+        <span class="keyword">func</span> <span class="func">mapView</span>(<span class="keyword">_</span> mapView: <span class="type">MKMapView</span>, regionWillChangeAnimated animated: <span class="type">Bool</span>) {
+            isDragging = <span class="keyword">true</span>
+        }
+
+        <span class="keyword">func</span> <span class="func">mapView</span>(<span class="keyword">_</span> mapView: <span class="type">MKMapView</span>, regionDidChangeAnimated animated: <span class="type">Bool</span>) {
+            isDragging = <span class="keyword">false</span>
+            parent.region = mapView.region
+        }
+    }
+
+    <span class="keyword">private func</span> <span class="func">regionsApproximatelyEqual</span>(_ a: <span class="type">MKCoordinateRegion</span>, _ b: <span class="type">MKCoordinateRegion</span>) -&gt; <span class="type">Bool</span> {
+        <span class="func">abs</span>(a.center.latitude - b.center.latitude) &lt; <span class="number">0.000_1</span>
+        &amp;&amp; <span class="func">abs</span>(a.center.longitude - b.center.longitude) &lt; <span class="number">0.000_1</span>
+        &amp;&amp; <span class="func">abs</span>(a.span.latitudeDelta - b.span.latitudeDelta) &lt; <span class="number">0.000_1</span>
+        &amp;&amp; <span class="func">abs</span>(a.span.longitudeDelta - b.span.longitudeDelta) &lt; <span class="number">0.000_1</span>
+    }
+}</code></pre>
+
+    <h3>Complete example: wrapping <code>UITextView</code> with a delegate</h3>
+    <p>
+        Text views are a classic stress test: attributed strings, caret, scrolling, keyboard, and delegate callbacks.
+        The pattern below keeps one source of truth in SwiftUI (<code>text</code>) while still allowing UIKit to drive typing.
+    </p>
+<pre><code><span class="keyword">import</span> SwiftUI
+<span class="keyword">import</span> UIKit
+
+<span class="keyword">struct</span> <span class="type">AttributedTextEditor</span>: <span class="type">UIViewRepresentable</span> {
+    <span class="keyword">@Binding</span> <span class="keyword">var</span> text: <span class="type">NSAttributedString</span>
+    <span class="keyword">var</span> isEditable: <span class="type">Bool</span> = <span class="keyword">true</span>
+
+    <span class="keyword">func</span> <span class="func">makeCoordinator</span>() -&gt; <span class="type">Coordinator</span> {
+        <span class="type">Coordinator</span>(<span class="keyword">self</span>)
+    }
+
+    <span class="keyword">func</span> <span class="func">makeUIView</span>(context: <span class="type">Context</span>) -&gt; <span class="type">UITextView</span> {
+        <span class="keyword">let</span> tv = <span class="type">UITextView</span>()
+        tv.delegate = context.coordinator
+        tv.isEditable = isEditable
+        tv.isScrollEnabled = <span class="keyword">true</span>
+        tv.backgroundColor = .clear
+        tv.attributedText = text
+        <span class="keyword">return</span> tv
+    }
+
+    <span class="keyword">func</span> <span class="func">updateUIView</span>(_ uiView: <span class="type">UITextView</span>, context: <span class="type">Context</span>) {
+        uiView.isEditable = isEditable
+
+        <span class="comment">// Avoid clobbering the caret while typing: compare value, not object identity.</span>
+        <span class="keyword">if</span> uiView.attributedText.string != text.string {
+            uiView.attributedText = text
+        }
+    }
+
+    <span class="keyword">final class</span> <span class="type">Coordinator</span>: <span class="type">NSObject</span>, <span class="type">UITextViewDelegate</span> {
+        <span class="keyword">var</span> parent: <span class="type">AttributedTextEditor</span>
+
+        <span class="func">init</span>(_ parent: <span class="type">AttributedTextEditor</span>) {
+            <span class="keyword">self</span>.parent = parent
+        }
+
+        <span class="keyword">func</span> <span class="func">textViewDidChange</span>(<span class="keyword">_</span> textView: <span class="type">UITextView</span>) {
+            parent.text = textView.attributedText
+        }
+
+        <span class="keyword">func</span> <span class="func">textView</span>(<span class="keyword">_</span> textView: <span class="type">UITextView</span>, shouldChangeTextIn range: <span class="type">NSRange</span>, replacementText text: <span class="type">String</span>) -&gt; <span class="type">Bool</span> {
+            <span class="comment">// Return false to veto edits; return true to allow.</span>
+            <span class="keyword">return</span> <span class="keyword">true</span>
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Interview sound bite</div>
+        <p>
+            “Representables are bridges with a strict lifecycle: create once, update many times, dismantle on removal.
+            Delegates belong in a <code>Coordinator</code> because SwiftUI’s <code>View</code> is a struct and cannot reliably be a
+            <code>UITextViewDelegate</code>.”
+        </p>
+    </div>
+
+    <!-- ===================== 2. Coordinator ===================== -->
+    <h2 id="coordinator">2. Coordinator pattern for delegates</h2>
+
+    <h3>Why <code>Coordinator</code> exists</h3>
+    <p>
+        UIKit’s delegate/data-source protocols are overwhelmingly <code>class</code>-constrained reference semantics.
+        SwiftUI views are <code>struct</code> values recreated as the tree is re-evaluated. If you assign <code>textView.delegate = self</code>
+        from inside a <code>struct</code>, you do not get a stable object identity across updates unless you introduce a reference type.
+        The coordinator is that stable object.
+    </p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Problem</th>
+                <th>Without coordinator</th>
+                <th>With coordinator</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Delegate must be a class instance</td>
+                <td>Temptation to use singletons / globals</td>
+                <td>One coordinator per representable instance, owned by SwiftUI’s bridge machinery</td>
+            </tr>
+            <tr>
+                <td>Callbacks need “current props”</td>
+                <td>Stale captures from <code>makeUIView</code> closures</td>
+                <td>Coordinator holds <code>parent</code> (the struct) and reads fresh values each callback</td>
+            </tr>
+            <tr>
+                <td>Retain cycles</td>
+                <td>UIKit holds delegate strongly; delegate holds UIKit</td>
+                <td>Use <code>weak</code> back-references to views/controllers when needed</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Coordinator roles beyond “delegate”</h3>
+    <ul>
+        <li><strong>Delegate / data source:</strong> <code>UITableViewDataSource</code>, <code>MKMapViewDelegate</code>, etc.</li>
+        <li><strong>Target-action:</strong> <code>UIControl</code> events wired with <code>addTarget(_:action:for:)</code> where the target is the coordinator.</li>
+        <li><strong>Gesture recognizers:</strong> attach to the view, implement <code>UIGestureRecognizerDelegate</code> on the coordinator.</li>
+        <li><strong>Combine / async glue:</strong> store cancellables or tasks; clear them in <code>dismantleUIView</code>.</li>
+    </ul>
+
+    <h3>Parent reference pattern</h3>
+    <p>
+        The usual pattern stores <code>var parent: MyRepresentable</code> on the coordinator. On each UIKit callback, you read
+        <code>parent</code> to decide how to update bindings. When SwiftUI recreates the representable struct, it updates the
+        bridge such that the coordinator’s <code>parent</code> tracks the latest props—think “refresh the adapter’s configuration,”
+        not “recreate the coordinator every time.”
+    </p>
+
+    <h3>Example: multiple delegate methods (<code>UIScrollViewDelegate</code>)</h3>
+<pre><code><span class="keyword">import</span> SwiftUI
+<span class="keyword">import</span> UIKit
+
+<span class="keyword">struct</span> <span class="type">ScrollOffsetReader</span>: <span class="type">UIViewRepresentable</span> {
+    <span class="keyword">@Binding</span> <span class="keyword">var</span> offset: <span class="type">CGFloat</span>
+    <span class="keyword">@Binding</span> <span class="keyword">var</span> isDragging: <span class="type">Bool</span>
+
+    <span class="keyword">func</span> <span class="func">makeCoordinator</span>() -&gt; <span class="type">Coordinator</span> { <span class="type">Coordinator</span>(<span class="keyword">self</span>) }
+
+    <span class="keyword">func</span> <span class="func">makeUIView</span>(context: <span class="type">Context</span>) -&gt; <span class="type">UIScrollView</span> {
+        <span class="keyword">let</span> scroll = <span class="type">UIScrollView</span>()
+        scroll.delegate = context.coordinator
+        scroll.alwaysBounceVertical = <span class="keyword">true</span>
+        <span class="keyword">return</span> scroll
+    }
+
+    <span class="keyword">func</span> <span class="func">updateUIView</span>(_ uiView: <span class="type">UIScrollView</span>, context: <span class="type">Context</span>) {
+        context.coordinator.parent = <span class="keyword">self</span>   <span class="comment">// explicit refresh pattern (also see note below)</span>
+    }
+
+    <span class="keyword">final class</span> <span class="type">Coordinator</span>: <span class="type">NSObject</span>, <span class="type">UIScrollViewDelegate</span> {
+        <span class="keyword">var</span> parent: <span class="type">ScrollOffsetReader</span>
+
+        <span class="func">init</span>(_ parent: <span class="type">ScrollOffsetReader</span>) {
+            <span class="keyword">self</span>.parent = parent
+        }
+
+        <span class="keyword">func</span> <span class="func">scrollViewDidScroll</span>(<span class="keyword">_</span> scrollView: <span class="type">UIScrollView</span>) {
+            parent.offset = scrollView.contentOffset.y
+        }
+
+        <span class="keyword">func</span> <span class="func">scrollViewWillBeginDragging</span>(<span class="keyword">_</span> scrollView: <span class="type">UIScrollView</span>) {
+            parent.isDragging = <span class="keyword">true</span>
+        }
+
+        <span class="keyword">func</span> <span class="func">scrollViewDidEndDragging</span>(<span class="keyword">_</span> scrollView: <span class="type">UIScrollView</span>, willDecelerate decelerate: <span class="type">Bool</span>) {
+            <span class="keyword">if</span> !decelerate { parent.isDragging = <span class="keyword">false</span> }
+        }
+
+        <span class="keyword">func</span> <span class="func">scrollViewDidEndDecelerating</span>(<span class="keyword">_</span> scrollView: <span class="type">UIScrollView</span>) {
+            parent.isDragging = <span class="keyword">false</span>
+        }
+    }
+}</code></pre>
+    <p>
+        Note: some teams assign <code>context.coordinator.parent = self</code> inside <code>updateUIView</code> to guarantee the coordinator
+        always references the latest struct values without relying on implicit update mechanics—either approach is
+        interview-defensible if you articulate <strong>why</strong> (avoid stale configuration during rapid state churn).
+    </p>
+
+    <!-- ===================== 3. Hosting ===================== -->
+    <h2 id="hosting">3. <code>UIHostingController</code> embedding</h2>
+
+    <h3>Embedding SwiftUI in UIKit</h3>
+    <p>
+        <code>UIHostingController</code> is a <code>UIViewController</code> whose root view hosts a SwiftUI hierarchy. It is the primary
+        vehicle for incremental adoption inside existing UIKit apps: keep navigation chrome in UIKit, drop SwiftUI for
+        isolated features, or wrap design-system experiments.
+    </p>
+
+    <h3>Child view controller containment (the correct way)</h3>
+    <p>
+        For production UIKit parents, you should use full containment so lifecycle events propagate:
+    </p>
+    <ol>
+        <li><code>addChild(hosting)</code></li>
+        <li>attach <code>hosting.view</code> to the hierarchy with Auto Layout (or frames, if you must)</li>
+        <li><code>hosting.didMove(toParent: self)</code></li>
+    </ol>
+    <p>
+        On teardown, reverse with <code>willMove(toParent: nil)</code>, remove constraints, <code>removeFromParent()</code>.
+    </p>
+
+<pre><code><span class="keyword">import</span> UIKit
+<span class="keyword">import</span> SwiftUI
+
+<span class="keyword">final class</span> <span class="type">ProfileViewController</span>: <span class="type">UIViewController</span> {
+    <span class="keyword">private let</span> userID: <span class="type">String</span>
+    <span class="keyword">private var</span> hosting: <span class="type">UIHostingController</span>&lt;<span class="type">ProfileSwiftUIView</span>&gt;?
+
+    <span class="func">init</span>(userID: <span class="type">String</span>) {
+        <span class="keyword">self</span>.userID = userID
+        <span class="keyword">super</span>.<span class="func">init</span>(nibName: <span class="keyword">nil</span>, bundle: <span class="keyword">nil</span>)
+    }
+
+    <span class="keyword">required init?</span>(coder: <span class="type">NSCoder</span>) { <span class="keyword">fatalError</span>(<span class="string">"init(coder:) has not been implemented"</span>) }
+
+    <span class="keyword">override func</span> <span class="func">viewDidLoad</span>() {
+        <span class="keyword">super</span>.<span class="func">viewDidLoad</span>()
+        view.backgroundColor = .systemBackground
+
+        <span class="keyword">let</span> root = <span class="type">ProfileSwiftUIView</span>(userID: userID)
+        <span class="keyword">let</span> host = <span class="type">UIHostingController</span>(rootView: root)
+        hosting = host
+
+        <span class="func">addChild</span>(host)
+        host.view.translatesAutoresizingMaskIntoConstraints = <span class="keyword">false</span>
+        view.<span class="func">addSubview</span>(host.view)
+
+        <span class="type">NSLayoutConstraint</span>.<span class="func">activate</span>([
+            host.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            host.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            host.view.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            host.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
+
+        host.<span class="func">didMove</span>(toParent: <span class="keyword">self</span>)
+    }
+}</code></pre>
+
+    <h3>Sizing: intrinsic content size vs explicit constraints</h3>
+    <p>
+        SwiftUI views do not automatically behave like a <code>UILabel</code> with a meaningful
+        <code>intrinsicContentSize</code> unless the hosted hierarchy exposes a compact layout. In UIKit tables and stacks,
+        “zero height hosting controller” is a recurring incident.
+    </p>
+    <ul>
+        <li><strong>Pin edges</strong> when the SwiftUI content should fill a known rect (most screens).</li>
+        <li><strong>Let height be intrinsic</strong> when embedding small widgets (cells, banners) and use iOS 16+
+            <code>sizingOptions</code> to translate SwiftUI’s ideal size into UIKit measurement.</li>
+    </ul>
+
+    <h3><code>sizingOptions</code> (iOS 16+)</h3>
+    <p>
+        <code>UIHostingController</code> gained sizing hooks so UIKit layout can ask SwiftUI “how big would you like to be?”
+        without manual magic. The flags that show up most in real apps:
+    </p>
+    <table>
+        <thead>
+            <tr>
+                <th>Option</th>
+                <th>Meaning (practical)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>.preferredContentSize</code></td>
+                <td>Updates <code>preferredContentSize</code> for presentation contexts (popovers/sheets) based on SwiftUI content.</td>
+            </tr>
+            <tr>
+                <td><code>.intrinsicContentSize</code></td>
+                <td>Feeds Auto Layout’s intrinsic size pipeline so parent constraints can hug SwiftUI content.</td>
+            </tr>
+        </tbody>
+    </table>
+
+<pre><code><span class="keyword">let</span> host = <span class="type">UIHostingController</span>(rootView: <span class="type">BannerView</span>(message: message))
+host.sizingOptions = [.intrinsicContentSize]   <span class="comment">// iOS 16+</span>
+<span class="comment">// In a cell: pin leading/trailing/top, height can be driven by content + priorities</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Sizing footgun</div>
+        <p>
+            Intrinsic sizing still requires sane SwiftUI layout: ambiguous SwiftUI layouts produce unstable or zero sizes,
+            and UIKit will faithfully propagate that ambiguity as constraint conflicts or clipping.
+        </p>
+    </div>
+
+    <!-- ===================== 4. Migration ===================== -->
+    <h2 id="migration-strategy">4. Incremental adoption strategy (UIKit → SwiftUI)</h2>
+
+    <h3>Bottom-up: leaf views first</h3>
+    <p>
+        Replace self-contained controls and cells where boundaries are narrow: labels with rich layout, badges, small
+        compound components. Risk is lower because navigation and business orchestration remain in UIKit.
+    </p>
+
+    <h3>Top-down: new screens in SwiftUI</h3>
+    <p>
+        Ship greenfield flows as SwiftUI inside a UIKit shell (<code>UIHostingController</code>) or SwiftUI app entry with UIKit
+        islands (<code>UIViewRepresentable</code>). This accelerates team skill growth and avoids rewriting stable legacy first.
+    </p>
+
+    <h3>Feature-by-feature migration</h3>
+    <p>
+        Carve vertical slices: one product area end-to-end (UI + state + analytics + tests). Slices prevent “half migrated”
+        modules that compile but behave inconsistently across navigation paths.
+    </p>
+
+    <h3>Shared state between UIKit and SwiftUI</h3>
+    <p>
+        Prefer a small number of well-defined state carriers:
+    </p>
+    <ul>
+        <li><strong><code>ObservableObject</code> + <code>@Published</code></strong> bridged into SwiftUI with <code>@ObservedObject</code>/<code>@StateObject</code>.</li>
+        <li><strong><code>@Observable</strong> (iOS 17) with observation in SwiftUI and explicit refresh hooks in UIKit if needed.</li>
+        <li><strong>Unidirectional stores</strong> (TCA-like, Redux-like) where UIKit subscribers and SwiftUI views read the same store.</li>
+    </ul>
+
+    <h3>Timeline and risk assessment (talk track)</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Phase</th>
+                <th>Scope</th>
+                <th>Risk</th>
+                <th>Success signal</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>0–6 weeks</td>
+                <td>Interop scaffolding, design tokens, navigation bridges</td>
+                <td>Medium: wrong sizing/containment patterns spread fast</td>
+                <td>One production feature flag using SwiftUI in UIKit</td>
+            </tr>
+            <tr>
+                <td>2–4 months</td>
+                <td>Vertical slices, shared VM layer, snapshot tests</td>
+                <td>High: state duplication bugs</td>
+                <td>Parity metrics (crashes, latency, QA escapes)</td>
+            </tr>
+            <tr>
+                <td>6–18 months</td>
+                <td>Broad migration + deprecation of legacy UI</td>
+                <td>Org risk: skill drift, review churn</td>
+                <td>Reduced UI defect rate / faster iteration on migrated areas</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>ASCII diagram: migration phases</h3>
+<div class="diagram">Phase A: UIKit App (monolith)
++---------------------------+
+| UINavigationController    |
+|  - Legacy feature screens |
++---------------------------+
+
+Phase B: Islands
++---------------------------+
+| UIKit shell               |
+|  - UIHostingController ----&gt; SwiftUI feature (new)
+|  - Legacy UIViewController |
++---------------------------+
+
+Phase C: Dual runtime (long coast)
++---------------------------+
+| SwiftUI root (new)        |
+|  - UIViewRepresentable ---&gt; critical UIKit SDKs
+|  - Native SwiftUI         |
++---------------------------+
+
+Phase D: Consolidation
++---------------------------+
+| SwiftUI-first + thin UIKit|
++---------------------------+</div>
+
+    <!-- ===================== 5. Data flow ===================== -->
+    <h2 id="data-flow">5. Two-way data flow between UIKit and SwiftUI</h2>
+
+    <h3>SwiftUI → UIKit: <code>updateUIView</code> on state change</h3>
+    <p>
+        When bindings or observed models change, SwiftUI schedules a pass that includes your representable’s
+        <code>updateUIView</code>. This is the “push props down” direction. Keep updates fast; defer heavy work to async queues
+        but mutate UIKit on the main thread.
+    </p>
+
+    <h3>UIKit → SwiftUI: coordinator + <code>Binding</code></h3>
+    <p>
+        UIKit callbacks run on the main thread; write into <code>@Binding</code>, <code>ObservableObject</code>, or call a closure injected
+        from SwiftUI. Avoid calling SwiftUI-specific assumptions from background threads.
+    </p>
+
+<pre><code><span class="keyword">struct</span> <span class="type">UIKitSearchField</span>: <span class="type">UIViewRepresentable</span> {
+    <span class="keyword">@Binding</span> <span class="keyword">var</span> query: <span class="type">String</span>
+    <span class="keyword">var</span> onSubmit: () -&gt; <span class="type">Void</span> = {}
+
+    <span class="keyword">func</span> <span class="func">makeCoordinator</span>() -&gt; <span class="type">Coordinator</span> { <span class="type">Coordinator</span>(<span class="keyword">self</span>) }
+
+    <span class="keyword">func</span> <span class="func">makeUIView</span>(context: <span class="type">Context</span>) -&gt; <span class="type">UISearchBar</span> {
+        <span class="keyword">let</span> bar = <span class="type">UISearchBar</span>()
+        bar.delegate = context.coordinator
+        <span class="keyword">return</span> bar
+    }
+
+    <span class="keyword">func</span> <span class="func">updateUIView</span>(_ uiView: <span class="type">UISearchBar</span>, context: <span class="type">Context</span>) {
+        <span class="keyword">if</span> uiView.text != query {
+            uiView.text = query
+        }
+    }
+
+    <span class="keyword">final class</span> <span class="type">Coordinator</span>: <span class="type">NSObject</span>, <span class="type">UISearchBarDelegate</span> {
+        <span class="keyword">var</span> parent: <span class="type">UIKitSearchField</span>
+        <span class="func">init</span>(_ parent: <span class="type">UIKitSearchField</span>) { <span class="keyword">self</span>.parent = parent }
+
+        <span class="keyword">func</span> <span class="func">searchBar</span>(<span class="keyword">_</span> searchBar: <span class="type">UISearchBar</span>, textDidChange searchText: <span class="type">String</span>) {
+            parent.query = searchText
+        }
+
+        <span class="keyword">func</span> <span class="func">searchBarSearchButtonClicked</span>(<span class="keyword">_</span> searchBar: <span class="type">UISearchBar</span>) {
+            parent.onSubmit()
+        }
+    }
+}</code></pre>
+
+    <h3><code>ObservableObject</code> shared between both worlds</h3>
+    <p>
+        A reference-type model owned by UIKit (e.g. view model created in <code>UIViewController</code>) can be passed into SwiftUI
+        via <code>UIHostingController(rootView:)</code> initializer capture or environment injection. SwiftUI observes changes;
+        UIKit can mutate the same object and call <code>objectWillChange.send()</code> when needed.
+    </p>
+
+<pre><code><span class="keyword">final class</span> <span class="type">SessionStore</span>: <span class="type">ObservableObject</span> {
+    <span class="keyword">@Published var</span> username: <span class="type">String</span> = <span class="string">""</span>
+}
+
+<span class="keyword">struct</span> <span class="type">HeaderView</span>: <span class="type">View</span> {
+    <span class="keyword">@ObservedObject</span> <span class="keyword">var</span> session: <span class="type">SessionStore</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">Text</span>(<span class="string">"Hello, \(session.username)"</span>)
+    }
+}
+
+<span class="comment">// UIKit creates the store once; SwiftUI observes it.</span>
+<span class="keyword">let</span> store = <span class="type">SessionStore</span>()
+<span class="keyword">let</span> host = <span class="type">UIHostingController</span>(rootView: <span class="type">HeaderView</span>(session: store))</code></pre>
+
+    <h3><code>@Observable</code> shared (iOS 17+)</h3>
+    <p>
+        With the Observation framework, SwiftUI views use <code>@Bindable</code>/<code>@State</code> patterns against <code>@Observable</code> models.
+        From UIKit, you still hold the same reference-typed model; updates can flow through method calls. Ensure UIKit-side
+        code triggers observation notifications appropriately when mutating fields that SwiftUI reads—in practice, prefer
+        narrow mutation APIs on the model rather than scattered field writes.
+    </p>
+
+<pre><code><span class="keyword">import</span> Observation
+
+<span class="keyword">@Observable</span> <span class="keyword">final class</span> <span class="type">Cart</span> {
+    <span class="keyword">var</span> itemCount: <span class="type">Int</span> = <span class="number">0</span>
+}
+
+<span class="keyword">struct</span> <span class="type">CartBadge</span>: <span class="type">View</span> {
+    <span class="keyword">@Bindable</span> <span class="keyword">var</span> cart: <span class="type">Cart</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">Text</span>(<span class="string">"\(cart.itemCount) items"</span>)
+    }
+}</code></pre>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Direction</th>
+                <th>Mechanism</th>
+                <th>Watch for</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>SwiftUI → UIKit</td>
+                <td><code>updateUIView</code>, environment-driven config</td>
+                <td>Feedback loops (map region, text caret)</td>
+            </tr>
+            <tr>
+                <td>UIKit → SwiftUI</td>
+                <td>Coordinator writes bindings / store</td>
+                <td>Main-thread violations, re-entrancy</td>
+            </tr>
+            <tr>
+                <td>Both</td>
+                <td>Shared reference model</td>
+                <td>Over-wide observation causing excessive body recomputation</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ===================== 6. Sizing ===================== -->
+    <h2 id="sizing">6. Sizing challenges (intrinsic content size bridging)</h2>
+
+    <h3>UIKit <code>intrinsicContentSize</code> vs SwiftUI sizing</h3>
+    <p>
+        UIKit Auto Layout asks views for an intrinsic size when constraints are underdetermined. SwiftUI instead uses
+        <em>proposals</em> and <em>responses</em> in its layout protocol; bridging layers must translate between the two paradigms.
+    </p>
+
+    <h3><code>UIHostingController</code> inside UIKit containers</h3>
+    <ul>
+        <li><strong>Table/collection cells:</strong> pin lateral edges; choose a height strategy (fixed, self-sizing with
+            <code>sizingOptions</code>, or explicit calculation).</li>
+        <li><strong>Stack views:</strong> remember UIStackView uses intrinsic sizes heavily—test on largest dynamic type.</li>
+        <li><strong>Navigation transitions:</strong> snapshot-based animations may not play nicely with highly dynamic SwiftUI sizes;
+            stabilize identity and avoid layout thrash during transitions.</li>
+    </ul>
+
+    <h3><code>UIViewRepresentable</code> inside SwiftUI</h3>
+    <p>
+        By default, many UIKit views return <code>UIView.noIntrinsicMetric</code> for one or both axes. SwiftUI may expand the view
+        to fill proposed space unless you constrain it with SwiftUI layout (e.g. <code>frame</code>, <code>fixedSize</code>, parent stack rules).
+    </p>
+
+    <h3>Common sizing bugs and fixes</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Symptom</th>
+                <th>Likely cause</th>
+                <th>Fix direction</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Zero-height SwiftUI in UIKit</td>
+                <td>No intrinsic content + missing height constraint</td>
+                <td>Pin height, or enable <code>sizingOptions</code> + hugging priorities</td>
+            </tr>
+            <tr>
+                <td>UIKit view fills too much space in SwiftUI</td>
+                <td>UIKit intrinsic width/height is large or unspecified</td>
+                <td>Use <code>frame(maxWidth:)</code>, <code>fixedSize</code>, or implement <code>sizeThatFits</code> (iOS 16+)</td>
+            </tr>
+            <tr>
+                <td>Scroll views “fight” the parent</td>
+                <td>Nested scrollable axes with ambiguous constraints</td>
+                <td>Split responsibilities; use <code>SwiftUI.ScrollView</code> or UIKit scroll, not both competing</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3><code>sizeThatFits</code> in <code>UIViewRepresentable</code> (iOS 16+)</h3>
+    <p>
+        Implementing <code>sizeThatFits</code> lets SwiftUI query the UIKit view for a natural size given a proposal. This is the
+        bridge answer to “my representable always expands to infinity.”
+    </p>
+
+<pre><code><span class="keyword">struct</span> <span class="type">MeasuredLabel</span>: <span class="type">UIViewRepresentable</span> {
+    <span class="keyword">var</span> text: <span class="type">String</span>
+
+    <span class="keyword">func</span> <span class="func">makeUIView</span>(context: <span class="type">Context</span>) -&gt; <span class="type">UILabel</span> {
+        <span class="keyword">let</span> label = <span class="type">UILabel</span>()
+        label.numberOfLines = <span class="number">0</span>
+        <span class="keyword">return</span> label
+    }
+
+    <span class="keyword">func</span> <span class="func">updateUIView</span>(_ uiView: <span class="type">UILabel</span>, context: <span class="type">Context</span>) {
+        uiView.text = text
+    }
+
+    <span class="keyword">func</span> <span class="func">sizeThatFits</span>(_ proposal: <span class="type">ProposedViewSize</span>, uiView: <span class="type">UILabel</span>, context: <span class="type">Context</span>) -&gt; <span class="type">CGSize</span>? {
+        <span class="keyword">let</span> width = proposal.width ?? <span class="type">UIView</span>.layoutFittingExpandedSize.width
+        <span class="keyword">let</span> target = <span class="type">CGSize</span>(width: width, height: .greatestFiniteMagnitude)
+        <span class="keyword">return</span> uiView.<span class="func">systemLayoutSizeFitting</span>(
+            target,
+            withHorizontalFittingPriority: .required,
+            verticalFittingPriority: .fittingSizeLevel
+        )
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Staff-level summary</div>
+        <p>
+            Interop sizing is translation work: UIKit wants intrinsic metrics and constraints; SwiftUI wants proposals.
+            When something looks “infinite” or “zero,” you are usually missing a translator—either explicit frames,
+            <code>UIHostingController.sizingOptions</code>, or <code>sizeThatFits</code> on the representable.
+        </p>
+    </div>
+
+    <!-- ===================== 7. Architect ===================== -->
+    <h2 id="architect-500k">7. Architect callout: migrating a 500K LOC UIKit app to SwiftUI</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">500K LOC UIKit → SwiftUI (6–18 month horizon)</div>
+        <p>
+            At this scale, migration is a <strong>program</strong>, not a refactor. Success is measured by risk-adjusted throughput:
+            shipping customer value while steadily reducing the percentage of new work that deepens UIKit coupling.
+        </p>
+        <p><strong>Phase planning.</strong></p>
+        <ul>
+            <li><strong>Months 0–3:</strong> interop standards (hosting containment, representable templates, state bridges), CI snapshots for SwiftUI, performance baselines.</li>
+            <li><strong>Months 3–9:</strong> vertical slices through high-churn product areas; shared domain/view-model layer; navigation adapters.</li>
+            <li><strong>Months 9–18:</strong> consolidate duplicated UI paths; retire worst legacy modules; train review rubrics for SwiftUI performance and identity.</li>
+        </ul>
+        <p><strong>Shared architecture layer.</strong></p>
+        <p>
+            Extract UI-agnostic use cases (networking, validation, feature flags, analytics events) so both UIKit and SwiftUI
+            call the same services. Ban “SwiftUI-only” business rules unless you enjoy split-brain bugs.
+        </p>
+        <p><strong>Navigation bridging.</strong></p>
+        <p>
+            Introduce a small routing abstraction: deep links and in-app routes resolve to either a UIKit stack push or a
+            SwiftUI navigation path. Avoid N×N ad hoc segues between runtimes.
+        </p>
+        <p><strong>State management bridging.</strong></p>
+        <p>
+            Standardize on one observable store style per app (Observation vs Combine vs external store). Document how UIKit
+            view controllers subscribe—via callbacks, Combine, or explicit presenter methods.
+        </p>
+        <p><strong>Testing strategy during migration.</strong></p>
+        <ul>
+            <li><strong>Snapshot tests</strong> for SwiftUI screens (dark mode, dynamic type, RTL).</li>
+            <li><strong>Integration tests</strong> for navigation bridges and feature flags.</li>
+            <li><strong>Performance tests</strong> on representative devices for scroll-heavy SwiftUI lists.</li>
+        </ul>
+        <p><strong>Risk mitigation.</strong></p>
+        <ul>
+            <li>Feature flags per screen/flow; instant rollback to UIKit path.</li>
+            <li>Crash bucketing split by runtime (SwiftUI vs UIKit) to spot bridge regressions quickly.</li>
+            <li>Memory leak audits around coordinators, hosting controllers, and delegate cycles.</li>
+        </ul>
+        <p><strong>Decision framework: what to migrate first</strong></p>
+        <table>
+            <thead>
+                <tr>
+                    <th>Migrate earlier</th>
+                    <th>Defer</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>High churn UI (frequent product iteration)</td>
+                    <td>Stable, rarely touched settings/admin surfaces</td>
+                </tr>
+                <tr>
+                    <td>Self-contained visuals with few system edge cases</td>
+                    <td>Heavy <code>UIKit</code> text stacks with custom IME behavior</td>
+                </tr>
+                <tr>
+                    <td>Areas with poor test coverage that SwiftUI snapshots can secure</td>
+                    <td>Modules tightly coupled to complex <code>UIView</code> subclass hierarchies</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Closing narrative</div>
+        <p>
+            Staff interviews reward systems thinking: you can name the protocols, but you win by explaining lifecycle,
+            thread model, sizing translation, and how you would run a multi-quarter migration without freezing feature development.
+        </p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="07-performance.html">← Performance</a>
+        <a href="09-interview-qa.html">Next: Interview Q&amp;A →</a>
+    </div>
+</div>
+</body>
+</html>

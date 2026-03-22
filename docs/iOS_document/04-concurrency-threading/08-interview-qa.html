@@ -1,0 +1,922 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Concurrency Interview Q&amp;A — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Concurrency &amp; Threading</a><span class="sep">›</span>
+        Interview Q&amp;A
+    </nav>
+
+    <h1>Concurrency &amp; Threading — Interview Q&amp;A</h1>
+    <p class="subtitle">55+ Staff-level interview questions covering GCD internals, actor reentrancy, Sendable, Combine backpressure, RunLoop edge cases, and concurrency system design. Each question is tagged by difficulty and includes a detailed answer.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">How to Use</div>
+        <p>Click any question to reveal its answer. Questions are tagged: <span class="tag tag-senior">Senior</span> for L5-level, <span class="tag tag-l6">L6</span> for Staff-level, and <span class="tag tag-architect">Architect</span> for system design depth. Try answering each question before revealing the answer.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>GCD Internals (Questions 1–10)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>1. What happens internally when you call dispatch_async? Walk through the full path from your code to thread execution.</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>When you call <code>dispatch_async(queue, block)</code>:</p>
+                <ol>
+                    <li><strong>Block copy</strong>: The block is copied from stack to heap via <code>_Block_copy</code>. All captured variables are retained (for objects) or copied (for value types).</li>
+                    <li><strong>Continuation wrapping</strong>: The block is wrapped in a <code>dispatch_continuation_t</code> struct that holds the block, the queue, the QoS, and voucher information.</li>
+                    <li><strong>Enqueue</strong>: The continuation is appended to the queue's internal FIFO list using a lock-free MPSC (Multiple Producer, Single Consumer) atomic linked list. This uses <code>os_atomic_xchg</code> for wait-free enqueue.</li>
+                    <li><strong>Drain signal</strong>: libdispatch signals the kernel's <code>pthread_workqueue</code> facility that work is available, specifying the QoS class.</li>
+                    <li><strong>Thread wakeup</strong>: The kernel either wakes an idle worker thread from the pool or creates a new one (up to the per-workqueue limit of 64).</li>
+                    <li><strong>Dequeue &amp; execute</strong>: The worker thread calls <code>_dispatch_queue_drain</code>, which dequeues the continuation and invokes the block.</li>
+                    <li><strong>Cleanup</strong>: After execution, the block is released via <code>_Block_release</code>, releasing captured objects.</li>
+                </ol>
+                <p>For serial queues, the drain function holds a "drain lock" ensuring only one block executes at a time. For concurrent queues, multiple threads can drain simultaneously.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>2. Explain the 64-thread limit in GCD. What is thread explosion, and how do you prevent it?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>GCD manages a per-process thread pool through the kernel's <code>pthread_workqueue</code>. Each workqueue (mapped to a QoS class) can have up to <strong>64 concurrent threads</strong>. Thread explosion occurs when you submit many blocks that each block their thread (e.g., synchronous I/O), causing GCD to create new threads up to and beyond this limit (serial queues use "overcommit" workqueues that can exceed 64).</p>
+                <p><strong>Consequences</strong>: Each thread costs ~512KB stack space. 200 threads = 100MB just for stacks. Plus massive context switching overhead, cache thrashing, and potential Jetsam kills.</p>
+                <p><strong>Prevention strategies</strong>:</p>
+                <ul>
+                    <li>Use <code>OperationQueue</code> with <code>maxConcurrentOperationCount</code></li>
+                    <li>Use <code>DispatchSemaphore</code> to limit concurrent work</li>
+                    <li>Use async/await (cooperative thread pool limited to CPU core count)</li>
+                    <li>Use <code>TaskGroup</code> with a sliding window pattern for bounded concurrency</li>
+                    <li>Avoid blocking threads — use async APIs instead of synchronous ones</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>3. What is priority inversion in the context of GCD? How does GCD resolve it?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Priority inversion</strong> occurs when a high-priority task is blocked waiting for a low-priority task that can't run because medium-priority tasks are consuming CPU time. The high-priority task effectively runs at the low-priority task's priority — inverted.</p>
+                <p>GCD resolves this through <strong>priority boosting</strong> (priority inheritance):</p>
+                <ul>
+                    <li><strong>dispatch_sync</strong>: When a high-QoS thread calls <code>sync</code> on a queue, GCD temporarily boosts the priority of the currently executing block on that queue to match the waiter's QoS.</li>
+                    <li><strong>Serial queues</strong>: The queue's effective QoS is raised to the highest QoS of any pending block.</li>
+                    <li><strong>DispatchSemaphore</strong>: Limited priority inheritance — the system can boost the signaling thread, but it's not as reliable as <code>os_unfair_lock</code> which has full kernel-level priority inheritance.</li>
+                </ul>
+                <p><strong>Important caveat</strong>: <code>DispatchSemaphore</code> does NOT fully support priority inheritance because the kernel doesn't know which thread holds the semaphore. For critical sections, prefer <code>os_unfair_lock</code> or serial dispatch queues.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>4. Why does using a barrier flag on a global concurrent queue have no effect?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Global concurrent queues are <strong>shared by the entire process</strong> — all frameworks, libraries, and your code submit work to the same global queues. If barriers worked on global queues, any code could block the entire system by submitting a barrier block. This would be a denial-of-service vulnerability within your own process.</p>
+                <p>The barrier flag is <strong>silently ignored</strong> on global queues. Barriers only work on custom concurrent queues that you create, because you control all the work submitted to them. This is why the reader-writer pattern requires a custom concurrent queue.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>5. Explain the target queue hierarchy. How can you use it for subsystem-level synchronization?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Every dispatch queue has a <strong>target queue</strong> — the queue where its blocks are ultimately executed. By default, custom queues target the default-priority global concurrent queue. You can set a custom target to create hierarchies.</p>
+                <p><strong>Key use case</strong>: If multiple serial queues share the same serial target queue, they become <strong>mutually exclusive</strong>. Blocks from any of these queues will never execute concurrently with each other, because they all funnel through the shared serial target.</p>
+                <p>This is powerful for subsystem-level synchronization: each module gets its own queue (for debugging labels and independent scheduling), but they all serialize through a shared target for thread safety. It's more granular than a single global lock but still prevents data races across the subsystem.</p>
+                <p><strong>QoS interaction</strong>: The target queue's QoS acts as a floor. If a child queue has a higher QoS than its target, the effective QoS is the higher of the two (to prevent priority inversion within the hierarchy).</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>6. What are the five QoS classes in GCD? When would you use each one?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <ul>
+                    <li><strong>.userInteractive</strong> (priority 33): Main thread work, animations, event handling. Uses performance cores, highest CPU priority.</li>
+                    <li><strong>.userInitiated</strong> (priority 25): User tapped something and is waiting for a result. High priority, performance cores.</li>
+                    <li><strong>.default</strong> (priority 21): Default when no QoS is specified. Balanced scheduling.</li>
+                    <li><strong>.utility</strong> (priority 17): Long-running tasks the user is aware of but not actively waiting for — downloads, imports, indexing. Prefers efficiency cores, I/O throttled, timer coalescing enabled.</li>
+                    <li><strong>.background</strong> (priority 9): Work the user doesn't know about — prefetching, maintenance, backups. Efficiency cores only, heavily throttled, may be deferred entirely during low battery.</li>
+                </ul>
+                <p>On Apple Silicon, .userInteractive and .userInitiated preferentially schedule on performance (P) cores, while .utility and .background schedule on efficiency (E) cores for energy savings.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>7. What is the difference between DispatchGroup's enter/leave pattern and the group-async pattern?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>The <strong>group-async pattern</strong> (<code>queue.async(group: group) { ... }</code>) automatically calls <code>enter()</code> before the block starts and <code>leave()</code> when the block completes. It works for synchronous blocks that complete when they return.</p>
+                <p>The <strong>enter/leave pattern</strong> is for asynchronous work where the block returns before the work is done (e.g., network callbacks). You manually call <code>group.enter()</code> before starting the async work and <code>group.leave()</code> in the completion handler.</p>
+                <p><strong>Critical rule</strong>: Every <code>enter()</code> must have exactly one matching <code>leave()</code>. Extra <code>leave()</code> calls crash (EXC_BAD_INSTRUCTION). Missing <code>leave()</code> calls cause the group to never complete. Always use <code>defer { group.leave() }</code> to ensure balance.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>8. Why should you avoid calling DispatchSemaphore.wait() on the main thread?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>semaphore.wait()</code> <strong>blocks the calling thread</strong> until <code>signal()</code> is called. On the main thread, this freezes the UI — no touch events, no animations, no screen updates. If the work that will call <code>signal()</code> also needs the main thread (e.g., a UIKit callback, a Combine sink on DispatchQueue.main), you get a <strong>deadlock</strong>: the main thread is blocked waiting for a signal that can only be delivered on the main thread.</p>
+                <p>Even without deadlock, blocking the main thread for more than a few seconds triggers the watchdog timer, and iOS will kill your app (0x8badf00d — "ate bad food" — the watchdog termination code).</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>9. Compare DispatchSource.makeTimerSource with Timer (NSTimer). When would you choose each?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Timer (NSTimer)</strong>: Requires a RunLoop. Added to a specific RunLoop mode. Pauses during scrolling if in .default mode. Fires on the thread whose RunLoop it's attached to. Tolerance property for energy optimization.</p>
+                <p><strong>DispatchSource timer</strong>: Does not require a RunLoop. Fires on any dispatch queue. Not affected by RunLoop modes — always fires. Leeway parameter for energy optimization (allows coalescing). More precise. Must be manually resumed (starts suspended).</p>
+                <p><strong>Choose Timer when</strong>: You need RunLoop mode awareness (e.g., intentionally pausing during scroll), or you're in a RunLoop-centric context.</p>
+                <p><strong>Choose DispatchSource timer when</strong>: You need reliable firing regardless of RunLoop mode, you need to fire on a background queue, or you need precise timing.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>10. What causes a deadlock with dispatch_sync, and how does it apply transitively through target queues?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Calling <code>sync</code> on the <strong>current</strong> serial queue deadlocks because: the current block holds the queue's execution token, and <code>sync</code> waits for that token to become available — classic self-deadlock.</p>
+                <p><strong>Transitive deadlock</strong>: If queue A targets queue B (serial), and you're executing on queue A and call <code>sync</code> on queue B, it deadlocks. The block on A is holding B's execution token (through the target relationship), and <code>sync</code> on B waits for that token.</p>
+                <p>This also applies to the main queue: calling <code>DispatchQueue.main.sync</code> from the main thread deadlocks, because the main queue is serial and you're already on it.</p>
+                <p><strong>Detection</strong>: libdispatch has some runtime deadlock detection that logs warnings, but it doesn't catch all transitive cases. The best prevention is to never call <code>sync</code> on a queue you might already be on, and to document target queue relationships.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Operation Queues (Questions 11–16)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>11. Why must custom async Operations manually fire KVO notifications for isExecuting and isFinished?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>The OperationQueue uses KVO (Key-Value Observing) to monitor operation state transitions. For synchronous operations (override <code>main()</code>), the base class automatically manages KVO: it sets isExecuting=true before calling main(), and isFinished=true after main() returns.</p>
+                <p>For asynchronous operations (override <code>start()</code>), the base class can't know when your async work completes — it returns from <code>start()</code> immediately. You must manually fire <code>willChangeValue(forKey:)</code> and <code>didChangeValue(forKey:)</code> for both "isExecuting" and "isFinished" when the state changes.</p>
+                <p><strong>If you forget</strong>: The queue never removes the operation from its <code>operations</code> array. It stays in the queue forever. Any operations that depend on it will never start. The queue's <code>operationCount</code> never reaches zero. This is one of the most common bugs with custom async operations.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>12. When an operation is cancelled, are its dependent operations also cancelled?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>No</strong>. Cancelling an operation does NOT automatically cancel its dependents. A cancelled operation still transitions to <code>isFinished = true</code> (after its <code>start()</code> is called), which satisfies the dependency. The dependent operation will then start with its own <code>isCancelled</code> still false.</p>
+                <p>For cascading cancellation, you must either: (1) check the dependency's <code>isCancelled</code> in the dependent's <code>main()</code>, (2) cancel the entire queue with <code>cancelAllOperations()</code>, or (3) implement custom cancellation propagation logic.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>13. What happens if you create a circular dependency between two operations?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>If operation A depends on B and B depends on A, <strong>neither will ever execute</strong>. Both operations remain in the "pending" state forever because each is waiting for the other to finish. The queue silently deadlocks — there's no crash, no warning, no error. The operations just sit in the queue's <code>operations</code> array indefinitely.</p>
+                <p>For complex pipelines, you should validate that your dependency graph is a DAG (Directed Acyclic Graph) before adding operations to the queue. You can do this with a topological sort or cycle detection algorithm.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>14. When should you choose OperationQueue over GCD or async/await?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Choose OperationQueue when</strong>:</p>
+                <ul>
+                    <li>You need <strong>complex dependency graphs</strong> — "B depends on A, C depends on A and B" — that would be awkward to express with nested closures or async/await chains</li>
+                    <li>You need <strong>KVO observation</strong> of task state (isReady, isExecuting, isFinished) for progress UI or monitoring</li>
+                    <li>You need <strong>reusable operation classes</strong> that encapsulate complex work with inputs, outputs, and cancellation</li>
+                    <li>You're building a <strong>data processing pipeline</strong> where operations represent discrete stages</li>
+                </ul>
+                <p><strong>Choose GCD when</strong>: Simple async dispatch, barriers for reader-writer patterns, DispatchSource for system events.</p>
+                <p><strong>Choose async/await when</strong>: Writing new code — it's safer (no thread explosion), more readable, and has better cancellation support. It's the default choice for most new code.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>15. How does BlockOperation handle multiple execution blocks? Are they serial or concurrent?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>When you add multiple execution blocks to a <code>BlockOperation</code> via <code>addExecutionBlock(_:)</code>, they run <strong>concurrently</strong>, not sequentially. The operation is only considered finished when ALL blocks have completed. The <code>completionBlock</code> runs after all execution blocks finish.</p>
+                <p>This means if your blocks share mutable state, you'll have a data race. For sequential execution, use separate operations with dependencies instead.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>16. How would you pass data between dependent operations?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Operations don't have a built-in data passing mechanism. Common patterns:</p>
+                <ul>
+                    <li><strong>Output properties</strong>: The producing operation stores results in a property. The consuming operation accesses the dependency's property in its <code>main()</code> via <code>dependencies.compactMap { $0 as? ProducerOperation }.first?.output</code>.</li>
+                    <li><strong>Adapter operations</strong>: Create a generic adapter that transforms one operation's output into another's input.</li>
+                    <li><strong>Shared context object</strong>: Pass a mutable context object that operations read from and write to (requires synchronization).</li>
+                    <li><strong>Closure-based wiring</strong>: Set up closures between operations before adding them to the queue.</li>
+                </ul>
+                <p>The output property pattern is most common. It's safe because the dependency is guaranteed to be finished (isFinished = true) before the dependent starts, so reading the output property doesn't race.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Swift Concurrency (Questions 17–28)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>17. How does async/await work under the hood? What are async frames and how do they differ from stack frames?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>The Swift compiler transforms async functions into <strong>state machines</strong>. Each <code>await</code> point becomes a state transition. The function's local variables are stored in a heap-allocated <strong>async frame</strong> (not on the thread's stack), so they survive suspension.</p>
+                <p><strong>Stack frames</strong>: Allocated on the thread's stack, automatically freed when the function returns. Tied to a specific thread.</p>
+                <p><strong>Async frames</strong>: Heap-allocated structures that hold the function's local state across suspension points. Not tied to any thread — the function can resume on a different thread than it suspended on.</p>
+                <p>This is why async functions can suspend without holding a thread: their state lives on the heap. The tradeoff is heap allocation overhead, but this is amortized by the massive reduction in thread count (cooperative thread pool is limited to CPU core count, typically 6-8 on modern iPhones).</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>18. What is the critical difference between Task { } and Task.detached { }?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>Task { }</code> <strong>inherits</strong> the creating context: actor isolation, priority, and task-local values. If called from a @MainActor context, the task runs on the MainActor.</p>
+                <p><code>Task.detached { }</code> <strong>does not inherit</strong> anything: no actor isolation (runs on the default concurrent executor), no priority inheritance (defaults to .medium), no task-local values.</p>
+                <p><strong>Both are unstructured</strong> — neither is a child of the creating task. They can outlive their creating scope. You must store the <code>Task</code> handle and cancel it manually to avoid leaks.</p>
+                <p><strong>Common mistake</strong>: Using <code>Task.detached</code> from a @MainActor context and then trying to update UI without explicitly hopping back to MainActor. Use <code>Task { }</code> when you want to stay on the same actor; use <code>Task.detached { }</code> only when you explicitly want to escape the current actor context.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>19. Explain structured concurrency. Why is it important, and how does TaskGroup implement it?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Structured concurrency</strong> means concurrent tasks form a tree — child tasks are scoped to their parent, and the parent doesn't complete until all children complete (or are cancelled). This eliminates resource leaks and dangling tasks.</p>
+                <p><strong>TaskGroup</strong> implements structured concurrency: child tasks created via <code>group.addTask</code> are children of the group. The <code>withTaskGroup</code> block doesn't return until all children complete. If the parent is cancelled, all children are cancelled. In <code>ThrowingTaskGroup</code>, if one child throws, the remaining children are automatically cancelled.</p>
+                <p><strong>Why it matters</strong>: Without structured concurrency (e.g., fire-and-forget <code>Task { }</code>), you can create tasks that outlive their creating scope, leak resources, or continue doing work after the user has navigated away. Structured concurrency makes the task lifecycle match the code scope — when the scope exits, all concurrent work is guaranteed to be done.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>20. How does task cancellation work in Swift concurrency? Is it preemptive or cooperative?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Task cancellation is <strong>cooperative</strong>. Calling <code>task.cancel()</code> sets a flag but does not stop the task. The task must check for cancellation and respond:</p>
+                <ul>
+                    <li><code>Task.checkCancellation()</code>: Throws <code>CancellationError</code> if cancelled</li>
+                    <li><code>Task.isCancelled</code>: Returns a Bool to check without throwing</li>
+                    <li><code>Task.sleep</code>: Automatically throws <code>CancellationError</code> if cancelled during sleep</li>
+                </ul>
+                <p>In <code>ThrowingTaskGroup</code>, when one child throws, the group cancels remaining children — but those children still need to check for cancellation to actually stop.</p>
+                <p>Well-behaved async APIs (like <code>URLSession.data(from:)</code>) check for cancellation internally and throw when cancelled.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>21. What is priority escalation in Swift concurrency? Give a concrete example.</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Priority escalation occurs when a high-priority task awaits a lower-priority task. The runtime detects the dependency and <strong>boosts the lower-priority task's priority</strong> to match the waiter, preventing priority inversion.</p>
+                <p><strong>Example</strong>: A <code>.userInitiated</code> task calls <code>await lowPriorityTask.value</code> where <code>lowPriorityTask</code> was created with <code>.background</code> priority. The runtime walks the dependency chain and escalates the background task to <code>.userInitiated</code> priority. For actors, this means the actor's executor will schedule the boosted job ahead of other same-priority jobs.</p>
+                <p>This is similar to GCD's priority inheritance but works at the task level rather than the thread level.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>22. What are TaskLocal values? How do they differ from thread-local storage?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>@TaskLocal</code> values are scoped to a task and its children. They propagate automatically through the task hierarchy — child tasks (including TaskGroup children) inherit their parent's task-local values.</p>
+                <p><strong>vs Thread-local storage</strong>: Thread-local values are tied to a specific thread. Since async code can resume on any thread, thread-local values are useless across await points — the task might resume on a different thread and see a different thread-local value. TaskLocal values follow the <em>task</em>, not the thread, so they work correctly across suspensions.</p>
+                <p><strong>Key behaviors</strong>: <code>Task { }</code> inherits task-local values. <code>Task.detached { }</code> does NOT inherit them. Values are set via <code>$taskLocal.withValue(value) { ... }</code> and are scoped to that closure.</p>
+                <p><strong>Use cases</strong>: Request IDs, trace IDs, user context, feature flags — anything that should propagate through a call chain without passing parameters explicitly.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>23. What is the Sendable protocol? Why does Swift need it?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>Sendable</code> is a marker protocol indicating a type is safe to share across concurrency domains (actors, tasks). Swift needs it because when data crosses an actor boundary (or is captured by a @Sendable closure), both the sender and receiver could access it concurrently — a data race.</p>
+                <p><strong>Implicitly Sendable</strong>: Value types where all stored properties are Sendable; actor types; final classes with only immutable Sendable properties; tuples of Sendable types.</p>
+                <p><strong>@unchecked Sendable</strong>: An escape hatch for types that handle their own synchronization (e.g., a class with a lock protecting mutable state). The compiler trusts you — if you're wrong, you get data races.</p>
+                <p>In Swift 6, all Sendable violations are compile errors by default, making data race safety a compile-time guarantee.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>24. What is the difference between withCheckedContinuation and withUnsafeContinuation?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Both bridge callback-based APIs to async/await. The difference is safety checking:</p>
+                <p><strong>withCheckedContinuation</strong>: Runtime checks that the continuation is resumed exactly once. Double-resume causes a crash. Never-resume generates a runtime warning in debug. Slight performance overhead for the checking.</p>
+                <p><strong>withUnsafeContinuation</strong>: No runtime checks. Double-resume is undefined behavior (memory corruption). Never-resume is a silent hang. Zero overhead.</p>
+                <p><strong>Rule</strong>: Use <code>withCheckedContinuation</code> for most code. Only use <code>withUnsafeContinuation</code> in hot paths where the checking overhead matters and you've thoroughly verified correctness.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>25. How would you limit concurrency in a TaskGroup to process 1000 items with max 10 concurrent tasks?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Use the <strong>sliding window pattern</strong>: seed the group with an initial batch of N tasks, then as each completes, add the next one. This maintains a constant concurrency level.</p>
+                <pre><code>await withTaskGroup(of: Result.self) { group in
+    var iterator = items.makeIterator()
+    // Seed with initial batch
+    for _ in 0..&lt;min(10, items.count) {
+        if let item = iterator.next() {
+            group.addTask { await process(item) }
+        }
+    }
+    // As each completes, add the next
+    for await result in group {
+        results.append(result)
+        if let item = iterator.next() {
+            group.addTask { await process(item) }
+        }
+    }
+}</code></pre>
+                <p>This pattern ensures exactly 10 tasks are in-flight at any time, preventing resource exhaustion while maximizing throughput.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>26. Describe the cooperative thread pool used by Swift concurrency. How does it prevent thread explosion?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Swift concurrency uses a <strong>cooperative thread pool</strong> with a width equal to the number of CPU cores (typically 6-8 on modern iPhones). Unlike GCD's thread pool (which can grow to 64+ threads), the cooperative pool has a hard limit.</p>
+                <p><strong>How it prevents thread explosion</strong>: Tasks don't block threads — they suspend at <code>await</code> points, freeing the thread to run other tasks. You can have thousands of in-flight tasks without creating thousands of threads. Each suspended task only consumes a small heap-allocated async frame (~a few hundred bytes), not a 512KB thread stack.</p>
+                <p><strong>Under the hood</strong>: The pool is backed by <code>dispatch_workloop_t</code> (introduced in iOS 12), which provides priority-ordered execution. The Swift runtime's default concurrent executor manages job scheduling across these worker threads.</p>
+                <p><strong>Important rule</strong>: You must never block a cooperative thread (e.g., with semaphore.wait() or synchronous I/O). Blocking reduces the effective pool width, potentially causing a thread starvation deadlock where all threads are blocked and no task can make progress.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>27. How would you migrate a GCD-based codebase to async/await? What's the recommended strategy?</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Bottom-up migration</strong>:</p>
+                <ol>
+                    <li><strong>Phase 1 — Leaf functions</strong>: Wrap callback-based APIs with <code>withCheckedContinuation</code>. Convert network calls, file I/O, and database operations to async.</li>
+                    <li><strong>Phase 2 — Service layer</strong>: Convert repositories and use cases. Replace DispatchGroup with TaskGroup. Replace serial queues protecting state with actors.</li>
+                    <li><strong>Phase 3 — Presentation layer</strong>: Convert ViewModels from Combine to @MainActor + async. Replace @Published with @Observable where possible.</li>
+                </ol>
+                <p><strong>Bridge patterns</strong>: Provide both async and callback versions during transition. Use <code>withCheckedContinuation</code> to wrap legacy callbacks. Use <code>Task { }</code> to call async code from synchronous contexts.</p>
+                <p><strong>Key decisions</strong>: Enable <code>-strict-concurrency=complete</code> early to see the scope. Use <code>@unchecked Sendable</code> as a temporary bridge. Migrate one module at a time. Keep both APIs until all callers migrate.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>28. What happens if you resume a withCheckedContinuation zero times? What about more than once?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Zero times</strong>: The task hangs forever — it's suspended waiting for a resume that never comes. With <code>withCheckedContinuation</code>, a runtime warning is generated in debug builds. With <code>withUnsafeContinuation</code>, it's a silent hang with no warning.</p>
+                <p><strong>More than once</strong>: With <code>withCheckedContinuation</code>, the second resume triggers a <strong>runtime crash</strong> (trap). With <code>withUnsafeContinuation</code>, it's <strong>undefined behavior</strong> — typically memory corruption because the continuation's memory has already been freed.</p>
+                <p>Always ensure every code path through your callback resumes the continuation exactly once. Use <code>defer</code> or careful control flow to guarantee this.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Actors &amp; Isolation (Questions 29–38)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>29. Explain actor reentrancy. Why is it the #1 gotcha in Swift concurrency?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Actor reentrancy means that when an actor method suspends at an <code>await</code> point, <strong>other messages can be processed by the actor</strong> before the original method resumes. This breaks the assumption that actor state is unchanged across an await.</p>
+                <p><strong>Why it's dangerous</strong>: Developers assume actors work like locks — exclusive access for the entire method. But actors release their "lock" at every await point. If you check a condition, await something, then act on the condition, the condition may have changed. This leads to duplicate work, violated invariants, and logic bugs.</p>
+                <p><strong>Classic example</strong>: An image cache that checks if a URL is cached, awaits a download, then stores the result. Multiple concurrent calls for the same URL will all see a cache miss and all start downloads — the check-then-act pattern is broken by reentrancy.</p>
+                <p><strong>Fix</strong>: Track in-flight work. Before starting an async operation, check if one is already in progress for the same key. If so, await the existing operation instead of starting a new one.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>30. How does @MainActor differ from DispatchQueue.main.async? What are the advantages?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>@MainActor advantages</strong>:</p>
+                <ul>
+                    <li><strong>Compile-time enforcement</strong>: The compiler verifies that @MainActor code is only called from the main actor or with await. DispatchQueue.main has no compile-time checking.</li>
+                    <li><strong>Granularity</strong>: @MainActor can be applied to types, methods, properties, and closures. DispatchQueue.main only works at the block level.</li>
+                    <li><strong>Sendable checking</strong>: The compiler verifies that data crossing the MainActor boundary is Sendable. No such checking with DispatchQueue.main.</li>
+                    <li><strong>Optimization</strong>: @MainActor may skip the hop if already on the main actor. DispatchQueue.main.async always dispatches.</li>
+                    <li><strong>Async integration</strong>: After an await in a @MainActor method, execution automatically resumes on the main actor. With GCD, you must manually dispatch back to main.</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>31. What is a global actor? When would you create a custom one instead of using @MainActor?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>A global actor is a singleton actor that can be used as an attribute to isolate code to a specific serial execution context. <code>@MainActor</code> is the built-in global actor for the main thread.</p>
+                <p><strong>Create a custom global actor when</strong>: You have a subsystem that needs its own serial execution context — e.g., a database layer where all operations must be serialized but shouldn't block the main thread. A <code>@DatabaseActor</code> ensures all database code runs on the same serial executor without manual queue management.</p>
+                <p><strong>Definition</strong>: Apply <code>@globalActor</code> to an actor type with a <code>static let shared</code> property. Then use it as an attribute on types, methods, and properties.</p>
+                <p><strong>Tradeoff</strong>: Every cross-actor call requires an await (context switch). Don't create global actors for fine-grained operations — batch work into fewer, larger calls.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>32. What does the nonisolated keyword do? When is it required?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>nonisolated</code> opts a method or property out of actor isolation. It can be called synchronously from any context but cannot access the actor's mutable (var) state — only immutable (let) properties.</p>
+                <p><strong>Required for</strong>: Protocol conformances that expect synchronous access. For example, <code>Hashable</code>, <code>Equatable</code>, and <code>CustomStringConvertible</code> require synchronous methods. Since actor methods are async from outside, you must mark these conformances as <code>nonisolated</code>.</p>
+                <p><strong>nonisolated(unsafe)</strong>: An escape hatch that disables isolation checking entirely. The compiler won't verify safety — you must ensure thread safety yourself. Use only for bridging to legacy code.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>33. What changes in Swift 6 strict concurrency mode? How do you prepare for it?</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p>Swift 6 makes data race safety a <strong>compile-time guarantee</strong>. All Sendable violations that were warnings become errors:</p>
+                <ul>
+                    <li>Non-Sendable types crossing actor boundaries → error</li>
+                    <li>Mutable captures in @Sendable closures → error</li>
+                    <li>Global mutable variables → error (must be actor-isolated or Sendable)</li>
+                    <li>Protocol conformance isolation mismatches → error</li>
+                </ul>
+                <p><strong>Preparation strategy</strong>:</p>
+                <ol>
+                    <li>Enable <code>-strict-concurrency=complete</code> in Swift 5.10 to see all warnings</li>
+                    <li>Fix warnings module-by-module, starting with leaf modules</li>
+                    <li>Use <code>@unchecked Sendable</code> as a temporary bridge for types you can't modify yet</li>
+                    <li>Use <code>nonisolated(unsafe)</code> for global variables that are genuinely safe</li>
+                    <li>Enable Swift 6 language mode per-target as each is ready</li>
+                    <li>Remove <code>@unchecked</code> annotations as you properly fix each type</li>
+                </ol>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>34. Can actors have inheritance? Why or why not?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>No</strong>, actors cannot inherit from other actors (or classes). This is by design: inheritance would complicate the isolation model. If a subclass could override an isolated method, it could potentially break the parent's isolation guarantees. The actor's serial executor is tied to the specific actor instance, and inheritance hierarchies would make it unclear which executor should be used.</p>
+                <p>Actors can conform to protocols and can be extended. For shared behavior, use protocols with default implementations or composition (an actor containing another actor).</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>35. How do actors handle their serial executor under the hood?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Each actor has a <strong>serial executor</strong> that processes jobs one at a time. By default, this is backed by a <code>DispatchSerialQueue</code> (or more precisely, a <code>dispatch_workloop_t</code> which provides priority-ordered execution).</p>
+                <p>When you call an actor method from outside, the call is wrapped in a <strong>job</strong> and submitted to the actor's executor queue. The executor processes jobs serially — only one job runs at a time, ensuring mutual exclusion of the actor's state.</p>
+                <p>At <code>await</code> points within an actor method, the current job yields the executor. Other pending jobs can then execute (this is reentrancy). When the awaited operation completes, a new job is created to resume the original method, and it's submitted back to the executor queue.</p>
+                <p>You can provide a <strong>custom executor</strong> by conforming to <code>SerialExecutor</code> protocol, which is useful for integrating actors with existing threading models (e.g., a Core Data managed object context that must run on a specific thread).</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>36. When do actors hurt performance? How do you design actor granularity?</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p>Actors hurt performance when:</p>
+                <ul>
+                    <li><strong>Too fine-grained</strong>: An actor per pixel, per character, or per small data item creates millions of actor hops. Each hop involves a context switch through the executor.</li>
+                    <li><strong>Hot path contention</strong>: A single actor accessed by many concurrent tasks becomes a bottleneck — all callers serialize through its executor.</li>
+                    <li><strong>Excessive cross-actor calls</strong>: Each cross-actor call requires an await (potential suspension + resume). In tight loops, this overhead dominates.</li>
+                </ul>
+                <p><strong>Granularity guidelines</strong>:</p>
+                <ul>
+                    <li><strong>Per-subsystem</strong>: One actor for a network manager, one for a cache — moderate contention, clear boundaries</li>
+                    <li><strong>Per-entity</strong>: One actor per chat room, per document — independent entities with their own state</li>
+                    <li><strong>Per-resource</strong>: One actor for a database connection pool — protecting a specific shared resource</li>
+                    <li><strong>Batch operations</strong>: Instead of calling an actor method 1000 times, provide a batch method that processes all items in one actor hop</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>37. What is the difference between MainActor.run { } and Task { @MainActor in }?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>MainActor.run { }</code> is an <strong>inline hop</strong> — the calling task suspends and resumes on the MainActor. The calling code waits for the block to complete. It's like a synchronous call that happens to execute on a different actor.</p>
+                <p><code>Task { @MainActor in }</code> creates a <strong>new unstructured task</strong> that runs on the MainActor. The calling code continues immediately — it's fire-and-forget.</p>
+                <p><strong>Use MainActor.run when</strong>: You need the result of the main-actor work, or you need it to complete before continuing.</p>
+                <p><strong>Use Task { @MainActor in } when</strong>: You want fire-and-forget UI updates, or you're in a synchronous context that can't use await.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>38. How would you fix the actor reentrancy problem in an image cache?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Use an <strong>in-flight tracking dictionary</strong> that maps URLs to their pending download tasks. Before starting a download, check if one is already in progress for that URL. If so, await the existing task instead of starting a new one.</p>
+                <pre><code>actor ImageCache {
+    private var cache: [URL: UIImage] = [:]
+    private var inFlight: [URL: Task&lt;UIImage, Error&gt;] = [:]
+
+    func fetchImage(url: URL) async throws -> UIImage {
+        if let cached = cache[url] { return cached }
+        if let existing = inFlight[url] {
+            return try await existing.value
+        }
+        let task = Task {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            return UIImage(data: data)!
+        }
+        inFlight[url] = task
+        do {
+            let image = try await task.value
+            cache[url] = image
+            inFlight[url] = nil
+            return image
+        } catch {
+            inFlight[url] = nil
+            throw error
+        }
+    }
+}</code></pre>
+                <p>This ensures only one download per URL, with all concurrent callers piggy-backing on the same task.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Async Sequences &amp; Combine (Questions 39–48)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>39. What is the default buffering policy of AsyncStream? Why is it dangerous for high-frequency producers?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>The default buffering policy is <code>.unbounded</code>. If the producer yields values faster than the consumer processes them, the internal buffer grows without limit, eventually causing an out-of-memory crash.</p>
+                <p>For high-frequency producers (sensor data at 100Hz, network events), always specify a bounded policy: <code>.bufferingNewest(N)</code> keeps the N most recent values (drops oldest), or <code>.bufferingOldest(N)</code> keeps the N oldest values (drops newest).</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>40. How does backpressure work in Combine vs AsyncSequence?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Combine</strong>: Explicit demand-based backpressure. The subscriber tells the publisher how many values it can handle via <code>Subscribers.Demand</code>. The publisher should not send more values than demanded. In practice, most operators (and <code>sink</code>) request <code>.unlimited</code>, effectively disabling backpressure.</p>
+                <p><strong>AsyncSequence</strong>: Natural pull-based backpressure. The consumer calls <code>next()</code> (via <code>for await</code>) and the producer is implicitly paused until the consumer is ready for the next value. However, <code>AsyncStream</code> with a continuation can buffer values if the producer yields faster than the consumer iterates, subject to the buffering policy.</p>
+                <p><strong>Key difference</strong>: Combine's backpressure is opt-in and often ignored. AsyncSequence's backpressure is structural — the consumer drives the pace by calling <code>next()</code>.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>41. Explain the difference between debounce and throttle in Combine.</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>debounce</strong>: Waits for a pause in values. Emits the last value after the specified interval of silence. If new values keep arriving, the timer resets. Use case: search-as-you-type (wait until user stops typing).</p>
+                <p><strong>throttle</strong>: Emits at most one value per time interval. Has a <code>latest</code> parameter: if true, emits the most recent value in the window; if false, emits the first value. Use case: scroll position updates (limit to 10 updates/second).</p>
+                <p><strong>Example</strong>: Input: A(0ms), B(50ms), C(100ms), [silence 400ms], D(500ms)</p>
+                <ul>
+                    <li>debounce(300ms): emits C at 400ms, D at 800ms</li>
+                    <li>throttle(300ms, latest:true): emits A at 0ms, C at 300ms, D at 500ms</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>42. What is the most common memory leak with Combine, and how do you prevent it?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>The #1 leak: <strong>not storing the AnyCancellable</strong>. If you don't store the cancellable returned by <code>sink</code>, it's immediately deallocated, cancelling the subscription before receiving any values.</p>
+                <p>The #2 leak: <strong>retain cycles in sink closures</strong>. If the sink closure captures <code>self</code> strongly, and <code>self</code> holds the cancellable, you get a cycle: self → cancellable → sink closure → self.</p>
+                <p><strong>Prevention</strong>:</p>
+                <ul>
+                    <li>Always use <code>.store(in: &amp;cancellables)</code> to store cancellables</li>
+                    <li>Use <code>[weak self]</code> in sink closures</li>
+                    <li>Use <code>.assign(to: &amp;$property)</code> instead of sink when assigning to @Published (no retain cycle)</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>43. How do you bridge a Combine publisher to an AsyncSequence?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Use the built-in <code>.values</code> property on any Combine publisher:</p>
+                <pre><code>let publisher = NotificationCenter.default.publisher(for: .someNotification)
+for await notification in publisher.values {
+    process(notification)
+}</code></pre>
+                <p>For <code>@Published</code> properties: <code>for await value in viewModel.$property.values { ... }</code></p>
+                <p>You can also apply Combine operators first, then bridge: <code>publisher.debounce(for: .milliseconds(300), scheduler: RunLoop.main).values</code></p>
+                <p>For custom bridging (e.g., adding buffering), wrap the publisher in an <code>AsyncStream</code> using <code>sink</code> to yield values to the continuation.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>44. What is the @Published property wrapper gotcha regarding timing of value delivery?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>@Published</code> sends the new value to subscribers in <code>willSet</code> — <strong>before</strong> the property is actually updated. If you access the property directly in the sink closure (instead of using the received value), you'll see the <strong>old</strong> value.</p>
+                <pre><code>model.$count.sink { newValue in
+    print(newValue)      // ✅ New value (from publisher)
+    print(model.count)   // ⚠️ OLD value (property not yet updated)
+}</code></pre>
+                <p>Always use the value passed to the sink, not the property itself. This is a subtle but common source of bugs.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>45. Compare Combine, AsyncSequence, and the Observation framework. When would you use each in a modern app?</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Observation (@Observable)</strong>: Best for UI state management in SwiftUI. Automatic per-property tracking (only re-renders views that read changed properties). Lowest learning curve. Use for ViewModels and UI state.</p>
+                <p><strong>async/await + AsyncSequence</strong>: Best for streaming data and async operations. Natural backpressure. Integrates with structured concurrency. Use for network streams, file processing, and bridging delegate APIs.</p>
+                <p><strong>Combine</strong>: Best for complex event processing with rich operators (debounce, combineLatest, switchToLatest). Multi-subscriber support. Use for complex reactive chains that have no AsyncSequence equivalent.</p>
+                <p><strong>Recommended architecture (2024+)</strong>:</p>
+                <ul>
+                    <li>UI Layer: @Observable + SwiftUI</li>
+                    <li>ViewModel: @Observable + async/await</li>
+                    <li>Service Layer: async/await + AsyncSequence</li>
+                    <li>Complex reactive logic: Combine (keep existing, don't add new)</li>
+                    <li>New streaming APIs: AsyncStream</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>46. What is the difference between receive(on:) and subscribe(on:) in Combine?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>receive(on:)</code> affects <strong>downstream</strong>: values and completion are delivered on the specified scheduler. Use it to ensure UI updates happen on the main thread.</p>
+                <p><code>subscribe(on:)</code> affects <strong>upstream</strong>: the subscription itself and the publisher's work happen on the specified scheduler. Use it to move heavy publisher work off the main thread.</p>
+                <p>In practice, <code>receive(on: DispatchQueue.main)</code> is used ~95% of the time. <code>subscribe(on:)</code> is less common because most publishers already do their work on appropriate threads.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>47. How would you build a custom AsyncSequence for paginated API fetching?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p>Create a struct conforming to <code>AsyncSequence</code> with a nested <code>AsyncIterator</code>. The iterator's <code>next()</code> method fetches the next page, returns the items, and tracks pagination state. When the API returns fewer items than the page size, set an <code>isExhausted</code> flag and return nil on subsequent calls.</p>
+                <p>Key considerations: check <code>Task.checkCancellation()</code> before each network call; handle errors by throwing from <code>next()</code>; track the current page/cursor in the iterator's mutable state.</p>
+                <p>Usage: <code>for try await page in PaginatedFetcher(url: baseURL, pageSize: 50) { ... }</code></p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>48. What happens to an AsyncStream's continuation if you call finish() and then yield()?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Yielding after <code>finish()</code> is <strong>silently ignored</strong>. The value is dropped. No crash, no error. However, it indicates a logic error in your code — you're producing values after declaring the stream is done.</p>
+                <p>Similarly, calling <code>finish()</code> multiple times is safe — subsequent calls are ignored. But storing a continuation that never has <code>finish()</code> called will keep the consuming task suspended forever.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>RunLoop &amp; Main Thread (Questions 49–57)</h2>
+
+    <div class="qa-section">
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>49. Why does Timer stop firing when the user scrolls a UIScrollView? How do you fix it?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>When a UIScrollView begins tracking a touch, the main RunLoop switches from <code>.default</code> mode to <code>.tracking</code> mode. <code>Timer.scheduledTimer</code> adds the timer to <code>.default</code> mode only. Since the RunLoop is now in <code>.tracking</code> mode, timers in <code>.default</code> mode are not processed.</p>
+                <p><strong>Fixes</strong>:</p>
+                <ul>
+                    <li>Add the timer to <code>.common</code> mode: <code>RunLoop.main.add(timer, forMode: .common)</code> — .common includes both .default and .tracking</li>
+                    <li>Use <code>DispatchSource.makeTimerSource</code> — not RunLoop-dependent, always fires</li>
+                    <li>Use Combine's <code>Timer.publish(every:on:in:)</code> with <code>.common</code> mode</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>50. What is the difference between RunLoop.main and DispatchQueue.main?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>RunLoop.main</strong>: The event processing loop on the main thread. Mode-aware — respects RunLoop modes. Work scheduled via <code>RunLoop.main.perform</code> may be delayed during scrolling (if in .default mode).</p>
+                <p><strong>DispatchQueue.main</strong>: A serial dispatch queue bound to the main thread. NOT mode-aware — blocks always execute regardless of RunLoop mode. Implemented as a Source0 on the main RunLoop, which is processed in all modes.</p>
+                <p><strong>Key implication</strong>: <code>DispatchQueue.main.async</code> is more reliable for general main-thread dispatch because it's not affected by RunLoop mode changes. Use <code>RunLoop.main</code> only when you specifically need mode-aware behavior.</p>
+                <p>In Combine, <code>.receive(on: RunLoop.main)</code> may delay delivery during scroll, while <code>.receive(on: DispatchQueue.main)</code> always delivers.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>51. How does @MainActor relate to the RunLoop and DispatchQueue.main?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><code>@MainActor</code> is backed by the main thread's executor, which uses <code>DispatchQueue.main</code> (not <code>RunLoop.main</code>). This means @MainActor code behaves like <code>DispatchQueue.main.async</code> — it executes regardless of RunLoop mode, including during scrolling.</p>
+                <p>The MainActor's executor is a <code>SerialExecutor</code> that dispatches jobs to the main dispatch queue. When you await a @MainActor method, the continuation is submitted to the main queue and executed during the RunLoop's Source0 processing phase.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>52. What are Source0 and Source1 in CFRunLoop? Give examples of each.</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Source0 (non-port-based)</strong>: Application-triggered sources. Must be manually signaled via <code>CFRunLoopSourceSignal</code> + <code>CFRunLoopWakeUp</code>. Examples: touch events (delivered by UIKit), <code>performSelector:onThread:</code>, GCD main queue blocks.</p>
+                <p><strong>Source1 (port-based)</strong>: Kernel-triggered sources via Mach ports. Automatically wake the RunLoop when a message arrives. Examples: inter-process communication from SpringBoard (touch hardware events before UIKit processing), <code>CFMachPort</code> callbacks, system events.</p>
+                <p>The key difference: Source0 requires explicit signaling (the app must tell the RunLoop "there's work"), while Source1 is automatically triggered by kernel events (the kernel wakes the RunLoop).</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>53. How would you detect UI jank (dropped frames) using RunLoop observers?</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p>Install a <code>CFRunLoopObserver</code> that monitors <code>.afterWaiting</code> and <code>.beforeWaiting</code> activities. Measure the time between these two events — this is the duration of one RunLoop iteration (one frame). If it exceeds 16.67ms (60fps) or 8.33ms (120fps ProMotion), a frame was dropped.</p>
+                <p>For production monitoring, log jank events with stack traces (using <code>Thread.callStackSymbols</code>) to identify the code causing the delay. Aggregate these reports to find the most common jank sources.</p>
+                <p>Alternative: Use <code>CADisplayLink</code> to measure frame timing. Compare <code>targetTimestamp - timestamp</code> with the actual time between callbacks. If the gap is larger than expected, frames were dropped.</p>
+                <p>Apple's MetricKit (<code>MXMetricManager</code>) also provides hang rate metrics in production without custom instrumentation.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>54. Why must all UIKit operations happen on the main thread?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>Three reasons:</p>
+                <ol>
+                    <li><strong>UIKit is not thread-safe</strong>: UIView and its subclasses use non-atomic properties. Concurrent access from multiple threads causes data races — corrupted state, crashes, visual glitches.</li>
+                    <li><strong>Rendering pipeline</strong>: Core Animation commits the layer tree to the render server at the end of each main RunLoop iteration. Modifying layers from a background thread races with this commit, causing rendering artifacts or crashes.</li>
+                    <li><strong>Event handling</strong>: Touch events are delivered on the main thread through the responder chain. Modifying the view hierarchy from another thread while touches are being processed causes undefined behavior.</li>
+                </ol>
+                <p>In Swift 6, <code>@MainActor</code> provides compile-time enforcement. In earlier versions, Xcode's Main Thread Checker (runtime diagnostic) catches violations.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>55. What is the frame budget for 60fps and 120fps (ProMotion)? How do you stay within it?</span>
+                <span class="tag tag-l6">L6</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>60fps</strong>: 16.67ms per frame. <strong>120fps (ProMotion)</strong>: 8.33ms per frame.</p>
+                <p>Every piece of work on the main thread eats into this budget: touch event processing, layout passes, display updates, Core Animation commits, timer callbacks, and your application logic.</p>
+                <p><strong>Techniques to stay within budget</strong>:</p>
+                <ul>
+                    <li>Move all non-UI work off the main thread (async/await, GCD)</li>
+                    <li>Chunk expensive main-thread work across multiple RunLoop iterations</li>
+                    <li>Use <code>CADisplayLink</code> for frame-synchronized work</li>
+                    <li>Defer non-critical work to idle time via <code>CFRunLoopPerformBlock</code></li>
+                    <li>Profile with Instruments (Time Profiler, Core Animation template)</li>
+                    <li>Avoid off-screen rendering triggers (cornerRadius + masksToBounds, shadows without shadowPath)</li>
+                    <li>Use prefetching for table/collection views</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>56. What is the watchdog timer, and what does the 0x8badf00d termination code mean?</span>
+                <span class="tag tag-senior">Senior</span>
+            </div>
+            <div class="qa-answer">
+                <p>iOS has a <strong>watchdog timer</strong> that monitors the main thread. If the main thread is blocked (unresponsive) for too long — typically around 20 seconds for foreground apps, less for background — the watchdog kills the app.</p>
+                <p>The termination code <code>0x8badf00d</code> (reads "ate bad food") indicates a watchdog kill. You'll see this in crash logs as the exception code. Common causes: synchronous network calls on the main thread, semaphore.wait() on main, heavy computation blocking the main RunLoop.</p>
+                <p>During app launch, the watchdog is stricter — you have about 20 seconds to present the first frame, or the app is killed.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('open')">
+                <span>57. Design a concurrency architecture for a large iOS app. What tools would you use at each layer?</span>
+                <span class="tag tag-architect">Architect</span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Recommended architecture</strong>:</p>
+                <ul>
+                    <li><strong>UI Layer</strong>: @MainActor for all UIKit/SwiftUI code. @Observable for SwiftUI state. No manual threading.</li>
+                    <li><strong>ViewModel Layer</strong>: @MainActor + async/await. Use Task { } for data loading. Store Task handles for cancellation on view disappear.</li>
+                    <li><strong>Service Layer</strong>: Actors for stateful services (caches, session managers). Async functions for stateless operations (API calls, parsing).</li>
+                    <li><strong>Data Layer</strong>: @DatabaseActor (custom global actor) for Core Data/SQLite. AsyncStream for real-time data (WebSocket, location).</li>
+                    <li><strong>Legacy Bridge</strong>: withCheckedContinuation for callback APIs. Combine for complex reactive chains that predate async/await.</li>
+                </ul>
+                <p><strong>Concurrency contract</strong>: All new code uses async/await + actors. GCD is only in the networking layer. Combine is only in existing ViewModel bindings (being migrated to @Observable). No raw threads. No semaphores on main thread. All types crossing actor boundaries must be Sendable.</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+    q.addEventListener('click', () => {
+        q.nextElementSibling.classList.toggle('open');
+    });
+});
+</script>
+
+<div class="container">
+    <div class="nav-footer">
+        <a href="07-main-thread-runloop.html">← Main Thread &amp; RunLoop</a>
+        <a href="index.html">Back to Series Overview →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Handling &amp; Memory — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Rendering &amp; Graphics</a><span class="sep">›</span>
+        Image Handling &amp; Memory
+    </nav>
+
+    <h1>Image Handling &amp; Memory</h1>
+    <p class="subtitle">UIImage memory cost analysis, ImageIO for efficient loading, downsampling techniques, HEIF/HEIC format, image caching architecture patterns, and building image pipelines for image-heavy apps.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#memory-cost">1. UIImage Memory Cost</a></li>
+            <li><a href="#decoding">2. Image Decoding Pipeline</a></li>
+            <li><a href="#downsampling">3. Downsampling Technique</a></li>
+            <li><a href="#imageio">4. ImageIO for Efficient Loading</a></li>
+            <li><a href="#renderer">5. UIGraphicsImageRenderer vs Legacy</a></li>
+            <li><a href="#heif">6. HEIF/HEIC Format</a></li>
+            <li><a href="#photos">7. PHImageManager &amp; Photos Framework</a></li>
+            <li><a href="#caching">8. Image Caching Architecture</a></li>
+            <li><a href="#pipeline">9. Image Pipeline Architecture</a></li>
+            <li><a href="#common-mistakes">10. Common Mistakes &amp; Fixes</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="memory-cost">1. UIImage Memory Cost</h2>
+
+    <p>The most critical fact about images on iOS: <strong>the memory cost of a displayed image is determined by its pixel dimensions, not its file size</strong>. A 2MB JPEG file can consume 48MB of RAM when decoded.</p>
+
+    <div class="diagram">
+Image Memory Formula:
+═════════════════════
+
+Memory = width × height × bytesPerPixel
+
+bytesPerPixel:
+  • sRGB (standard):  4 bytes (RGBA, 8 bits per channel)
+  • Wide color (P3):  8 bytes (RGBA, 16 bits per channel)
+  • Grayscale:        1 byte  (8 bits)
+
+Examples:
+┌──────────────────────────┬────────────┬──────────────┐
+│ Source                   │ Pixels     │ Decoded RAM  │
+├──────────────────────────┼────────────┼──────────────┤
+│ iPhone 15 photo (12MP)   │ 4032×3024  │ ~48 MB       │
+│ iPhone 15 Pro (48MP)     │ 8064×6048  │ ~195 MB      │
+│ 1080p screenshot         │ 1920×1080  │ ~8 MB        │
+│ App icon (1024×1024)     │ 1024×1024  │ ~4 MB        │
+│ Thumbnail (100×100)      │ 100×100    │ ~40 KB       │
+│ Avatar (48×48 @3x)       │ 144×144    │ ~83 KB       │
+└──────────────────────────┴────────────┴──────────────┘
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>A photo gallery showing 10 full-resolution 12MP photos simultaneously would consume <strong>~480MB</strong> of decoded bitmap memory — far exceeding the ~200MB Jetsam limit for background apps and approaching the ~1GB limit for foreground apps on older devices. This is why downsampling is not optional — it's a survival requirement.</p>
+    </div>
+
+    <pre><code><span class="comment">// Calculate decoded memory for any image</span>
+<span class="keyword">func</span> <span class="func">decodedMemorySize</span>(of image: <span class="type">UIImage</span>) -> <span class="type">Int</span> {
+    <span class="keyword">guard let</span> cgImage = image.cgImage <span class="keyword">else</span> { <span class="keyword">return</span> <span class="number">0</span> }
+    <span class="keyword">return</span> cgImage.bytesPerRow * cgImage.height
+}
+
+<span class="comment">// For a 4032×3024 photo:</span>
+<span class="comment">// bytesPerRow = 4032 × 4 = 16,128</span>
+<span class="comment">// total = 16,128 × 3024 = 48,770,832 bytes ≈ 48 MB</span>
+
+<span class="keyword">func</span> <span class="func">formattedMemorySize</span>(of image: <span class="type">UIImage</span>) -> <span class="type">String</span> {
+    <span class="keyword">let</span> bytes = <span class="func">decodedMemorySize</span>(of: image)
+    <span class="keyword">let</span> formatter = <span class="type">ByteCountFormatter</span>()
+    formatter.allowedUnits = [.useMB, .useKB]
+    formatter.countStyle = .memory
+    <span class="keyword">return</span> formatter.<span class="func">string</span>(fromByteCount: <span class="type">Int64</span>(bytes))
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="decoding">2. Image Decoding Pipeline</h2>
+
+    <p>When you assign a <code>UIImage</code> to a <code>UIImageView</code>, the image isn't decoded immediately. Decoding happens lazily during the Core Animation render loop's <strong>Prepare phase</strong> — on the main thread.</p>
+
+    <div class="diagram">
+Image Lifecycle:
+════════════════
+
+1. Load (file/network)     → Compressed data in memory (small)
+2. Create UIImage          → Wrapper around compressed data (tiny)
+3. Assign to UIImageView   → Still compressed (no decode yet)
+4. Render loop: Prepare    → DECODE on main thread! (expensive)
+5. GPU upload              → Texture in GPU memory
+6. Compositing             → Displayed on screen
+
+The decode at step 4 is the performance killer.
+It happens on the MAIN THREAD during the render loop.
+    </div>
+
+    <h3>Force Decoding on Background Thread</h3>
+    <pre><code><span class="comment">// Pre-decode image on background thread to avoid main thread hitch</span>
+<span class="keyword">func</span> <span class="func">predecodedImage</span>(_ image: <span class="type">UIImage</span>) -> <span class="type">UIImage</span>? {
+    <span class="keyword">guard let</span> cgImage = image.cgImage <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+
+    <span class="keyword">let</span> colorSpace = <span class="type">CGColorSpaceCreateDeviceRGB</span>()
+    <span class="keyword">guard let</span> context = <span class="type">CGContext</span>(
+        data: <span class="keyword">nil</span>,
+        width: cgImage.width,
+        height: cgImage.height,
+        bitsPerComponent: <span class="number">8</span>,
+        bytesPerRow: cgImage.width * <span class="number">4</span>,
+        space: colorSpace,
+        bitmapInfo: <span class="type">CGImageAlphaInfo</span>.premultipliedFirst.rawValue |
+                    <span class="type">CGBitmapInfo</span>.byteOrder32Little.rawValue
+    ) <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+
+    context.<span class="func">draw</span>(cgImage, in: <span class="type">CGRect</span>(
+        x: <span class="number">0</span>, y: <span class="number">0</span>,
+        width: cgImage.width, height: cgImage.height
+    ))
+
+    <span class="keyword">guard let</span> decodedImage = context.<span class="func">makeImage</span>() <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+    <span class="keyword">return</span> <span class="type">UIImage</span>(cgImage: decodedImage, scale: image.scale,
+                   orientation: image.imageOrientation)
+}
+
+<span class="comment">// Usage: decode on background, display on main</span>
+<span class="type">DispatchQueue</span>.global(qos: .userInitiated).<span class="func">async</span> {
+    <span class="keyword">let</span> decoded = <span class="func">predecodedImage</span>(originalImage)
+    <span class="type">DispatchQueue</span>.main.<span class="func">async</span> {
+        imageView.image = decoded
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Decoding + Full Resolution = Double Trouble</div>
+        <p>Pre-decoding a full-resolution image means you're holding the <strong>full decoded bitmap</strong> in memory. If you're displaying the image in a 200×200 point view on a 3x display, you only need a 600×600 pixel bitmap (~1.4MB), not the full 4032×3024 bitmap (~48MB). Always <strong>downsample first, then decode</strong>.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="downsampling">3. Downsampling Technique</h2>
+
+    <p>Downsampling is the most important image optimization technique on iOS. It decodes the image at a reduced resolution, consuming only the memory needed for the display size.</p>
+
+    <pre><code><span class="keyword">import</span> ImageIO
+
+<span class="comment">// The gold standard: downsample using ImageIO</span>
+<span class="comment">// This decodes only the pixels needed, not the full image</span>
+<span class="keyword">func</span> <span class="func">downsample</span>(
+    imageAt url: <span class="type">URL</span>,
+    to pointSize: <span class="type">CGSize</span>,
+    scale: <span class="type">CGFloat</span> = <span class="type">UIScreen</span>.main.scale
+) -> <span class="type">UIImage</span>? {
+    <span class="keyword">let</span> imageSourceOptions = [kCGImageSourceShouldCache: <span class="keyword">false</span>] <span class="keyword">as</span> <span class="type">CFDictionary</span>
+    <span class="keyword">guard let</span> imageSource = <span class="type">CGImageSourceCreateWithURL</span>(
+        url <span class="keyword">as</span> <span class="type">CFURL</span>, imageSourceOptions
+    ) <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+
+    <span class="keyword">let</span> maxDimension = <span class="func">max</span>(pointSize.width, pointSize.height) * scale
+    <span class="keyword">let</span> downsampleOptions: [<span class="type">CFString</span>: <span class="type">Any</span>] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: <span class="keyword">true</span>,
+        kCGImageSourceShouldCacheImmediately: <span class="keyword">true</span>,
+        kCGImageSourceCreateThumbnailWithTransform: <span class="keyword">true</span>,
+        kCGImageSourceThumbnailMaxPixelSize: maxDimension
+    ]
+
+    <span class="keyword">guard let</span> downsampledImage = <span class="type">CGImageSourceCreateThumbnailAtIndex</span>(
+        imageSource, <span class="number">0</span>, downsampleOptions <span class="keyword">as</span> <span class="type">CFDictionary</span>
+    ) <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+
+    <span class="keyword">return</span> <span class="type">UIImage</span>(cgImage: downsampledImage)
+}
+
+<span class="comment">// Memory comparison:</span>
+<span class="comment">// Full 12MP photo:   4032 × 3024 × 4 = ~48 MB</span>
+<span class="comment">// Downsampled to     600 × 600 × 4   = ~1.4 MB</span>
+<span class="comment">// Savings: 97% memory reduction!</span></code></pre>
+
+    <h3>Downsampling from Data (Network Images)</h3>
+    <pre><code><span class="keyword">func</span> <span class="func">downsample</span>(
+    data: <span class="type">Data</span>,
+    to pointSize: <span class="type">CGSize</span>,
+    scale: <span class="type">CGFloat</span> = <span class="type">UIScreen</span>.main.scale
+) -> <span class="type">UIImage</span>? {
+    <span class="keyword">let</span> imageSourceOptions = [kCGImageSourceShouldCache: <span class="keyword">false</span>] <span class="keyword">as</span> <span class="type">CFDictionary</span>
+    <span class="keyword">guard let</span> imageSource = <span class="type">CGImageSourceCreateWithData</span>(
+        data <span class="keyword">as</span> <span class="type">CFData</span>, imageSourceOptions
+    ) <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+
+    <span class="keyword">let</span> maxDimension = <span class="func">max</span>(pointSize.width, pointSize.height) * scale
+    <span class="keyword">let</span> options: [<span class="type">CFString</span>: <span class="type">Any</span>] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: <span class="keyword">true</span>,
+        kCGImageSourceShouldCacheImmediately: <span class="keyword">true</span>,
+        kCGImageSourceCreateThumbnailWithTransform: <span class="keyword">true</span>,
+        kCGImageSourceThumbnailMaxPixelSize: maxDimension
+    ]
+
+    <span class="keyword">guard let</span> cgImage = <span class="type">CGImageSourceCreateThumbnailAtIndex</span>(
+        imageSource, <span class="number">0</span>, options <span class="keyword">as</span> <span class="type">CFDictionary</span>
+    ) <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+
+    <span class="keyword">return</span> <span class="type">UIImage</span>(cgImage: cgImage)
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Why ImageIO Downsampling Is Superior</div>
+        <p>ImageIO's <code>CGImageSourceCreateThumbnailAtIndex</code> is fundamentally different from creating a <code>UIImage</code> and then drawing it at a smaller size:</p>
+        <ul>
+            <li><strong>ImageIO</strong>: Reads only the pixels needed from the compressed data. For JPEG, it can use the embedded thumbnail or decode at a reduced resolution using the DCT coefficients. Peak memory is proportional to the <em>output</em> size.</li>
+            <li><strong>UIImage + draw</strong>: Decodes the <em>entire</em> image into a full-resolution bitmap, then creates a second bitmap at the target size. Peak memory is proportional to the <em>input</em> size (the full image).</li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="imageio">4. ImageIO for Efficient Loading</h2>
+
+    <h3>Reading Image Metadata Without Decoding</h3>
+    <pre><code><span class="keyword">import</span> ImageIO
+
+<span class="keyword">func</span> <span class="func">imageMetadata</span>(at url: <span class="type">URL</span>) -> (size: <span class="type">CGSize</span>, type: <span class="type">String</span>?)? {
+    <span class="keyword">guard let</span> source = <span class="type">CGImageSourceCreateWithURL</span>(
+        url <span class="keyword">as</span> <span class="type">CFURL</span>, <span class="keyword">nil</span>
+    ) <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+
+    <span class="keyword">guard let</span> properties = <span class="type">CGImageSourceCopyPropertiesAtIndex</span>(
+        source, <span class="number">0</span>, <span class="keyword">nil</span>
+    ) <span class="keyword">as</span>? [<span class="type">CFString</span>: <span class="type">Any</span>] <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+
+    <span class="keyword">let</span> width = properties[kCGImagePropertyPixelWidth] <span class="keyword">as</span>? <span class="type">CGFloat</span> ?? <span class="number">0</span>
+    <span class="keyword">let</span> height = properties[kCGImagePropertyPixelHeight] <span class="keyword">as</span>? <span class="type">CGFloat</span> ?? <span class="number">0</span>
+    <span class="keyword">let</span> type = <span class="type">CGImageSourceGetType</span>(source) <span class="keyword">as</span> <span class="type">String</span>?
+
+    <span class="keyword">return</span> (<span class="type">CGSize</span>(width: width, height: height), type)
+}
+
+<span class="comment">// Read EXIF data</span>
+<span class="keyword">func</span> <span class="func">exifData</span>(at url: <span class="type">URL</span>) -> [<span class="type">String</span>: <span class="type">Any</span>]? {
+    <span class="keyword">guard let</span> source = <span class="type">CGImageSourceCreateWithURL</span>(url <span class="keyword">as</span> <span class="type">CFURL</span>, <span class="keyword">nil</span>),
+          <span class="keyword">let</span> properties = <span class="type">CGImageSourceCopyPropertiesAtIndex</span>(
+              source, <span class="number">0</span>, <span class="keyword">nil</span>
+          ) <span class="keyword">as</span>? [<span class="type">String</span>: <span class="type">Any</span>] <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+
+    <span class="keyword">return</span> properties[kCGImagePropertyExifDictionary <span class="keyword">as</span> <span class="type">String</span>] <span class="keyword">as</span>? [<span class="type">String</span>: <span class="type">Any</span>]
+}</code></pre>
+
+    <h3>Progressive Image Loading</h3>
+    <pre><code><span class="comment">// Incrementally decode a progressive JPEG as data arrives</span>
+<span class="keyword">class</span> <span class="type">ProgressiveImageLoader</span> {
+    <span class="keyword">private var</span> imageSource: <span class="type">CGImageSource</span>?
+    <span class="keyword">private var</span> accumulatedData = <span class="type">Data</span>()
+
+    <span class="keyword">func</span> <span class="func">appendData</span>(_ newData: <span class="type">Data</span>) -> <span class="type">UIImage</span>? {
+        accumulatedData.<span class="func">append</span>(newData)
+
+        <span class="keyword">if</span> imageSource == <span class="keyword">nil</span> {
+            imageSource = <span class="type">CGImageSourceCreateIncremental</span>(<span class="keyword">nil</span>)
+        }
+
+        <span class="keyword">guard let</span> source = imageSource <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+
+        <span class="type">CGImageSourceUpdateData</span>(source, accumulatedData <span class="keyword">as</span> <span class="type">CFData</span>, <span class="keyword">false</span>)
+
+        <span class="keyword">let</span> status = <span class="type">CGImageSourceGetStatus</span>(source)
+        <span class="keyword">guard</span> status == .statusIncomplete || status == .statusComplete <span class="keyword">else</span> {
+            <span class="keyword">return nil</span>
+        }
+
+        <span class="keyword">guard let</span> cgImage = <span class="type">CGImageSourceCreateImageAtIndex</span>(
+            source, <span class="number">0</span>, <span class="keyword">nil</span>
+        ) <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+
+        <span class="keyword">return</span> <span class="type">UIImage</span>(cgImage: cgImage)
+    }
+
+    <span class="keyword">func</span> <span class="func">finalize</span>() {
+        <span class="keyword">guard let</span> source = imageSource <span class="keyword">else</span> { <span class="keyword">return</span> }
+        <span class="type">CGImageSourceUpdateData</span>(source, accumulatedData <span class="keyword">as</span> <span class="type">CFData</span>, <span class="keyword">true</span>)
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="renderer">5. UIGraphicsImageRenderer vs Legacy</h2>
+
+    <table>
+        <thead>
+            <tr><th>Aspect</th><th>UIGraphicsImageRenderer (Modern)</th><th>UIGraphicsBeginImageContext (Legacy)</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Color space</td>
+                <td>Automatic (sRGB or Display P3)</td>
+                <td>Always sRGB</td>
+            </tr>
+            <tr>
+                <td>Pixel format</td>
+                <td>Automatic (can use 1-byte grayscale)</td>
+                <td>Always 4 bytes per pixel</td>
+            </tr>
+            <tr>
+                <td>Wide color</td>
+                <td>Supported on P3 displays</td>
+                <td>Not supported</td>
+            </tr>
+            <tr>
+                <td>Memory</td>
+                <td>Up to 75% less for non-color content</td>
+                <td>Always maximum</td>
+            </tr>
+            <tr>
+                <td>API</td>
+                <td>Block-based, auto-cleanup</td>
+                <td>Begin/End pairs, manual cleanup</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// ✅ Modern: UIGraphicsImageRenderer</span>
+<span class="keyword">let</span> renderer = <span class="type">UIGraphicsImageRenderer</span>(size: <span class="type">CGSize</span>(width: <span class="number">100</span>, height: <span class="number">100</span>))
+<span class="keyword">let</span> image = renderer.<span class="func">image</span> { ctx <span class="keyword">in</span>
+    <span class="type">UIColor</span>.systemBlue.<span class="func">setFill</span>()
+    ctx.<span class="func">fill</span>(<span class="type">CGRect</span>(x: <span class="number">0</span>, y: <span class="number">0</span>, width: <span class="number">100</span>, height: <span class="number">100</span>))
+    <span class="comment">// Automatically chooses optimal pixel format</span>
+    <span class="comment">// Automatically handles scale</span>
+    <span class="comment">// Automatically cleans up context</span>
+}
+
+<span class="comment">// ❌ Legacy: UIGraphicsBeginImageContext</span>
+<span class="type">UIGraphicsBeginImageContextWithOptions</span>(
+    <span class="type">CGSize</span>(width: <span class="number">100</span>, height: <span class="number">100</span>), <span class="keyword">false</span>, <span class="number">0</span>
+)
+<span class="type">UIColor</span>.systemBlue.<span class="func">setFill</span>()
+<span class="type">UIRectFill</span>(<span class="type">CGRect</span>(x: <span class="number">0</span>, y: <span class="number">0</span>, width: <span class="number">100</span>, height: <span class="number">100</span>))
+<span class="keyword">let</span> legacyImage = <span class="type">UIGraphicsGetImageFromCurrentImageContext</span>()
+<span class="type">UIGraphicsEndImageContext</span>()
+<span class="comment">// Always 4 bytes/pixel, always sRGB, manual cleanup required</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="heif">6. HEIF/HEIC Format</h2>
+
+    <p>HEIF (High Efficiency Image Format) using HEVC compression is the default capture format on iOS since iPhone 7. It offers ~50% smaller file sizes than JPEG at equivalent quality.</p>
+
+    <table>
+        <thead>
+            <tr><th>Aspect</th><th>HEIF/HEIC</th><th>JPEG</th><th>PNG</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Compression</td>
+                <td>HEVC (lossy/lossless)</td>
+                <td>DCT (lossy)</td>
+                <td>DEFLATE (lossless)</td>
+            </tr>
+            <tr>
+                <td>File size (12MP)</td>
+                <td>~2-3 MB</td>
+                <td>~5-6 MB</td>
+                <td>~30+ MB</td>
+            </tr>
+            <tr>
+                <td>Decoded memory</td>
+                <td>Same as JPEG (pixel-based)</td>
+                <td>width × height × 4</td>
+                <td>width × height × 4</td>
+            </tr>
+            <tr>
+                <td>Decode speed</td>
+                <td>Slower (hardware accelerated)</td>
+                <td>Fast</td>
+                <td>Fast</td>
+            </tr>
+            <tr>
+                <td>Alpha channel</td>
+                <td>Supported</td>
+                <td>Not supported</td>
+                <td>Supported</td>
+            </tr>
+            <tr>
+                <td>Depth data</td>
+                <td>Supported</td>
+                <td>Not supported</td>
+                <td>Not supported</td>
+            </tr>
+            <tr>
+                <td>Animation</td>
+                <td>Supported (HEICS)</td>
+                <td>Not supported</td>
+                <td>Not supported (APNG exists)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Check HEIF support</span>
+<span class="keyword">let</span> heifSupported = <span class="type">CGImageSourceCopyTypeIdentifiers</span>() <span class="keyword">as!</span> [<span class="type">String</span>]
+<span class="keyword">let</span> canDecodeHEIF = heifSupported.<span class="func">contains</span>(<span class="string">"public.heic"</span>)
+
+<span class="comment">// Convert HEIF to JPEG for sharing with non-Apple platforms</span>
+<span class="keyword">func</span> <span class="func">convertToJPEG</span>(_ heifData: <span class="type">Data</span>, quality: <span class="type">CGFloat</span> = <span class="number">0.8</span>) -> <span class="type">Data</span>? {
+    <span class="keyword">guard let</span> image = <span class="type">UIImage</span>(data: heifData) <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+    <span class="keyword">return</span> image.<span class="func">jpegData</span>(compressionQuality: quality)
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="photos">7. PHImageManager &amp; Photos Framework</h2>
+
+    <pre><code><span class="keyword">import</span> Photos
+
+<span class="keyword">class</span> <span class="type">PhotoLoader</span> {
+    <span class="keyword">let</span> imageManager = <span class="type">PHCachingImageManager</span>()
+
+    <span class="keyword">func</span> <span class="func">loadThumbnail</span>(
+        for asset: <span class="type">PHAsset</span>,
+        targetSize: <span class="type">CGSize</span>,
+        completion: @escaping (<span class="type">UIImage</span>?) -> <span class="type">Void</span>
+    ) -> <span class="type">PHImageRequestID</span> {
+        <span class="keyword">let</span> options = <span class="type">PHImageRequestOptions</span>()
+        options.deliveryMode = .opportunistic
+        options.resizeMode = .fast
+        options.isNetworkAccessAllowed = <span class="keyword">true</span>
+
+        <span class="keyword">return</span> imageManager.<span class="func">requestImage</span>(
+            for: asset,
+            targetSize: targetSize,
+            contentMode: .aspectFill,
+            options: options
+        ) { image, info <span class="keyword">in</span>
+            <span class="keyword">let</span> isDegraded = info?[<span class="type">PHImageResultIsDegradedKey</span>] <span class="keyword">as</span>? <span class="type">Bool</span> ?? <span class="keyword">false</span>
+            <span class="keyword">if</span> !isDegraded {
+                <span class="func">completion</span>(image)
+            }
+        }
+    }
+
+    <span class="comment">// Pre-cache thumbnails for smooth scrolling</span>
+    <span class="keyword">func</span> <span class="func">startCaching</span>(assets: [<span class="type">PHAsset</span>], targetSize: <span class="type">CGSize</span>) {
+        imageManager.<span class="func">startCachingImages</span>(
+            for: assets,
+            targetSize: targetSize,
+            contentMode: .aspectFill,
+            options: <span class="keyword">nil</span>
+        )
+    }
+
+    <span class="keyword">func</span> <span class="func">stopCaching</span>(assets: [<span class="type">PHAsset</span>], targetSize: <span class="type">CGSize</span>) {
+        imageManager.<span class="func">stopCachingImages</span>(
+            for: assets,
+            targetSize: targetSize,
+            contentMode: .aspectFill,
+            options: <span class="keyword">nil</span>
+        )
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="caching">8. Image Caching Architecture</h2>
+
+    <p>Production image caching follows a multi-tier architecture. Libraries like SDWebImage and Kingfisher implement this pattern.</p>
+
+    <div class="diagram">
+Image Cache Architecture (SDWebImage/Kingfisher pattern):
+═════════════════════════════════════════════════════════
+
+Request: imageView.setImage(url)
+         │
+         ▼
+┌─────────────────┐  HIT   ┌──────────────────┐
+│  Memory Cache   │───────▶│  Return decoded   │
+│  (NSCache)      │        │  UIImage          │
+│  ~50-100 MB     │        └──────────────────┘
+└────────┬────────┘
+         │ MISS
+         ▼
+┌─────────────────┐  HIT   ┌──────────────────┐
+│  Disk Cache     │───────▶│  Decode on bg     │
+│  (FileManager)  │        │  thread, cache    │
+│  ~200-500 MB    │        │  in memory        │
+└────────┬────────┘        └──────────────────┘
+         │ MISS
+         ▼
+┌─────────────────┐        ┌──────────────────┐
+│  Network        │───────▶│  Download, cache  │
+│  (URLSession)   │        │  to disk + memory │
+└─────────────────┘        └──────────────────┘
+    </div>
+
+    <pre><code><span class="keyword">class</span> <span class="type">ImageCache</span> {
+    <span class="keyword">static let</span> shared = <span class="type">ImageCache</span>()
+
+    <span class="keyword">private let</span> memoryCache = <span class="type">NSCache</span>&lt;<span class="type">NSString</span>, <span class="type">UIImage</span>&gt;()
+    <span class="keyword">private let</span> ioQueue = <span class="type">DispatchQueue</span>(label: <span class="string">"com.app.imagecache.io"</span>)
+    <span class="keyword">private let</span> diskCacheURL: <span class="type">URL</span>
+
+    <span class="keyword">init</span>() {
+        memoryCache.totalCostLimit = <span class="number">100</span> * <span class="number">1024</span> * <span class="number">1024</span>  <span class="comment">// 100 MB</span>
+        memoryCache.countLimit = <span class="number">200</span>
+
+        diskCacheURL = <span class="type">FileManager</span>.default
+            .<span class="func">urls</span>(for: .cachesDirectory, in: .userDomainMask)[<span class="number">0</span>]
+            .<span class="func">appendingPathComponent</span>(<span class="string">"ImageCache"</span>)
+
+        <span class="keyword">try</span>? <span class="type">FileManager</span>.default.<span class="func">createDirectory</span>(
+            at: diskCacheURL,
+            withIntermediateDirectories: <span class="keyword">true</span>
+        )
+    }
+
+    <span class="keyword">func</span> <span class="func">image</span>(for key: <span class="type">String</span>) -> <span class="type">UIImage</span>? {
+        <span class="comment">// Check memory cache first</span>
+        <span class="keyword">if let</span> cached = memoryCache.<span class="func">object</span>(forKey: key <span class="keyword">as</span> <span class="type">NSString</span>) {
+            <span class="keyword">return</span> cached
+        }
+        <span class="keyword">return nil</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">store</span>(_ image: <span class="type">UIImage</span>, for key: <span class="type">String</span>) {
+        <span class="keyword">let</span> cost = <span class="func">decodedMemorySize</span>(of: image)
+        memoryCache.<span class="func">setObject</span>(image, forKey: key <span class="keyword">as</span> <span class="type">NSString</span>,
+                              cost: cost)
+
+        <span class="comment">// Async disk write</span>
+        ioQueue.<span class="func">async</span> { [weak <span class="keyword">self</span>] <span class="keyword">in</span>
+            <span class="keyword">guard let self</span> = <span class="keyword">self</span> <span class="keyword">else</span> { <span class="keyword">return</span> }
+            <span class="keyword">let</span> fileURL = <span class="keyword">self</span>.diskCacheURL
+                .<span class="func">appendingPathComponent</span>(key.<span class="func">md5Hash</span>())
+            <span class="keyword">if let</span> data = image.<span class="func">jpegData</span>(compressionQuality: <span class="number">0.9</span>) {
+                <span class="keyword">try</span>? data.<span class="func">write</span>(to: fileURL)
+            }
+        }
+    }
+
+    <span class="keyword">private func</span> <span class="func">decodedMemorySize</span>(of image: <span class="type">UIImage</span>) -> <span class="type">Int</span> {
+        <span class="keyword">guard let</span> cgImage = image.cgImage <span class="keyword">else</span> { <span class="keyword">return</span> <span class="number">0</span> }
+        <span class="keyword">return</span> cgImage.bytesPerRow * cgImage.height
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="pipeline">9. Image Pipeline Architecture</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: Image Pipeline for Image-Heavy Apps</div>
+        <p>For apps like Instagram, Pinterest, or any photo-centric app, the image pipeline is a critical architectural component. Here's the Staff-level design:</p>
+    </div>
+
+    <div class="diagram">
+Production Image Pipeline:
+══════════════════════════
+
+┌──────────────────────────────────────────────────────────┐
+│                    ImagePipeline                          │
+│                                                          │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐            │
+│  │ Request  │──▶│ Dedup    │──▶│ Memory   │── HIT ──▶  │
+│  │ Builder  │   │ (coalesce│   │ Cache    │            │
+│  │          │   │ same URL)│   │ Lookup   │            │
+│  └──────────┘   └──────────┘   └────┬─────┘            │
+│                                      │ MISS             │
+│                                      ▼                  │
+│                                ┌──────────┐             │
+│                                │ Disk     │── HIT ──▶   │
+│                                │ Cache    │  (bg decode) │
+│                                └────┬─────┘             │
+│                                     │ MISS              │
+│                                     ▼                   │
+│                                ┌──────────┐             │
+│                                │ Network  │             │
+│                                │ Fetch    │             │
+│                                └────┬─────┘             │
+│                                     │                   │
+│                                     ▼                   │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐           │
+│  │ Display  │◀──│ Process  │◀──│ Decode   │           │
+│  │ (main    │   │ (resize, │   │ (bg      │           │
+│  │  thread) │   │  round)  │   │  thread) │           │
+│  └──────────┘   └──────────┘   └──────────┘           │
+│                                                         │
+│  All heavy work on background DispatchQueue             │
+│  Only final UIImage assignment on main thread           │
+└─────────────────────────────────────────────────────────┘
+    </div>
+
+    <pre><code><span class="keyword">class</span> <span class="type">ImagePipeline</span> {
+    <span class="keyword">static let</span> shared = <span class="type">ImagePipeline</span>()
+
+    <span class="keyword">private let</span> cache = <span class="type">ImageCache</span>.shared
+    <span class="keyword">private let</span> session: <span class="type">URLSession</span>
+    <span class="keyword">private let</span> processingQueue = <span class="type">DispatchQueue</span>(
+        label: <span class="string">"com.app.image.processing"</span>,
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+    <span class="keyword">private var</span> activeTasks: [<span class="type">URL</span>: [(<span class="type">UIImage</span>?) -> <span class="type">Void</span>]] = [:]
+    <span class="keyword">private let</span> lock = <span class="type">NSLock</span>()
+
+    <span class="keyword">init</span>() {
+        <span class="keyword">let</span> config = <span class="type">URLSessionConfiguration</span>.default
+        config.urlCache = <span class="keyword">nil</span>  <span class="comment">// We manage our own cache</span>
+        session = <span class="type">URLSession</span>(configuration: config)
+    }
+
+    <span class="keyword">func</span> <span class="func">loadImage</span>(
+        url: <span class="type">URL</span>,
+        targetSize: <span class="type">CGSize</span>,
+        completion: @escaping (<span class="type">UIImage</span>?) -> <span class="type">Void</span>
+    ) {
+        <span class="keyword">let</span> cacheKey = <span class="string">"\(url.absoluteString)_\(targetSize.width)x\(targetSize.height)"</span>
+
+        <span class="comment">// 1. Memory cache</span>
+        <span class="keyword">if let</span> cached = cache.<span class="func">image</span>(for: cacheKey) {
+            <span class="func">completion</span>(cached)
+            <span class="keyword">return</span>
+        }
+
+        <span class="comment">// 2. Coalesce duplicate requests</span>
+        lock.<span class="func">lock</span>()
+        <span class="keyword">if var</span> existing = activeTasks[url] {
+            existing.<span class="func">append</span>(completion)
+            activeTasks[url] = existing
+            lock.<span class="func">unlock</span>()
+            <span class="keyword">return</span>
+        }
+        activeTasks[url] = [completion]
+        lock.<span class="func">unlock</span>()
+
+        <span class="comment">// 3. Network fetch</span>
+        session.<span class="func">dataTask</span>(with: url) { [weak <span class="keyword">self</span>] data, _, _ <span class="keyword">in</span>
+            <span class="keyword">guard let self</span> = <span class="keyword">self</span>, <span class="keyword">let</span> data = data <span class="keyword">else</span> {
+                <span class="keyword">self</span>?.<span class="func">completeRequest</span>(for: url, image: <span class="keyword">nil</span>)
+                <span class="keyword">return</span>
+            }
+
+            <span class="comment">// 4. Downsample + decode on background thread</span>
+            <span class="keyword">self</span>.processingQueue.<span class="func">async</span> {
+                <span class="keyword">let</span> image = <span class="func">downsample</span>(data: data, to: targetSize)
+                <span class="keyword">if let</span> image = image {
+                    <span class="keyword">self</span>.cache.<span class="func">store</span>(image, for: cacheKey)
+                }
+                <span class="keyword">self</span>.<span class="func">completeRequest</span>(for: url, image: image)
+            }
+        }.<span class="func">resume</span>()
+    }
+
+    <span class="keyword">private func</span> <span class="func">completeRequest</span>(for url: <span class="type">URL</span>, image: <span class="type">UIImage</span>?) {
+        lock.<span class="func">lock</span>()
+        <span class="keyword">let</span> completions = activeTasks.<span class="func">removeValue</span>(forKey: url) ?? []
+        lock.<span class="func">unlock</span>()
+
+        <span class="type">DispatchQueue</span>.main.<span class="func">async</span> {
+            completions.<span class="func">forEach</span> { $0(image) }
+        }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="common-mistakes">10. Common Mistakes &amp; Fixes</h2>
+
+    <table>
+        <thead>
+            <tr><th>Mistake</th><th>Impact</th><th>Fix</th></tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Displaying full-resolution photos in thumbnails</td>
+                <td>~48MB per image instead of ~40KB</td>
+                <td>Downsample with ImageIO to target display size</td>
+            </tr>
+            <tr>
+                <td>Decoding images on main thread</td>
+                <td>Frame drops during scroll</td>
+                <td>Pre-decode on background queue</td>
+            </tr>
+            <tr>
+                <td>No memory cache</td>
+                <td>Re-decode from disk on every appearance</td>
+                <td>NSCache with cost-based eviction</td>
+            </tr>
+            <tr>
+                <td>Using <code>UIGraphicsBeginImageContext</code></td>
+                <td>Always 4 bytes/pixel, no wide color</td>
+                <td>Use <code>UIGraphicsImageRenderer</code></td>
+            </tr>
+            <tr>
+                <td>Duplicate network requests for same URL</td>
+                <td>Wasted bandwidth and CPU</td>
+                <td>Coalesce requests by URL</td>
+            </tr>
+            <tr>
+                <td>Not cancelling requests for off-screen cells</td>
+                <td>Wasted work, potential wrong image</td>
+                <td>Cancel in <code>prepareForReuse()</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice Summary</div>
+        <ul>
+            <li><strong>Always downsample</strong> to the display size using ImageIO — never display full-resolution images in small views</li>
+            <li><strong>Decode on background threads</strong> to avoid main thread hitches during the render loop's Prepare phase</li>
+            <li><strong>Use UIGraphicsImageRenderer</strong> instead of the legacy context APIs</li>
+            <li><strong>Implement multi-tier caching</strong>: memory (NSCache) → disk → network</li>
+            <li><strong>Coalesce duplicate requests</strong> for the same URL</li>
+            <li><strong>Cancel requests</strong> for cells that scroll off-screen</li>
+            <li><strong>Monitor memory</strong> with <code>os_proc_available_memory()</code> and reduce cache size under pressure</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="04-text-rendering.html">← Text Rendering</a>
+        <a href="06-scrolling-performance.html">Next: Scrolling Performance →</a>
+    </div>
+</div>
+</body>
+</html>

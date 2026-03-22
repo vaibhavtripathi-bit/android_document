@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Main Thread &amp; RunLoop — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Concurrency &amp; Threading</a><span class="sep">›</span>
+        Main Thread &amp; RunLoop
+    </nav>
+
+    <h1>Main Thread &amp; RunLoop</h1>
+    <p class="subtitle">The RunLoop that powers UIKit's main thread — modes, sources, why Timer stops during scrolling, the critical difference between RunLoop.main and DispatchQueue.main, the MainActor relationship, and UI thread safety rules.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#runloop-basics">1. RunLoop Fundamentals</a></li>
+            <li><a href="#modes">2. RunLoop Modes: default, tracking, common</a></li>
+            <li><a href="#sources">3. CFRunLoop Sources</a></li>
+            <li><a href="#timer-scroll">4. Why Timer Doesn't Fire During Scrolling</a></li>
+            <li><a href="#runloop-vs-dispatch">5. RunLoop.main vs DispatchQueue.main</a></li>
+            <li><a href="#main-actor">6. Main Actor Relationship</a></li>
+            <li><a href="#ui-safety">7. UI Thread Safety</a></li>
+            <li><a href="#architect">8. Architect: RunLoop-Aware Programming</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="runloop-basics">1. RunLoop Fundamentals</h2>
+
+    <p>A <code>RunLoop</code> is an event-processing loop that manages input sources (events) for a thread. Every thread can have at most one RunLoop. The main thread's RunLoop is created automatically and runs for the lifetime of the app — it's what keeps the app alive and responsive.</p>
+
+    <h3>1.1 The RunLoop Cycle</h3>
+
+    <div class="diagram">
+Main RunLoop Cycle (simplified):
+
+    ┌─────────────────────────────────────────────────────────┐
+    │                                                          │
+    │  ┌──────────────────────┐                                │
+    │  │  1. Process Timers   │  Fire any timers whose         │
+    │  │                      │  fire date has passed          │
+    │  └──────────┬───────────┘                                │
+    │             │                                            │
+    │             ▼                                            │
+    │  ┌──────────────────────┐                                │
+    │  │  2. Process Sources  │  Handle input sources:         │
+    │  │     (Source0)        │  - Touch events                │
+    │  │                      │  - performSelector:onThread:   │
+    │  └──────────┬───────────┘                                │
+    │             │                                            │
+    │             ▼                                            │
+    │  ┌──────────────────────┐                                │
+    │  │  3. Process Sources  │  Handle port-based sources:    │
+    │  │     (Source1)        │  - Mach port messages           │
+    │  │                      │  - CFMachPort callbacks        │
+    │  └──────────┬───────────┘                                │
+    │             │                                            │
+    │             ▼                                            │
+    │  ┌──────────────────────┐                                │
+    │  │  4. Process Blocks   │  Execute blocks added via      │
+    │  │                      │  CFRunLoopPerformBlock         │
+    │  └──────────┬───────────┘                                │
+    │             │                                            │
+    │             ▼                                            │
+    │  ┌──────────────────────┐                                │
+    │  │  5. Sleep / Wait     │  Block until:                  │
+    │  │                      │  - A source fires              │
+    │  │                      │  - A timer fires               │
+    │  │                      │  - RunLoop timeout             │
+    │  └──────────┬───────────┘                                │
+    │             │                                            │
+    │             └────────────────────────────────────────────┘
+    │                          (loop back to step 1)
+    </div>
+
+    <h3>1.2 RunLoop in Swift</h3>
+
+    <pre><code><span class="comment">// The main RunLoop (always exists)</span>
+<span class="keyword">let</span> mainRunLoop = <span class="type">RunLoop</span>.main
+<span class="keyword">let</span> cfMainRunLoop = <span class="type">CFRunLoopGetMain</span>()
+
+<span class="comment">// Current thread's RunLoop (created on first access)</span>
+<span class="keyword">let</span> currentRunLoop = <span class="type">RunLoop</span>.current
+
+<span class="comment">// Running a RunLoop on a background thread (rare but possible)</span>
+<span class="keyword">let</span> thread = <span class="type">Thread</span> {
+    <span class="keyword">let</span> runLoop = <span class="type">RunLoop</span>.current
+    <span class="comment">// Add sources/timers to the RunLoop</span>
+    runLoop.<span class="func">add</span>(timer, forMode: .default)
+    <span class="comment">// Run the loop</span>
+    runLoop.<span class="func">run</span>(until: <span class="type">Date</span>.distantFuture)
+}
+thread.<span class="func">start</span>()</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Why Does the App Need a RunLoop?</div>
+        <p>Without a RunLoop, the main thread would execute <code>main()</code> and exit — the app would terminate immediately. The RunLoop keeps the main thread alive by blocking (sleeping) when there's no work, and waking up to process events (touches, timers, network callbacks). It's the heartbeat of every iOS app. The <code>UIApplicationMain</code> function (or <code>@main</code>) sets up the main RunLoop and never returns.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="modes">2. RunLoop Modes: default, tracking, common</h2>
+
+    <p>A RunLoop mode determines which sources and timers are processed during a given iteration of the loop. The RunLoop runs in <strong>exactly one mode at a time</strong>.</p>
+
+    <h3>2.1 Standard Modes</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Mode</th>
+                <th>Constant</th>
+                <th>When Active</th>
+                <th>What Runs</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Default</td>
+                <td><code>.default</code> / <code>kCFRunLoopDefaultMode</code></td>
+                <td>Normal app operation (idle)</td>
+                <td>Timers, input sources, performSelector</td>
+            </tr>
+            <tr>
+                <td>Tracking</td>
+                <td><code>.tracking</code> / <code>UITrackingRunLoopMode</code></td>
+                <td>During UIScrollView scrolling</td>
+                <td>Only scroll-tracking sources</td>
+            </tr>
+            <tr>
+                <td>Common</td>
+                <td><code>.common</code> / <code>kCFRunLoopCommonModes</code></td>
+                <td>Pseudo-mode: includes default + tracking</td>
+                <td>Sources/timers added to common run in both modes</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="diagram">
+RunLoop Mode Switching During Scroll:
+
+Normal operation:        User starts scrolling:       Scroll ends:
+┌──────────────────┐    ┌──────────────────┐         ┌──────────────────┐
+│  Mode: .default  │───▶│ Mode: .tracking  │────────▶│  Mode: .default  │
+│                  │    │                  │         │                  │
+│ ✅ Timers fire   │    │ ❌ Timers pause  │         │ ✅ Timers resume  │
+│ ✅ Sources fire   │    │ ✅ Scroll events  │         │ ✅ Sources fire   │
+│ ✅ Perform selectors│  │ ❌ Other sources  │         │ ✅ Perform selectors│
+└──────────────────┘    └──────────────────┘         └──────────────────┘
+
+Solution: Add timer to .common mode → fires in BOTH modes
+    </div>
+
+    <h3>2.2 Custom RunLoop Modes</h3>
+
+    <pre><code><span class="comment">// You can create custom modes (rare but powerful)</span>
+<span class="keyword">let</span> customMode = <span class="type">RunLoop</span>.<span class="type">Mode</span>(<span class="string">"com.app.customProcessing"</span>)
+
+<span class="comment">// Run the RunLoop in custom mode for a specific duration</span>
+<span class="type">RunLoop</span>.current.<span class="func">run</span>(mode: customMode, before: <span class="type">Date</span>(timeIntervalSinceNow: <span class="number">1.0</span>))
+
+<span class="comment">// Only sources/timers added to this mode will fire</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="sources">3. CFRunLoop Sources</h2>
+
+    <p>The RunLoop processes two types of sources, plus timers:</p>
+
+    <h3>3.1 Source Types</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Type</th>
+                <th>Mechanism</th>
+                <th>Examples</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Source0</strong> (non-port)</td>
+                <td>Application-triggered. Must be manually signaled via <code>CFRunLoopSourceSignal</code> + <code>CFRunLoopWakeUp</code></td>
+                <td>Touch events, <code>performSelector:onThread:</code>, custom sources</td>
+            </tr>
+            <tr>
+                <td><strong>Source1</strong> (port-based)</td>
+                <td>Kernel-triggered via Mach ports. Automatically wakes the RunLoop.</td>
+                <td>Mach port messages, <code>CFMachPort</code>, system events from SpringBoard</td>
+            </tr>
+            <tr>
+                <td><strong>Timers</strong></td>
+                <td>Fire at scheduled times. Not real-time — fire at the next RunLoop iteration after the fire date.</td>
+                <td><code>Timer</code>, <code>CFRunLoopTimer</code>, <code>performSelector:afterDelay:</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="diagram">
+How Touch Events Reach Your Code:
+
+IOKit (hardware) → SpringBoard → Mach port (Source1) → Main RunLoop
+                                                          │
+                                                          ▼
+                                              UIApplication.sendEvent()
+                                                          │
+                                                          ▼
+                                              UIWindow.sendEvent()
+                                                          │
+                                                          ▼
+                                              Hit testing → UIResponder chain
+    </div>
+
+    <h3>3.2 RunLoop Observers</h3>
+
+    <pre><code><span class="comment">// Observing RunLoop activity (useful for profiling)</span>
+<span class="keyword">let</span> observer = <span class="type">CFRunLoopObserverCreateWithHandler</span>(
+    <span class="keyword">nil</span>,  <span class="comment">// allocator</span>
+    <span class="type">CFRunLoopActivity</span>.allActivities.rawValue,  <span class="comment">// activities to observe</span>
+    <span class="keyword">true</span>,  <span class="comment">// repeats</span>
+    <span class="number">0</span>,     <span class="comment">// order</span>
+    { observer, activity <span class="keyword">in</span>
+        <span class="keyword">switch</span> activity {
+        <span class="keyword">case</span> .entry:
+            <span class="func">print</span>(<span class="string">"RunLoop entered"</span>)
+        <span class="keyword">case</span> .beforeTimers:
+            <span class="func">print</span>(<span class="string">"About to process timers"</span>)
+        <span class="keyword">case</span> .beforeSources:
+            <span class="func">print</span>(<span class="string">"About to process sources"</span>)
+        <span class="keyword">case</span> .beforeWaiting:
+            <span class="func">print</span>(<span class="string">"About to sleep"</span>)
+        <span class="keyword">case</span> .afterWaiting:
+            <span class="func">print</span>(<span class="string">"Woke up"</span>)
+        <span class="keyword">case</span> .exit:
+            <span class="func">print</span>(<span class="string">"RunLoop iteration complete"</span>)
+        <span class="keyword">default</span>: <span class="keyword">break</span>
+        }
+    }
+)
+
+<span class="type">CFRunLoopAddObserver</span>(<span class="type">CFRunLoopGetMain</span>(), observer, <span class="type">CFRunLoopMode</span>.defaultMode)</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: RunLoop Observers for Jank Detection</div>
+        <p>A common Staff-level technique for detecting UI jank is to install a RunLoop observer that measures the time between <code>.beforeSources</code> and <code>.afterWaiting</code>. If a single RunLoop iteration takes longer than 16.67ms (for 60fps) or 8.33ms (for 120fps ProMotion), you've dropped a frame. This is how tools like Facebook's <code>FBRetainCycleDetector</code> and custom performance monitors work.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="timer-scroll">4. Why Timer Doesn't Fire During Scrolling</h2>
+
+    <p>This is one of the most frequently asked iOS interview questions, and understanding it requires knowing RunLoop modes.</p>
+
+    <h3>4.1 The Problem</h3>
+
+    <pre><code><span class="comment">// This timer STOPS firing when the user scrolls a UIScrollView</span>
+<span class="keyword">let</span> timer = <span class="type">Timer</span>.<span class="func">scheduledTimer</span>(
+    withTimeInterval: <span class="number">1.0</span>,
+    repeats: <span class="keyword">true</span>
+) { _ <span class="keyword">in</span>
+    <span class="func">print</span>(<span class="string">"Tick"</span>)  <span class="comment">// Stops printing during scroll!</span>
+}
+<span class="comment">// Timer.scheduledTimer adds to RunLoop.current in .default mode</span></code></pre>
+
+    <h3>4.2 Why It Happens</h3>
+
+    <div class="diagram">
+Timer in .default mode only:
+
+Normal:                     During scroll:
+┌─────────────────────┐    ┌─────────────────────┐
+│ RunLoop mode:       │    │ RunLoop mode:        │
+│   .default          │    │   .tracking          │
+│                     │    │                      │
+│ Timer in .default ✅ │    │ Timer in .default ❌  │
+│ Timer fires!        │    │ Timer NOT processed! │
+└─────────────────────┘    └─────────────────────┘
+
+When UIScrollView begins tracking, the RunLoop switches to
+.tracking mode. Timers added only to .default mode are
+not processed in .tracking mode.
+    </div>
+
+    <h3>4.3 The Fix</h3>
+
+    <pre><code><span class="comment">// Fix 1: Add timer to .common modes (includes both .default and .tracking)</span>
+<span class="keyword">let</span> timer = <span class="type">Timer</span>(timeInterval: <span class="number">1.0</span>, repeats: <span class="keyword">true</span>) { _ <span class="keyword">in</span>
+    <span class="func">print</span>(<span class="string">"Tick"</span>)  <span class="comment">// Fires during scrolling too!</span>
+}
+<span class="type">RunLoop</span>.main.<span class="func">add</span>(timer, forMode: .common)
+
+<span class="comment">// Fix 2: Use DispatchSourceTimer instead (not RunLoop-dependent)</span>
+<span class="keyword">let</span> timer = <span class="type">DispatchSource</span>.<span class="func">makeTimerSource</span>(queue: .main)
+timer.<span class="func">schedule</span>(deadline: .<span class="func">now</span>(), repeating: <span class="number">1.0</span>)
+timer.<span class="func">setEventHandler</span> {
+    <span class="func">print</span>(<span class="string">"Tick"</span>)  <span class="comment">// Always fires — not affected by RunLoop modes</span>
+}
+timer.<span class="func">resume</span>()
+
+<span class="comment">// Fix 3: Use Combine Timer publisher</span>
+<span class="type">Timer</span>.<span class="func">publish</span>(every: <span class="number">1.0</span>, on: .main, in: .common)
+    .<span class="func">autoconnect</span>()
+    .<span class="func">sink</span> { _ <span class="keyword">in</span>
+        <span class="func">print</span>(<span class="string">"Tick"</span>)  <span class="comment">// Fires during scrolling</span>
+    }</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall: Timer.scheduledTimer Default Mode</div>
+        <p><code>Timer.scheduledTimer</code> always adds the timer to the <strong>current</strong> RunLoop in <code>.default</code> mode. If you call it from a background thread, it adds to that thread's RunLoop (which may not be running). If you call it from the main thread, it works but pauses during scrolling. Always explicitly add timers to <code>.common</code> mode if you need them to fire during user interaction.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="runloop-vs-dispatch">5. RunLoop.main vs DispatchQueue.main</h2>
+
+    <p>This is a subtle but critical distinction that trips up even experienced developers. They are <strong>not the same thing</strong>.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th><code>RunLoop.main</code></th>
+                <th><code>DispatchQueue.main</code></th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>What it is</td>
+                <td>Event processing loop on main thread</td>
+                <td>Serial dispatch queue bound to main thread</td>
+            </tr>
+            <tr>
+                <td>Mode-aware</td>
+                <td>Yes — respects RunLoop modes</td>
+                <td>No — always executes regardless of mode</td>
+            </tr>
+            <tr>
+                <td>When blocks execute</td>
+                <td>During specific RunLoop phases</td>
+                <td>Between RunLoop iterations (Source0)</td>
+            </tr>
+            <tr>
+                <td>Timer behavior</td>
+                <td>Mode-dependent (may pause during scroll)</td>
+                <td>DispatchSourceTimer: always fires</td>
+            </tr>
+            <tr>
+                <td>Combine scheduler</td>
+                <td><code>RunLoop.main</code> — mode-aware</td>
+                <td><code>DispatchQueue.main</code> — always fires</td>
+            </tr>
+            <tr>
+                <td>Use case</td>
+                <td>Timer scheduling, RunLoop-aware APIs</td>
+                <td>General main-thread dispatch</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// These behave differently during scrolling!</span>
+
+<span class="comment">// RunLoop.main: respects modes</span>
+<span class="type">RunLoop</span>.main.<span class="func">perform</span> {
+    <span class="func">print</span>(<span class="string">"RunLoop perform"</span>)
+    <span class="comment">// Executes in .default mode only</span>
+    <span class="comment">// May be delayed during scrolling</span>
+}
+
+<span class="comment">// DispatchQueue.main: always executes</span>
+<span class="type">DispatchQueue</span>.main.<span class="func">async</span> {
+    <span class="func">print</span>(<span class="string">"Dispatch async"</span>)
+    <span class="comment">// Executes regardless of RunLoop mode</span>
+    <span class="comment">// Fires even during scrolling</span>
+}
+
+<span class="comment">// Combine: the scheduler matters</span>
+publisher
+    .<span class="func">receive</span>(on: <span class="type">RunLoop</span>.main)  <span class="comment">// May delay during scroll</span>
+    .<span class="func">sink</span> { ... }
+
+publisher
+    .<span class="func">receive</span>(on: <span class="type">DispatchQueue</span>.main)  <span class="comment">// Always delivers</span>
+    .<span class="func">sink</span> { ... }</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: How DispatchQueue.main Integrates with RunLoop</div>
+        <p>GCD's main queue is implemented as a <strong>Source0</strong> on the main RunLoop. When you call <code>DispatchQueue.main.async</code>, the block is enqueued and the RunLoop is woken up via <code>CFRunLoopWakeUp</code>. The block executes during the Source0 processing phase of the RunLoop iteration. Because Source0 processing happens in all modes (it's not mode-specific like timers), main queue blocks execute even during scrolling. This is why <code>DispatchQueue.main</code> is generally more reliable than <code>RunLoop.main.perform</code>.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="main-actor">6. Main Actor Relationship</h2>
+
+    <p>The <code>@MainActor</code> in Swift concurrency is backed by the main thread's executor, which uses <code>DispatchQueue.main</code> (not <code>RunLoop.main</code>). This means @MainActor code behaves like <code>DispatchQueue.main.async</code>, not like RunLoop-scheduled work.</p>
+
+    <pre><code><span class="comment">// @MainActor uses DispatchQueue.main's executor</span>
+<span class="keyword">@MainActor</span>
+<span class="keyword">func</span> <span class="func">updateUI</span>() {
+    <span class="comment">// This runs on the main thread via the main dispatch queue</span>
+    <span class="comment">// NOT via RunLoop.main.perform</span>
+    <span class="comment">// Therefore: it executes even during scrolling</span>
+    label.text = <span class="string">"Updated"</span>
+}
+
+<span class="comment">// MainActor.run also uses the main dispatch queue</span>
+<span class="keyword">await</span> <span class="type">MainActor</span>.<span class="func">run</span> {
+    <span class="comment">// Equivalent to DispatchQueue.main.async in terms of scheduling</span>
+    tableView.<span class="func">reloadData</span>()
+}</code></pre>
+
+    <div class="diagram">
+Main Thread Execution Contexts:
+
+┌─────────────────────────────────────────────────────────────┐
+│                    Main Thread                               │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │                  Main RunLoop                         │   │
+│  │                                                       │   │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌──────────────┐ │   │
+│  │  │   Timers    │  │  Source0    │  │   Source1    │ │   │
+│  │  │ (mode-aware)│  │ (GCD main  │  │ (Mach ports) │ │   │
+│  │  │             │  │  queue)    │  │              │ │   │
+│  │  └─────────────┘  └──────┬──────┘  └──────────────┘ │   │
+│  │                          │                            │   │
+│  │              ┌───────────┴───────────┐                │   │
+│  │              │                       │                │   │
+│  │     DispatchQueue.main       @MainActor               │   │
+│  │     .async { ... }           func f() { ... }         │   │
+│  │                                                       │   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="ui-safety">7. UI Thread Safety</h2>
+
+    <p>All UIKit and AppKit operations must happen on the main thread. Violating this causes crashes, visual glitches, or undefined behavior.</p>
+
+    <h3>7.1 Why Main Thread Only?</h3>
+
+    <ul>
+        <li><strong>UIKit is not thread-safe</strong>: UIView, UIViewController, and all their subclasses use non-atomic properties and are not designed for concurrent access</li>
+        <li><strong>Rendering pipeline</strong>: Core Animation commits happen on the main thread at the end of each RunLoop iteration. Modifying the layer tree from a background thread races with the commit</li>
+        <li><strong>Event handling</strong>: Touch events are delivered on the main thread. Modifying the view hierarchy from another thread while touches are being processed causes crashes</li>
+    </ul>
+
+    <h3>7.2 Detecting Main Thread Violations</h3>
+
+    <pre><code><span class="comment">// Runtime detection: Main Thread Checker (Xcode)</span>
+<span class="comment">// Enable in: Edit Scheme → Run → Diagnostics → Main Thread Checker</span>
+<span class="comment">// Pauses on UIKit calls from background threads</span>
+
+<span class="comment">// Compile-time detection: @MainActor (Swift 6)</span>
+<span class="keyword">@MainActor</span>
+<span class="keyword">func</span> <span class="func">updateLabel</span>(_ text: <span class="type">String</span>) {
+    label.text = text  <span class="comment">// Compiler guarantees main thread</span>
+}
+
+<span class="comment">// Manual assertion</span>
+<span class="keyword">func</span> <span class="func">unsafeUIUpdate</span>() {
+    <span class="func">dispatchPrecondition</span>(condition: .<span class="func">onQueue</span>(.main))
+    <span class="comment">// or</span>
+    <span class="func">assert</span>(<span class="type">Thread</span>.isMainThread)
+    label.text = <span class="string">"Updated"</span>
+}
+
+<span class="comment">// Common patterns for ensuring main thread</span>
+
+<span class="comment">// Pattern 1: DispatchQueue.main.async</span>
+<span class="type">DispatchQueue</span>.<span class="func">global</span>().<span class="func">async</span> {
+    <span class="keyword">let</span> data = <span class="func">processData</span>()
+    <span class="type">DispatchQueue</span>.main.<span class="func">async</span> {
+        <span class="keyword">self</span>.label.text = data.title
+    }
+}
+
+<span class="comment">// Pattern 2: @MainActor (modern)</span>
+<span class="type">Task</span> {
+    <span class="keyword">let</span> data = <span class="keyword">await</span> <span class="func">processData</span>()
+    <span class="keyword">await</span> <span class="type">MainActor</span>.<span class="func">run</span> {
+        label.text = data.title
+    }
+}
+
+<span class="comment">// Pattern 3: @MainActor on the function</span>
+<span class="keyword">@MainActor</span>
+<span class="keyword">func</span> <span class="func">display</span>(_ data: <span class="type">ProcessedData</span>) {
+    label.text = data.title
+    imageView.image = data.image
+}</code></pre>
+
+    <h3>7.3 Common Main Thread Violations</h3>
+
+    <pre><code><span class="comment">// ❌ Violation 1: URLSession callback updating UI</span>
+<span class="type">URLSession</span>.shared.<span class="func">dataTask</span>(with: url) { data, _, _ <span class="keyword">in</span>
+    <span class="comment">// This callback is on a background thread!</span>
+    <span class="keyword">self</span>.imageView.image = <span class="type">UIImage</span>(data: data!)  <span class="comment">// 💀 Crash risk</span>
+}
+
+<span class="comment">// ❌ Violation 2: NotificationCenter observer on wrong thread</span>
+<span class="type">NotificationCenter</span>.default.<span class="func">addObserver</span>(
+    forName: .dataDidUpdate,
+    object: <span class="keyword">nil</span>,
+    queue: <span class="keyword">nil</span>  <span class="comment">// nil = fires on posting thread, which may be background!</span>
+) { _ <span class="keyword">in</span>
+    <span class="keyword">self</span>.tableView.<span class="func">reloadData</span>()  <span class="comment">// 💀 May be background thread</span>
+}
+
+<span class="comment">// ✅ Fix: Specify .main queue</span>
+<span class="type">NotificationCenter</span>.default.<span class="func">addObserver</span>(
+    forName: .dataDidUpdate,
+    object: <span class="keyword">nil</span>,
+    queue: .main  <span class="comment">// ✅ Always delivers on main thread</span>
+) { _ <span class="keyword">in</span>
+    <span class="keyword">self</span>.tableView.<span class="func">reloadData</span>()
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">8. Architect: RunLoop-Aware Programming for Responsive UIs</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>Understanding the RunLoop is essential for building responsive UIs at scale. The main RunLoop has a budget of ~16.67ms per iteration (60fps) or ~8.33ms (120fps ProMotion). Every piece of work on the main thread eats into this budget. Staff engineers must design systems that respect this constraint.</p>
+    </div>
+
+    <h3>8.1 Frame Budget</h3>
+
+    <div class="diagram">
+Frame Budget (60fps):
+
+One RunLoop iteration = One frame = 16.67ms
+
+┌──────────────────────────────────────────────────────────────┐
+│                        16.67ms budget                         │
+│                                                               │
+│  ┌──────┐ ┌──────┐ ┌──────────┐ ┌────────┐ ┌─────────────┐ │
+│  │Touch │ │Timer │ │ Layout   │ │ Display│ │  CA Commit  │ │
+│  │events│ │fire  │ │ pass     │ │ pass   │ │  (to render │ │
+│  │ 1ms  │ │ 2ms  │ │  4ms     │ │  3ms   │ │   server)   │ │
+│  └──────┘ └──────┘ └──────────┘ └────────┘ │    5ms      │ │
+│                                             └─────────────┘ │
+│  Total: 15ms ✅ (within budget)                              │
+└──────────────────────────────────────────────────────────────┘
+
+If total > 16.67ms → DROPPED FRAME (jank)
+    </div>
+
+    <h3>8.2 Techniques for Staying Within Budget</h3>
+
+    <pre><code><span class="comment">// Technique 1: Defer expensive work to idle time</span>
+<span class="keyword">func</span> <span class="func">deferToIdleTime</span>(_ work: <span class="keyword">@escaping</span> () -> <span class="type">Void</span>) {
+    <span class="comment">// CFRunLoopPerformBlock schedules for the next idle iteration</span>
+    <span class="type">CFRunLoopPerformBlock</span>(<span class="type">CFRunLoopGetMain</span>(), <span class="type">CFRunLoopMode</span>.defaultMode.rawValue) {
+        <span class="func">work</span>()
+    }
+    <span class="type">CFRunLoopWakeUp</span>(<span class="type">CFRunLoopGetMain</span>())
+}
+
+<span class="comment">// Technique 2: Chunk work across multiple RunLoop iterations</span>
+<span class="keyword">func</span> <span class="func">processInChunks</span>(items: [<span class="type">Item</span>], chunkSize: <span class="type">Int</span> = <span class="number">10</span>) {
+    <span class="keyword">var</span> index = <span class="number">0</span>
+
+    <span class="keyword">func</span> <span class="func">processNextChunk</span>() {
+        <span class="keyword">let</span> end = <span class="func">min</span>(index + chunkSize, items.count)
+        <span class="keyword">for</span> i <span class="keyword">in</span> index..&lt;end {
+            <span class="func">processItem</span>(items[i])
+        }
+        index = end
+
+        <span class="keyword">if</span> index &lt; items.count {
+            <span class="comment">// Schedule next chunk on next RunLoop iteration</span>
+            <span class="type">DispatchQueue</span>.main.<span class="func">async</span> {
+                <span class="func">processNextChunk</span>()
+            }
+        }
+    }
+
+    <span class="func">processNextChunk</span>()
+}
+
+<span class="comment">// Technique 3: Use CADisplayLink for frame-synchronized work</span>
+<span class="keyword">class</span> <span class="type">SmoothAnimator</span> {
+    <span class="keyword">private var</span> displayLink: <span class="type">CADisplayLink</span>?
+
+    <span class="keyword">func</span> <span class="func">start</span>() {
+        displayLink = <span class="type">CADisplayLink</span>(target: <span class="keyword">self</span>, selector: #selector(<span class="func">tick</span>))
+        displayLink?.<span class="func">add</span>(to: .main, forMode: .common)  <span class="comment">// .common for scroll</span>
+    }
+
+    <span class="keyword">@objc func</span> <span class="func">tick</span>(_ link: <span class="type">CADisplayLink</span>) {
+        <span class="keyword">let</span> frameDuration = link.targetTimestamp - link.timestamp
+        <span class="comment">// frameDuration tells you the budget for this frame</span>
+        <span class="func">updateAnimation</span>(dt: frameDuration)
+    }
+}</code></pre>
+
+    <h3>8.3 RunLoop Monitoring for Production</h3>
+
+    <pre><code><span class="comment">// Production jank detector using RunLoop observer</span>
+<span class="keyword">final class</span> <span class="type">JankDetector</span> {
+    <span class="keyword">private var</span> lastActivity: <span class="type">CFAbsoluteTime</span> = <span class="number">0</span>
+    <span class="keyword">private let</span> threshold: <span class="type">CFAbsoluteTime</span> = <span class="number">0.05</span>  <span class="comment">// 50ms = 3 dropped frames</span>
+
+    <span class="keyword">func</span> <span class="func">start</span>() {
+        <span class="keyword">let</span> observer = <span class="type">CFRunLoopObserverCreateWithHandler</span>(
+            <span class="keyword">nil</span>,
+            <span class="type">CFRunLoopActivity</span>.beforeWaiting.rawValue |
+            <span class="type">CFRunLoopActivity</span>.afterWaiting.rawValue,
+            <span class="keyword">true</span>, <span class="number">0</span>
+        ) { [<span class="keyword">weak self</span>] _, activity <span class="keyword">in</span>
+            <span class="keyword">guard let self</span> = <span class="keyword">self</span> <span class="keyword">else</span> { <span class="keyword">return</span> }
+
+            <span class="keyword">if</span> activity == .afterWaiting {
+                <span class="keyword">self</span>.lastActivity = <span class="type">CFAbsoluteTimeGetCurrent</span>()
+            } <span class="keyword">else if</span> activity == .beforeWaiting {
+                <span class="keyword">let</span> elapsed = <span class="type">CFAbsoluteTimeGetCurrent</span>() - <span class="keyword">self</span>.lastActivity
+                <span class="keyword">if</span> elapsed > <span class="keyword">self</span>.threshold {
+                    <span class="func">reportJank</span>(duration: elapsed)
+                }
+            }
+        }
+
+        <span class="type">CFRunLoopAddObserver</span>(
+            <span class="type">CFRunLoopGetMain</span>(),
+            observer,
+            <span class="type">CFRunLoopMode</span>.commonModes
+        )
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Main Thread Guidelines</div>
+        <ul>
+            <li><strong>Never block the main thread</strong>: No synchronous network calls, no heavy computation, no file I/O</li>
+            <li><strong>Use @MainActor</strong> for compile-time main thread safety instead of runtime assertions</li>
+            <li><strong>Prefer DispatchQueue.main over RunLoop.main</strong> for general main-thread dispatch (mode-independent)</li>
+            <li><strong>Add timers to .common mode</strong> if they must fire during scrolling</li>
+            <li><strong>Chunk expensive work</strong> across multiple RunLoop iterations to maintain 60fps</li>
+            <li><strong>Use CADisplayLink</strong> for frame-synchronized animations (add to .common mode)</li>
+            <li><strong>Monitor jank in production</strong> with RunLoop observers and MetricKit</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="06-combine-framework.html">← Combine Framework</a>
+        <a href="08-interview-qa.html">Next: Interview Q&amp;A →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Darwin &amp; XNU Kernel Basics — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">System Frameworks</a><span class="sep">›</span>
+        Darwin &amp; XNU Kernel Basics
+    </nav>
+
+    <h1>Darwin &amp; XNU Kernel Basics</h1>
+    <p class="subtitle">A Staff-level map of Apple’s kernel stack: Mach IPC, the BSD personality, user-space daemons that define iOS behavior, memory policy (no swap, Jetsam), and the capability model (entitlements + sandbox). Understanding these layers turns “mysterious” production failures into diagnosable system interactions.</p>
+
+    <p>
+        <span class="tag tag-l6">L6</span>
+        <span class="tag tag-architect">Architect</span>
+        <span class="tag tag-senior">Senior+</span>
+    </p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#xnu-architecture">XNU Kernel Architecture</a></li>
+            <li><a href="#mach-microkernel">Mach Microkernel Layer</a></li>
+            <li><a href="#bsd-layer">BSD Layer</a></li>
+            <li><a href="#launchd">launchd (PID 1)</a></li>
+            <li><a href="#springboard">SpringBoard</a></li>
+            <li><a href="#backboardd">backboardd</a></li>
+            <li><a href="#process-model">Process Model: No Swap &amp; Jetsam</a></li>
+            <li><a href="#entitlements">Entitlements System</a></li>
+            <li><a href="#sandbox">Sandbox Profiles</a></li>
+            <li><a href="#architect-debugging">Architect: Debugging Production with XNU Knowledge</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="xnu-architecture"><span class="tag tag-architect">Architect</span> XNU Kernel Architecture</h2>
+
+    <p><strong>XNU</strong> stands for <em>“X is Not Unix.”</em> It is the kernel at the heart of Darwin, which underpins macOS, iOS, iPadOS, watchOS, tvOS, and visionOS. XNU is deliberately <strong>hybrid</strong>: it combines a <strong>Mach</strong>-style microkernel core (scheduling primitives, IPC, VM at the lowest level) with a large in-kernel <strong>BSD</strong> subsystem that supplies POSIX semantics, the process model as developers usually think of it, and the networking stack. On Apple platforms, <strong>IOKit</strong> provides the C++ driver framework for device matching, power management, and user-kernel driver boundaries.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Why “Hybrid” Matters in Interviews</div>
+        <p>Interviewers often probe whether you understand that “Unix syscalls” on Apple OSes are not implemented the same way as on Linux. Many syscalls are handled in the BSD layer, but underneath, Mach still owns fundamental abstractions: tasks, threads, ports, and the virtual memory object model. When you debug a weird IPC failure or VM edge case, the answer frequently lives at the Mach/BSD boundary—not in application code.</p>
+    </div>
+
+    <h3>Historical Lineage: NeXTSTEP → macOS → iOS</h3>
+
+    <p>Mach concepts entered Apple’s stack through NeXTSTEP and the evolution toward Darwin. The portable microkernel ideas (ports, messages, capability-flavored rights) proved valuable for a multi-process desktop OS and later for a tightly sandboxed mobile OS where <strong>fine-grained capability control</strong> and <strong>inter-process services</strong> dominate. iOS inherited the same kernel family as macOS but with different policy: stricter sandboxing, no swap, aggressive memory reclamation (Jetsam), and a different set of default entitlements and platform restrictions (e.g., <code>fork</code> is not a supported app model).</p>
+
+    <h3>Layered View of XNU</h3>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────┐
+│                     User space (apps, daemons, frameworks)           │
+│  UIKit/SwiftUI · SpringBoard · backboardd · launchd · XPC services   │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │ syscalls, Mach traps, IOKit user clients
+┌───────────────────────────────▼─────────────────────────────────────┐
+│                           XNU (Darwin kernel)                        │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ BSD subsystem: VFS/APFS hooks, POSIX processes, sockets, sysctl │ │
+│  │ security model integration, signal semantics, select APIs      │ │
+│  └────────────────────────────┬───────────────────────────────────┘ │
+│  ┌────────────────────────────▼───────────────────────────────────┐ │
+│  │ Mach core: tasks/threads, sched, VM primitives, IPC (ports/msgs) │ │
+│  └────────────────────────────┬───────────────────────────────────┘ │
+│  ┌────────────────────────────▼───────────────────────────────────┐ │
+│  │ IOKit + driver layer: HID, display, sensors, buses, power        │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │ hardware
+┌───────────────────────────────▼─────────────────────────────────────┐
+│                          SoC / devices                               │
+└─────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <p>At a high level: <strong>IOKit</strong> talks to hardware and exposes user-kernel interfaces; <strong>Mach</strong> provides the mechanical substrate for isolation and IPC; <strong>BSD</strong> layers the developer-facing “Unix” world on top. Frameworks like XPC build on Mach ports and MIG-generated interfaces, even when your Swift code never mentions “Mach.”</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Confusing the BSD <code>pid</code> with a Mach <code>task</code></div>
+        <p>Every BSD process has a <code>pid</code>, but under the hood it is backed by a Mach <strong>task</strong> that owns port namespaces, VM maps, and threads. Debugging tools may show both worlds. A crash reporter might describe a thread’s BSD thread id while the kernel reason references Mach exceptions—both refer to the same running entity through different lenses.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="mach-microkernel"><span class="tag tag-l6">L6</span> Mach Microkernel Concepts</h2>
+
+    <p>Mach is not “just an implementation detail.” It defines how isolation and communication actually work at the lowest stable layer Apple documents (in headers, lldb, and open-source XNU drops). The vocabulary you need for Staff-level discussions:</p>
+
+    <ul>
+        <li><strong>Task</strong> — The unit of <em>resource grouping</em>: a Mach task owns a virtual address space (VM map), a port namespace (capabilities), and holds references to threads. It is <em>not</em> the unit of execution.</li>
+        <li><strong>Thread</strong> — The unit of <em>CPU execution</em> within a task. Scheduling, preemption, and stack state are thread-level.</li>
+        <li><strong>Port</strong> — A kernel-protected communication endpoint. Ports are referenced by integer names in a task’s namespace; holding a port right is analogous to holding a capability.</li>
+        <li><strong>Message</strong> — Typed data sent from one port to another; may carry <em>out-of-line</em> memory descriptors and <em>port rights</em> transfers, enabling secure handoff of capabilities across process boundaries.</li>
+    </ul>
+
+    <h3>Port Rights: Send, Receive, Send-Once</h3>
+
+    <p>Port rights are first-class objects in Mach IPC:</p>
+
+    <ul>
+        <li><strong>MACH_PORT_RIGHT_RECEIVE</strong> — The owner of a receive right is the only endpoint that can dequeue messages for that port (the “server” side for that port name in that namespace).</li>
+        <li><strong>MACH_PORT_RIGHT_SEND</strong> — Allows enqueueing messages to the port (the “client” side), if the kernel can validate the target.</li>
+        <li><strong>MACH_PORT_RIGHT_SEND_ONCE</strong> — A single-use send capability, commonly used for reply ports in RPC patterns: after one successful delivery, the right is destroyed, which bounds lifetime and reduces capability leakage.</li>
+    </ul>
+
+    <h3>Port Sets</h3>
+
+    <p>A <strong>port set</strong> groups multiple receive rights so a server thread can block on <code>mach_msg</code> and wake when <em>any</em> member port receives a message—similar in spirit to <code>select</code>/<code>poll</code> for Mach IPC. This pattern shows up in long-lived daemons and subsystem servers that multiplex many logical endpoints.</p>
+
+    <h3>Mach IPC Performance: Why It Underpins Everything</h3>
+
+    <p>Mach messages are not “free,” but they are the sanctioned fast path for kernel-mediated capability transfer. Higher-level IPC (XPC, endpoint demuxing, driver user clients) ultimately reduces to Mach primitives. Understanding this helps you reason about:</p>
+
+    <ul>
+        <li>Why batching and serialization shape cross-process hot paths</li>
+        <li>Why “just call into another process” can dominate latency if done per frame</li>
+        <li>Why broken entitlements or sandbox rules surface as <em>IPC failures</em> rather than simple file errors</li>
+    </ul>
+
+    <div class="diagram">
+Mach IPC (simplified request/reply):
+
+  Client Task                              Server Task
+ ┌──────────────┐                        ┌──────────────┐
+ │ send right   │    mach_msg()          │ recv right   │
+ │  ─────────►  ├──────────────────────► │  (service    │
+ │              │   + inline buffer      │   port)      │
+ │ send-once    │   + OOL descriptors    │              │
+ │ reply right  │   + port rights moved  │ port set?    │
+ │  ◄───────────┼──────────────────────► │ (optional    │
+ │              │                        │  multiplex)  │
+ └──────────────┘                        └──────────────┘
+
+Key idea: rights move between tasks; the kernel validates every transfer.
+    </div>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Trace XPC Issues to Capability + IPC</div>
+        <p>When an XPC connection fails or a helper service never starts, Staff-level debugging often combines <code>Console</code>/<code>log</code> subsystem errors, <code>launchctl</code> state on macOS analogs, and an understanding that the underlying failure may be “missing port right / invalid destination / denied sandbox IPC.” Treat it as a distributed systems problem with kernel-enforced ACLs.</p>
+    </div>
+
+    <h3>From Mach Ports to Pasteboard and XPC</h3>
+
+    <p>User-visible features that feel “high level” still depend on cross-process handoff. <strong>XPC</strong> uses Mach messaging under the hood. The <strong>pasteboard</strong> involves system daemons and app processes coordinating data movement—again crossing process boundaries where sandbox rules and entitlements gate who may read or publish which item types. When you reason about security, think: <em>which task holds which rights, and which IPC graph is even allowed?</em></p>
+
+    <!-- ============================================================ -->
+    <h2 id="bsd-layer"><span class="tag tag-senior">Senior+</span> BSD Layer</h2>
+
+    <p>The BSD personality is what makes Darwin feel like Unix: file descriptors, sockets, signals, <code>sysctl</code>, and much of the syscall table as experienced from C/Objective-C/Swift runtimes. For application developers, most daily APIs ultimately call into this layer (sometimes after passing through libsystem wrappers).</p>
+
+    <h3>POSIX Compliance — With Apple Policy on Top</h3>
+
+    <p>Many POSIX APIs exist for compatibility, but <strong>policy</strong> differs on iOS: sandboxing, code signing, and entitlements determine whether an operation succeeds, even when the syscall exists. A Staff candidate should articulate: <em>POSIX is necessary but not sufficient for success on Apple OSes.</em></p>
+
+    <h3>Process Model: <code>pid</code>, Lifetime, and <code>fork</code> on iOS</h3>
+
+    <p>BSD exposes processes with parent/child relationships and pids. On iOS, applications do not use <code>fork</code> as an architecture tool; the supported unit of isolation is a separate signed binary (app, extension, XPC service) launched by <code>launchd</code> with a specific plist and sandbox profile. Attempting to treat iOS like a generic POSIX server OS leads to wrong mental models.</p>
+
+    <h3>File System: APFS and VFS</h3>
+
+    <p>The kernel’s <strong>VFS</strong> indirection allows multiple file systems; on modern Apple devices, <strong>APFS</strong> is dominant. Copy-on-write, snapshots, cloning, and encryption features interact with app containers and data protection classes. Staff discussions often tie APFS behavior to performance (metadata updates, fsync semantics) and to backup/restore correctness.</p>
+
+    <h3>Networking: BSD Sockets and the Stack</h3>
+
+    <p>TCP/UDP/IP and routing integrate with the BSD layer. Higher frameworks (<code>URLSession</code>, Network framework) wrap these facilities with connection pooling, TLS, and multipath policy. When debugging odd connectivity, the split of responsibility between user frameworks and kernel stack still matters (e.g., interface availability, DNS policy, VPN split tunneling).</p>
+
+    <h3>Security: POSIX Permissions + Apple Sandbox</h3>
+
+    <p>Traditional Unix permissions still exist for system areas, but third-party apps are constrained by the <strong>App Sandbox</strong> and <strong>entitlements</strong>. The effective security decision is often: <em>does this process’s sandbox profile and signature allow this class of operation on this object?</em></p>
+
+    <h3><code>sysctl</code>: Kernel Introspection</h3>
+
+    <p><code>sysctl</code> provides a structured interface to read (and sometimes write) kernel state: hardware identifiers, VM stats, network knobs, security options, and more. It is a common bridge between “ops-style introspection” and runtime behavior. Use it carefully—availability and keys differ across OS versions, and sandboxing may block queries.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Concept</th>
+                <th>Mach View</th>
+                <th>BSD View</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Isolation container</td>
+                <td>Task + port namespace + VM map</td>
+                <td>Process (<code>pid</code>), file descriptor table</td>
+            </tr>
+            <tr>
+                <td>Execution</td>
+                <td>Thread (scheduled by Mach)</td>
+                <td>BSD thread (pthread), <code>tid</code> concepts in tools</td>
+            </tr>
+            <tr>
+                <td>IPC primitive</td>
+                <td>Ports, messages, port rights</td>
+                <td>Unix domain sockets, pipes, <code>shm</code> (policy-gated)</td>
+            </tr>
+            <tr>
+                <td>Identity / credentials</td>
+                <td>Task auth tokens as resolved via IPC + kernel</td>
+                <td>UID/GID, groups, POSIX ACLs (where applicable)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: One Process, Two Namespaces</div>
+        <p>Think of a running iOS app as a single logical product backed by a Mach task and a BSD process simultaneously. Debugging tools may emphasize one side. lldb’s thread listings, Mach exception ports for crash reporting, and BSD signal delivery all connect to the same live process—understanding both views prevents “impossible” contradictions in postmortems.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="launchd"><span class="tag tag-architect">Architect</span> launchd (PID 1)</h2>
+
+    <p>On Darwin, <strong>launchd</strong> is PID 1—the first user-space process the kernel starts after bootstrapping. It replaces traditional <code>init</code> + rc script orchestration with a unified, property-list-driven service manager that understands Mach services, sockets, jobs, timers, and dependencies.</p>
+
+    <h3>What launchd Manages</h3>
+
+    <ul>
+        <li><strong>Daemons</strong> (<code>*.plist</code> in system domains) — system-wide background services.</li>
+        <li><strong>Agents</strong> — per-user (macOS) or analogous constructs; on iOS the emphasis is system daemons + app-hosted services.</li>
+        <li><strong>XPC services</strong> — bundles paired with executables and Mach service names, often launched on demand.</li>
+    </ul>
+
+    <h3>Property Lists and Job Definitions</h3>
+
+    <p>Jobs are described declaratively: program path, arguments, environment, throttle intervals, Mach service names, sockets to advertise, and dependency ordering. launchd merges these definitions across domains (system vs user) on macOS; on iOS, the set is highly curated and code-signed.</p>
+
+    <h3>On-Demand Launching and Socket Activation</h3>
+
+    <p>launchd avoids spawning every daemon at boot. Services can be started when:</p>
+
+    <ul>
+        <li>A Mach message arrives at a advertised service port</li>
+        <li>A client opens a listening socket that launchd holds on the service’s behalf</li>
+        <li>A timer or external event triggers the job</li>
+    </ul>
+
+    <p>This reduces memory and CPU at boot—critical for mobile—while preserving responsiveness.</p>
+
+    <h3>Why launchd Replaced init/rc Scripts</h3>
+
+    <p>Declarative plists reduce error-prone shell glue, unify dependency management, integrate with Mach IPC naming, and support fine-grained restart policies. For Apple, it is also a security boundary: only trusted plists in protected locations define what can run as which user, with which sandbox and label.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Assuming “Daemon == Always Running”</div>
+        <p>Many “daemons” are ephemeral on iOS. If your feature depends on an XPC service, measure cold-start latency and failure modes when launchd must spin the service up under memory pressure. Jetsam may have reclaimed helper processes moments earlier.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="springboard"><span class="tag tag-l6">L6</span> SpringBoard</h2>
+
+    <p><strong>SpringBoard</strong> is the iOS home screen shell: icons, widgets, app switcher presentation, notification banners in coordination with other services, and the orchestration of foreground app transitions. It is a privileged, platform-owned application that sits closest to the user’s perception of “the OS UI.”</p>
+
+    <h3>App Launching and Switching</h3>
+
+    <p>When you tap an icon or a notification, SpringBoard participates in the choreography of bringing an app to the foreground: coordinating animations, interface orientation expectations, snapshot usage, and handoff to the app process. Failures here manifest as hangs returning to home, blank snapshots, or stuck transitions—often misattributed to the target app when the shell stalled.</p>
+
+    <h3>SBApplication and Internal Models</h3>
+
+    <p>Internally, SpringBoard maintains representations of installed applications and their runtime state (foreground/background/suspended). Interview discussions may reference <strong>SBApplication</strong>-style types as the conceptual model for “what SpringBoard believes about an app,” even though third-party developers do not link against these private classes.</p>
+
+    <h3>Coordination with backboardd</h3>
+
+    <p>SpringBoard owns much product policy; <strong>backboardd</strong> owns low-latency input and display plumbing. The split keeps the shell responsive even when policy work is heavy. SpringBoard consumes events and state that backboardd normalizes from hardware.</p>
+
+    <h3>Respring</h3>
+
+    <p>If SpringBoard crashes, users experience a <strong>respring</strong>—the shell restarts, briefly dropping you to a black screen or spinner. This is a strong signal that the failure is in system UI orchestration, not necessarily in the foreground app. Crash logs for SpringBoard are invaluable for Apple-internal triage; third-party developers infer indirectly via surrounding symptoms.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: “System UI” Bugs vs App Bugs</div>
+        <p>Staff engineers separate categories: (1) app view hierarchy bugs, (2) SpringBoard transition/state bugs, (3) backboardd input/delivery bugs, (4) GPU/display pipeline issues. The remediation paths differ radically. Profiling the app alone misses shell-side deadlocks.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="backboardd"><span class="tag tag-senior">Senior+</span> backboardd</h2>
+
+    <p><strong>backboardd</strong> is the system daemon responsible for turning hardware signals into structured events for the UI subsystem and for managing major pieces of the display pipeline. It sits close to IOKit HID and Core Animation’s feeding edge.</p>
+
+    <h3>HID Events: From IOKit to Hit-Testing</h3>
+
+    <p>Touch, Apple Pencil, keyboard, and certain sensor-derived inputs arrive through driver stacks and user-space daemons. backboardd participates in composing touch paths, timing, and coalescing semantics before SpringBoard and applications consume them via higher layers (UIKit event delivery).</p>
+
+    <h3>Why Apple Separated backboardd from SpringBoard</h3>
+
+    <p><strong>Latency and determinism.</strong> Input and display teardown must stay smooth even if the home screen is doing expensive work (widget timelines, icon animations). Isolating backboardd:</p>
+
+    <ul>
+        <li>Reduces the chance that shell policy work blocks touch routing</li>
+        <li>Localizes crashes: a SpringBoard bug might respring; a backboardd failure might present as system-wide touch loss or display freezes</li>
+        <li>Matches a security/stability boundary between “policy” and “plumbing”</li>
+    </ul>
+
+    <h3>Display Pipeline Responsibilities</h3>
+
+    <p>backboardd interacts with display timing, compositing handoff, and system gestures (edge swipes, home indicator). When you debug jank, consider both app-side main-thread work <em>and</em> system-side scheduling and event delivery—especially on ProMotion devices where frame pacing interacts with multiple clocks.</p>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Instrument the Full Path for Input Jank</div>
+        <p>Use Instruments time profiles and event tracing; correlate main-thread stalls with input timestamps. If stalls are absent in the app but jank persists, escalate suspicion to system daemons and GPU workload—not just Swift code.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="process-model"><span class="tag tag-architect">Architect</span> Process Model: No Swap, Jetsam</h2>
+
+    <p>iOS devices do not rely on a large <strong>swap file</strong> like traditional macOS/desktop Linux setups. Working sets must fit into <strong>physical RAM</strong> (with compression and reclaim strategies), so memory is a hard, time-critical resource. The kernel’s OOM policy is <strong>Jetsam</strong>—it terminates processes to free memory.</p>
+
+    <h3>No Swap: Implications</h3>
+
+    <ul>
+        <li>Allocations that would “spill to disk” on desktop instead pressure the global memory pool</li>
+        <li>Memory warnings and kernel reclaim are not “hints” in the same sense as desktop paging</li>
+        <li>Background work must be budgeted; the system will kill before negotiating</li>
+    </ul>
+
+    <h3>Jetsam Priority Bands (Conceptual)</h3>
+
+    <p>Jetsam classifies processes into priority bands (foreground app, background tasks, suspended apps, system daemons, etc.—exact internal naming evolves). Under pressure, lower-priority processes with large footprints are killed first. The foreground app is protected until the situation is dire.</p>
+
+    <div class="diagram">
+Jetsam priority (simplified; higher = more protected):
+
+        MOST PROTECTED
+              │
+              ▼
+    ┌───────────────────┐
+    │ Foreground app    │  ← last resort victim
+    └─────────┬─────────┘
+              │
+    ┌─────────▼─────────┐
+    │ Active audio/nav  │  ← elevated workloads (policy-dependent)
+    └─────────┬─────────┘
+              │
+    ┌─────────▼─────────┐
+    │ Background/suspended apps │  ← common Jetsam victims
+    └─────────┬─────────┘
+              │
+    ┌─────────▼─────────┐
+    │ Non-essential daemons     │  ← reclaimed earlier
+    └───────────────────────────┘
+
+        LEAST PROTECTED (killed first under pressure)
+    </div>
+
+    <h3>Memory Pressure Levels and Decision Making</h3>
+
+    <p>The system moves through escalating pressure states. User space may observe pressure via APIs (e.g., dispatch memory pressure sources), but the ultimate arbiter is kernel policy. Jetsam considers footprints with emphasis on non-reclaimable <strong>dirty</strong> pages and <strong>compressed</strong> memory accounting—clean, mmap’d read-only pages are far less damaging.</p>
+
+    <h3><code>memorystatus_kill_on_behalf</code> (Conceptual)</h3>
+
+    <p>Apple’s kernel includes memorystatus infrastructure to kill on behalf of the system when a process endangers stability—names like <code>memorystatus_kill_on_behalf</code> appear in engineering discussions and kernel strings/releases. Interview-level understanding: <em>the kernel proactively chooses victims using priority + footprint + internal flags, not app cooperation.</em></p>
+
+    <h3>Why Apps Die “Without Warning”</h3>
+
+    <p><code>SIGKILL</code> cannot be handled. There is no graceful teardown guarantee when Jetsam triggers. Your <code>applicationWillTerminate</code> may not run. This is why caches must be durable incrementally, and why long-running background tasks need checkpointing.</p>
+
+    <h3>Dirty vs Clean vs Compressed</h3>
+
+    <ul>
+        <li><strong>Dirty</strong> — modified private pages; can’t be recreated without app data</li>
+        <li><strong>Clean</strong> — can be reloaded from backing store (e.g., mapped read-only segments)</li>
+        <li><strong>Compressed</strong> — kernel-compressed inactive pages—still counts against pressure accounting</li>
+    </ul>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Dimension</th>
+                <th>iOS</th>
+                <th>macOS (typical)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Swap / paging to disk</td>
+                <td>Not a safety net; RAM + compression driven</td>
+                <td>Virtual memory with swap/participating stores</td>
+            </tr>
+            <tr>
+                <td>OOM behavior</td>
+                <td>Jetsam kills processes</td>
+                <td>More likely to page; killing less aggressive for desktop UX</td>
+            </tr>
+            <tr>
+                <td>Background CPU/memory</td>
+                <td>Heavily throttled; strict budgets</td>
+                <td>More permissive for daemons and power users</td>
+            </tr>
+            <tr>
+                <td>App lifecycle</td>
+                <td>Suspended apps remain memory residents until reclaimed</td>
+                <td>Less aggressive mobile-style suspension</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Observing Memory Pressure in Code</h3>
+
+    <pre><code><span class="keyword">import</span> <span class="type">Dispatch</span>
+
+<span class="keyword">final</span> <span class="keyword">class</span> <span class="type">MemoryPressureObserver</span> {
+    <span class="keyword">private</span> <span class="keyword">let</span> source: <span class="type">DispatchSourceMemoryPressure</span>
+
+    <span class="func">init</span>(handler: <span class="keyword">@escaping</span> (<span class="type">DispatchSourceMemoryPressure</span>.<span class="type">Event</span>) -&gt; <span class="type">Void</span>) {
+        source = <span class="type">DispatchSource</span>.<span class="func">makeMemoryPressureSource</span>(eventMask: [.warning, .critical], queue: .main)
+        source.<span class="func">setEventHandler</span> {
+            <span class="keyword">let</span> data = source.<span class="func">data</span>
+            <span class="func">handler</span>(data)
+        }
+        source.<span class="func">resume</span>()
+    }
+
+    <span class="func">deinit</span> { source.<span class="func">cancel</span>() }
+}
+
+<span class="comment">// Usage: on .critical, drop caches aggressively — Jetsam may be imminent.</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Equating <code>didReceiveMemoryWarning</code> with Safety</div>
+        <p>UIKit memory warnings are best-effort signals. Jetsam does not wait for your view controller to react. Combine warnings with footprint instrumentation (Xcode Memory Gauge, <code>os_proc_available_memory</code>, MetricKit) for production-grade strategy.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="entitlements"><span class="tag tag-l6">L6</span> Entitlements System</h2>
+
+    <p><strong>Entitlements</strong> are signed, declarative capabilities attached to a binary’s code signature. They are key-value assertions interpreted by the kernel and security subsystem when enforcing file access, Mach service lookups, keychain access groups, push environments, HealthKit usage, associated domains, and more.</p>
+
+    <h3>How Entitlements Gate Resources</h3>
+
+    <p>At runtime, when a process asks to perform a privileged operation, Apple’s enforcement stack checks whether the operation’s class is allowed by:</p>
+
+    <ul>
+        <li>The app’s entitlements</li>
+        <li>The provisioning profile’s allowed entitlements (development/distribution)</li>
+        <li>Platform policy (some capabilities are never available to third parties)</li>
+    </ul>
+
+    <h3>Common Entitlements (Examples)</h3>
+
+    <ul>
+        <li><strong>Push</strong> — Apple Push Notification service capability</li>
+        <li><strong>Keychain access groups</strong> — sharing credentials across app group members</li>
+        <li><strong>App groups</strong> — container sharing between app and extensions</li>
+        <li><strong>HealthKit</strong> — access to health data types</li>
+        <li><strong>Associated domains</strong> — universal links / Handoff domains</li>
+    </ul>
+
+    <h3>Private Entitlements</h3>
+
+    <p>Apple-internal system binaries carry entitlements not grantable to App Store apps. Seeing a capability “in the wild” on a jailbroken or internal build does not imply availability to third-party developers. Staff interviews often test whether you understand <em>policy tiers</em>—public API vs private SPI vs system-only entitlement.</p>
+
+    <h3>Provisioning Profile Relationship</h3>
+
+    <p>Xcode merges requested capabilities into profiles. The signed profile must embed the entitlement keys the app uses; mismatches produce opaque failures (“operation not permitted”) rather than compile errors. CI should verify profiles for each target (app, extensions, watch).</p>
+
+    <h3>Checking Entitlements at Runtime (Illustrative)</h3>
+
+    <pre><code><span class="keyword">import</span> <span class="type">Security</span>
+
+<span class="comment">/// Returns entitlement plist object if present on this task's signature.</span>
+<span class="keyword">func</span> <span class="func">entitlementValue</span>(<span class="keyword">_</span> key: <span class="type">String</span>) -&gt; <span class="type">CFTypeRef</span>? {
+    <span class="keyword">guard</span> <span class="keyword">let</span> task = <span class="func">SecTaskCreateFromSelf</span>(<span class="keyword">nil</span>) <span class="keyword">else</span> { <span class="keyword">return</span> <span class="keyword">nil</span> }
+    <span class="keyword">return</span> <span class="func">SecTaskCopyValueForEntitlement</span>(task, key <span class="keyword">as</span> <span class="type">CFString</span>, <span class="keyword">nil</span>)
+}
+
+<span class="comment">// Example: detect app groups container entitlement (boolean or array depends on key)</span>
+<span class="keyword">let</span> groups = <span class="func">entitlementValue</span>(<span class="string">"com.apple.security.application-groups"</span>)</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Treat Entitlement Errors as Configuration Bugs</div>
+        <p>When a capability fails only on TestFlight or only on device, diff the signed entitlements (<code>codesign -d --entitlements :-</code> on macOS build artifacts) across configurations. Most “mysterious” keychain or group container failures are signature/profile drift.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="sandbox"><span class="tag tag-architect">Architect</span> Sandbox Profiles</h2>
+
+    <p>Every third-party iOS app runs inside the <strong>App Sandbox</strong>—a mandatory profile that constrains filesystem paths, IPC targets, network semantics (often mediated by higher layers), and syscall classes. The sandbox is not “optional hardening”; it is the default adversarial model for App Store software.</p>
+
+    <h3>Container Structure</h3>
+
+    <p>Apps receive a private <strong>container</strong> on disk: Library, Documents, tmp, shared app group paths when entitled. Paths outside the container are generally unreachable unless mediated by powerbox-style APIs (document picker) or system frameworks that broker access.</p>
+
+    <h3><code>sandbox_init</code> and Profile Attachment</h3>
+
+    <p>System processes and some macOS apps explicitly attach sandbox profiles via <code>sandbox_init</code>/<code>sandbox_init_with_parameters</code> family APIs; iOS App Store apps inherit sandbox rules from their signed profile embedded at launch. Understanding the API helps you read Apple open-source samples and system headers even if you rarely call it directly.</p>
+
+    <h3>SBPL — Sandbox Profile Language</h3>
+
+    <p>Profiles are expressed in SBPL (a Lisp-like DSL) compiled into binary sandbox rules. Rules describe allow/deny patterns for file reads/writes, IPC, sysctl, Mach lookups, etc. Apple ships compiled profiles; third-party developers typically do not author raw SBPL for iOS App Store targets—instead, Xcode capability toggles map to entitlements + template rules.</p>
+
+    <h3>What the Sandbox Restricts</h3>
+
+    <ul>
+        <li><strong>File access</strong> — Scoped to container + explicit entitlements + user-mediated picks</li>
+        <li><strong>Network</strong> — Often combined with ATS and enterprise policies; outbound traffic still runs in sandboxed process context</li>
+        <li><strong>IPC</strong> — Mach service access is filtered; not every XPC endpoint is reachable from sandboxed apps</li>
+    </ul>
+
+    <h3>iOS vs macOS Sandbox</h3>
+
+    <p>macOS supports developer-provisioned sandboxing for Mac App Store apps but also supports non-sandboxed apps with user-granted permissions. iOS is stricter by design: the threat model assumes arbitrary code in apps; containment is non-negotiable.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Sandbox Denials in Logs</div>
+        <p>When an operation is denied, Console may show sandbox violations with operation classes and targeted paths. Staff-level triage correlates these lines with entitlements, app group IDs, and whether the code path runs inside an extension with a different container.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architect-debugging"><span class="tag tag-architect">Architect</span> How XNU Internals Help Debug Production</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>Production issues at scale rarely look like textbook API misuse. They look like: “SIGKILL with no stack,” “XPC interrupted,” “pasteboard intermittently empty,” “keychain -34018,” “GPU hangs with clean app stacks,” or “memory warnings never arrived.” The XNU-centered mental model maps these symptoms to concrete subsystems: Mach exceptions, Jetsam policy, Darwin notifications, entitlement/sandbox enforcement, and display/input daemons.</p>
+    </div>
+
+    <h3>Mach Exception Handling and Crash Reporting</h3>
+
+    <p>Crash reporters install Mach exception ports or use task APIs to intercept faults (e.g., EXC_BAD_ACCESS). Understanding Mach exceptions explains why some crashes are synchronous signals in-thread while others are reported asynchronously by a supervising task, and why symbolication differs across debugger attachments.</p>
+
+    <h3>Jetsam and Memory Optimization</h3>
+
+    <p>When crash-free metrics drop but stacks are empty, suspect Jetsam. Memory graphs, footprint regressions around image decoding, and background extension usage are the levers. Optimize dirty memory, not just “allocations.”</p>
+
+    <h3>Darwin Notifications for IPC</h3>
+
+    <p><strong>Darwin notifications</strong> (<code>CFNotificationCenterGetDarwinNotifyCenter</code>) broadcast system-level strings across processes with at-most-once, coalescing semantics—no object payloads. They are ideal for “something changed” signals; heavy data should live in shared containers or XPC. Understanding delivery helps debug missed updates across extensions.</p>
+
+    <pre><code><span class="keyword">import</span> <span class="type">Foundation</span>
+
+<span class="keyword">let</span> center = <span class="type">CFNotificationCenterGetDarwinNotifyCenter</span>()
+<span class="keyword">let</span> n = <span class="type">CFNotificationName</span>(rawValue: <span class="string">"com.example.app.refresh"</span> <span class="keyword">as</span> <span class="type">CFString</span>)
+
+<span class="comment">// Poster — coalescing, string name only; no NSDictionary payload</span>
+<span class="type">CFNotificationCenterPostNotification</span>(center, n, <span class="keyword">nil</span>, <span class="keyword">nil</span>, <span class="keyword">true</span>)
+
+<span class="comment">// Observer: CFNotificationCenterAddObserver on Darwin center;</span>
+<span class="comment">// callback receives no userInfo — use shared container / DB for data.</span></code></pre>
+
+    <h3>Entitlements and Capability Issues</h3>
+
+    <p>When a feature works in debug but fails in release, or works in the app but not in an extension, compare <strong>signatures and containers</strong>. Entitlements are the ACLs of the Apple platform—treat them like IAM policies in cloud systems.</p>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Build a Subsystem → Kernel Layer Map for Your App</div>
+        <p>For each major feature (sync, auth, notifications, widgets), document: which processes are involved, which containers they read, which entitlements they require, which XPC/Mach services they touch, and what memory class they allocate. This single page prevents weeks of blind guessing in incidents.</p>
+    </div>
+
+    <h3>Staff Interview Sound Bites (High Signal)</h3>
+
+    <ul>
+        <li>XNU is hybrid Mach + BSD + IOKit; Mach IPC is the capability substrate for higher-level services.</li>
+        <li>iOS memory is RAM-constrained; Jetsam is the OOM killer—design for <code>SIGKILL</code> without warning.</li>
+        <li>SpringBoard vs backboardd separates shell policy from input/display plumbing for latency and stability.</li>
+        <li>launchd unifies service lifecycle with plist-driven, on-demand Mach and socket activation.</li>
+        <li>Entitlements + sandbox = effective security policy; POSIX is necessary but insufficient.</li>
+    </ul>
+
+    <div class="nav-footer">
+        <a href="index.html">← Series Overview</a>
+        <a href="02-objc-runtime.html">Objective-C Runtime →</a>
+    </div>
+</div>
+</body>
+</html>

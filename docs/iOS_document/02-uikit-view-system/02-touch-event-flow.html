@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Touch &amp; Event Flow — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">UIKit View System</a><span class="sep">›</span>
+        Touch &amp; Event Flow
+    </nav>
+
+    <h1>Touch &amp; Event Flow</h1>
+    <p class="subtitle">The full touch pipeline from IOKit HID through SpringBoard to UIResponder chain. Gesture recognizer state machine. UIScrollView's 150ms delay. This is a classic Staff-level interview question — know every step.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#full-pipeline">1. The Full Touch Pipeline</a></li>
+            <li><a href="#uitouch-lifecycle">2. UITouch Lifecycle</a></li>
+            <li><a href="#uievent-types">3. UIEvent Types</a></li>
+            <li><a href="#responder-chain">4. The Responder Chain</a></li>
+            <li><a href="#gesture-recognizers">5. Gesture Recognizer State Machine</a></li>
+            <li><a href="#gesture-internals">6. UIGestureRecognizer Internals</a></li>
+            <li><a href="#scroll-view-delay">7. UIScrollView Delayed Touch Delivery</a></li>
+            <li><a href="#multi-touch">8. Multi-Touch Handling</a></li>
+            <li><a href="#architect-section">9. Architect: Custom Gesture Systems</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="full-pipeline">1. The Full Touch Pipeline</h2>
+    <!-- ============================================================ -->
+
+    <p>When a user touches the screen, the event travels through multiple system layers before reaching your app's view. Understanding this full pipeline is a <strong>classic Staff/L6 interview question</strong>.</p>
+
+    <div class="diagram">
+THE COMPLETE TOUCH PIPELINE
+═══════════════════════════════════════════════════════════════════
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │  HARDWARE LAYER                                             │
+  │  ┌─────────────────────────────────────────────────────┐   │
+  │  │  Capacitive Touch Digitizer                          │   │
+  │  │  • Scans at 120Hz (or 240Hz on ProMotion for Apple  │   │
+  │  │    Pencil)                                           │   │
+  │  │  • Detects capacitance changes → touch coordinates   │   │
+  │  └──────────────────────┬──────────────────────────────┘   │
+  └─────────────────────────┼───────────────────────────────────┘
+                            ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  KERNEL LAYER (XNU / IOKit)                                 │
+  │  ┌─────────────────────────────────────────────────────┐   │
+  │  │  IOKit HID (Human Interface Device) System           │   │
+  │  │  • MultitouchHID driver processes raw touch data     │   │
+  │  │  • Creates IOHIDEvent with touch coordinates,        │   │
+  │  │    pressure, radius, timestamp                       │   │
+  │  │  • Sends via Mach port to userspace                  │   │
+  │  └──────────────────────┬──────────────────────────────┘   │
+  └─────────────────────────┼───────────────────────────────────┘
+                            ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  SYSTEM DAEMON LAYER                                        │
+  │  ┌─────────────────────────────────────────────────────┐   │
+  │  │  backboardd (iOS 6+, replaced SpringBoard for HID)   │   │
+  │  │  • Receives IOHIDEvent via Mach port                 │   │
+  │  │  • Determines which app owns the touched screen      │   │
+  │  │    region                                            │   │
+  │  │  • Packages as a GSEvent                             │   │
+  │  │  • Sends to target app via Mach port IPC             │   │
+  │  └──────────────────────┬──────────────────────────────┘   │
+  └─────────────────────────┼───────────────────────────────────┘
+                            ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  APP PROCESS — UIKit Event Loop                             │
+  │                                                             │
+  │  ┌──────────────────────────────────────────────────────┐  │
+  │  │  1. RunLoop receives Mach port message               │  │
+  │  │  2. Source1 callback → _UIApplicationHandleEventQueue│  │
+  │  │  3. GSEvent → UIEvent wrapping                       │  │
+  │  └──────────────────────┬───────────────────────────────┘  │
+  │                         ▼                                   │
+  │  ┌──────────────────────────────────────────────────────┐  │
+  │  │  4. UIApplication.sendEvent(_ event: UIEvent)        │  │
+  │  │     • The app's singleton receives the event         │  │
+  │  └──────────────────────┬───────────────────────────────┘  │
+  │                         ▼                                   │
+  │  ┌──────────────────────────────────────────────────────┐  │
+  │  │  5. UIWindow.sendEvent(_ event: UIEvent)             │  │
+  │  │     • Window dispatches to the correct view          │  │
+  │  │     • For .began: performs HIT TESTING               │  │
+  │  │     • For .moved/.ended: sends to previously-hit view│  │
+  │  └──────────────────────┬───────────────────────────────┘  │
+  │                         ▼                                   │
+  │  ┌──────────────────────────────────────────────────────┐  │
+  │  │  6. HIT TESTING (only on .began phase)               │  │
+  │  │     UIWindow.hitTest(_:with:)                        │  │
+  │  │     → Reverse pre-order traversal of view tree       │  │
+  │  │     → Returns the deepest view containing the point  │  │
+  │  └──────────────────────┬───────────────────────────────┘  │
+  │                         ▼                                   │
+  │  ┌──────────────────────────────────────────────────────┐  │
+  │  │  7. GESTURE RECOGNIZER RECOGNITION                   │  │
+  │  │     • All gesture recognizers on the hit view AND    │  │
+  │  │       its ancestors receive the touch                │  │
+  │  │     • GRs process in parallel                        │  │
+  │  │     • If a GR recognizes → it "claims" the touch     │  │
+  │  │     • Other GRs get .cancelled                       │  │
+  │  └──────────────────────┬───────────────────────────────┘  │
+  │                         ▼                                   │
+  │  ┌──────────────────────────────────────────────────────┐  │
+  │  │  8. RESPONDER CHAIN (if no GR claims the touch)      │  │
+  │  │     hitView.touchesBegan(_:with:)                    │  │
+  │  │     → If not handled, passes up responder chain:     │  │
+  │  │       View → ViewController → Parent VC → Window     │  │
+  │  │       → UIApplication → UIApplicationDelegate        │  │
+  │  └──────────────────────────────────────────────────────┘  │
+  └─────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>Step-by-Step Code Flow</h3>
+
+    <pre><code><span class="comment">// Step 4: UIApplication receives the event</span>
+<span class="comment">// This is the entry point into your app's event handling</span>
+<span class="keyword">class</span> <span class="type">UIApplication</span> {
+    <span class="keyword">open func</span> <span class="func">sendEvent</span>(_ event: <span class="type">UIEvent</span>) {
+        <span class="comment">// Dispatches to the appropriate window</span>
+        <span class="keyword">for</span> window <span class="keyword">in</span> windows {
+            <span class="keyword">if</span> window.<span class="func">isEventRelevant</span>(event) {
+                window.<span class="func">sendEvent</span>(event)
+            }
+        }
+    }
+}
+
+<span class="comment">// Step 5-6: UIWindow dispatches and performs hit testing</span>
+<span class="keyword">class</span> <span class="type">UIWindow</span> {
+    <span class="keyword">open func</span> <span class="func">sendEvent</span>(_ event: <span class="type">UIEvent</span>) {
+        <span class="keyword">for</span> touch <span class="keyword">in</span> event.<span class="func">allTouches</span> ?? [] {
+            <span class="keyword">switch</span> touch.phase {
+            <span class="keyword">case</span> .began:
+                <span class="comment">// Hit test to find the target view</span>
+                <span class="keyword">let</span> hitView = <span class="func">hitTest</span>(touch.location(in: <span class="keyword">self</span>), with: event)
+                touch._setView(hitView)
+                <span class="comment">// Deliver to gesture recognizers first, then view</span>
+                <span class="func">deliverToGestureRecognizers</span>(touch, event)
+                hitView?.<span class="func">touchesBegan</span>([touch], with: event)
+
+            <span class="keyword">case</span> .moved:
+                <span class="comment">// Deliver to the SAME view that received .began</span>
+                touch.view?.<span class="func">touchesMoved</span>([touch], with: event)
+
+            <span class="keyword">case</span> .ended:
+                touch.view?.<span class="func">touchesEnded</span>([touch], with: event)
+
+            <span class="keyword">case</span> .cancelled:
+                touch.view?.<span class="func">touchesCancelled</span>([touch], with: event)
+
+            <span class="keyword">default</span>: <span class="keyword">break</span>
+            }
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive</div>
+        <p><strong>Why backboardd, not SpringBoard?</strong> Before iOS 6, SpringBoard handled all HID events. This was problematic because SpringBoard is a full app with its own UI — if it was busy (e.g., animating the app switcher), touch delivery to apps would be delayed. Apple moved HID handling to <code>backboardd</code>, a lightweight daemon that does nothing but route events. This reduced touch latency significantly.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="uitouch-lifecycle">2. UITouch Lifecycle</h2>
+    <!-- ============================================================ -->
+
+    <p>A <code>UITouch</code> object represents a single finger on the screen. It is <strong>reused</strong> across phases — the same object transitions through began → moved → ended.</p>
+
+    <div class="diagram">
+UITouch Phase Lifecycle:
+
+  ┌──────────┐     ┌──────────┐     ┌──────────┐
+  │  .began   │────▶│  .moved   │────▶│  .ended   │
+  └──────────┘     └────┬─────┘     └──────────┘
+       │                │                  ▲
+       │                └──────────────────┘
+       │                (multiple .moved events)
+       │
+       │           ┌──────────────┐
+       └──────────▶│  .cancelled   │
+                   └──────────────┘
+                   (system interruption:
+                    phone call, gesture
+                    recognizer claim, etc.)
+
+  .stationary — finger is touching but hasn't moved
+  .regionEntered / .regionMoved / .regionExited — indirect touches (Apple TV)
+    </div>
+
+    <pre><code><span class="keyword">class</span> <span class="type">TouchTrackingView</span>: <span class="type">UIView</span> {
+
+    <span class="keyword">override func</span> <span class="func">touchesBegan</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?) {
+        <span class="keyword">for</span> touch <span class="keyword">in</span> touches {
+            <span class="comment">// UITouch properties available at each phase:</span>
+            <span class="keyword">let</span> location = touch.<span class="func">location</span>(in: <span class="keyword">self</span>)
+            <span class="keyword">let</span> previousLocation = touch.<span class="func">previousLocation</span>(in: <span class="keyword">self</span>)
+            <span class="keyword">let</span> timestamp = touch.timestamp          <span class="comment">// TimeInterval since boot</span>
+            <span class="keyword">let</span> phase = touch.phase                   <span class="comment">// .began</span>
+            <span class="keyword">let</span> tapCount = touch.tapCount              <span class="comment">// 1 for single, 2 for double</span>
+            <span class="keyword">let</span> type = touch.type                     <span class="comment">// .direct, .indirect, .pencil</span>
+            <span class="keyword">let</span> force = touch.force                   <span class="comment">// 3D Touch / Force Touch</span>
+            <span class="keyword">let</span> maxForce = touch.maximumPossibleForce  <span class="comment">// device capability</span>
+            <span class="keyword">let</span> radius = touch.majorRadius             <span class="comment">// touch size estimate</span>
+            <span class="keyword">let</span> tolerance = touch.majorRadiusTolerance
+
+            <span class="comment">// The view that was hit-tested (doesn't change across phases)</span>
+            <span class="keyword">let</span> hitView = touch.view
+
+            <span class="comment">// The window that received the touch</span>
+            <span class="keyword">let</span> window = touch.window
+
+            <span class="comment">// Estimated properties (Apple Pencil)</span>
+            <span class="keyword">let</span> azimuth = touch.<span class="func">azimuthAngle</span>(in: <span class="keyword">self</span>)
+            <span class="keyword">let</span> altitude = touch.altitudeAngle
+        }
+    }
+
+    <span class="keyword">override func</span> <span class="func">touchesMoved</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?) {
+        <span class="keyword">for</span> touch <span class="keyword">in</span> touches {
+            <span class="keyword">let</span> location = touch.<span class="func">location</span>(in: <span class="keyword">self</span>)
+            <span class="keyword">let</span> previous = touch.<span class="func">previousLocation</span>(in: <span class="keyword">self</span>)
+            <span class="keyword">let</span> delta = <span class="type">CGPoint</span>(
+                x: location.x - previous.x,
+                y: location.y - previous.y
+            )
+            <span class="comment">// Use delta for dragging, drawing, etc.</span>
+        }
+    }
+
+    <span class="keyword">override func</span> <span class="func">touchesEnded</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?) {
+        <span class="comment">// Clean up tracking state</span>
+    }
+
+    <span class="keyword">override func</span> <span class="func">touchesCancelled</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?) {
+        <span class="comment">// MUST handle this — system can cancel at any time</span>
+        <span class="comment">// Treat as touchesEnded but revert any in-progress changes</span>
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall</div>
+        <p><strong>Always implement <code>touchesCancelled</code>.</strong> The system cancels touches when: a gesture recognizer claims the touch, a phone call comes in, the app is backgrounded, a system alert appears, or Control Center/Notification Center is pulled. If you don't handle cancellation, your view can be stuck in a "pressed" state.</p>
+    </div>
+
+    <h3>Coalesced and Predicted Touches</h3>
+
+    <pre><code><span class="comment">// On ProMotion displays (120Hz) and with Apple Pencil (240Hz),</span>
+<span class="comment">// touches arrive faster than the 60Hz display refresh.</span>
+<span class="comment">// UIKit coalesces them but provides access to the full set.</span>
+
+<span class="keyword">override func</span> <span class="func">touchesMoved</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?) {
+    <span class="keyword">guard let</span> touch = touches.first <span class="keyword">else</span> { <span class="keyword">return</span> }
+
+    <span class="comment">// Coalesced touches: all intermediate positions since last callback</span>
+    <span class="keyword">if let</span> coalesced = event?.<span class="func">coalescedTouches</span>(for: touch) {
+        <span class="keyword">for</span> coalescedTouch <span class="keyword">in</span> coalesced {
+            <span class="keyword">let</span> point = coalescedTouch.<span class="func">location</span>(in: <span class="keyword">self</span>)
+            <span class="comment">// Use for smooth drawing — don't skip intermediate points</span>
+            drawingPath.<span class="func">addLine</span>(to: point)
+        }
+    }
+
+    <span class="comment">// Predicted touches: where the system thinks the finger is heading</span>
+    <span class="keyword">if let</span> predicted = event?.<span class="func">predictedTouches</span>(for: touch) {
+        <span class="keyword">for</span> predictedTouch <span class="keyword">in</span> predicted {
+            <span class="keyword">let</span> point = predictedTouch.<span class="func">location</span>(in: <span class="keyword">self</span>)
+            <span class="comment">// Use for low-latency drawing — render ahead of the finger</span>
+            <span class="comment">// Must be replaced with actual touches on next callback</span>
+            predictedPath.<span class="func">addLine</span>(to: point)
+        }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="uievent-types">3. UIEvent Types</h2>
+    <!-- ============================================================ -->
+
+    <table>
+        <thead>
+            <tr>
+                <th>UIEvent.EventType</th>
+                <th>Description</th>
+                <th>Delivery</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>.touches</code></td>
+                <td>Touch events (finger, pencil)</td>
+                <td>Hit-tested view → responder chain</td>
+            </tr>
+            <tr>
+                <td><code>.motion</code></td>
+                <td>Shake gesture</td>
+                <td>First responder → responder chain</td>
+            </tr>
+            <tr>
+                <td><code>.remoteControl</code></td>
+                <td>Headphone buttons, external controls</td>
+                <td>First responder → responder chain</td>
+            </tr>
+            <tr>
+                <td><code>.presses</code></td>
+                <td>Physical button presses (game controllers, keyboard)</td>
+                <td>First responder → responder chain</td>
+            </tr>
+            <tr>
+                <td><code>.scroll</code></td>
+                <td>Scroll wheel (trackpad, mouse)</td>
+                <td>Hit-tested view</td>
+            </tr>
+            <tr>
+                <td><code>.hover</code></td>
+                <td>Pointer hover (iPadOS, Catalyst)</td>
+                <td>Hit-tested view</td>
+            </tr>
+            <tr>
+                <td><code>.transform</code></td>
+                <td>Pinch/rotation from trackpad</td>
+                <td>Hit-tested view</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="responder-chain">4. The Responder Chain</h2>
+    <!-- ============================================================ -->
+
+    <p>The responder chain is the path an event follows if the initial receiver doesn't handle it. Every <code>UIResponder</code> has a <code>next</code> property pointing to the next responder in the chain.</p>
+
+    <div class="diagram">
+Responder Chain (typical):
+
+  ┌─────────────────────┐
+  │  Hit-Tested UIView   │  ← First responder for touch events
+  └──────────┬──────────┘
+             │ .next
+  ┌──────────▼──────────┐
+  │  Parent UIView       │  ← superview
+  └──────────┬──────────┘
+             │ .next
+  ┌──────────▼──────────┐
+  │  UIViewController    │  ← view.next is the view controller
+  └──────────┬──────────┘
+             │ .next
+  ┌──────────▼──────────┐
+  │  Parent UIView       │  ← VC's view's superview
+  │  (container VC view) │
+  └──────────┬──────────┘
+             │ .next
+  ┌──────────▼──────────┐
+  │  Parent VC           │  ← container view controller
+  └──────────┬──────────┘
+             │ .next
+  ┌──────────▼──────────┐
+  │  UIWindow            │
+  └──────────┬──────────┘
+             │ .next
+  ┌──────────▼──────────┐
+  │  UIWindowScene       │  ← iOS 13+
+  └──────────┬──────────┘
+             │ .next
+  ┌──────────▼──────────┐
+  │  UIApplication       │
+  └──────────┬──────────┘
+             │ .next
+  ┌──────────▼──────────┐
+  │  UIApplicationDelegate│  ← if it's a UIResponder (it is)
+  └──────────┬──────────┘
+             │ .next
+             ▼
+            nil  ← event is dropped
+    </div>
+
+    <pre><code><span class="comment">// The responder chain is built from the `next` property</span>
+<span class="keyword">class</span> <span class="type">UIResponder</span> {
+    <span class="keyword">open var</span> next: <span class="type">UIResponder</span>? { <span class="keyword">get</span> }
+
+    <span class="comment">// Touch events</span>
+    <span class="keyword">open func</span> <span class="func">touchesBegan</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?)
+    <span class="keyword">open func</span> <span class="func">touchesMoved</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?)
+    <span class="keyword">open func</span> <span class="func">touchesEnded</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?)
+    <span class="keyword">open func</span> <span class="func">touchesCancelled</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?)
+
+    <span class="comment">// Motion events</span>
+    <span class="keyword">open func</span> <span class="func">motionBegan</span>(_ motion: <span class="type">UIEvent</span>.<span class="type">EventSubtype</span>, with event: <span class="type">UIEvent</span>?)
+    <span class="keyword">open func</span> <span class="func">motionEnded</span>(_ motion: <span class="type">UIEvent</span>.<span class="type">EventSubtype</span>, with event: <span class="type">UIEvent</span>?)
+
+    <span class="comment">// Press events (physical buttons)</span>
+    <span class="keyword">open func</span> <span class="func">pressesBegan</span>(_ presses: <span class="type">Set</span>&lt;<span class="type">UIPress</span>&gt;, with event: <span class="type">UIPressesEvent</span>?)
+    <span class="keyword">open func</span> <span class="func">pressesEnded</span>(_ presses: <span class="type">Set</span>&lt;<span class="type">UIPress</span>&gt;, with event: <span class="type">UIPressesEvent</span>?)
+
+    <span class="comment">// First responder management</span>
+    <span class="keyword">open var</span> canBecomeFirstResponder: <span class="type">Bool</span> { <span class="keyword">get</span> }
+    <span class="keyword">open func</span> <span class="func">becomeFirstResponder</span>() -> <span class="type">Bool</span>
+    <span class="keyword">open func</span> <span class="func">resignFirstResponder</span>() -> <span class="type">Bool</span>
+}
+
+<span class="comment">// The `next` property chain for UIView:</span>
+<span class="comment">// UIView.next → superview (if no VC manages this view)</span>
+<span class="comment">// UIView.next → UIViewController (if VC.view == this view)</span>
+<span class="comment">// UIViewController.next → parent VC's view (or window)</span></code></pre>
+
+    <h3>Event Forwarding</h3>
+
+    <pre><code><span class="comment">// Default implementation of touchesBegan forwards up the chain</span>
+<span class="keyword">class</span> <span class="type">UIResponder</span> {
+    <span class="keyword">open func</span> <span class="func">touchesBegan</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?) {
+        <span class="comment">// Default: forward to next responder</span>
+        next?.<span class="func">touchesBegan</span>(touches, with: event)
+    }
+}
+
+<span class="comment">// To HANDLE an event (stop propagation), override WITHOUT calling super</span>
+<span class="keyword">class</span> <span class="type">MyView</span>: <span class="type">UIView</span> {
+    <span class="keyword">override func</span> <span class="func">touchesBegan</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?) {
+        <span class="comment">// Handle the touch — don't call super to stop propagation</span>
+        handleTouch(touches)
+    }
+}
+
+<span class="comment">// To OBSERVE but not consume, override AND call super</span>
+<span class="keyword">class</span> <span class="type">ObservingView</span>: <span class="type">UIView</span> {
+    <span class="keyword">override func</span> <span class="func">touchesBegan</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?) {
+        logTouch(touches)
+        <span class="keyword">super</span>.<span class="func">touchesBegan</span>(touches, with: event)  <span class="comment">// Continue propagation</span>
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="gesture-recognizers">5. Gesture Recognizer State Machine</h2>
+    <!-- ============================================================ -->
+
+    <p>Gesture recognizers are state machines that run in parallel with the responder chain. They intercept touches <em>before</em> the responder chain and can claim exclusive ownership.</p>
+
+    <div class="diagram">
+UIGestureRecognizer State Machine:
+
+  DISCRETE gestures (tap, swipe):
+
+    .possible ──────▶ .recognized ──────▶ (reset to .possible)
+        │                                       
+        └──────────▶ .failed ───────────▶ (reset to .possible)
+
+
+  CONTINUOUS gestures (pan, pinch, rotation):
+
+    .possible ──▶ .began ──▶ .changed ──▶ .changed ──▶ .ended
+        │            │          │                         │
+        │            │          └──▶ .cancelled           │
+        │            └──────────▶ .cancelled              │
+        │                                                 │
+        └──▶ .failed                                      │
+                                                          ▼
+                                              (reset to .possible)
+
+
+  State transitions trigger action method calls:
+  • .began    → action called
+  • .changed  → action called (repeatedly)
+  • .ended    → action called
+  • .cancelled → action called
+  • .failed   → action NOT called
+  • .possible → action NOT called
+    </div>
+
+    <pre><code><span class="comment">// Gesture recognizer action handling</span>
+<span class="keyword">class</span> <span class="type">GestureViewController</span>: <span class="type">UIViewController</span> {
+
+    <span class="keyword">override func</span> <span class="func">viewDidLoad</span>() {
+        <span class="keyword">super</span>.<span class="func">viewDidLoad</span>()
+
+        <span class="keyword">let</span> pan = <span class="type">UIPanGestureRecognizer</span>(target: <span class="keyword">self</span>, action: #<span class="func">selector</span>(handlePan))
+        view.<span class="func">addGestureRecognizer</span>(pan)
+    }
+
+    @objc <span class="keyword">func</span> <span class="func">handlePan</span>(_ gesture: <span class="type">UIPanGestureRecognizer</span>) {
+        <span class="keyword">switch</span> gesture.state {
+        <span class="keyword">case</span> .began:
+            <span class="comment">// Gesture just recognized — start tracking</span>
+            <span class="keyword">let</span> location = gesture.<span class="func">location</span>(in: view)
+            startDragging(at: location)
+
+        <span class="keyword">case</span> .changed:
+            <span class="comment">// Finger moved — update position</span>
+            <span class="keyword">let</span> translation = gesture.<span class="func">translation</span>(in: view)
+            updateDrag(by: translation)
+            gesture.<span class="func">setTranslation</span>(.zero, in: view)  <span class="comment">// Reset for delta</span>
+
+        <span class="keyword">case</span> .ended:
+            <span class="comment">// Finger lifted — apply velocity for momentum</span>
+            <span class="keyword">let</span> velocity = gesture.<span class="func">velocity</span>(in: view)
+            finishDragging(withVelocity: velocity)
+
+        <span class="keyword">case</span> .cancelled:
+            <span class="comment">// System cancelled — revert to original position</span>
+            cancelDragging()
+
+        <span class="keyword">case</span> .failed, .possible:
+            <span class="keyword">break</span>
+
+        @unknown <span class="keyword">default</span>:
+            <span class="keyword">break</span>
+        }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="gesture-internals">6. UIGestureRecognizer Internals</h2>
+    <!-- ============================================================ -->
+
+    <h3>Touch Delivery with Gesture Recognizers</h3>
+
+    <p>When gesture recognizers are present, the touch delivery becomes more complex. By default, both the gesture recognizer AND the view receive touches simultaneously until the GR makes a decision.</p>
+
+    <pre><code><span class="comment">// The default behavior:</span>
+<span class="comment">// 1. Touch begins → both GR and view receive touchesBegan</span>
+<span class="comment">// 2. Touch moves → both GR and view receive touchesMoved</span>
+<span class="comment">// 3. GR recognizes → view receives touchesCancelled</span>
+<span class="comment">//    OR GR fails → view continues receiving touches normally</span>
+
+<span class="comment">// Key properties that control this behavior:</span>
+
+<span class="comment">// cancelsTouchesInView (default: true)</span>
+<span class="comment">// When GR recognizes, the view gets touchesCancelled</span>
+gesture.cancelsTouchesInView = <span class="keyword">true</span>
+
+<span class="comment">// delaysTouchesBegan (default: false)</span>
+<span class="comment">// If true, view doesn't get touchesBegan until GR fails</span>
+gesture.delaysTouchesBegan = <span class="keyword">false</span>
+
+<span class="comment">// delaysTouchesEnded (default: true)</span>
+<span class="comment">// If true, view doesn't get touchesEnded until GR fails</span>
+gesture.delaysTouchesEnded = <span class="keyword">true</span></code></pre>
+
+    <h3>require(toFail:) — Dependency Between Recognizers</h3>
+
+    <pre><code><span class="comment">// Single tap should only fire if double tap fails</span>
+<span class="keyword">let</span> singleTap = <span class="type">UITapGestureRecognizer</span>(target: <span class="keyword">self</span>, action: #<span class="func">selector</span>(handleSingleTap))
+singleTap.numberOfTapsRequired = <span class="number">1</span>
+
+<span class="keyword">let</span> doubleTap = <span class="type">UITapGestureRecognizer</span>(target: <span class="keyword">self</span>, action: #<span class="func">selector</span>(handleDoubleTap))
+doubleTap.numberOfTapsRequired = <span class="number">2</span>
+
+<span class="comment">// singleTap waits for doubleTap to fail before recognizing</span>
+singleTap.<span class="func">require</span>(toFail: doubleTap)
+
+<span class="comment">// This introduces a ~300ms delay on single taps (waiting for potential second tap)</span>
+<span class="comment">// Trade-off: correctness vs responsiveness</span></code></pre>
+
+    <h3>Simultaneous Recognition</h3>
+
+    <pre><code><span class="comment">// By default, only one gesture recognizer can be active at a time.</span>
+<span class="comment">// Use the delegate to allow simultaneous recognition.</span>
+
+<span class="keyword">class</span> <span class="type">MapViewController</span>: <span class="type">UIViewController</span>, <span class="type">UIGestureRecognizerDelegate</span> {
+
+    <span class="keyword">override func</span> <span class="func">viewDidLoad</span>() {
+        <span class="keyword">super</span>.<span class="func">viewDidLoad</span>()
+
+        <span class="keyword">let</span> pan = <span class="type">UIPanGestureRecognizer</span>(target: <span class="keyword">self</span>, action: #<span class="func">selector</span>(handlePan))
+        <span class="keyword">let</span> pinch = <span class="type">UIPinchGestureRecognizer</span>(target: <span class="keyword">self</span>, action: #<span class="func">selector</span>(handlePinch))
+        <span class="keyword">let</span> rotation = <span class="type">UIRotationGestureRecognizer</span>(target: <span class="keyword">self</span>, action: #<span class="func">selector</span>(handleRotation))
+
+        pan.delegate = <span class="keyword">self</span>
+        pinch.delegate = <span class="keyword">self</span>
+        rotation.delegate = <span class="keyword">self</span>
+
+        view.<span class="func">addGestureRecognizer</span>(pan)
+        view.<span class="func">addGestureRecognizer</span>(pinch)
+        view.<span class="func">addGestureRecognizer</span>(rotation)
+    }
+
+    <span class="comment">// Allow all three gestures simultaneously (like Maps app)</span>
+    <span class="keyword">func</span> <span class="func">gestureRecognizer</span>(
+        _ gestureRecognizer: <span class="type">UIGestureRecognizer</span>,
+        shouldRecognizeSimultaneouslyWith other: <span class="type">UIGestureRecognizer</span>
+    ) -> <span class="type">Bool</span> {
+        <span class="keyword">return true</span>
+    }
+
+    <span class="comment">// Other delegate methods for fine-grained control:</span>
+
+    <span class="keyword">func</span> <span class="func">gestureRecognizerShouldBegin</span>(
+        _ gestureRecognizer: <span class="type">UIGestureRecognizer</span>
+    ) -> <span class="type">Bool</span> {
+        <span class="comment">// Return false to prevent recognition (e.g., based on direction)</span>
+        <span class="keyword">if let</span> pan = gestureRecognizer <span class="keyword">as</span>? <span class="type">UIPanGestureRecognizer</span> {
+            <span class="keyword">let</span> velocity = pan.<span class="func">velocity</span>(in: view)
+            <span class="comment">// Only allow horizontal pans</span>
+            <span class="keyword">return</span> <span class="func">abs</span>(velocity.x) > <span class="func">abs</span>(velocity.y)
+        }
+        <span class="keyword">return true</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">gestureRecognizer</span>(
+        _ gestureRecognizer: <span class="type">UIGestureRecognizer</span>,
+        shouldReceive touch: <span class="type">UITouch</span>
+    ) -> <span class="type">Bool</span> {
+        <span class="comment">// Prevent GR from receiving touches on certain views</span>
+        <span class="keyword">return</span> !(touch.view <span class="keyword">is</span> <span class="type">UIButton</span>)
+    }
+
+    <span class="keyword">func</span> <span class="func">gestureRecognizer</span>(
+        _ gestureRecognizer: <span class="type">UIGestureRecognizer</span>,
+        shouldBeRequiredToFailBy other: <span class="type">UIGestureRecognizer</span>
+    ) -> <span class="type">Bool</span> {
+        <span class="comment">// Dynamic version of require(toFail:)</span>
+        <span class="keyword">return false</span>
+    }
+}</code></pre>
+
+    <h3>Custom Gesture Recognizer Subclass</h3>
+
+    <pre><code><span class="keyword">import</span> UIKit.UIGestureRecognizerSubclass
+
+<span class="keyword">class</span> <span class="type">DirectionLockPanGesture</span>: <span class="type">UIPanGestureRecognizer</span> {
+
+    <span class="keyword">enum</span> <span class="type">Direction</span> {
+        <span class="keyword">case</span> horizontal, vertical, undetermined
+    }
+
+    <span class="keyword">private(set) var</span> direction: <span class="type">Direction</span> = .undetermined
+    <span class="keyword">private var</span> initialTouchPoint: <span class="type">CGPoint</span> = .zero
+    <span class="keyword">private let</span> lockThreshold: <span class="type">CGFloat</span> = <span class="number">10</span>
+
+    <span class="keyword">override func</span> <span class="func">touchesBegan</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>) {
+        <span class="keyword">super</span>.<span class="func">touchesBegan</span>(touches, with: event)
+        direction = .undetermined
+        initialTouchPoint = touches.first!.<span class="func">location</span>(in: view)
+    }
+
+    <span class="keyword">override func</span> <span class="func">touchesMoved</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>) {
+        <span class="keyword">super</span>.<span class="func">touchesMoved</span>(touches, with: event)
+
+        <span class="keyword">if</span> direction == .undetermined {
+            <span class="keyword">let</span> currentPoint = touches.first!.<span class="func">location</span>(in: view)
+            <span class="keyword">let</span> dx = <span class="func">abs</span>(currentPoint.x - initialTouchPoint.x)
+            <span class="keyword">let</span> dy = <span class="func">abs</span>(currentPoint.y - initialTouchPoint.y)
+
+            <span class="keyword">if</span> dx > lockThreshold || dy > lockThreshold {
+                direction = dx > dy ? .horizontal : .vertical
+            }
+        }
+    }
+
+    <span class="keyword">override func</span> <span class="func">reset</span>() {
+        <span class="keyword">super</span>.<span class="func">reset</span>()
+        direction = .undetermined
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="scroll-view-delay">7. UIScrollView Delayed Touch Delivery</h2>
+    <!-- ============================================================ -->
+
+    <p><code>UIScrollView</code> introduces a <strong>150ms delay</strong> before delivering touches to its subviews. This is necessary to determine whether the user intends to scroll or tap a subview.</p>
+
+    <div class="diagram">
+UIScrollView Touch Delivery Timeline:
+
+  Touch begins
+  ─────┬────────────────────────────────────────────────▶ time
+       │
+       │  0ms: UIScrollView intercepts touch
+       │        (delaysContentTouches = true by default)
+       │
+       │  0-150ms: Waiting period
+       │           • If finger moves &gt; threshold → SCROLL
+       │           • If finger stays still → deliver to subview
+       │
+       │  150ms: Timer fires
+       │         • Touch delivered to content subview
+       │         • touchesBegan sent to the hit-tested view
+       │
+       │  If user starts scrolling AFTER touch delivered:
+       │  • touchesCancelled sent to subview
+       │  • canCancelContentTouches controls this behavior
+    </div>
+
+    <pre><code><span class="comment">// UIScrollView touch delivery properties</span>
+<span class="keyword">let</span> scrollView = <span class="type">UIScrollView</span>()
+
+<span class="comment">// delaysContentTouches (default: true)</span>
+<span class="comment">// If true, scroll view waits ~150ms before delivering touches to subviews</span>
+<span class="comment">// Set to false for immediate touch response (e.g., drawing apps)</span>
+scrollView.delaysContentTouches = <span class="keyword">true</span>
+
+<span class="comment">// canCancelContentTouches (default: true)</span>
+<span class="comment">// If true, scroll view can cancel an already-delivered touch when scrolling starts</span>
+<span class="comment">// Set to false if subviews need uninterrupted touch tracking</span>
+scrollView.canCancelContentTouches = <span class="keyword">true</span>
+
+<span class="comment">// Override to selectively delay touches</span>
+<span class="keyword">class</span> <span class="type">SelectiveScrollView</span>: <span class="type">UIScrollView</span> {
+    <span class="keyword">override func</span> <span class="func">touchesShouldCancel</span>(in view: <span class="type">UIView</span>) -> <span class="type">Bool</span> {
+        <span class="comment">// Don't cancel touches on buttons — let them complete</span>
+        <span class="keyword">if</span> view <span class="keyword">is</span> <span class="type">UIButton</span> { <span class="keyword">return false</span> }
+        <span class="keyword">return true</span>
+    }
+
+    <span class="keyword">override func</span> <span class="func">touchesShouldBegin</span>(
+        _ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;,
+        with event: <span class="type">UIEvent</span>?,
+        in view: <span class="type">UIView</span>
+    ) -> <span class="type">Bool</span> {
+        <span class="comment">// Return false to prevent touch delivery to specific subviews</span>
+        <span class="keyword">return true</span>
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall</div>
+        <p><strong>The 150ms delay causes "sluggish" buttons inside scroll views.</strong> Users notice the delay when tapping buttons in a <code>UITableView</code> or <code>UICollectionView</code>. The cell highlights with a delay. Solutions: (1) Set <code>delaysContentTouches = false</code> on the scroll view (but this can break scrolling from button areas), or (2) Override <code>touchesShouldCancel(in:)</code> to return <code>true</code> for <code>UIControl</code> subclasses, which allows the scroll view to cancel the touch if the user starts scrolling.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="multi-touch">8. Multi-Touch Handling</h2>
+    <!-- ============================================================ -->
+
+    <pre><code><span class="comment">// Multi-touch is disabled by default on UIView</span>
+view.isMultipleTouchEnabled = <span class="keyword">true</span>  <span class="comment">// Must enable explicitly</span>
+
+<span class="comment">// With multi-touch enabled, touchesBegan can receive multiple touches</span>
+<span class="keyword">class</span> <span class="type">MultiTouchView</span>: <span class="type">UIView</span> {
+    <span class="keyword">private var</span> activeTouches: [<span class="type">UITouch</span>: <span class="type">CGPoint</span>] = [:]
+
+    <span class="keyword">override func</span> <span class="func">touchesBegan</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?) {
+        <span class="keyword">for</span> touch <span class="keyword">in</span> touches {
+            activeTouches[touch] = touch.<span class="func">location</span>(in: <span class="keyword">self</span>)
+        }
+        <span class="comment">// activeTouches.count = number of fingers currently touching</span>
+    }
+
+    <span class="keyword">override func</span> <span class="func">touchesMoved</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?) {
+        <span class="keyword">for</span> touch <span class="keyword">in</span> touches {
+            activeTouches[touch] = touch.<span class="func">location</span>(in: <span class="keyword">self</span>)
+        }
+    }
+
+    <span class="keyword">override func</span> <span class="func">touchesEnded</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?) {
+        <span class="keyword">for</span> touch <span class="keyword">in</span> touches {
+            activeTouches.<span class="func">removeValue</span>(forKey: touch)
+        }
+    }
+
+    <span class="keyword">override func</span> <span class="func">touchesCancelled</span>(_ touches: <span class="type">Set</span>&lt;<span class="type">UITouch</span>&gt;, with event: <span class="type">UIEvent</span>?) {
+        <span class="keyword">for</span> touch <span class="keyword">in</span> touches {
+            activeTouches.<span class="func">removeValue</span>(forKey: touch)
+        }
+    }
+}
+
+<span class="comment">// IMPORTANT: UITouch uses object identity (===), not value equality</span>
+<span class="comment">// The same UITouch object is reused across began/moved/ended phases</span>
+<span class="comment">// You can use it as a dictionary key because it conforms to Hashable</span></code></pre>
+
+    <h3>Exclusive Touch</h3>
+
+    <pre><code><span class="comment">// exclusiveTouch prevents other views from receiving touches simultaneously</span>
+button.isExclusiveTouch = <span class="keyword">true</span>
+
+<span class="comment">// When a view with exclusiveTouch is being touched,</span>
+<span class="comment">// no other views in the same window can receive new touches.</span>
+<span class="comment">// Useful for preventing accidental multi-button presses.</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect-section">9. Architect: Custom Gesture Systems</h2>
+    <!-- ============================================================ -->
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p><strong>Building custom gesture systems for complex multi-touch scenarios:</strong></p>
+        <p>At Staff level, you may need to design gesture systems that go beyond standard recognizers. Examples include:</p>
+        <ul>
+            <li><strong>Drawing apps</strong> — Palm rejection, pressure-sensitive strokes, simultaneous drawing + zoom</li>
+            <li><strong>Map-like interfaces</strong> — Simultaneous pan + pinch + rotation with momentum</li>
+            <li><strong>Custom transitions</strong> — Gesture-driven interactive transitions that can be interrupted and reversed</li>
+            <li><strong>Collaborative canvases</strong> — Multiple independent touch streams for different tools</li>
+        </ul>
+        <p><strong>Key architectural decisions:</strong></p>
+        <ol>
+            <li><strong>Gesture recognizer vs raw touches</strong> — Use GRs when possible (they handle edge cases). Use raw touches only when GRs can't express your gesture.</li>
+            <li><strong>Failure requirements graph</strong> — Complex apps can create dependency chains. Keep the graph shallow (max 2 levels) to avoid latency.</li>
+            <li><strong>Simultaneous recognition policy</strong> — Centralize this in a single delegate object rather than scattering across view controllers.</li>
+            <li><strong>Touch routing</strong> — For complex canvases, consider a custom <code>hitTest</code> that routes touches to different subsystems based on tool selection.</li>
+        </ol>
+    </div>
+
+    <pre><code><span class="comment">// Example: Centralized gesture coordination for a complex app</span>
+<span class="keyword">class</span> <span class="type">GestureCoordinator</span>: <span class="type">NSObject</span>, <span class="type">UIGestureRecognizerDelegate</span> {
+
+    <span class="keyword">enum</span> <span class="type">GesturePolicy</span> {
+        <span class="keyword">case</span> exclusive
+        <span class="keyword">case</span> simultaneousWithSameType
+        <span class="keyword">case</span> simultaneousWithAll
+    }
+
+    <span class="keyword">private var</span> policies: [<span class="type">String</span>: <span class="type">GesturePolicy</span>] = [:]
+
+    <span class="keyword">func</span> <span class="func">register</span>(
+        _ recognizer: <span class="type">UIGestureRecognizer</span>,
+        policy: <span class="type">GesturePolicy</span>,
+        identifier: <span class="type">String</span>
+    ) {
+        recognizer.delegate = <span class="keyword">self</span>
+        policies[identifier] = policy
+        recognizer.name = identifier
+    }
+
+    <span class="keyword">func</span> <span class="func">gestureRecognizer</span>(
+        _ gestureRecognizer: <span class="type">UIGestureRecognizer</span>,
+        shouldRecognizeSimultaneouslyWith other: <span class="type">UIGestureRecognizer</span>
+    ) -> <span class="type">Bool</span> {
+        <span class="keyword">guard let</span> name = gestureRecognizer.name,
+              <span class="keyword">let</span> policy = policies[name] <span class="keyword">else</span> {
+            <span class="keyword">return false</span>
+        }
+
+        <span class="keyword">switch</span> policy {
+        <span class="keyword">case</span> .exclusive:
+            <span class="keyword">return false</span>
+        <span class="keyword">case</span> .simultaneousWithSameType:
+            <span class="keyword">return</span> <span class="func">type</span>(of: gestureRecognizer) == <span class="func">type</span>(of: other)
+        <span class="keyword">case</span> .simultaneousWithAll:
+            <span class="keyword">return true</span>
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice</div>
+        <p><strong>Interview tip:</strong> When asked "Describe the full touch event pipeline," start from the hardware (digitizer → IOKit → backboardd) and work your way through the app process (RunLoop → UIApplication → UIWindow → hit test → gesture recognizers → responder chain). Mention the key decision points: hit testing determines WHERE, gesture recognizers determine WHAT, and the responder chain determines WHO handles unrecognized events. This demonstrates systems-level thinking that L6 interviewers look for.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="01-view-hierarchy-internals.html">← View Hierarchy</a>
+        <a href="03-layout-system.html">Layout System →</a>
+    </div>
+</div>
+</body>
+</html>

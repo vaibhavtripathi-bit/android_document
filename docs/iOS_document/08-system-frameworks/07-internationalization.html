@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Internationalization — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">System Frameworks</a><span class="sep">›</span>
+        Internationalization
+    </nav>
+
+    <h1>Internationalization (i18n)</h1>
+    <p class="subtitle">A Staff-level treatment of how iOS resolves localized resources, formats locale-sensitive data, handles RTL and plurals, and scales string workflows from <code>Localizable.strings</code> to String Catalogs. The goal is not memorizing API names—it is explaining <em>lookup order</em>, <em>fallback semantics</em>, <em>performance traps</em>, and <em>architecture</em> under multilingual production load.</p>
+
+    <p>
+        <span class="tag tag-l6">L6</span>
+        <span class="tag tag-architect">Architect</span>
+        <span class="tag tag-senior">Senior+</span>
+    </p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#bundle-localized">Bundle.localizedString &amp; NSLocalizedString</a></li>
+            <li><a href="#string-localized">String(localized:) &amp; Extraction (iOS 16+)</a></li>
+            <li><a href="#locale">Locale: Structure &amp; Preferred Languages</a></li>
+            <li><a href="#date-formatting">DateFormatter vs FormatStyle</a></li>
+            <li><a href="#rtl">Right-to-Left (RTL) Support</a></li>
+            <li><a href="#plurals">Plural Rules &amp; .stringsdict</a></li>
+            <li><a href="#xcstrings">String Catalogs (.xcstrings, Xcode 15+)</a></li>
+            <li><a href="#cfbundle">CFBundleLocalizations &amp; XLIFF</a></li>
+            <li><a href="#numbers">Number, Currency &amp; Measurement Formatting</a></li>
+            <li><a href="#architect-scale">Architect: 40+ Locales at Scale</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="bundle-localized"><span class="tag tag-senior">Senior+</span> Bundle.localizedString &amp; NSLocalizedString</h2>
+
+    <p>At runtime, <strong>NSLocalizedString</strong> is a thin macro that forwards to <code>Bundle.main</code> (or a specified bundle) and ultimately to <strong>Bundle.localizedString(forKey:value:table:)</strong>. The critical interview skill is describing the <em>resource discovery algorithm</em>: which <code>.lproj</code> folder is consulted, in what order, and what happens when a key is missing.</p>
+
+    <h3>What NSLocalizedString Actually Expands To</h3>
+
+    <p>Conceptually, <code>NSLocalizedString("key", comment: "…")</code> resolves to a call equivalent to fetching a localized string from the main bundle’s string table. The <code>comment</code> argument is metadata for translators and extraction tools; it is not shown to end users unless you wire tooling incorrectly. Staff candidates should distinguish <strong>development-time extraction</strong> from <strong>runtime lookup</strong>.</p>
+
+    <pre><code><span class="comment">// Typical macro usage (conceptually maps to Bundle lookup)</span>
+<span class="keyword">let</span> title = <span class="func">NSLocalizedString</span>(<span class="string">"settings_title"</span>, comment: <span class="string">"Navigation title for Settings"</span>)
+
+<span class="comment">// Explicit bundle + table (Feature.strings → table name "Feature")</span>
+<span class="keyword">let</span> promo = <span class="type">Bundle</span>.main.<span class="func">localizedString</span>(
+    forKey: <span class="string">"promo_headline"</span>,
+    value: <span class="keyword">nil</span>,
+    table: <span class="string">"Feature"</span>
+)</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: The <code>value</code> Parameter</div>
+        <p>When <code>value</code> is <code>nil</code>, missing keys typically fall back to the key itself as the displayed string (depending on bundle configuration and whether a Base localization exists). Passing a non-<code>nil</code> <code>value</code> supplies a developer default when no translation is found—useful during incremental localization, but dangerous if it becomes the “real” English copy shipped to users because a locale file was incomplete.</p>
+    </div>
+
+    <h3>Where Bundles Search: <code>.lproj</code> Directories</h3>
+
+    <p>Localized resources live under language-specific directories inside the bundle, conventionally named <code>&lt;language&gt;.lproj</code> (e.g. <code>en.lproj</code>, <code>fr-CA.lproj</code>). String tables are property-list–style text files: <code>Localizable.strings</code> (default table), or <code>&lt;Name&gt;.strings</code> for named tables. At build time, Xcode compiles these into optimized binary <code>.strings</code> or includes them as resources; at runtime, <code>NSBundle</code> maps the user’s resolved language preferences to the correct folder.</p>
+
+    <div class="diagram">
+Bundle localization lookup (conceptual)
+
+  App process calls:
+      Bundle.main.localizedString(forKey: "save", value: nil, table: nil)
+                           │
+                           ▼
+              ┌────────────────────────────┐
+              │ Resolve "preferred" locale │
+              │ (see fallback chain)       │
+              └─────────────┬──────────────┘
+                            │
+         ┌──────────────────┼──────────────────┐
+         ▼                  ▼                  ▼
+    fr-CA.lproj       fr.lproj            Base.lproj
+   Localizable.      Localizable.        Localizable.
+    strings?           strings?             strings?
+         │                  │                  │
+         └──────── merge / fallback ──────────┘
+                            │
+                            ▼
+                   Return value or key / dev default
+    </div>
+
+    <h3>Language Fallback Chain</h3>
+
+    <p>iOS does not treat localization as a single “locale string.” It uses the user’s <strong>preferred language list</strong> (Settings → General → Language &amp; Region) combined with what your app actually ships. For each preferred language identifier, the bundle runtime attempts progressively more general matches—e.g. <code>zh-Hans-CN</code> may fall back through related identifiers and ultimately to <strong>Base</strong> or <strong>development language</strong> resources. Exact behavior depends on available <code>.lproj</code> folders, whether you use Base localization, and iOS version refinements; interviews reward candidates who articulate <em>preferred languages drive the chain</em>, not only <code>Locale.current</code>.</p>
+
+    <div class="diagram">
+Locale / language fallback (high level)
+
+  User preferred languages:  [ fr-CA , en ]
+                │
+                ▼
+  For each entry, bundle tries best lproj match
+                │
+                ├─► Exact region match (fr-CA.lproj)
+                ├─► Language-only (fr.lproj)
+                ├─► Script / variant variants as available
+                └─► Base.lproj / Development language resources
+
+  Note: Locale.current (region, calendar, formats)
+        can differ from UI string language choice.
+    </div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Equating <code>Locale.current</code> with UI Language</div>
+        <p>A user can run your UI in French while <code>Locale.current</code> remains tied to a region where they live or work (currency, week start, decimal separator). String choice follows bundle language resolution; number/date formatting follows the locale you pass to formatters (often <code>.current</code> or <code>.autoupdatingCurrent</code>). Mixing these up causes “wrong language strings but correct regional formats” bugs—or the reverse.</p>
+    </div>
+
+    <h3>Bundle.main vs Custom Bundles</h3>
+
+    <p><strong>Bundle.main</strong> is the application’s main bundle resource container. Frameworks and plug-ins have their own bundles; SPM resources use <code>Bundle.module</code>. For interviews: explain that <code>localizedString</code> is always relative to <em>whichever bundle contains the strings file</em>. Shipping a feature SDK localized independently requires either embedding strings in that bundle or centralizing keys in the host app—both have workflow implications.</p>
+
+    <h3>Localizable.strings Format &amp; genstrings</h3>
+
+    <p><code>Localizable.strings</code> is a sequence of <code>"key" = "value";</code> entries with C-style escapes. Keys are arbitrary strings but should be stable identifiers, not English sentences, to avoid translator churn when copy edits.</p>
+
+    <pre><code><span class="comment">/* Feature: Onboarding */</span>
+<span class="string">"onboarding_welcome_title"</span> = <span class="string">"Welcome"</span>;
+<span class="string">"onboarding_welcome_body"</span> = <span class="string">"Let’s personalize your feed."</span>;</code></pre>
+
+    <p>Historically, <strong>genstrings</strong> scanned Objective-C/Swift sources for macros and emitted template <code>.strings</code> files. Modern workflows prefer Xcode string extraction / String Catalogs, but Staff discussions still mention genstrings for legacy codebases and CI drift prevention.</p>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Key Naming Conventions</div>
+        <p>Use hierarchical, stable keys (<code>screen_section_control_purpose</code>), keep English default values in Base or the development language, document <em>placeholders</em> and <em>gender</em> needs in comments, and avoid reusing the same key for semantically different English sentences—translators need context, not ambiguity.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="string-localized"><span class="tag tag-l6">L6</span> String(localized:) — Swift 5 / iOS 15+ (Refined iOS 16+)</h2>
+
+    <p>Swift’s <strong>String(localized:)</strong> and related initializers integrate localization into the type system and enable <strong>compile-time string catalog extraction</strong> when using String Catalogs or appropriate build settings. Compared to <code>NSLocalizedString</code>, the Swift API emphasizes default source strings, optional tables/bundles, and structured interpolation via <code>String.LocalizationValue</code>.</p>
+
+    <h3>Core Initializers</h3>
+
+    <pre><code><span class="comment">// Default table Localizable, main bundle, with translator comment</span>
+<span class="keyword">let</span> title = <span class="type">String</span>(localized: <span class="string">"Profile"</span>, comment: <span class="string">"Nav title"</span>)
+
+<span class="comment">// Named table + explicit bundle (e.g. SwiftPM)</span>
+<span class="keyword">let</span> sdkCopy = <span class="type">String</span>(
+    localized: <span class="string">"sdk_error_network"</span>,
+    table: <span class="string">"SDK"</span>,
+    bundle: .module,
+    comment: <span class="string">"Shown when offline"</span>
+)</code></pre>
+
+    <h3>AttributedString(localized:)</h3>
+
+    <p>Rich text localization must preserve runs, links, and emphasis across languages where word order changes. <strong>AttributedString</strong> initializers parallel <code>String(localized:)</code> so localized markdown-like attributes can be resolved with the same bundle/table machinery—critical for SwiftUI Text concatenation and accessibility.</p>
+
+    <pre><code><span class="keyword">var</span> attributed = <span class="type">AttributedString</span>(localized: <span class="string">"terms **bold** agreement"</span>)</code></pre>
+
+    <h3>Interpolation in Localized Strings</h3>
+
+    <p>Swift interpolation participates in localization: interpolated values can flow into pluralization and grammar rules when paired with <code>stringsdict</code> / String Catalog plural variants. Staff-level depth: explain that naive <code>"\(count) items"</code> without plural machinery is incorrect for many locales; you need ICU/CLDR-driven plural selection.</p>
+
+    <pre><code><span class="keyword">let</span> count = <span class="number">3</span>
+<span class="keyword">let</span> message = <span class="type">String</span>(localized: <span class="string">"You have \(count) unread messages."</span>)</code></pre>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>NSLocalizedString</th>
+                <th>String(localized:)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Language surface</td>
+                <td>C macro + Foundation</td>
+                <td>Swift stdlib-friendly API</td>
+            </tr>
+            <tr>
+                <td>Default / fallback string</td>
+                <td>Key often becomes UI default</td>
+                <td>Source string doubles as default value in catalog workflows</td>
+            </tr>
+            <tr>
+                <td>Extraction</td>
+                <td>Historically genstrings / Xcode</td>
+                <td>String Catalog compile-time extraction</td>
+            </tr>
+            <tr>
+                <td>Type safety</td>
+                <td>Plain C String macros</td>
+                <td>Interpolation-aware <code>LocalizationValue</code></td>
+            </tr>
+            <tr>
+                <td>Tables / bundles</td>
+                <td><code>NSLocalizedStringFromTable(inBundle:…)</code></td>
+                <td><code>table:bundle:</code> parameters on same initializer family</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Compile-Time Extraction vs Runtime</div>
+        <p>Extraction analyzes Swift source (and sometimes ObjC) to populate catalogs. Runtime still performs key/value lookup in compiled resources. A Staff answer clarifies that “compile-time” here means <em>build pipeline integration</em>—it does not magically remove the need for correct bundle packaging, fallback languages, or translator delivery of XLIFF updates.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="locale"><span class="tag tag-senior">Senior+</span> Locale: Components &amp; Identifiers</h2>
+
+    <p><strong>Locale</strong> on Apple platforms wraps ICU concepts exposed through Foundation: language, region, script, calendar, numbering system, collation, and more. Identifiers follow <strong>BCP 47</strong> conventions (e.g. <code>en-US</code>, <code>zh-Hans-CN</code>).</p>
+
+    <h3>Structural Pieces You Should Name in Interviews</h3>
+
+    <ul>
+        <li><strong>Language code</strong> — Core language (e.g. <code>en</code>, <code>fr</code>).</li>
+        <li><strong>Region code</strong> — Geographic or regional variant (e.g. <code>US</code>, <code>CA</code>).</li>
+        <li><strong>Script</strong> — Writing system when disambiguation matters (e.g. <code>Hans</code> vs <code>Hant</code>).</li>
+        <li><strong>Variant</strong> — Less common subtags for dialects or orthography.</li>
+        <li><strong>Calendar</strong> — Gregorian vs others; affects date arithmetic display.</li>
+        <li><strong>Collation</strong> — Sorting behavior for string comparisons.</li>
+    </ul>
+
+    <h3>Locale.current vs Locale.autoupdatingCurrent</h3>
+
+    <p><strong>Locale.current</strong> captures the user’s locale at the time you read it. <strong>Locale.autoupdatingCurrent</strong> returns a proxy that tracks live changes when the user switches region settings while your app runs—important for long-lived processes and <code>FormatStyle</code> usage in SwiftUI where you want reactive updates without manual observation.</p>
+
+    <pre><code><span class="keyword">let</span> fixed = <span class="type">Locale</span>.current
+<span class="keyword">let</span> live = <span class="type">Locale</span>.autoupdatingCurrent
+
+<span class="keyword">let</span> prefs = <span class="type">Locale</span>.preferredLanguages
+<span class="comment">// Ordered list; first is primary UI language preference where applicable</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Cached Formatters with Stale Locales</div>
+        <p>Teams often cache a <code>DateFormatter</code> created once at launch. If the user changes region formats, a formatter pinned to an old locale shows wrong separators. Prefer <code>autoupdatingCurrent</code> or recreate formatters on <code>NSLocale.currentLocaleDidChangeNotification</code> (and test background transitions).</p>
+    </div>
+
+    <h3>How iOS Determines “The” Locale</h3>
+
+    <p>System settings combine language preferences, region, calendar, temperature unit, and first day of week. UI language for your strings is driven by bundle resolution against preferred languages; many formatters default to <code>Locale.current</code> for numeric and date conventions. Articulate that split clearly—it is a favorite Staff follow-up.</p>
+
+    <h3>Locale-Sensitive Operations</h3>
+
+    <p>Beyond formatting: uppercase/lowercase mappings, sorting (<code>String.compare(_:locale:)</code>), searching, and <code>Locale</code>-aware parsing. Getting this wrong yields subtle bugs (e.g. Turkish dotted/dotless I).</p>
+
+    <!-- ============================================================ -->
+    <h2 id="date-formatting"><span class="tag tag-l6">L6</span> DateFormatter vs FormatStyle (iOS 15+)</h2>
+
+    <p><strong>DateFormatter</strong> is mutable, heavy, and easy to misconfigure; <strong>FormatStyle</strong> (e.g. <code>Date.FormatStyle</code>) provides value-oriented, composable formatting with tight Swift integration and automatic localization when tied to the appropriate locale.</p>
+
+    <h3>DateFormatter: The Classic API</h3>
+
+    <pre><code><span class="keyword">let</span> df = <span class="type">DateFormatter</span>()
+df.locale = .current
+df.dateStyle = .medium
+df.timeStyle = .short
+<span class="keyword">let</span> s1 = df.<span class="func">string</span>(from: <span class="type">Date</span>())
+
+<span class="comment">// Custom pattern — easy to break localization if you hardcode wrong locale</span>
+df.dateFormat = <span class="string">"yyyy-MM-dd HH:mm"</span>
+<span class="keyword">let</span> s2 = df.<span class="func">string</span>(from: <span class="type">Date</span>())</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: DateFormatter Allocation Cost</div>
+        <p><code>DateFormatter</code> is famously expensive to create because it touches ICU caches, calendars, and time zones. Creating one per table cell in a scrolling list is a classic performance regression. Cache instances (e.g. per locale + time zone + format) or migrate hot paths to <code>FormatStyle</code> where appropriate.</p>
+    </div>
+
+    <h3>FormatStyle: Modern, Composable, Localized</h3>
+
+    <pre><code><span class="keyword">let</span> now = <span class="type">Date</span>()
+<span class="keyword">let</span> a = now.<span class="func">formatted</span>(date: .abbreviated, time: .shortened)
+<span class="keyword">let</span> b = now.<span class="func">formatted</span>(.dateTime.day().month(.wide).year())
+
+<span class="keyword">let</span> style = <span class="type">Date</span>.<span class="type">FormatStyle</span>(date: .numeric, time: .omitted)
+    .locale(.init(identifier: <span class="string">"de_DE"</span>))
+<span class="keyword">let</span> c = now.<span class="func">formatted</span>(style)</code></pre>
+
+    <h3>Relative &amp; ISO 8601</h3>
+
+    <pre><code><span class="keyword">let</span> rel = now.<span class="func">formatted</span>(.<span class="func">relative</span>(presentation: .named))
+<span class="keyword">let</span> iso = now.<span class="func">formatted</span>(.<span class="func">iso8601</span>(timeZone: .gmt, includingFractionalSeconds: <span class="keyword">false</span>))</code></pre>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Topic</th>
+                <th>DateFormatter</th>
+                <th>Date.FormatStyle</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Mutability</td>
+                <td>Mutable object; shared cache risky</td>
+                <td>Value types; compose immutably</td>
+            </tr>
+            <tr>
+                <td>Localization</td>
+                <td>Via <code>locale</code> + styles</td>
+                <td>Built-in localized presets</td>
+            </tr>
+            <tr>
+                <td>Performance story</td>
+                <td>Expensive init; reuse advised</td>
+                <td>Generally preferred in new Swift code</td>
+            </tr>
+            <tr>
+                <td>SwiftUI affinity</td>
+                <td>Manual bridging</td>
+                <td>Natural fit with <code>formatted()</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Prefer FormatStyle for New Code</div>
+        <p>For greenfield SwiftUI/UIKit models, default to <code>FormatStyle</code> for dates, numbers, and measurements. Keep <code>DateFormatter</code> expertise for legacy code, intricate <code>dateFormat</code> needs, and interop with APIs expecting <code>String</code> from formatters.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="rtl"><span class="tag tag-architect">Architect</span> Right-to-Left (RTL) Layout</h2>
+
+    <p>Arabic, Hebrew, and other RTL scripts require <em>semantic</em> layout: “leading” should map to the right edge in RTL. UIKit and SwiftUI largely automate this when you use leading/trailing anchors and stack views with appropriate semantic content attributes.</p>
+
+    <h3>semanticContentAttribute</h3>
+
+    <p><strong>UIView.semanticContentAttribute</strong> overrides automatic behavior: <code>.unspecified</code> inherits, <code>.forceLeftToRight</code> pins LTR, <code>.forceRightToLeft</code> pins RTL. Use sparingly—forcing direction breaks user expectations except for neutral glyphs (timers, charts) or media controls where platform HIG allows exceptions.</p>
+
+    <h3>Leading / Trailing vs Left / Right</h3>
+
+    <pre><code><span class="comment">// Auto Layout (UIKit)</span>
+<span class="type">NSLayoutConstraint</span>.<span class="func">activate</span>([
+    label.leadingAnchor.<span class="func">constraint</span>(equalTo: view.leadingAnchor, constant: <span class="number">16</span>),
+    label.trailingAnchor.<span class="func">constraint</span>(equalTo: view.trailingAnchor, constant: -<span class="number">16</span>),
+])</code></pre>
+
+    <h3>userInterfaceLayoutDirection</h3>
+
+    <p>Query <strong>UIView.userInterfaceLayoutDirection</strong> (or trait environment equivalents) when custom drawing must mirror manually. Natural text alignment uses <code>NSTextAlignment.natural</code> so paragraphs follow script direction.</p>
+
+    <h3>Flipping Images</h3>
+
+    <p>Directional icons (arrows, chevrons) should flip in RTL. Use UIImage symbols with automatic RTL mirroring where possible; for bitmaps, <strong>UIImage.imageFlippedForRightToLeftLayoutDirection()</strong> produces an appropriately mirrored variant.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Pseudolanguage Without Switching Device Language</div>
+        <p>Xcode schemes support <strong>Double Length Pseudolanguage</strong>, <strong>Right-to-Left Pseudolanguage</strong>, and similar options to stress layout and truncation. This catches clipped German strings and broken RTL constraints faster than manual locale toggles.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="plurals"><span class="tag tag-l6">L6</span> Plural Rules &amp; .stringsdict</h2>
+
+    <p>Pluralization is language-specific. English’s “1 file vs 2 files” is trivial; Polish, Russian, Arabic, and others require intricate rules. Apple’s solution pairs <strong>NSStringLocalizedFormatKey</strong> with ICU/CLDR <strong>plural categories</strong>: <code>zero</code>, <code>one</code>, <code>two</code>, <code>few</code>, <code>many</code>, <code>other</code>.</p>
+
+    <h3>.stringsdict Structure (XML Plist)</h3>
+
+    <p>A <code>Localizable.stringsdict</code> file is an XML plist mapping a format key to variable plural rules. The runtime selects the correct variant based on numeric value and locale rules.</p>
+
+    <pre><code><span class="comment">&lt;?xml version="1.0" encoding="UTF-8"?&gt;</span>
+<span class="comment">&lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"</span>
+<span class="comment"> "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;</span>
+<span class="keyword">&lt;plist</span> <span class="attr">version</span>=<span class="string">"1.0"</span><span class="keyword">&gt;</span>
+<span class="keyword">&lt;dict&gt;</span>
+    <span class="keyword">&lt;key&gt;</span>files.count<span class="keyword">&lt;/key&gt;</span>
+    <span class="keyword">&lt;dict&gt;</span>
+        <span class="keyword">&lt;key&gt;</span>NSStringLocalizedFormatKey<span class="keyword">&lt;/key&gt;</span>
+        <span class="keyword">&lt;string&gt;</span>%#@files@<span class="keyword">&lt;/string&gt;</span>
+        <span class="keyword">&lt;key&gt;</span>files<span class="keyword">&lt;/key&gt;</span>
+        <span class="keyword">&lt;dict&gt;</span>
+            <span class="keyword">&lt;key&gt;</span>NSStringFormatSpecTypeKey<span class="keyword">&lt;/key&gt;</span>
+            <span class="keyword">&lt;string&gt;</span>NSStringPluralRuleType<span class="keyword">&lt;/string&gt;</span>
+            <span class="keyword">&lt;key&gt;</span>NSStringFormatValueTypeKey<span class="keyword">&lt;/key&gt;</span>
+            <span class="keyword">&lt;string&gt;</span>d<span class="keyword">&lt;/string&gt;</span>
+            <span class="keyword">&lt;key&gt;</span>zero<span class="keyword">&lt;/key&gt;</span>
+            <span class="keyword">&lt;string&gt;</span>No files<span class="keyword">&lt;/string&gt;</span>
+            <span class="keyword">&lt;key&gt;</span>one<span class="keyword">&lt;/key&gt;</span>
+            <span class="keyword">&lt;string&gt;</span>%d file<span class="keyword">&lt;/string&gt;</span>
+            <span class="keyword">&lt;key&gt;</span>other<span class="keyword">&lt;/key&gt;</span>
+            <span class="keyword">&lt;string&gt;</span>%d files<span class="keyword">&lt;/string&gt;</span>
+        <span class="keyword">&lt;/dict&gt;</span>
+    <span class="keyword">&lt;/dict&gt;</span>
+<span class="keyword">&lt;/dict&gt;</span>
+<span class="keyword">&lt;/plist&gt;</span></code></pre>
+
+    <pre><code><span class="keyword">let</span> count = <span class="number">42</span>
+<span class="comment">// Resolves "files.count" via Localizable.stringsdict for the active locale</span>
+<span class="keyword">let</span> text = <span class="type">String</span>.<span class="func">localizedStringWithFormat</span>(
+    <span class="type">NSLocalizedString</span>(<span class="string">"files.count"</span>, comment: <span class="string">"Pluralized file count"</span>),
+    count
+)</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: English-Only Plural Branches</div>
+        <p>Shipping only <code>one</code> and <code>other</code> may work for English but fail CLDR expectations elsewhere. Always let native linguists validate plural keys; automated QA should include locales with complex plural rules.</p>
+    </div>
+
+    <h3>Variable Width &amp; Device-Specific Strings</h3>
+
+    <p>Apple platforms support <strong>variable width</strong> strings (adaptive copy for narrow vs wide layouts) via <code>NSStringVariableWidthRuleType</code> in stringsdict—useful for Watch complications vs phone banners. Use device categories judiciously to avoid exploding translation matrix cost.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="xcstrings"><span class="tag tag-senior">Senior+</span> String Catalogs (<code>.xcstrings</code>, Xcode 15+)</h2>
+
+    <p>String Catalogs consolidate translations into a JSON-based <strong>.xcstrings</strong> document tracked by Xcode. They supersede scattering plain <code>.strings</code> and <code>.stringsdict</code> for many apps, adding states like <em>stale</em>, <em>new</em>, and translator-ready export.</p>
+
+    <h3>What Changes Architecturally</h3>
+
+    <ul>
+        <li><strong>Single source file per target/module</strong> (typical) instead of many parallel text files.</li>
+        <li><strong>Automatic extraction</strong> from Swift/ObjC into the catalog on build.</li>
+        <li><strong>Plural / variation</strong> modeled in structured entries rather than raw plist XML.</li>
+        <li><strong>Reviewability</strong> in PRs via readable JSON (with care for noise from automatic updates).</li>
+    </ul>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Dimension</th>
+                <th>Legacy .strings / .stringsdict</th>
+                <th>String Catalog (.xcstrings)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>File shape</td>
+                <td>Multiple per locale / type</td>
+                <td>Structured catalog, export to XLIFF</td>
+            </tr>
+            <tr>
+                <td>Pluralization</td>
+                <td>stringsdict XML plist</td>
+                <td>Built-in plural/variation UI</td>
+            </tr>
+            <tr>
+                <td>Drift risk</td>
+                <td>Keys orphaned easily</td>
+                <td>Stale detection + states</td>
+            </tr>
+            <tr>
+                <td>Migration</td>
+                <td>N/A</td>
+                <td>Importer from strings/stringsdict</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Treat Catalogs Like Schema</div>
+        <p>Version control catalogs with the same discipline as API schemas: meaningful commit messages when translations land, CI checks that fail on missing locales for release branches, and ownership by a localization lead to resolve merge conflicts from automated extraction.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="cfbundle"><span class="tag tag-senior">Senior+</span> CFBundleLocalizations &amp; Shipping Locales</h2>
+
+    <p><strong>CFBundleLocalizations</strong> in <code>Info.plist</code> advertises the localizations your bundle contains. It influences what the App Store can display and helps system services understand supported languages—keep it aligned with actual <code>.lproj</code> folders to avoid storefront mismatches.</p>
+
+    <h3>Base Localization &amp; Development Language</h3>
+
+    <p><strong>Base.lproj</strong> holds non-localized or universal storyboard/xib resources; localized deltas live in language folders. The <strong>development language</strong> is the source-of-truth locale for keys in many workflows. Staff interviews expect you to connect this to XLIFF export: developers export strings, translators return XLIFF, Xcode imports updates.</p>
+
+    <h3>Localization Testing in Xcode</h3>
+
+    <p>Use scheme pseudolanguages, snapshot tests per locale, and on-device language switching. Pair with <strong>TestFlight</strong> external groups in priority markets for real-world copy validation.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Export / Import (XLIFF)</div>
+        <p>XLIFF is the interchange format between engineering and TMS (translation management systems). A Staff-level narrative includes: developer exports, TMS applies translation memory, linguists translate, QA validates, import back into Xcode, CI verifies no empty values for release locales.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="numbers"><span class="tag tag-l6">L6</span> Number, Currency &amp; Measurement Formatting</h2>
+
+    <p>Numeric formatting must respect grouping separators, decimal separators, and digit shapes. <strong>NumberFormatter</strong> remains the workhorse; Swift’s <strong>IntegerFormatStyle</strong>, <strong>FloatingPointFormatStyle</strong>, and <strong>Decimal.FormatStyle</strong> provide modern localized composition similar to date styles.</p>
+
+    <h3>NumberFormatter Examples</h3>
+
+    <pre><code><span class="keyword">let</span> nf = <span class="type">NumberFormatter</span>()
+nf.numberStyle = .decimal
+nf.locale = .current
+<span class="keyword">let</span> dec = nf.<span class="func">string</span>(from: <span class="type">NSNumber</span>(value: <span class="number">1234567.89</span>)) ?? <span class="string">""</span>
+
+<span class="keyword">let</span> cur = <span class="type">NumberFormatter</span>()
+cur.numberStyle = .currency
+cur.currencyCode = <span class="string">"EUR"</span>
+<span class="keyword">let</span> price = cur.<span class="func">string</span>(from: <span class="type">NSNumber</span>(value: <span class="number">19.99</span>)) ?? <span class="string">""</span>
+
+<span class="keyword">let</span> pct = <span class="type">NumberFormatter</span>()
+pct.numberStyle = .percent
+pct.locale = .current</code></pre>
+
+    <h3>FormatStyle Examples</h3>
+
+    <pre><code><span class="keyword">let</span> n = <span class="number">1234567.891</span>
+<span class="keyword">let</span> a = n.<span class="func">formatted</span>(.<span class="func">number</span>.precision(.fractionLength(<span class="number">2</span>)))
+<span class="keyword">let</span> b = (<span class="number">42</span> <span class="keyword">as</span> <span class="type">Int</span>).<span class="func">formatted</span>(.<span class="func">currency</span>(code: <span class="string">"JPY"</span>))
+
+<span class="keyword">let</span> measurement = <span class="type">Measurement</span>(value: <span class="number">5</span>, unit: <span class="type">UnitLength</span>.kilometers)
+<span class="keyword">let</span> m1 = <span class="type">MeasurementFormatter</span>()
+m1.locale = .current
+<span class="keyword">let</span> legacy = m1.<span class="func">string</span>(from: measurement)
+
+<span class="keyword">let</span> m2 = measurement.<span class="func">formatted</span>(.<span class="func">measurement</span>(width: .wide, usage: .road))</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Storing Preformatted Currency Strings</div>
+        <p>Persist amounts as <code>Decimal</code> + ISO currency code + (optional) rounding policy—not as localized strings. Display formatting belongs at the view layer so locale changes and accessibility (VoiceOver reading amounts) stay correct.</p>
+    </div>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Measurement Unit Localization</div>
+        <p>Use <code>Measurement</code> with <code>Unit*</code> types and format with locale-aware styles. Avoid hardcoding unit abbreviations; US vs UK vs SI locales differ in spacing, separators, and unit names.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architect-scale"><span class="tag tag-architect">Architect</span> i18n Architecture at 40+ Locales</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must Know: End-to-End Localization System</div>
+        <p>At scale, i18n is a <strong>pipeline problem</strong> intersecting product, engineering, and vendor TMS—not a “strings file” problem. Your architecture must answer: Who owns keys? How do you prevent duplicate English sources of truth? How do you ship partial translations safely? How do you test RTL, long strings, and number formats under feature flags? How do dynamic/server-rendered strings re-enter the same QA bar as client strings?</p>
+    </div>
+
+    <h3>String Management</h3>
+
+    <ul>
+        <li><strong>Single catalog per module</strong> for SPM packages; avoid cross-bundle key collisions via prefixes (<code>payments_</code>, <code>auth_</code>).</li>
+        <li><strong>Key stability contracts</strong>: treat key renames as API breaks for translation memory.</li>
+        <li><strong>Context payloads</strong>: screenshots, comments, max lengths for marketing banners.</li>
+    </ul>
+
+    <h3>Translation Workflow</h3>
+
+    <ul>
+        <li>Automate XLIFF export on release branches; block merge if critical locales missing.</li>
+        <li>Maintain <strong>translation memory</strong> and glossary for brand terms (legal constraints).</li>
+        <li>Human QA for high-risk locales; machine translation only with human post-edit for user-visible prose.</li>
+    </ul>
+
+    <h3>Pseudo-Localization</h3>
+
+    <p>Run CI jobs that compile with pseudolanguages to detect truncation, hardcoded concatenation, non-localizable images, and layout breaks before translators waste cycles.</p>
+
+    <h3>Performance Considerations</h3>
+
+    <ul>
+        <li>Cache formatters and styles sensibly; prefer value-type <code>FormatStyle</code> composition on hot paths.</li>
+        <li>Avoid synchronous string/file IO on main thread when loading large string packs; bundles are fast, but custom resource pipelines might not be.</li>
+        <li>Measure app size impact: 40 languages × rich strings increases download size—consider on-demand resources if appropriate.</li>
+    </ul>
+
+    <h3>Dynamic &amp; Server-Driven Content</h3>
+
+    <p>Server-returned copy must carry <strong>locale negotiation</strong> (Accept-Language), <strong>versioning</strong> for cached translations, and <strong>fallback</strong> policies. For mixed client/server strings, define a single ID scheme and ensure mobile clients can render HTML/attributed safely across languages (bidirectional text, linkification).</p>
+
+    <div class="diagram">
+Staff-level interview storyline (i18n)
+
+  Product copy change
+        │
+        ▼
+  Swift/ObjC source ──► Xcode extract ──► String Catalog / XLIFF
+        │                        │
+        │                        └──► TMS + translators
+        ▼                                 │
+  Runtime bundle resolution ◄─────────────┘
+        │
+        ├──► Locale-sensitive formatters (FormatStyle)
+        ├──► RTL layout + UIImage mirroring
+        └──► Plural / inflection rules (stringsdict / catalog)
+
+  Failure modes to mention: stale keys, partial locales, formatter cache,
+  Locale vs language mismatch, illegal string concatenation, unmirrored icons.
+    </div>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Define “Done” for a Locale</div>
+        <p>A locale is not “done” when strings exist—it is done when plural rules, number/date samples, screenshots, RTL layout, and legal disclaimers pass review. Staff engineers write checklists and automate verifiable pieces (missing key detection, pseudolanguage UI tests).</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="06-accessibility.html">← Accessibility</a>
+        <a href="08-interview-qa.html">Interview Questions →</a>
+    </div>
+</div>
+</body>
+</html>

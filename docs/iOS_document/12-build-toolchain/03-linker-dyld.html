@@ -1,0 +1,814 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Linker &amp; dyld — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Build &amp; Toolchain</a><span class="sep">›</span>
+        Linker &amp; dyld
+    </nav>
+
+    <h1>Linker &amp; dyld</h1>
+    <p class="subtitle">Static and dynamic linking internals — from ld64's symbol resolution and dead code stripping through dyld4's shared cache, @rpath resolution, mergeable libraries, two-level namespaces, and the linking strategies that determine app launch time, binary size, and modularity at scale.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#static-vs-dynamic">1. Static vs Dynamic Linking</a></li>
+            <li><a href="#linker">2. The Linker (ld64 / ld-prime)</a></li>
+            <li><a href="#dyld">3. dyld4 and the Shared Cache</a></li>
+            <li><a href="#rpath">4. @rpath, @executable_path, @loader_path</a></li>
+            <li><a href="#search-paths">5. Framework Search Paths</a></li>
+            <li><a href="#symbol-visibility">6. Symbol Visibility</a></li>
+            <li><a href="#dead-code">7. Dead Code Stripping</a></li>
+            <li><a href="#mergeable">8. Mergeable Libraries (Xcode 15)</a></li>
+            <li><a href="#namespaces">9. Two-Level Namespaces</a></li>
+            <li><a href="#weak-linking">10. Weak Linking</a></li>
+            <li><a href="#architect">11. Architect: Linking Strategy for 200+ Modules</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="static-vs-dynamic">1. Static vs Dynamic Linking</h2>
+
+    <p>The choice between static and dynamic linking is one of the most impactful architectural decisions for large iOS apps. It affects launch time, binary size, build time, and code sharing.</p>
+
+    <h3>1.1 Static Linking</h3>
+
+    <div class="diagram">
+Static Linking: Code copied into the executable at build time
+
+Build Time:
+  ┌─────────┐  ┌─────────┐  ┌─────────┐
+  │ Core.a  │  │  UI.a   │  │Network.a│   ← Static libraries (.a)
+  │ (code)  │  │ (code)  │  │ (code)  │
+  └────┬────┘  └────┬────┘  └────┬────┘
+       │            │            │
+       └────────────┼────────────┘
+                    │
+              ┌─────┴─────┐
+              │   ld64    │  ← Linker copies all code into executable
+              └─────┬─────┘
+                    │
+              ┌─────┴─────┐
+              │  MyApp    │  ← Single executable with all code embedded
+              │ (large)   │
+              └───────────┘
+
+Runtime:
+  ┌───────────────────────┐
+  │       MyApp           │  ← Everything in one binary
+  │  ┌──────┐ ┌────────┐ │
+  │  │ Core │ │   UI   │ │     No dynamic loading needed
+  │  └──────┘ └────────┘ │     Fast launch (no dyld work)
+  │  ┌─────────┐         │
+  │  │ Network │         │
+  │  └─────────┘         │
+  └───────────────────────┘
+    </div>
+
+    <h3>1.2 Dynamic Linking</h3>
+
+    <div class="diagram">
+Dynamic Linking: Code loaded at runtime by dyld
+
+Build Time:
+  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+  │Core.framework│  │ UI.framework │  │Net.framework │  ← Dynamic frameworks
+  │  (Mach-O)    │  │  (Mach-O)    │  │  (Mach-O)    │
+  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+         │                 │                  │
+         └─────────────────┼──────────────────┘
+                           │
+                     ┌─────┴─────┐
+                     │   ld64    │  ← Linker records references only
+                     └─────┬─────┘
+                           │
+                     ┌─────┴─────┐
+                     │  MyApp    │  ← Small executable with load commands
+                     │ (small)   │
+                     └───────────┘
+
+Runtime:
+  ┌───────────────────────┐
+  │       MyApp           │
+  │  (load commands)      │  dyld loads frameworks at launch
+  └───────────┬───────────┘
+              │
+    ┌─────────┼──────────┬──────────────┐
+    ▼         ▼          ▼              ▼
+  ┌──────┐ ┌──────┐ ┌─────────┐ ┌──────────┐
+  │ Core │ │  UI  │ │ Network │ │ System.fw│
+  └──────┘ └──────┘ └─────────┘ └──────────┘
+    </div>
+
+    <h3>1.3 Comparison Table</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Static Library (.a)</th>
+                <th>Static Framework</th>
+                <th>Dynamic Framework</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Launch time</td>
+                <td>Fastest (no dyld work)</td>
+                <td>Fastest (no dyld work)</td>
+                <td>Slower (+2-5ms per framework)</td>
+            </tr>
+            <tr>
+                <td>Binary size</td>
+                <td>Larger (dead code stripping helps)</td>
+                <td>Larger (dead code stripping helps)</td>
+                <td>Smaller executable, but frameworks add overhead</td>
+            </tr>
+            <tr>
+                <td>Build time</td>
+                <td>Slower link phase</td>
+                <td>Slower link phase</td>
+                <td>Faster link phase</td>
+            </tr>
+            <tr>
+                <td>Code sharing</td>
+                <td>No (copied per target)</td>
+                <td>No (copied per target)</td>
+                <td>Yes (app + extensions share)</td>
+            </tr>
+            <tr>
+                <td>Resources</td>
+                <td>No bundle (resources need separate handling)</td>
+                <td>Has bundle (resources included)</td>
+                <td>Has bundle (resources included)</td>
+            </tr>
+            <tr>
+                <td>Dead code stripping</td>
+                <td>Yes (linker removes unused symbols)</td>
+                <td>Yes</td>
+                <td>No (entire framework loaded)</td>
+            </tr>
+            <tr>
+                <td>App extensions</td>
+                <td>Code duplicated in each extension</td>
+                <td>Code duplicated in each extension</td>
+                <td>Shared between app and extensions</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">When to Use Each</div>
+        <p><strong>Static</strong>: Default choice for internal modules. Faster launch, dead code stripping, simpler deployment. Use when you don't need code sharing with extensions.</p>
+        <p><strong>Dynamic</strong>: When you have app extensions that share significant code with the main app. Also required for SwiftUI previews in some configurations.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="linker">2. The Linker (ld64 / ld-prime)</h2>
+
+    <p>The linker combines compiled object files (<code>.o</code>) and libraries into a final Mach-O executable. Apple ships two linkers: the classic <code>ld64</code> and the new <code>ld-prime</code> (Xcode 15+, written in C++ with better performance).</p>
+
+    <h3>2.1 Linker Pipeline</h3>
+
+    <div class="diagram">
+Linker Pipeline:
+
+Input:
+  *.o files (compiled sources)
+  *.a files (static libraries)
+  *.dylib / *.tbd files (dynamic library references)
+       │
+       ▼
+┌──────────────────────────────────────────────────────┐
+│  1. Parse Input Files                                 │
+│     Read Mach-O headers, symbol tables, relocations   │
+├──────────────────────────────────────────────────────┤
+│  2. Symbol Resolution                                 │
+│     Match undefined symbols to definitions             │
+│     Resolve weak vs strong symbols                     │
+│     Report undefined symbol errors                     │
+├──────────────────────────────────────────────────────┤
+│  3. Dead Code Stripping                               │
+│     Mark reachable symbols from entry points           │
+│     Remove unreachable code and data                   │
+├──────────────────────────────────────────────────────┤
+│  4. Layout                                            │
+│     Assign addresses to segments and sections          │
+│     __TEXT, __DATA, __LINKEDIT layout                   │
+├──────────────────────────────────────────────────────┤
+│  5. Fixup Generation                                  │
+│     Generate rebase info (ASLR)                        │
+│     Generate bind info (dyld symbol binding)           │
+│     Generate chained fixups (iOS 15+)                  │
+├──────────────────────────────────────────────────────┤
+│  6. Output                                            │
+│     Write final Mach-O executable                      │
+│     Generate dSYM (debug symbols) if requested         │
+└──────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>2.2 Key Linker Flags</h3>
+
+    <pre><code><span class="comment"># Common linker flags (set via OTHER_LDFLAGS)</span>
+
+<span class="comment"># Link against a framework</span>
+-framework UIKit
+-framework CoreData
+
+<span class="comment"># Link against a library</span>
+-lsqlite3          <span class="comment"># links libsqlite3.dylib or .tbd</span>
+-lz                <span class="comment"># links libz.dylib</span>
+
+<span class="comment"># Force load all symbols from a static library</span>
+-force_load /path/to/libFoo.a
+
+<span class="comment"># Load all ObjC symbols (needed for categories in static libs)</span>
+-ObjC
+
+<span class="comment"># Dead code stripping</span>
+-dead_strip
+
+<span class="comment"># Export/hide symbols</span>
+-exported_symbols_list exports.txt
+-unexported_symbols_list hidden.txt
+
+<span class="comment"># Map file (shows what's in the binary)</span>
+-map output.map
+
+<span class="comment"># Linker warning control</span>
+-warn_unused_dylibs
+-no_warn_duplicate_libraries</code></pre>
+
+    <h3>2.3 install_name_tool</h3>
+
+    <p>This tool modifies the install names and rpaths in Mach-O binaries. Useful for fixing up framework paths after building.</p>
+
+    <pre><code><span class="comment"># View current install name</span>
+otool -D MyFramework.framework/MyFramework
+
+<span class="comment"># Change install name</span>
+install_name_tool -id @rpath/MyFramework.framework/MyFramework \
+    MyFramework.framework/MyFramework
+
+<span class="comment"># Change a dependency path</span>
+install_name_tool -change /old/path/libFoo.dylib @rpath/libFoo.dylib \
+    MyApp
+
+<span class="comment"># Add an rpath</span>
+install_name_tool -add_rpath @executable_path/Frameworks MyApp
+
+<span class="comment"># Delete an rpath</span>
+install_name_tool -delete_rpath /usr/local/lib MyApp</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="dyld">3. dyld4 and the Shared Cache</h2>
+
+    <p>dyld (dynamic linker/loader) is responsible for loading dynamic libraries at runtime. dyld4 (iOS 16+, macOS 13+) is a complete rewrite with significant performance improvements.</p>
+
+    <h3>3.1 dyld4 Launch Sequence</h3>
+
+    <div class="diagram">
+App Launch with dyld4:
+
+Kernel loads executable into memory
+       │
+       ▼
+┌──────────────────────────────────────────────────────────┐
+│  dyld4 Launch Closure (pre-computed, cached)              │
+├──────────────────────────────────────────────────────────┤
+│                                                           │
+│  1. Load Closure from Cache                               │
+│     └─ Pre-computed dependency graph, symbol bindings     │
+│     └─ Stored in dyld shared cache or on-disk closure     │
+│                                                           │
+│  2. Map Dylibs                                            │
+│     └─ mmap() each dynamic library into address space     │
+│     └─ System frameworks already in shared cache (fast)   │
+│                                                           │
+│  3. Apply Fixups                                          │
+│     ├─ Rebase: adjust pointers for ASLR slide             │
+│     └─ Bind: resolve external symbol references           │
+│     └─ Chained fixups (iOS 15+): walk fixup chains        │
+│                                                           │
+│  4. Run Initializers                                      │
+│     ├─ C++ static constructors                            │
+│     ├─ ObjC +load methods                                 │
+│     └─ Swift type metadata initialization                 │
+│                                                           │
+│  5. Jump to main()                                        │
+│                                                           │
+└──────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>3.2 Shared Cache</h3>
+
+    <p>The dyld shared cache is a single file containing all system frameworks pre-linked together. It's generated by Apple and stored on device. This is why system frameworks have near-zero loading cost.</p>
+
+    <pre><code><span class="comment"># View shared cache contents</span>
+dyld_shared_cache_util -list /System/Library/dyld/dyld_shared_cache_arm64e
+
+<span class="comment"># Extract a framework from the cache</span>
+dyld_shared_cache_util -extract /tmp/extracted \
+    /System/Library/dyld/dyld_shared_cache_arm64e
+
+<span class="comment"># On macOS, view loaded dylibs</span>
+DYLD_PRINT_LIBRARIES=1 ./MyApp
+
+<span class="comment"># Measure dyld time</span>
+DYLD_PRINT_STATISTICS=1 ./MyApp
+<span class="comment"># Output:</span>
+<span class="comment"># Total pre-main time: 312.00 milliseconds (100.0%)</span>
+<span class="comment">#   dylib loading time: 198.00 milliseconds (63.4%)</span>
+<span class="comment">#   rebase/binding time:  45.00 milliseconds (14.4%)</span>
+<span class="comment">#   ObjC setup time:      32.00 milliseconds (10.2%)</span>
+<span class="comment">#   initializer time:     37.00 milliseconds (11.8%)</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">dyld Launch Time Impact</div>
+        <p>Each embedded dynamic framework adds approximately <strong>2-5ms</strong> to launch time. An app with 100 dynamic frameworks can add 200-500ms to pre-main time. This is why Apple recommends limiting embedded dynamic frameworks to ~6 for optimal launch performance. Use <code>DYLD_PRINT_STATISTICS</code> to measure.</p>
+    </div>
+
+    <h3>3.3 dyld4 vs dyld3 Improvements</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Feature</th>
+                <th>dyld3</th>
+                <th>dyld4</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Closure caching</td>
+                <td>On-disk closures</td>
+                <td>In-process + on-disk closures</td>
+            </tr>
+            <tr>
+                <td>Just-in-time binding</td>
+                <td>No (all upfront)</td>
+                <td>Yes (lazy binding for some symbols)</td>
+            </tr>
+            <tr>
+                <td>Chained fixups</td>
+                <td>Limited</td>
+                <td>Full support (smaller __LINKEDIT)</td>
+            </tr>
+            <tr>
+                <td>Page-in linking</td>
+                <td>No</td>
+                <td>Yes (apply fixups on page fault)</td>
+            </tr>
+            <tr>
+                <td>Compact info</td>
+                <td>Separate rebase/bind opcodes</td>
+                <td>Chained fixups (embedded in __DATA)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="rpath">4. @rpath, @executable_path, @loader_path</h2>
+
+    <p>These are special path variables used in Mach-O load commands to locate dynamic libraries at runtime. Understanding them is essential for debugging "library not found" crashes.</p>
+
+    <h3>4.1 Path Variables</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Variable</th>
+                <th>Resolves To</th>
+                <th>Use Case</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>@executable_path</code></td>
+                <td>Directory containing the main executable</td>
+                <td>Frameworks embedded in app bundle</td>
+            </tr>
+            <tr>
+                <td><code>@loader_path</code></td>
+                <td>Directory containing the Mach-O that references the library</td>
+                <td>Framework depending on another framework</td>
+            </tr>
+            <tr>
+                <td><code>@rpath</code></td>
+                <td>Searched in order from the runpath search path list</td>
+                <td>Flexible — works for apps and frameworks</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>4.2 How @rpath Resolution Works</h3>
+
+    <div class="diagram">
+Framework install name: @rpath/MyFramework.framework/MyFramework
+
+dyld resolves @rpath by searching LD_RUNPATH_SEARCH_PATHS in order:
+
+App's LD_RUNPATH_SEARCH_PATHS:
+  1. @executable_path/Frameworks
+  2. @loader_path/Frameworks
+
+Search order:
+  1. /path/to/MyApp.app/Frameworks/MyFramework.framework/MyFramework  ← Found!
+  2. (would try @loader_path/Frameworks next if not found)
+
+For nested frameworks (framework depending on framework):
+  Framework A's LD_RUNPATH_SEARCH_PATHS:
+    1. @executable_path/Frameworks     ← Resolves to app's Frameworks/
+    2. @loader_path/Frameworks         ← Resolves to FrameworkA's Frameworks/
+    </div>
+
+    <pre><code><span class="comment"># View rpaths in a binary</span>
+otool -l MyApp | grep -A 2 LC_RPATH
+
+<span class="comment"># View library dependencies</span>
+otool -L MyApp.app/MyApp
+
+<span class="comment"># Typical output:</span>
+<span class="comment"># @rpath/Core.framework/Core (compatibility version 1.0.0)</span>
+<span class="comment"># @rpath/UI.framework/UI (compatibility version 1.0.0)</span>
+<span class="comment"># /usr/lib/libobjc.A.dylib</span>
+<span class="comment"># /usr/lib/libSystem.B.dylib</span>
+<span class="comment"># /System/Library/Frameworks/UIKit.framework/UIKit</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="search-paths">5. Framework Search Paths</h2>
+
+    <p>The compiler and linker use different search paths to find frameworks. Misconfigured search paths are a common source of build failures.</p>
+
+    <h3>5.1 Build Settings</h3>
+
+    <pre><code><span class="comment">// Framework search paths (for the compiler and linker to find .framework bundles)</span>
+FRAMEWORK_SEARCH_PATHS = $(inherited) $(SRCROOT)/Carthage/Build/iOS
+
+<span class="comment">// Library search paths (for .a and .dylib files)</span>
+LIBRARY_SEARCH_PATHS = $(inherited) $(SRCROOT)/Libraries
+
+<span class="comment">// Header search paths (for C/ObjC headers)</span>
+HEADER_SEARCH_PATHS = $(inherited) $(SRCROOT)/include
+
+<span class="comment">// Swift import paths (for .swiftmodule files)</span>
+SWIFT_INCLUDE_PATHS = $(inherited) $(SRCROOT)/Modules
+
+<span class="comment">// System framework search paths (searched after FRAMEWORK_SEARCH_PATHS)</span>
+SYSTEM_FRAMEWORK_SEARCH_PATHS = $(inherited)
+
+<span class="comment">// Runpath search paths (for dyld at runtime)</span>
+LD_RUNPATH_SEARCH_PATHS = $(inherited) @executable_path/Frameworks</code></pre>
+
+    <h3>5.2 Search Order</h3>
+
+    <div class="diagram">
+Framework Search Order (compile time):
+
+  1. FRAMEWORK_SEARCH_PATHS (project-specific)
+  2. SYSTEM_FRAMEWORK_SEARCH_PATHS
+  3. SDK framework directories
+     └─ $(SDKROOT)/System/Library/Frameworks
+  4. Toolchain frameworks
+     └─ $(TOOLCHAIN_DIR)/usr/lib/swift
+
+Library Search Order (link time):
+  1. LIBRARY_SEARCH_PATHS
+  2. SDK library directories
+     └─ $(SDKROOT)/usr/lib
+  3. Toolchain libraries
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="symbol-visibility">6. Symbol Visibility</h2>
+
+    <p>Symbol visibility controls which symbols are exported from a dynamic library. Reducing exported symbols improves link time, launch time, and binary size.</p>
+
+    <h3>6.1 Visibility Levels</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Visibility</th>
+                <th>Exported?</th>
+                <th>Description</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>default</code> (public)</td>
+                <td>Yes</td>
+                <td>Visible to other binaries, can be dynamically bound</td>
+            </tr>
+            <tr>
+                <td><code>hidden</code></td>
+                <td>No</td>
+                <td>Only visible within the binary, not exported</td>
+            </tr>
+            <tr>
+                <td><code>internal</code> (Swift)</td>
+                <td>Depends</td>
+                <td>Exported from dynamic frameworks, hidden from static</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Swift access control maps to symbol visibility:</span>
+<span class="keyword">public func</span> <span class="func">publicAPI</span>()     <span class="comment">// → exported symbol (visible to clients)</span>
+<span class="keyword">internal func</span> <span class="func">internalAPI</span>() <span class="comment">// → exported from dylib (for testing), hidden from static lib</span>
+<span class="keyword">private func</span> <span class="func">privateImpl</span>()  <span class="comment">// → hidden symbol (name-mangled, not exported)</span>
+
+<span class="comment">// In C/ObjC:</span>
+<span class="comment">__attribute__((visibility("default"))) void publicFunc(void);</span>
+<span class="comment">__attribute__((visibility("hidden"))) void hiddenFunc(void);</span></code></pre>
+
+    <pre><code><span class="comment"># View exported symbols</span>
+nm -gU MyFramework.framework/MyFramework | head -20
+
+<span class="comment"># Count exported symbols</span>
+nm -gU MyFramework.framework/MyFramework | wc -l
+
+<span class="comment"># Use exported symbols list to limit exports</span>
+<span class="comment"># In build settings:</span>
+EXPORTED_SYMBOLS_FILE = exports.exp
+
+<span class="comment"># exports.exp:</span>
+_main
+_MyPublicFunction
+_OBJC_CLASS_$_MyPublicClass</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Minimize Exported Symbols</div>
+        <p>For dynamic frameworks, use an exported symbols file to explicitly list only the symbols clients need. Fewer exported symbols means faster dyld binding, smaller __LINKEDIT, and better encapsulation. A framework with 10,000 symbols that only needs to export 100 can see measurable launch time improvements.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="dead-code">7. Dead Code Stripping</h2>
+
+    <p>Dead code stripping removes unreachable code and data from the final binary. It's one of the most effective ways to reduce binary size when using static libraries.</p>
+
+    <h3>7.1 How It Works</h3>
+
+    <div class="diagram">
+Dead Code Stripping Algorithm:
+
+1. Start from entry points (roots):
+   • main()
+   • ObjC class references
+   • Symbols marked as "no dead strip"
+   • C/C++ constructors
+
+2. Trace all reachable symbols:
+   main() → calls funcA() → calls funcB()
+                           → references ClassX
+   
+3. Remove everything not reachable:
+
+   Before:                    After:
+   ┌──────────┐              ┌──────────┐
+   │ main()   │ ✓ reachable  │ main()   │
+   │ funcA()  │ ✓ reachable  │ funcA()  │
+   │ funcB()  │ ✓ reachable  │ funcB()  │
+   │ funcC()  │ ✗ dead       │ ClassX   │
+   │ ClassX   │ ✓ reachable  └──────────┘
+   │ ClassY   │ ✗ dead        Removed: funcC(), ClassY
+   └──────────┘
+    </div>
+
+    <h3>7.2 Limitations</h3>
+
+    <pre><code><span class="comment">// ObjC classes are always considered "live" due to runtime registration</span>
+<span class="comment">// The linker can't know if a class is used via NSClassFromString()</span>
+
+<span class="comment">// Swift classes with @objc are also kept alive</span>
+<span class="keyword">@objc class</span> <span class="type">MyClass</span>: <span class="type">NSObject</span> { }  <span class="comment">// Won't be stripped even if unused</span>
+
+<span class="comment">// Pure Swift classes CAN be stripped if unreferenced</span>
+<span class="keyword">class</span> <span class="type">PureSwiftClass</span> { }  <span class="comment">// Will be stripped if no references</span>
+
+<span class="comment">// Dynamic frameworks: NO dead code stripping</span>
+<span class="comment">// The entire framework is loaded, even if only one function is used</span>
+<span class="comment">// This is a major argument for static linking</span></code></pre>
+
+    <pre><code><span class="comment"># Enable dead code stripping</span>
+DEAD_CODE_STRIPPING = YES
+
+<span class="comment"># View what was stripped (link map)</span>
+OTHER_LDFLAGS = -Wl,-map,output.map -Wl,-dead_strip
+
+<span class="comment"># The map file shows all symbols and their sizes</span>
+<span class="comment"># Compare map files before/after to see stripping impact</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="mergeable">8. Mergeable Libraries (Xcode 15)</h2>
+
+    <p>Mergeable libraries are a new linking mode in Xcode 15 that gives you the <strong>best of both worlds</strong>: dynamic frameworks for debug builds (fast linking) and static linking for release builds (fast launch, dead code stripping).</p>
+
+    <h3>8.1 How Mergeable Libraries Work</h3>
+
+    <div class="diagram">
+Mergeable Libraries: Automatic static/dynamic switching
+
+Debug Build (dynamic — fast link time):
+  ┌──────────────┐  ┌──────────────┐
+  │Core.framework│  │ UI.framework │   ← Dynamic frameworks
+  └──────┬───────┘  └──────┬───────┘
+         │                 │
+    dyld loads at runtime (fast build, slower launch)
+
+Release Build (merged — fast launch):
+  ┌──────────────┐  ┌──────────────┐
+  │Core.framework│  │ UI.framework │   ← Same frameworks
+  └──────┬───────┘  └──────┬───────┘
+         │                 │
+    Linker merges into executable (slower build, fast launch)
+         │
+  ┌──────┴───────┐
+  │    MyApp     │   ← Single binary with all code merged
+  │ + dead strip │      Dead code stripped, no dyld overhead
+  └──────────────┘
+    </div>
+
+    <h3>8.2 Enabling Mergeable Libraries</h3>
+
+    <pre><code><span class="comment">// In the framework's build settings:</span>
+MERGEABLE_LIBRARY = YES
+
+<span class="comment">// In the app's build settings:</span>
+MERGED_BINARY_TYPE = automatic  <span class="comment">// or "manual"</span>
+
+<span class="comment">// "automatic": Xcode merges in Release, keeps dynamic in Debug</span>
+<span class="comment">// "manual": You control which frameworks merge via build settings</span></code></pre>
+
+    <h3>8.3 Requirements and Limitations</h3>
+
+    <ul>
+        <li>Requires Xcode 15+ and iOS 17+ deployment target (for full benefits)</li>
+        <li>Frameworks must be built as dynamic frameworks with <code>MERGEABLE_LIBRARY = YES</code></li>
+        <li>ObjC categories in mergeable libraries need <code>-ObjC</code> linker flag</li>
+        <li>Can't merge frameworks that are also used by app extensions (they need to stay dynamic for sharing)</li>
+    </ul>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Mergeable Libraries vs Static Libraries</div>
+        <p>Mergeable libraries solve the "debug build time vs release launch time" tradeoff. With static libraries, you get fast launch but slow debug linking. With dynamic frameworks, you get fast debug linking but slow launch. Mergeable libraries automatically switch between the two modes based on build configuration.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="namespaces">9. Two-Level Namespaces</h2>
+
+    <p>Two-level namespaces are a Mach-O feature where each undefined symbol records <strong>which library</strong> it expects to find the symbol in. This is the default on macOS/iOS and provides both correctness and performance benefits.</p>
+
+    <h3>9.1 Two-Level vs Flat Namespace</h3>
+
+    <div class="diagram">
+Flat Namespace (legacy, rarely used):
+  Symbol "foo" → search ALL loaded libraries in order
+  Problem: Name collisions between libraries
+
+Two-Level Namespace (default):
+  Symbol "foo" from "libBar" → look ONLY in libBar
+  Benefit: No collisions, faster lookup, deterministic
+
+Example:
+  App imports "parse" from JSONKit.framework
+  App imports "parse" from XMLKit.framework
+  
+  Flat: Ambiguous — which "parse" gets called?
+  Two-Level: Each binding specifies the library → no ambiguity
+    </div>
+
+    <pre><code><span class="comment"># Check if binary uses two-level namespaces</span>
+otool -hv MyApp | grep TWOLEVEL
+
+<span class="comment"># Force flat namespace (rarely needed)</span>
+OTHER_LDFLAGS = -flat_namespace
+
+<span class="comment"># At runtime, force flat namespace</span>
+DYLD_FORCE_FLAT_NAMESPACE=1 ./MyApp</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="weak-linking">10. Weak Linking</h2>
+
+    <p>Weak linking allows your app to reference symbols that may not exist at runtime. This is essential for supporting multiple OS versions where newer APIs may not be available on older devices.</p>
+
+    <h3>10.1 Framework-Level Weak Linking</h3>
+
+    <pre><code><span class="comment">// In Build Phases → Link Binary With Libraries:</span>
+<span class="comment">// Set framework status to "Optional" instead of "Required"</span>
+
+<span class="comment">// Or via linker flags:</span>
+OTHER_LDFLAGS = -weak_framework SwiftUI
+
+<span class="comment">// At runtime, check if framework is available:</span>
+<span class="keyword">if</span> <span class="type">NSClassFromString</span>(<span class="string">"SwiftUI.UIHostingController"</span>) != <span class="keyword">nil</span> {
+    <span class="comment">// SwiftUI is available</span>
+}</code></pre>
+
+    <h3>10.2 Symbol-Level Weak Linking</h3>
+
+    <pre><code><span class="comment">// Swift handles this with @available and #available</span>
+<span class="keyword">if</span> <span class="keyword">#available</span>(iOS <span class="number">17</span>, *) {
+    <span class="comment">// Use iOS 17 API — compiler generates weak reference</span>
+    <span class="keyword">let</span> observer = <span class="type">TipKit</span>.<span class="type">TipObserver</span>()
+} <span class="keyword">else</span> {
+    <span class="comment">// Fallback for older iOS</span>
+}
+
+<span class="comment">// Under the hood, the compiler emits a weak_import for the symbol.</span>
+<span class="comment">// dyld sets weak symbols to NULL if the library doesn't provide them.</span>
+<span class="comment">// The #available check prevents calling NULL function pointers.</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">11. Architect: Linking Strategy for 200+ Modules</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>At Staff level, you need to design the linking strategy for a large modular app. The wrong choice can add 2+ seconds to launch time or 50MB+ to binary size. Here's a systematic approach.</p>
+    </div>
+
+    <h3>11.1 Decision Framework</h3>
+
+    <div class="diagram">
+Linking Strategy Decision Tree:
+
+  Does the module share code with app extensions?
+  ├── YES → Dynamic framework (shared between app + extensions)
+  │         └── Consider: Is the shared code > 1MB?
+  │             ├── YES → Dynamic framework (saves total size)
+  │             └── NO  → Static library (duplication is acceptable)
+  │
+  └── NO → Does the app target iOS 17+?
+           ├── YES → Mergeable library (best of both worlds)
+           └── NO  → Static library (default choice)
+                     └── Consider: Is build time a problem?
+                         ├── YES → Dynamic for debug, static for release
+                         └── NO  → Static everywhere
+    </div>
+
+    <h3>11.2 Recommended Architecture</h3>
+
+    <pre><code><span class="comment">// Typical large app linking architecture</span>
+
+<span class="comment">// Layer 1: Core modules — STATIC (always linked, dead-code stripped)</span>
+<span class="comment">// - Networking, Storage, Analytics, Logging, Common utilities</span>
+<span class="comment">// - These are used by everything, static avoids dyld overhead</span>
+
+<span class="comment">// Layer 2: Feature modules — STATIC or MERGEABLE</span>
+<span class="comment">// - Home, Search, Profile, Settings, etc.</span>
+<span class="comment">// - Static for best launch time, mergeable for build speed</span>
+
+<span class="comment">// Layer 3: Shared extension modules — DYNAMIC</span>
+<span class="comment">// - Code shared between app and extensions (Share, Widget, etc.)</span>
+<span class="comment">// - Must be dynamic for code sharing</span>
+
+<span class="comment">// Layer 4: Third-party SDKs — STATIC preferred</span>
+<span class="comment">// - Firebase, analytics SDKs, etc.</span>
+<span class="comment">// - Static to enable dead code stripping of unused features</span></code></pre>
+
+    <h3>11.3 Measuring Impact</h3>
+
+    <pre><code><span class="comment"># Measure launch time impact</span>
+DYLD_PRINT_STATISTICS=1 ./MyApp.app/MyApp
+
+<span class="comment"># Count dynamic frameworks</span>
+otool -L MyApp.app/MyApp | grep @rpath | wc -l
+
+<span class="comment"># Target: fewer than 6 embedded dynamic frameworks</span>
+<span class="comment"># Each adds ~2-5ms to pre-main time</span>
+
+<span class="comment"># Measure binary size impact</span>
+<span class="comment"># Generate link map for both static and dynamic configurations</span>
+<span class="comment"># Compare __TEXT + __DATA segment sizes</span>
+size -m MyApp.app/MyApp</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Linking Strategy Checklist for Large Apps</div>
+        <ul>
+            <li>Default to static linking for all internal modules</li>
+            <li>Use dynamic only when code sharing with extensions is required</li>
+            <li>Consider mergeable libraries for iOS 17+ targets</li>
+            <li>Enable dead code stripping (<code>DEAD_CODE_STRIPPING = YES</code>)</li>
+            <li>Minimize exported symbols from dynamic frameworks</li>
+            <li>Measure pre-main time with <code>DYLD_PRINT_STATISTICS</code></li>
+            <li>Keep embedded dynamic frameworks under 6</li>
+            <li>Use <code>-ObjC</code> flag when static linking ObjC libraries with categories</li>
+            <li>Generate and review link maps to understand binary composition</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="02-swift-compiler.html">← Swift Compiler</a>
+        <a href="04-spm-internals.html">Next: SPM Internals →</a>
+    </div>
+</div>
+</body>
+</html>

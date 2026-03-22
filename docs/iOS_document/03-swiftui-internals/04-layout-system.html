@@ -1,0 +1,814 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SwiftUI Layout System — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">SwiftUI Internals</a><span class="sep">›</span>
+        Layout System
+    </nav>
+
+    <h1>SwiftUI Layout System</h1>
+    <p class="subtitle">How proposals, ideal sizes, and placement compose into adaptive UIs — the mental model interviewers expect at staff level, including <code>Layout</code>, <code>GeometryReader</code>, alignment guides, <code>ViewThatFits</code>, <code>LayoutValueKey</code>, and when to avoid “geometry soup.”</p>
+
+    <p>
+        <span class="tag tag-l6">L6</span>
+        <span class="tag tag-senior">Senior+</span>
+        <span class="tag tag-architect">Architecture</span>
+    </p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#three-phase">1. The Three-Phase Layout: Propose → Measure → Place</a></li>
+            <li><a href="#negotiation">2. Negotiation Walkthrough &amp; ASCII Models</a></li>
+            <li><a href="#proposed-size">3. ProposedViewSize: zero, infinity, unspecified</a></li>
+            <li><a href="#view-responses">4. Built-in Views: Text, Image, Color, Spacer</a></li>
+            <li><a href="#layout-protocol">5. Layout Protocol (iOS 16+)</a></li>
+            <li><a href="#layoutSubview">5.4 LayoutSubview, dimensions, and placement</a></li>
+            <li><a href="#geometry-reader">6. GeometryReader: Mechanics &amp; Misuse</a></li>
+            <li><a href="#alignment-guide">7. alignmentGuide &amp; Custom Alignments</a></li>
+            <li><a href="#frame-fixed">8. frame vs fixedSize</a></li>
+            <li><a href="#view-that-fits">9. ViewThatFits</a></li>
+            <li><a href="#layout-value-key">10. LayoutValueKey — Child → Layout Metadata</a></li>
+            <li><a href="#priorities">11. layoutPriority &amp; Content Flexing</a></li>
+            <li><a href="#architect">12. Architect: Adaptive Layouts Without GeometryReader</a></li>
+            <li><a href="#comparison-tables">13. Master Comparison Tables</a></li>
+            <li><a href="#interview">14. Interview Drills &amp; Follow-ups</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="three-phase">1. The Three-Phase Layout: Propose → Measure → Place</h2>
+
+    <p>SwiftUI layout is a <strong>recursive negotiation</strong> between parents and children. It is not UIKit Auto Layout’s constraint solver expressed in Swift; there is no global multi-pass “satisfy all constraints” phase. At L6/staff depth, narrate three phases that repeat down the tree:</p>
+
+    <ol>
+        <li><strong>Proposal</strong> — The parent proposes a <code>ProposedViewSize</code> to each child. Width and height are each an optional <code>CGFloat</code>: concrete, <code>nil</code> (unspecified), <code>0</code>, or <code>.infinity</code> when the axis is unbounded for measurement.</li>
+        <li><strong>Measurement</strong> — Each child answers “how big would I like to be?” by combining its intrinsic (ideal) behavior with the proposal. For custom containers this maps to <code>Layout.sizeThatFits</code> and child <code>LayoutSubview.sizeThatFits</code>. Built-in stacks implement the same idea internally.</li>
+        <li><strong>Placement</strong> — The parent assigns each child an origin (and often a final size) in its own coordinate space. Custom layouts do this in <code>placeSubviews</code> via <code>place(at:proposal:)</code>.</li>
+    </ol>
+
+    <p>The critical staff-level point: <strong>the parent owns policy</strong>. Children report sizes and alignment contributions; they do not “pull” arbitrary frames from ancestors except through the negotiated proposal/placement pipeline (and modifiers that reshape proposals).</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Sound bite for the loop</div>
+        <p>“Parent proposes, child measures, parent places — recursively.” If asked what breaks the model, cite <code>GeometryReader</code> greediness, <code>fixedSize</code> overriding compression, or <code>ViewThatFits</code> branching measurement order.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="negotiation">2. Negotiation Walkthrough &amp; ASCII Models</h2>
+
+    <h3>2.1 Single parent, two children (conceptual)</h3>
+
+    <div class="diagram">
+┌────────────────────────────────────────────────────────────────────────────┐
+│  PARENT (e.g. HStack)                                                       │
+│                                                                             │
+│   proposal₁ ──► CHILD A ──► sizeA (CGSize)                                  │
+│   proposal₂ ──► CHILD B ──► sizeB (CGSize)                                  │
+│                                                                             │
+│   Parent aggregates (sum widths, max height, + spacing) → own sizeThatFits   │
+│   Parent assigns origins: A at x0, B at x0 + sizeA.width + gap              │
+└────────────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>2.2 Depth-first recursion</h3>
+
+    <div class="diagram">
+       ROOT proposes to Column
+              │
+              ▼
+         ┌─────────┐
+         │ VStack  │──── proposes to Row ────► Leaf measures
+         └─────────┘              │
+              ▲                   ▼
+              │            ┌─────────┐
+              └────────────│ HStack  │──── proposes to each chip
+                           └─────────┘
+
+   Order: measure leaves first (as driven by parent algorithms), bubble sizes up,
+   then place top-down. Lazy containers defer work until near visibility.
+    </div>
+
+    <h3>2.3 Where “ideal size” enters</h3>
+
+    <p>Every view has a notion of how big it <em>wants</em> to be when unconstrained on an axis. Text uses font + string + line limits; <code>Image</code> uses asset dimensions (unless resizable); flexible shapes expand to the proposal. Modifiers wrap the child and transform proposals, so the same leaf can report different sizes depending on its modifier stack.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="proposed-size">3. ProposedViewSize: zero, infinity, unspecified</h2>
+
+    <p><code>ProposedViewSize</code> is the currency of layout. Along each axis the proposal is optional: a <code>CGFloat</code>, <code>nil</code>, <code>0</code>, or <code>CGFloat.infinity</code> (conceptually “unbounded for this measurement pass”).</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Proposal</th>
+                <th>Typical meaning</th>
+                <th>Child behavior (rule of thumb)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Concrete width/height</td>
+                <td>“You are being offered this much space on this axis.”</td>
+                <td>Text wraps; images scale per resizable rules; flexible views often fill.</td>
+            </tr>
+            <tr>
+                <td><code>nil</code> (unspecified)</td>
+                <td>“No opinion — report your natural/intrinsic size.”</td>
+                <td>Ideal sizes dominate; used when parent sizes from children.</td>
+            </tr>
+            <tr>
+                <td><code>0</code></td>
+                <td>“How small can you become?” (tight probe)</td>
+                <td>Minimum layouts; useful in custom <code>Layout</code> for bin-packing tests.</td>
+            </tr>
+            <tr>
+                <td><code>.infinity</code></td>
+                <td>“Unbounded along this axis for measurement.”</td>
+                <td>Single-line text width; scroll content; avoid confusing with screen size.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Infinity vs nil — interview trap</div>
+        <p>Both can yield large measurements, but they encode different parental intent. <code>nil</code> asks for natural sizing; <code>infinity</code> often appears when a scroll view or lazy container needs “maximum line width” style measurement. Mixing them up reads as shallow API familiarity.</p>
+    </div>
+
+    <pre><code><span class="comment">// Illustrative: asking a subview for ideal vs bounded width</span>
+<span class="keyword">let</span> natural = subview.<span class="func">sizeThatFits</span>(.<span class="type">unspecified</span>)
+<span class="keyword">let</span> wrapped = subview.<span class="func">sizeThatFits</span>(<span class="type">ProposedViewSize</span>(width: <span class="number">200</span>, height: <span class="keyword">nil</span>))</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="view-responses">4. Built-in Views: Text, Image, Color, Spacer</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>View</th>
+                <th>Measurement behavior</th>
+                <th>Staff-level note</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>Text</code></td>
+                <td>String + font + environment; wraps when width is finite.</td>
+                <td>Dynamic Type and locale change intrinsic size; test edge strings.</td>
+            </tr>
+            <tr>
+                <td><code>Image</code></td>
+                <td>Intrinsic pixel size unless <code>resizable</code> + scaling.</td>
+                <td>SF Symbols scale with font; template rendering affects hit targets.</td>
+            </tr>
+            <tr>
+                <td><code>Color</code> / <code>Rectangle</code></td>
+                <td>Expands to fill proposal — “flexible cheap fills.”</td>
+                <td>Great for backgrounds; pair with <code>frame</code> to avoid surprise expansion.</td>
+            </tr>
+            <tr>
+                <td><code>Spacer</code></td>
+                <td>Minimum 0; absorbs remaining space per stack policy.</td>
+                <td>Not magic — the stack’s algorithm distributes flexible gaps.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Text respects finite width; Color expands unless constrained</span>
+<span class="type">VStack</span>(alignment: .leading, spacing: <span class="number">8</span>) {
+    <span class="type">Text</span>(<span class="string">"This line wraps when the parent proposes a bounded width."</span>)
+        .border(.red)
+    <span class="type">Color</span>.blue
+        .frame(height: <span class="number">40</span>)
+    <span class="type">Spacer</span>(minLength: <span class="number">0</span>)
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="layout-protocol">5. Layout Protocol (iOS 16+)</h2>
+
+    <p>The <code>Layout</code> protocol is how you <strong>become</strong> the parent: you receive a <code>Subviews</code> collection of <code>LayoutSubview</code> proxies, measure them under proposals, return your container’s size, then assign child positions.</p>
+
+    <h3>5.1 Core requirements</h3>
+
+    <ul>
+        <li><code>sizeThatFits(proposal:subviews:cache:)</code> — Return the size of your container given the incoming proposal and measured children.</li>
+        <li><code>placeSubviews(in:proposal:subviews:cache:)</code> — Position each subview inside <code>bounds</code> using <code>place(at:proposal:)</code>.</li>
+    </ul>
+
+    <h3>5.2 Cache: <code>makeCache</code>, <code>updateCache</code>, expensive work</h3>
+
+    <p>Use the cache when your algorithm would otherwise repeat O(n²) work across <code>sizeThatFits</code> and <code>placeSubviews</code>, or when you need stable scratch storage for wrapping indices, prefix sums, or radix passes. The cache type is yours; SwiftUI passes it <code>inout</code>.</p>
+
+    <div class="callout callout-success">
+        <div class="callout-title">What “good” looks like</div>
+        <p>Factor shared packing logic (e.g. row breaking) into one function invoked from both <code>sizeThatFits</code> and <code>placeSubviews</code>, backed by a cache struct. Interviewers listen for that symmetry — measurement and placement must agree.</p>
+    </div>
+
+    <h3>5.3 Complete example: horizontal flow layout with wrapping</h3>
+
+    <pre><code><span class="keyword">import</span> SwiftUI
+
+<span class="keyword">struct</span> <span class="type">FlowLayout</span>: <span class="type">Layout</span> {
+    <span class="keyword">var</span> spacing: <span class="type">CGFloat</span> = <span class="number">8</span>
+    <span class="keyword">var</span> lineSpacing: <span class="type">CGFloat</span> = <span class="number">8</span>
+
+    <span class="keyword">struct</span> <span class="type">Cache</span> {
+        <span class="keyword">var</span> sizes: [<span class="type">CGSize</span>] = []
+        <span class="keyword">var</span> rows: [[<span class="type">Int</span>]] = []
+        <span class="keyword">var</span> rowHeights: [<span class="type">CGFloat</span>] = []
+        <span class="keyword">var</span> totalSize: <span class="type">CGSize</span> = .zero
+    }
+
+    <span class="keyword">func</span> <span class="func">makeCache</span>(subviews: <span class="type">Subviews</span>) -> <span class="type">Cache</span> { <span class="type">Cache</span>() }
+
+    <span class="keyword">func</span> <span class="func">updateCache</span>(<span class="keyword">_</span> cache: <span class="keyword">inout</span> <span class="type">Cache</span>, subviews: <span class="type">Subviews</span>) {
+        cache.sizes = subviews.<span class="func">map</span> { $0.<span class="func">sizeThatFits</span>(.<span class="type">unspecified</span>) }
+    }
+
+    <span class="keyword">func</span> <span class="func">sizeThatFits</span>(
+        proposal: <span class="type">ProposedViewSize</span>,
+        subviews: <span class="type">Subviews</span>,
+        cache: <span class="keyword">inout</span> <span class="type">Cache</span>
+    ) -> <span class="type">CGSize</span> {
+        <span class="func">pack</span>(proposal: proposal, subviews: subviews, cache: &amp;cache)
+        <span class="keyword">return</span> cache.totalSize
+    }
+
+    <span class="keyword">func</span> <span class="func">placeSubviews</span>(
+        <span class="keyword">in</span> bounds: <span class="type">CGRect</span>,
+        proposal: <span class="type">ProposedViewSize</span>,
+        subviews: <span class="type">Subviews</span>,
+        cache: <span class="keyword">inout</span> <span class="type">Cache</span>
+    ) {
+        <span class="func">pack</span>(proposal: proposal, subviews: subviews, cache: &amp;cache)
+        <span class="keyword">var</span> y = bounds.minY
+        <span class="keyword">for</span> (rowIndex, row) <span class="keyword">in</span> cache.rows.<span class="func">enumerated</span>() {
+            <span class="keyword">let</span> rowHeight = cache.rowHeights[rowIndex]
+            <span class="keyword">var</span> x = bounds.minX
+            <span class="keyword">for</span> i <span class="keyword">in</span> row {
+                <span class="keyword">let</span> size = cache.sizes[i]
+                subviews[i].<span class="func">place</span>(
+                    at: <span class="type">CGPoint</span>(x: x, y: y + (rowHeight - size.height) / <span class="number">2</span>),
+                    proposal: <span class="type">ProposedViewSize</span>(width: size.width, height: size.height)
+                )
+                x += size.width + spacing
+            }
+            y += rowHeight + lineSpacing
+        }
+    }
+
+    <span class="keyword">private func</span> <span class="func">pack</span>(proposal: <span class="type">ProposedViewSize</span>, subviews: <span class="type">Subviews</span>, cache: <span class="keyword">inout</span> <span class="type">Cache</span>) {
+        <span class="keyword">guard</span> !subviews.isEmpty <span class="keyword">else</span> {
+            cache.rows = []; cache.rowHeights = []; cache.totalSize = .zero; <span class="keyword">return</span>
+        }
+        <span class="func">updateCache</span>(&amp;cache, subviews: subviews)
+        <span class="keyword">let</span> maxWidth = proposal.width ?? .infinity
+        cache.rows = []
+        cache.rowHeights = []
+        <span class="keyword">var</span> row: [<span class="type">Int</span>] = []
+        <span class="keyword">var</span> rowWidth: <span class="type">CGFloat</span> = <span class="number">0</span>
+        <span class="keyword">var</span> rowHeight: <span class="type">CGFloat</span> = <span class="number">0</span>
+
+        <span class="keyword">for</span> idx <span class="keyword">in</span> subviews.<span class="func">indices</span> {
+            <span class="keyword">let</span> size = cache.sizes[idx]
+            <span class="keyword">let</span> extra = row.isEmpty ? <span class="number">0</span> : spacing
+            <span class="keyword">if</span> rowWidth + extra + size.width &gt; maxWidth, !row.isEmpty {
+                cache.rows.<span class="func">append</span>(row)
+                cache.rowHeights.<span class="func">append</span>(rowHeight)
+                row = []
+                rowWidth = <span class="number">0</span>
+                rowHeight = <span class="number">0</span>
+            }
+            <span class="keyword">if</span> !row.isEmpty { rowWidth += spacing }
+            row.<span class="func">append</span>(idx)
+            rowWidth += size.width
+            rowHeight = <span class="func">max</span>(rowHeight, size.height)
+        }
+        cache.rows.<span class="func">append</span>(row)
+        cache.rowHeights.<span class="func">append</span>(rowHeight)
+
+        <span class="keyword">let</span> totalWidth = cache.rows.<span class="func">map</span> { r <span class="keyword">in</span>
+            r.<span class="func">map</span> { cache.sizes[$0].width }.<span class="func">reduce</span>(<span class="number">0</span>, +)
+                + <span class="type">CGFloat</span>(<span class="func">max</span>(r.count - <span class="number">1</span>, <span class="number">0</span>)) * spacing
+        }.<span class="func">max</span>() ?? <span class="number">0</span>
+        <span class="keyword">let</span> totalHeight = cache.rowHeights.<span class="func">reduce</span>(<span class="number">0</span>, +)
+            + <span class="type">CGFloat</span>(<span class="func">max</span>(cache.rowHeights.count - <span class="number">1</span>, <span class="number">0</span>)) * lineSpacing
+        cache.totalSize = <span class="type">CGSize</span>(width: totalWidth, height: totalHeight)
+    }
+}</code></pre>
+
+    <h3>5.4 Complete example: radial layout</h3>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">RadialLayout</span>: <span class="type">Layout</span> {
+    <span class="keyword">var</span> radius: <span class="type">CGFloat</span>
+
+    <span class="keyword">func</span> <span class="func">sizeThatFits</span>(
+        proposal: <span class="type">ProposedViewSize</span>,
+        subviews: <span class="type">Subviews</span>,
+        cache: <span class="keyword">inout</span> ()
+    ) -> <span class="type">CGSize</span> {
+        <span class="keyword">let</span> maxChild = subviews
+            .<span class="func">map</span> { $0.<span class="func">sizeThatFits</span>(proposal) }
+            .<span class="func">max</span>(by: { $0.width * $0.height &lt; $1.width * $1.height }) ?? .zero
+        <span class="keyword">let</span> side = radius * <span class="number">2</span> + <span class="func">max</span>(maxChild.width, maxChild.height)
+        <span class="keyword">return</span> <span class="type">CGSize</span>(width: side, height: side)
+    }
+
+    <span class="keyword">func</span> <span class="func">placeSubviews</span>(
+        <span class="keyword">in</span> bounds: <span class="type">CGRect</span>,
+        proposal: <span class="type">ProposedViewSize</span>,
+        subviews: <span class="type">Subviews</span>,
+        cache: <span class="keyword">inout</span> ()
+    ) {
+        <span class="keyword">let</span> center = <span class="type">CGPoint</span>(x: bounds.midX, y: bounds.midY)
+        <span class="keyword">let</span> count = subviews.count
+        <span class="keyword">guard</span> count &gt; <span class="number">0</span> <span class="keyword">else</span> { <span class="keyword">return</span> }
+        <span class="keyword">for</span> (index, sub) <span class="keyword">in</span> subviews.<span class="func">enumerated</span>() {
+            <span class="keyword">let</span> angle = (<span class="type">CGFloat</span>(index) / <span class="type">CGFloat</span>(count)) * <span class="number">2</span> * .pi - .pi / <span class="number">2</span>
+            <span class="keyword">let</span> childSize = sub.<span class="func">sizeThatFits</span>(proposal)
+            <span class="keyword">let</span> point = <span class="type">CGPoint</span>(
+                x: center.x + <span class="func">cos</span>(angle) * radius - childSize.width / <span class="number">2</span>,
+                y: center.y + <span class="func">sin</span>(angle) * radius - childSize.height / <span class="number">2</span>
+            )
+            sub.<span class="func">place</span>(
+                at: point,
+                proposal: <span class="type">ProposedViewSize</span>(width: childSize.width, height: childSize.height)
+            )
+        }
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="layoutSubview">5.5 LayoutSubview: dimensions, priorities, and <code>place</code></h2>
+
+    <p><code>LayoutSubview</code> is the stand-in for a child inside a <code>Layout</code>. Typical operations:</p>
+
+    <ul>
+        <li><code>sizeThatFits(_ proposal: ProposedViewSize) -> CGSize</code> — Measure under a proposal without committing placement.</li>
+        <li><code>dimensions(in proposal: ProposedViewSize) -> ViewDimensions</code> — Richer measurement including alignment guide contributions.</li>
+        <li><code>place(at:proposal:anchor:)</code> — Set position; the proposal often matches the size you intend the child to occupy after layout.</li>
+        <li>Subscript with <code>LayoutValueKey</code> — Read per-child metadata (see <a href="#layout-value-key">section 10</a>).</li>
+    </ul>
+
+    <p>Staff-level detail: when you call <code>place</code>, you are both positioning and re-proposing a size for the child’s own subtree. Mismatch between what you measured and what you place is a common bug source (clipping, mis-centered labels).</p>
+
+    <!-- ============================================================ -->
+    <h2 id="geometry-reader">6. GeometryReader (and Why It’s Often Misused)</h2>
+
+    <p><code>GeometryReader</code> provides a <code>GeometryProxy</code> with <code>size</code>, safe area, and coordinate-space transforms. Mechanically, it answers “what did my parent propose?” and forwards layout to its content.</p>
+
+    <h3>6.1 Why it is “greedy”</h3>
+
+    <p>In stacks, a reader often expands to occupy all flexible space along axes where the parent’s proposal allows growth. That means the reader’s <em>reported</em> size can be much larger than the intrinsic size of the content inside the closure — siblings see a large view, not a tight label.</p>
+
+    <div class="diagram">
+Parent proposes: width = 300, vertical axis flexible
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │   GeometryReader      │  occupies full proposal (greedy)
+              └──────────┬───────────┘
+                         │
+               closure uses proxy.size
+    </div>
+
+    <h3>6.2 Misuse: simple relative sizing</h3>
+
+    <pre><code><span class="comment">// MISUSE — reader becomes layout backbone for one Text</span>
+<span class="type">GeometryReader</span> { geo <span class="keyword">in</span>
+    <span class="type">Text</span>(<span class="string">"Hello"</span>)
+        .font(.system(size: geo.size.width * <span class="number">0.1</span>))
+}</code></pre>
+
+    <h3>6.3 Prefer: frames, typography, and Layout</h3>
+
+    <pre><code><span class="comment">// BETTER — explicit width policy + semantic text style</span>
+<span class="type">Text</span>(<span class="string">"Hello"</span>)
+    .font(.title)
+    .frame(maxWidth: .infinity, alignment: .leading)</code></pre>
+
+    <h3>6.4 Scoped reader pattern (when you need pixels)</h3>
+
+    <pre><code><span class="comment">// Isolate greed: fixed height band, reader only for chart math</span>
+<span class="type">ChartContainer</span>()
+    .frame(height: <span class="number">220</span>)
+    .overlay {
+        <span class="type">GeometryReader</span> { proxy <span class="keyword">in</span>
+            <span class="type">Canvas</span> { context, size <span class="keyword">in</span>
+                <span class="comment">// draw using proxy.size — bounded by overlay parent</span>
+            }
+        }
+    }</code></pre>
+
+    <h3>6.5 When GeometryReader <em>is</em> appropriate</h3>
+
+    <ul>
+        <li>Custom drawing whose strokes must track the container bounds.</li>
+        <li>Draggable overlays, parallax, hit testing mapped to parent coordinates.</li>
+        <li>Bridging precise rects to UIKit interop.</li>
+        <li>One-off effects where a custom <code>Layout</code> is heavier than the problem warrants — but be ready to justify the tradeoff.</li>
+    </ul>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Red flag phrase</div>
+        <p>“I wrap everything in <code>GeometryReader</code>.” Prefer policy in <code>Layout</code>, <code>ViewThatFits</code>, and modifiers; use readers at intentional boundaries.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="alignment-guide">7. alignmentGuide &amp; Custom Alignments</h2>
+
+    <p>Stacks align children along shared <strong>alignment lines</strong> (<code>HorizontalAlignment</code>, <code>VerticalAlignment</code>). <code>alignmentGuide</code> offsets where a particular child contributes its guide value relative to defaults.</p>
+
+    <h3>7.1 Custom alignment IDs</h3>
+
+    <p>Define an <code>AlignmentID</code> with <code>defaultValue(in:)</code>, then expose a static on the alignment enum via extension.</p>
+
+    <pre><code><span class="keyword">private</span> <span class="keyword">enum</span> <span class="type">BubbleAlignment</span>: <span class="type">AlignmentID</span> {
+    <span class="keyword">static func</span> <span class="func">defaultValue</span>(<span class="keyword">in</span> context: <span class="type">ViewDimensions</span>) -> <span class="type">CGFloat</span> {
+        context[<span class="type">VerticalAlignment</span>.center]
+    }
+}
+
+<span class="keyword">extension</span> <span class="type">VerticalAlignment</span> {
+    <span class="keyword">static let</span> bubbleTip = <span class="type">VerticalAlignment</span>(<span class="type">BubbleAlignment</span>.<span class="keyword">self</span>)
+}
+
+<span class="type">HStack</span>(alignment: .bubbleTip) {
+    <span class="type">Image</span>(systemName: <span class="string">"person.circle.fill"</span>)
+        .alignmentGuide(.bubbleTip) { d <span class="keyword">in</span> d[<span class="type">VerticalAlignment</span>.center] }
+    <span class="type">VStack</span>(alignment: .leading) {
+        <span class="type">Text</span>(<span class="string">"Title"</span>).font(.headline)
+        <span class="type">Text</span>(<span class="string">"Subtitle"</span>).foregroundStyle(.secondary)
+    }
+    .alignmentGuide(.bubbleTip) { d <span class="keyword">in</span> d[<span class="type">VerticalAlignment</span>.top] + <span class="number">6</span> }
+}</code></pre>
+
+    <h3>7.2 Complex scenario: timeline markers</h3>
+
+    <p>For timelines, you often want icons and text to share a vertical line while baselines differ. Custom vertical alignment + guides beat hard-coded padding when Dynamic Type doubles line counts.</p>
+
+    <pre><code><span class="keyword">private</span> <span class="keyword">enum</span> <span class="type">TimelineRail</span>: <span class="type">AlignmentID</span> {
+    <span class="keyword">static func</span> <span class="func">defaultValue</span>(<span class="keyword">in</span> context: <span class="type">ViewDimensions</span>) -> <span class="type">CGFloat</span> {
+        context[<span class="type">HorizontalAlignment</span>.leading]
+    }
+}
+
+<span class="keyword">extension</span> <span class="type">HorizontalAlignment</span> {
+    <span class="keyword">static let</span> timeline = <span class="type">HorizontalAlignment</span>(<span class="type">TimelineRail</span>.<span class="keyword">self</span>)
+}
+
+<span class="type">HStack</span>(alignment: .top, spacing: <span class="number">12</span>) {
+    <span class="type">Circle</span>()
+        .fill(.tint)
+        .frame(width: <span class="number">10</span>, height: <span class="number">10</span>)
+        .alignmentGuide(.timeline) { d <span class="keyword">in</span> d[<span class="type">HorizontalAlignment</span>.center] }
+    <span class="type">VStack</span>(alignment: .leading, spacing: <span class="number">4</span>) {
+        <span class="type">Text</span>(<span class="string">"Event"</span>).font(.headline)
+        <span class="type">Text</span>(<span class="string">"Detail text can wrap across multiple lines."</span>)
+    }
+    .alignmentGuide(.timeline) { d <span class="keyword">in</span> d[<span class="type">HorizontalAlignment</span>.leading] - <span class="number">18</span> }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Cross-branch alignment</div>
+        <p><code>alignmentGuide</code> adjusts a child’s contribution to a stack line. Aligning arbitrary nodes in different subtrees often moves to <code>PreferenceKey</code>, overlays, or explicit <code>Layout</code> — say that aloud before diving into hacks.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="frame-fixed">8. frame vs fixedSize</h2>
+
+    <p>Both reshape proposals; they answer different questions. <code>frame</code> expresses desired dimensions or flexibility bands; <code>fixedSize</code> pushes back on compression so ideal sizes win.</p>
+
+    <h3>8.1 Fixed frame</h3>
+
+    <pre><code><span class="type">Color</span>.orange
+    .frame(width: <span class="number">100</span>, height: <span class="number">44</span>)</code></pre>
+
+    <h3>8.2 Flexible frame (min / ideal / max)</h3>
+
+    <pre><code><span class="type">Text</span>(<span class="string">"Flexible"</span>)
+    .frame(minWidth: <span class="number">120</span>, idealWidth: <span class="number">200</span>, maxWidth: .infinity)</code></pre>
+
+    <h3>8.3 fixedSize — full and partial</h3>
+
+    <pre><code><span class="type">Label</span>(<span class="string">"New"</span>, systemImage: <span class="string">"sparkles"</span>)
+    .padding(.horizontal, <span class="number">8</span>)
+    .fixedSize()
+
+<span class="type">Text</span>(<span class="string">"Do not truncate this title vertically"</span>)
+    .fixedSize(horizontal: <span class="keyword">false</span>, vertical: <span class="keyword">true</span>)</code></pre>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Modifier</th>
+                <th>Effect on negotiation</th>
+                <th>Typical use</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>frame(width:height:)</code></td>
+                <td>Targets explicit dimensions; still interacts with parent clamps.</td>
+                <td>Thumbnails, fixed buttons, skeleton placeholders.</td>
+            </tr>
+            <tr>
+                <td><code>frame(min:ideal:max:)</code></td>
+                <td>Declares a flexibility band on an axis.</td>
+                <td>Responsive rows, split views, “take remaining width.”</td>
+            </tr>
+            <tr>
+                <td><code>fixedSize()</code></td>
+                <td>Prioritizes ideal size; overflow bubbles to ancestors.</td>
+                <td>Chips, pills, protecting titles from compression.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="view-that-fits">9. ViewThatFits</h2>
+
+    <p><code>ViewThatFits</code> evaluates its child views <strong>in source order</strong> and selects the first whose measured size fits the proposal on the axes you specify (<code>Axis.Set</code>). It is declarative adaptive branching without imperative width checks.</p>
+
+    <h3>9.1 Horizontal adaptation</h3>
+
+    <pre><code><span class="type">ViewThatFits</span>(in: .horizontal) {
+    <span class="type">HStack</span> {
+        <span class="type">Text</span>(<span class="string">"Short"</span>)
+        <span class="type">Text</span>(<span class="string">"Detail"</span>)
+        <span class="type">Text</span>(<span class="string">"Extra"</span>)
+    }
+    <span class="type">VStack</span>(alignment: .leading) {
+        <span class="type">Text</span>(<span class="string">"Short"</span>)
+        <span class="type">Text</span>(<span class="string">"Detail"</span>)
+        <span class="type">Text</span>(<span class="string">"Extra"</span>)
+    }
+}</code></pre>
+
+    <h3>9.2 Vertical-only checks</h3>
+
+    <pre><code><span class="type">ViewThatFits</span>(in: .vertical) {
+    <span class="type">Text</span>(<span class="string">"Compact summary"</span>).font(.title3)
+    <span class="type">Text</span>(<span class="string">"Compact"</span>).font(.footnote)
+}</code></pre>
+
+    <p><strong>Use cases:</strong> toolbar overflow, sidebar vs stack navigation, multi-column grids collapsing to one column, “rich vs compact” cell variants.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Ordering matters</div>
+        <p>List the <em>most spacious</em> variant first. The first fitting child wins; siblings are not composed together. Combine with <code>Layout</code> or breakpoints when partial visibility is required.</p>
+    </div>
+
+    <h3>9.3 Mental model diagram</h3>
+
+    <div class="diagram">
+  Incoming proposal to ViewThatFits
+           │
+           ▼
+   Try child #1 (measure)
+        │
+        ├─ fits? ──► select #1 (done)
+        │
+        └─ else try child #2 …
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="layout-value-key">10. LayoutValueKey — Passing Values from Child to Layout</h2>
+
+    <p><code>LayoutValueKey</code> lets children publish typed metadata that only their containing <code>Layout</code> reads — no global preferences, no mirror view hierarchies. Conform with a <code>defaultValue</code>; children set values via <code>layoutValue(key:value:)</code>.</p>
+
+    <pre><code><span class="keyword">struct</span> <span class="type">FlexibilityKey</span>: <span class="type">LayoutValueKey</span> {
+    <span class="keyword">static var</span> defaultValue: <span class="type">Double</span> { <span class="number">1</span> }
+}
+
+<span class="keyword">extension</span> <span class="type">View</span> {
+    <span class="keyword">func</span> <span class="func">layoutFlexibility</span>(<span class="keyword">_</span> value: <span class="type">Double</span>) -> <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="keyword">self</span>.layoutValue(key: <span class="type">FlexibilityKey</span>.<span class="keyword">self</span>, value: value)
+    }
+}
+
+<span class="keyword">struct</span> <span class="type">WeightedRowLayout</span>: <span class="type">Layout</span> {
+    <span class="keyword">func</span> <span class="func">sizeThatFits</span>(
+        proposal: <span class="type">ProposedViewSize</span>,
+        subviews: <span class="type">Subviews</span>,
+        cache: <span class="keyword">inout</span> ()
+    ) -> <span class="type">CGSize</span> {
+        <span class="keyword">let</span> widths = subviews.<span class="func">map</span> { $0.<span class="func">sizeThatFits</span>(proposal).width }
+        <span class="keyword">let</span> totalWidth = widths.<span class="func">reduce</span>(<span class="number">0</span>, +)
+        <span class="keyword">let</span> height = subviews.<span class="func">map</span> { $0.<span class="func">sizeThatFits</span>(proposal).height }.<span class="func">max</span>() ?? <span class="number">0</span>
+        <span class="keyword">return</span> <span class="type">CGSize</span>(width: totalWidth, height: height)
+    }
+
+    <span class="keyword">func</span> <span class="func">placeSubviews</span>(
+        <span class="keyword">in</span> bounds: <span class="type">CGRect</span>,
+        proposal: <span class="type">ProposedViewSize</span>,
+        subviews: <span class="type">Subviews</span>,
+        cache: <span class="keyword">inout</span> ()
+    ) {
+        <span class="keyword">let</span> weights = subviews.<span class="func">map</span> { $0[<span class="type">FlexibilityKey</span>.<span class="keyword">self</span>] }
+        <span class="keyword">let</span> sum = weights.<span class="func">reduce</span>(<span class="number">0</span>, +)
+        <span class="keyword">var</span> x = bounds.minX
+        <span class="keyword">for</span> (idx, sub) <span class="keyword">in</span> subviews.<span class="func">enumerated</span>() {
+            <span class="keyword">let</span> fraction = sum &gt; <span class="number">0</span> ? weights[idx] / sum : <span class="number">1</span> / <span class="type">CGFloat</span>(subviews.count)
+            <span class="keyword">let</span> width = bounds.width * <span class="type">CGFloat</span>(fraction)
+            <span class="keyword">let</span> h = sub.<span class="func">sizeThatFits</span>(<span class="type">ProposedViewSize</span>(width: width, height: proposal.height)).height
+            sub.<span class="func">place</span>(
+                at: <span class="type">CGPoint</span>(x: x, y: bounds.midY - h / <span class="number">2</span>),
+                proposal: <span class="type">ProposedViewSize</span>(width: width, height: h)
+            )
+            x += width
+        }
+    }
+}</code></pre>
+
+    <pre><code><span class="type">WeightedRowLayout</span> {
+    <span class="type">Color</span>.red.layoutFlexibility(<span class="number">2</span>)
+    <span class="type">Color</span>.green.layoutFlexibility(<span class="number">1</span>)
+    <span class="type">Color</span>.blue.layoutFlexibility(<span class="number">1</span>)
+}
+.frame(height: <span class="number">44</span>)</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="priorities">11. layoutPriority &amp; Content Flexing</h2>
+
+    <p><code>layoutPriority</code> biases flexible space allocation in stacks: higher priority views resist shrinking and claim extra room when the parent has to distribute ambiguity. It does not override explicit frames or <code>fixedSize</code> in all cases — it adjusts <em>relative</em> claims among flexible siblings.</p>
+
+    <pre><code><span class="type">HStack</span> {
+    <span class="type">Text</span>(<span class="string">"Secondary"</span>)
+        .foregroundStyle(.secondary)
+        .layoutPriority(<span class="number">0</span>)
+    <span class="type">Text</span>(<span class="string">"Primary title should win space first"</span>)
+        .lineLimit(<span class="number">1</span>)
+        .layoutPriority(<span class="number">1</span>)
+}</code></pre>
+
+    <p>Pair this mentally with <code>fixedSize</code>: priority decides who gets flex; <code>fixedSize</code> changes whether compression is even on the table.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">12. Architect Callout: Complex Adaptive Layouts Without GeometryReader</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Whiteboard-grade system design</div>
+        <p><strong>Breakpoints via measurement, not magic numbers:</strong> Prefer <code>ViewThatFits</code> to choose between a two-column dashboard and a stacked layout. The proposal encodes available space; you avoid brittle <code>UIScreen.main</code>-style checks in <code>body</code>.</p>
+        <p><strong>Dashboard grids:</strong> Implement a custom <code>Layout</code> that reads tile spans from <code>LayoutValueKey</code> (column/row span, importance). Cache row heights and occupied cells — same conceptual job as compositional collection layouts, expressed as proposal-driven code.</p>
+        <p><strong>Compose policies:</strong> Outer <code>ViewThatFits</code> selects column vs stack; inner <code>FlowLayout</code> wraps tags; leaves use <code>fixedSize</code> to protect chip intrinsic widths. Reserve <code>GeometryReader</code> for canvases (charts, rubber-band gestures) with explicit bounded frames.</p>
+        <p><strong>Testing narrative:</strong> Layout driven by proposals snapshots cleanly across size classes; scattered geometry math in views does not.</p>
+    </div>
+
+    <div class="diagram">
+┌──────────────────────────────────────────────────────────────────┐
+│                     Adaptive dashboard composition                │
+│                                                                   │
+│   ViewThatFits (horizontal)                                       │
+│        │                                                          │
+│        ├── Wide: GridLayout + LayoutValueKey (spans)              │
+│        │                                                          │
+│        └── Narrow: FlowLayout (chips) + VStack (sections)         │
+│                                                                   │
+│   GeometryReader only inside bounded chart / gesture overlays     │
+└──────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Staff interview closing move</div>
+        <p>End with: “We pushed policy into <code>Layout</code> + <code>ViewThatFits</code>, used <code>LayoutValueKey</code> for per-tile metadata, and isolated <code>GeometryReader</code> to drawing layers.” That sentence signals architectural maturity.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="comparison-tables">13. Master Comparison Tables</h2>
+
+    <h3>13.1 Tool selection</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Goal</th>
+                <th>Prefer</th>
+                <th>Avoid / caveat</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Wrap children like tags</td>
+                <td>Custom <code>Layout</code> (flow)</td>
+                <td>Deeply nested <code>HStack</code> + <code>Spacer</code> forests</td>
+            </tr>
+            <tr>
+                <td>Choose layout by available space</td>
+                <td><code>ViewThatFits</code></td>
+                <td>Hard-coded width comparisons in every view</td>
+            </tr>
+            <tr>
+                <td>Align icons to semantic text features</td>
+                <td>Custom alignment + <code>alignmentGuide</code></td>
+                <td>Magic constant padding per Dynamic Type bucket</td>
+            </tr>
+            <tr>
+                <td>Per-child metadata for an algorithm</td>
+                <td><code>LayoutValueKey</code></td>
+                <td>Parallel “shadow” view trees for metadata</td>
+            </tr>
+            <tr>
+                <td>Chart / gesture math in parent space</td>
+                <td>Scoped <code>GeometryReader</code></td>
+                <td>Screen-root reader affecting entire hierarchy</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>13.2 Phase → API mapping</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Conceptual phase</th>
+                <th>Built-in container</th>
+                <th>Custom container</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Proposal to children</td>
+                <td>Internal to <code>HStack</code> / <code>LazyVStack</code></td>
+                <td>Your calls to <code>subview.sizeThatFits</code></td>
+            </tr>
+            <tr>
+                <td>Aggregate size</td>
+                <td>Stack rules + spacers + priorities</td>
+                <td><code>Layout.sizeThatFits</code></td>
+            </tr>
+            <tr>
+                <td>Placement</td>
+                <td>Alignment lines + stack policy</td>
+                <td><code>Layout.placeSubviews</code> + <code>place(at:proposal:)</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>13.3 Modifiers vs layout types</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Tool</th>
+                <th>Role</th>
+                <th>When it shines</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>frame</code></td>
+                <td>Reshapes proposals / declares ideal-min-max bands.</td>
+                <td>Explicit sizing and responsive flex bands.</td>
+            </tr>
+            <tr>
+                <td><code>fixedSize</code></td>
+                <td>Defends intrinsic size against compression.</td>
+                <td>Chips, single-line titles, measurement diagnostics.</td>
+            </tr>
+            <tr>
+                <td><code>layoutPriority</code></td>
+                <td>Relative flex preference among siblings.</td>
+                <td>Truncation fights in toolbars and list rows.</td>
+            </tr>
+            <tr>
+                <td><code>Layout</code></td>
+                <td>Custom parent policy with explicit measure/place.</td>
+                <td>Flow, radial, dashboards, non-stack geometries.</td>
+            </tr>
+            <tr>
+                <td><code>ViewThatFits</code></td>
+                <td>Declarative adaptive branching via measurement.</td>
+                <td>Primary/secondary columns, compact fallbacks.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="interview">14. Interview Drills &amp; Follow-ups</h2>
+
+    <ol>
+        <li><strong>Whiteboard</strong> the three phases for an <code>HStack</code> with a <code>Spacer</code> — who proposes infinity, who absorbs?</li>
+        <li><strong>Implement</strong> <code>FlowLayout</code> from memory: shared pack function, cache rows, identical logic in <code>sizeThatFits</code> and <code>placeSubviews</code>.</li>
+        <li><strong>Contrast</strong> <code>GeometryReader</code> greediness vs a custom <code>Layout</code> that measures children with tight proposals.</li>
+        <li><strong>Explain</strong> when <code>ViewThatFits</code> is insufficient (partial visibility, simultaneous variants) and what you combine instead.</li>
+        <li><strong>Trace</strong> a <code>fixedSize</code> modifier through a nested <code>VStack</code> — where does overflow surface (scroll vs clip)?</li>
+    </ol>
+
+    <p class="subtitle" style="margin-top: 48px;">Rehearsal goal: narrate proposals before APIs — then name the SwiftUI tools that encode each policy.</p>
+
+    <div class="nav-footer">
+        <a href="03-state-management.html">← State Management</a>
+        <a href="05-rendering-integration.html">Next: Rendering →</a>
+    </div>
+</div>
+</body>
+</html>

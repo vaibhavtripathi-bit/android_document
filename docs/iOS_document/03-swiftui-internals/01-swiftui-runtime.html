@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SwiftUI Runtime & AttributeGraph — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">SwiftUI Internals</a><span class="sep">›</span>
+        SwiftUI Runtime
+    </nav>
+
+    <p>
+        <span class="tag tag-l6">L6</span>
+        <span class="tag tag-architect">Architect</span>
+        <span class="tag tag-senior">Staff+</span>
+    </p>
+    <h1>SwiftUI Runtime &amp; AttributeGraph</h1>
+    <p class="subtitle">
+        A systems-level mental model for how SwiftUI schedules work, tracks dependencies, and commits frames.
+        This page is written for senior/staff interviews where “I use <code>@State</code>” is not enough—you need to explain
+        <em>what runs</em>, <em>when</em>, and <em>why</em> performance cliffs appear at scale.
+    </p>
+
+    <nav class="toc" aria-label="On this page">
+        <h3>On this page</h3>
+        <ul>
+            <li><a href="#attributegraph">1. AttributeGraph (AG)</a></li>
+            <li><a href="#viewgraph">2. ViewGraph structure</a></li>
+            <li><a href="#body-calls">3. How <code>body</code> is called (and skipped)</a></li>
+            <li><a href="#identity">4. Structural vs explicit identity</a></li>
+            <li><a href="#debugging">5. <code>_ViewDebug</code> &amp; <code>_printChanges()</code></a></li>
+            <li><a href="#render-loop">6. The SwiftUI render loop</a></li>
+            <li><a href="#architect-scale">7. Architect: AG at scale</a></li>
+        </ul>
+    </nav>
+
+    <div class="callout callout-info">
+        <div class="callout-title">How to read this page</div>
+        <p>
+            SwiftUI’s runtime is mostly closed-source (implemented in a private C++ framework commonly referred to as
+            <strong>AttributeGraph</strong>). What follows is the <em>externally observable</em> model that matches
+            Instruments, debug logging, and Apple engineer framing in WWDC sessions—not a line-by-line source dump.
+        </p>
+    </div>
+
+    <!-- ===================== 1. AttributeGraph ===================== -->
+    <h2 id="attributegraph">1. AttributeGraph (AG): the dependency engine</h2>
+
+    <h3>1.1 What AttributeGraph is</h3>
+    <p>
+        AttributeGraph is SwiftUI’s internal graph engine: a persistent, incremental computation system that stores
+        <em>attributes</em> (values or handles to values) and <em>rules</em> (functions that derive one attribute from others).
+        Your Swift <code>View</code> types are ephemeral structs; AG is the long-lived structure that remembers what depends on what
+        across updates.
+    </p>
+    <ul>
+        <li><strong>Private C++ framework.</strong> AG ships inside Apple’s OS frameworks; it is not open source. Public SwiftUI API is a thin Swift surface over graph operations.</li>
+        <li><strong>Graph, not tree.</strong> Dependencies can fan-in and fan-out; reuse and sharing are first-class. One model field can influence many view attributes without duplicating storage at the Swift layer.</li>
+        <li><strong>Incremental.</strong> When inputs change, AG marks affected nodes dirty and re-evaluates the minimal subgraph rather than recomputing the whole UI from first principles.</li>
+        <li><strong>Cross-runtime.</strong> The same conceptual engine also backs related declarative subsystems on Apple platforms; SwiftUI is the most visible customer.</li>
+    </ul>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Interview trap</div>
+        <p>
+            Do not equate “SwiftUI is declarative” with “SwiftUI re-renders the whole screen every time.”
+            The declarative API is how you <em>describe</em> possibilities; AG decides what to <em>recompute</em>.
+        </p>
+    </div>
+
+    <h3>1.2 How AG tracks dependencies between views and state</h3>
+    <p>
+        When SwiftUI materializes a view subtree, it installs <em>subscriptions</em> between dynamic inputs—<code>@State</code>,
+        <code>@Binding</code>, <code>@Observable</code> / <code>ObservableObject</code>, environment values, preferences, focus, scene phase—and the
+        attribute nodes that represent layout, rendering, and animation state. Reading a dynamic property during
+        <code>body</code> evaluation records an edge: “this attribute depends on that source.”
+    </p>
+    <p>
+        The critical staff-level detail: dependency edges are recorded during <strong>evaluation</strong> of the graph rules that
+        rebuild view structure, not merely at compile time. If a code path stops reading a value, dependencies can shrink;
+        if a new branch reads additional state, the graph grows new edges on the next pass.
+    </p>
+    <p>
+        On write, the source invalidates dependents. Invalidation is cheap; eager full recomputation would be expensive.
+        The graph batches work and schedules it on the run loop (see <a href="#render-loop">§6</a>).
+    </p>
+
+    <h3>1.3 AG nodes: attribute nodes vs rule nodes</h3>
+    <p>
+        Think of AG as a spreadsheet on steroids—except cells can be layout proposals, resolved fonts, or Core Animation payloads:
+    </p>
+    <table>
+        <thead>
+            <tr>
+                <th>Concept</th>
+                <th>Role</th>
+                <th>Typical examples</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Attribute node</strong></td>
+                <td>Holds a value or a reference to computed state in the graph.</td>
+                <td>Layout proposals, resolved environment, transform, opacity, platform render payload, accessibility metadata.</td>
+            </tr>
+            <tr>
+                <td><strong>Rule node</strong></td>
+                <td>Defines how an attribute is produced from inputs (pure-ish computation in AG terms).</td>
+                <td>Child size depends on parent proposal; text height depends on font &amp; string; alignment depends on subviews.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <p>
+        In interviews, you can say: <strong>rules are the “functions” of the graph; attributes are the “cells.”</strong>
+        SwiftUI’s modifiers often compile to chains of small rules that transform one attribute into another (padding expands bounds;
+        opacity scales presentation; animation attaches timing metadata to attribute transitions).
+    </p>
+
+    <div class="diagram">Simplified dependency fan-out (one @State, many attributes)
+
+  @State count
+       |
+       +----&gt; rule: Text.string(count)
+       |            |
+       |            +--&gt; attr: attributed string
+       |            +--&gt; attr: ideal size
+       |
+       +----&gt; rule: Button.enabled(...)
+       |
+       +----&gt; rule: accessibility label (may combine multiple inputs)</div>
+
+    <h3>1.4 How invalidation propagates</h3>
+    <p>
+        A state change marks the immediate attribute nodes as <em>invalid</em>. AG then walks the dependency edges outward:
+    </p>
+    <ol>
+        <li><strong>Local invalidation:</strong> only the subgraph reachable from the changed source is considered.</li>
+        <li><strong>Coalescing:</strong> multiple writes in the same turn collapse into one scheduled update pass.</li>
+        <li><strong>Re-evaluation:</strong> rules run in an order that respects dependencies (conceptually topological; cycles are avoided by construction).</li>
+        <li><strong>Diff / commit:</strong> resulting changes are applied to the render server (Core Animation on iOS).</li>
+    </ol>
+
+    <div class="diagram">State write
+    |
+    v
+[ Invalidated attributes ] --depends-on--&gt; [ Rules re-run ]
+    |
+    v
+[ Updated layout/render attributes ] --&gt; [ Diff vs last frame ] --&gt; [ CA transaction ]</div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Invalidation style</th>
+                <th>What triggers it</th>
+                <th>Observable symptom</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Fine-grained</td>
+                <td>Leaf state only read by a small subtree</td>
+                <td>Only that subtree’s bodies tend to re-run</td>
+            </tr>
+            <tr>
+                <td>Broad fan-out</td>
+                <td>Shared observable at root, many readers</td>
+                <td>Large parts of the tree refresh together</td>
+            </tr>
+            <tr>
+                <td>Structural churn</td>
+                <td>Identity changes, type-erased dynamism</td>
+                <td>Re-allocation of graph regions; state resets</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>1.5 AG and the heap: memory implications</h3>
+    <p>
+        Your <code>View</code> structs may be tiny, but AG persists per-node metadata, dependency lists, caches, and bridging
+        to UIKit/AppKit where needed. Large hierarchies, deep chains of modifiers, and “accidental” graph fan-out (many
+        dependencies from one hot node) increase steady-state memory and make invalidation waves more expensive.
+    </p>
+    <ul>
+        <li><strong>Modifier chains</strong> are not “free composition”—each layer can add graph structure and intermediate attributes.</li>
+        <li><strong>Conditional branches</strong> that churn identity can allocate and tear down graph regions repeatedly.</li>
+        <li><strong>Type erasure</strong> (<code>AnyView</code>) can inhibit optimizations and increase dynamism in the graph.</li>
+        <li><strong>Environment / preference propagation</strong> can create many dependent attributes if overused on hot paths.</li>
+    </ul>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Practical takeaway</div>
+        <p>
+            Performance work at staff level often looks like <em>graph hygiene</em>: shrinking hot subtrees, stabilizing identity,
+            and avoiding redundant dynamic reads—not micro-optimizing Swift syntax.
+        </p>
+    </div>
+
+    <h3>1.6 Code: state change → AG-driven update</h3>
+    <p>
+        The following example is intentionally noisy with <code>print</code> so you can map console output to graph invalidation
+        (pair with <code>_printChanges()</code> in <a href="#debugging">§5</a>).
+    </p>
+<pre><code><span class="keyword">import</span> SwiftUI
+
+<span class="keyword">struct</span> <span class="type">CounterDemo</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> count = <span class="number">0</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span> {
+            <span class="type">Text</span>(<span class="string">"Count: \(count)"</span>)
+            <span class="type">Button</span>(<span class="string">"Increment"</span>) {
+                count += <span class="number">1</span>   <span class="comment">// 1) writes @State container</span>
+            }
+        }
+        .padding()
+        .onChange(of: count) { oldValue, newValue <span class="keyword">in</span>
+            <span class="comment">// 2) side effect after commit; not a substitute for understanding AG</span>
+            <span class="func">print</span>(<span class="string">"count: \(oldValue) -&gt; \(newValue)"</span>)
+        }
+    }
+}</code></pre>
+    <p>
+        When <code>count</code> changes, SwiftUI marks the attributes that <em>read</em> <code>count</code> during the last
+        <code>body</code> evaluation as stale. On the next frame tick, those attributes recompute; layout for
+        <code>Text</code> may rerun because the string value changed.
+    </p>
+
+    <h3>1.7 Code: <code>ObservableObject</code> and broad invalidation</h3>
+    <p>
+        Reference-type observables integrate with a different change-notification path than isolated <code>@State</code>, but the
+        <em>result</em> is still graph invalidation: <code>objectWillChange</code> (or macro-generated equivalents) signals dependents.
+        If dozens of views read the same object, fan-out is easy to create accidentally.
+    </p>
+<pre><code><span class="keyword">import</span> SwiftUI
+<span class="keyword">import</span> Combine
+
+<span class="keyword">final</span> <span class="keyword">class</span> <span class="type">Cart</span>: <span class="type">ObservableObject</span> {
+    <span class="keyword">@Published</span> <span class="keyword">var</span> itemCount: <span class="type">Int</span> = <span class="number">0</span>
+    <span class="keyword">@Published</span> <span class="keyword">var</span> lastError: <span class="type">String</span>? = <span class="keyword">nil</span>
+}
+
+<span class="keyword">struct</span> <span class="type">Shelf</span>: <span class="type">View</span> {
+    <span class="keyword">@ObservedObject</span> <span class="keyword">var</span> cart: <span class="type">Cart</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">Text</span>(<span class="string">"Items: \(cart.itemCount)"</span>)
+    }
+}
+
+<span class="keyword">struct</span> <span class="type">Banner</span>: <span class="type">View</span> {
+    <span class="keyword">@ObservedObject</span> <span class="keyword">var</span> cart: <span class="type">Cart</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="keyword">if</span> <span class="keyword">let</span> e = cart.lastError {
+            <span class="type">Text</span>(e).foregroundStyle(.red)
+        }
+    }
+}</code></pre>
+    <p>
+        A single <code>cart</code> mutation can invalidate <em>every</em> view that observed that object during the last evaluation,
+        even if a particular child only cares about one field—unless you refactor observation boundaries (smaller objects,
+        <code>@Observable</code> field granularity, or passing only needed values).
+    </p>
+
+    <!-- ===================== 2. ViewGraph ===================== -->
+    <h2 id="viewgraph">2. ViewGraph structure</h2>
+
+    <h3>2.1 How SwiftUI builds the view graph from <code>View</code> structs</h3>
+    <p>
+        SwiftUI walks your type-erased view tree (the “structure” produced by <code>body</code>) and constructs a parallel
+        <strong>ViewGraph</strong>: a persistent representation of the hierarchy, identities, and slots where child content attaches.
+        The walk is driven by generic static typing at compile time, but the runtime graph is dynamic across states.
+    </p>
+    <p>
+        Key idea: <code>body</code> returns a <em>description</em>; ViewGraph stores <em>instances</em> keyed by identity and structure.
+        When the description changes, SwiftUI <em>diffs</em> it against the previous description to decide whether to update nodes,
+        move subtrees, or destroy and recreate regions of the graph.
+    </p>
+
+    <h3>2.2 View graph vs render tree</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Layer</th>
+                <th>What it is</th>
+                <th>Analog</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>View graph</strong></td>
+                <td>Logical SwiftUI hierarchy: identities, layout inputs, preferences, gestures, accessibility.</td>
+                <td>“What the UI <em>means</em>.”</td>
+            </tr>
+            <tr>
+                <td><strong>Render tree / platform layer</strong></td>
+                <td>Concrete rendering: Core Animation layers, UIView hosts, Metal draws, etc.</td>
+                <td>“What actually <em>paints</em>.”</td>
+            </tr>
+        </tbody>
+    </table>
+    <p>
+        Many views are “thin” and compile down to a small set of platform primitives. Others (like lazy containers) have
+        elaborate internal graphs that defer work until visibility. A staff answer acknowledges both trees: you can have a
+        small render tree while the view graph is still doing significant work (and vice versa for some bridged views).
+    </p>
+
+    <h3>2.3 How ViewGraph maps to AttributeGraph</h3>
+    <p>
+        ViewGraph carries semantic structure; AG carries incremental computation. In practice, view nodes (and modifiers)
+        <em>install</em> attributes and rules into AG so that when inputs change, layout and display attributes update without
+        rebuilding everything from scratch.
+    </p>
+    <ul>
+        <li><strong>View identity</strong> determines whether a node is updated in place or replaced.</li>
+        <li><strong>AG dependencies</strong> determine how much recomputes when that node’s inputs change.</li>
+        <li><strong>Transactions / animation</strong> attach timing metadata to attribute updates.</li>
+    </ul>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Concern</th>
+                <th>Primary owner</th>
+                <th>Staff note</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>“Is this the same logical control?”</td>
+                <td>ViewGraph + identity</td>
+                <td>Drives <code>@State</code> lifetime and focus</td>
+            </tr>
+            <tr>
+                <td>“What recomputes when a field flips?”</td>
+                <td>AttributeGraph</td>
+                <td>Drives CPU cost per frame</td>
+            </tr>
+            <tr>
+                <td>“What actually moved on screen?”</td>
+                <td>Render server / CA</td>
+                <td>Drives GPU + compositing</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>2.4 ASCII: sample UI ViewGraph</h3>
+    <p>
+        Consider a navigation-style screen with a conditional banner:
+    </p>
+<pre><code><span class="keyword">struct</span> <span class="type">SampleScreen</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> showBanner = <span class="keyword">true</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">NavigationStack</span> {
+            <span class="type">List</span> {
+                <span class="keyword">if</span> showBanner {
+                    <span class="type">Text</span>(<span class="string">"Headline"</span>).font(.headline)
+                }
+                <span class="type">Text</span>(<span class="string">"Row"</span>)
+            }
+        }
+    }
+}</code></pre>
+
+    <div class="diagram">ViewGraph (logical, simplified)
+
+Root: NavigationStack
+ |
+ +-- List (container)
+      |
+      +-- Branch: Conditional (showBanner)
+      |     |
+      |     +-- [TRUE slot]  Text("Headline") + font modifier chain
+      |     |
+      |     +-- [FALSE slot] (empty / placeholder internal node)
+      |
+      +-- Text("Row")
+
+Each node carries:
+- structural identity (type + position + explicit id if any)
+- link into AG for layout, environment, render attributes</div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Why this matters in interviews</div>
+        <p>
+            Staff candidates explain <em>where</em> state lives (graph), <em>what</em> invalidates (dependencies), and
+            <em>how</em> structure diffs preserve or destroy nodes (identity). That triad is the SwiftUI performance story.
+        </p>
+    </div>
+
+    <!-- ===================== 3. body ===================== -->
+    <h2 id="body-calls">3. How <code>body</code> is called (and when it is not)</h2>
+
+    <h3>3.1 <code>body</code> is computed, not stored</h3>
+    <p>
+        A SwiftUI view’s <code>body</code> is a computed property. There is no cached “last body” value sitting in your struct.
+        Instead, SwiftUI stores the persistent graph state elsewhere and invokes <code>body</code> when it needs a fresh structural
+        description consistent with current inputs.
+    </p>
+
+    <h3>3.2 SwiftUI calls <code>body</code> when dependencies change</h3>
+    <p>
+        If no input that your <code>body</code> <em>read</em> last time has changed, SwiftUI can skip re-invoking
+        <code>body</code> for that node. This is not magic compiler elision—it is graph-driven invalidation.
+    </p>
+
+    <h3>3.3 Proof with <code>Self._printChanges()</code></h3>
+    <p>
+        In DEBUG builds, SwiftUI can log which values changed, triggering recomputation. Place
+        <code>Self._printChanges()</code> early in <code>body</code> to correlate prints with dependency changes
+        (details in <a href="#debugging">§5</a>).
+    </p>
+
+    <h3>3.4 When <code>body</code> is skipped</h3>
+    <ul>
+        <li><strong>No invalid inputs:</strong> static subtree with no dynamic reads.</li>
+        <li><strong>Equatable optimization:</strong> for types that implement <code>Equatable</code>, SwiftUI may avoid calling
+            <code>body</code> if the instance compares equal (see <code>EquatableView</code> / <code>.equatable()</code> patterns).</li>
+        <li><strong>Parent not invalidated:</strong> if a parent’s <code>body</code> does not run, nested descriptions may not be
+            re-queried unless their own inputs changed via other paths (the graph is nuanced; use logging to verify).</li>
+    </ul>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common misconception</div>
+        <p>
+            Putting <code>print</code> in <code>body</code> and seeing it “not fire” does not prove your view is lazy in the way
+            UIKit’s <code>layoutSubviews</code> is lazy. It usually means <strong>no dependency you read changed</strong>, or an
+            optimization short-circuited the call.
+        </p>
+    </div>
+
+    <h3>3.5 Code: prints expose call patterns</h3>
+<pre><code><span class="keyword">import</span> SwiftUI
+
+<span class="keyword">struct</span> <span class="type">Parent</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> title = <span class="string">"Hello"</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="func">print</span>(<span class="string">"Parent.body"</span>)
+        <span class="type">VStack</span> {
+            <span class="type">Child</span>(label: title)
+            <span class="type">StaticChild</span>()
+        }
+    }
+}
+
+<span class="keyword">struct</span> <span class="type">Child</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> label: <span class="type">String</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="func">print</span>(<span class="string">"Child.body \(label)"</span>)
+        <span class="type">Text</span>(label)
+    }
+}
+
+<span class="keyword">struct</span> <span class="type">StaticChild</span>: <span class="type">View</span> {
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="func">print</span>(<span class="string">"StaticChild.body"</span>)
+        <span class="type">Text</span>(<span class="string">"constant"</span>)
+    }
+}</code></pre>
+    <p>
+        When <code>title</code> changes, expect <code>Parent.body</code> and <code>Child.body</code> to run again because
+        <code>Parent</code> read <code>title</code> and <code>Child</code> depends on the updated input. <code>StaticChild</code>
+        may or may not print depending on whether SwiftUI re-queries that subtree during the same invalidation wave—
+        <strong>measure, don’t guess</strong>.
+    </p>
+
+    <h3>3.6 Equatable short-circuit example</h3>
+<pre><code><span class="keyword">struct</span> <span class="type">HeavyChild</span>: <span class="type">View</span>, <span class="type">Equatable</span> {
+    <span class="keyword">let</span> value: <span class="type">Int</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="func">print</span>(<span class="string">"HeavyChild.body \(value)"</span>)
+        <span class="type">Text</span>(<span class="string">"\(value)"</span>)
+    }
+
+    <span class="keyword">static</span> <span class="keyword">func</span> == (lhs: <span class="type">HeavyChild</span>, rhs: <span class="type">HeavyChild</span>) -&gt; <span class="type">Bool</span> {
+        lhs.value == rhs.value
+    }
+}
+
+<span class="keyword">struct</span> <span class="type">ParentEq</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> tick = <span class="number">0</span>
+    <span class="keyword">private</span> <span class="keyword">let</span> stable = <span class="number">42</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span> {
+            <span class="type">Button</span>(<span class="string">"tick \(tick)"</span>) { tick += <span class="number">1</span> }
+            <span class="type">HeavyChild</span>(value: stable).equatable()
+        }
+    }
+}</code></pre>
+    <p>
+        Here, toggling <code>tick</code> may re-run <code>ParentEq.body</code>, but <code>HeavyChild</code> can skip if SwiftUI’s
+        fast path determines the equatable view’s value did not change. Always validate with Instruments and logging on the
+        OS versions you ship.
+    </p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Signal</th>
+                <th>Likely meaning</th>
+                <th>Next step</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>body</code> prints every frame</td>
+                <td>Timer, animation, or upstream invalidation</td>
+                <td>Trace who invalidates the parent</td>
+            </tr>
+            <tr>
+                <td><code>body</code> never prints</td>
+                <td>No subscribed inputs changing</td>
+                <td>Confirm reads vs writes; check identity</td>
+            </tr>
+            <tr>
+                <td><code>body</code> prints on unrelated model edits</td>
+                <td>Over-broad observation</td>
+                <td>Split models / localize <code>@Observable</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ===================== 4. Identity ===================== -->
+    <h2 id="identity">4. Structural identity vs explicit identity</h2>
+
+    <h3>4.1 Structural identity</h3>
+    <p>
+        Structural identity is <em>where</em> a view sits in the hierarchy: the path through container views, conditional
+        branches, loops, and modifier order. Two views of the same type at the same structural position are treated as the
+        “same slot” unless something disrupts identity.
+    </p>
+
+    <h3>4.2 Explicit identity</h3>
+    <p>
+        Explicit identity is provided by <code>.id(...)</code> and by stable identifiers in <code>ForEach</code>. It tells SwiftUI
+        “treat this as a distinct node” even if structure looks similar, or force a reset when the id changes.
+    </p>
+
+    <h3>4.3 How identity affects state preservation</h3>
+    <p>
+        <code>@State</code> is stored <em>by identity</em>. If you replace a view’s identity, its state resets. If identity is stable,
+        state survives across <code>body</code> recomputations even though the struct is recreated.
+    </p>
+
+    <h3>4.4 Code: structural stability</h3>
+<pre><code><span class="keyword">struct</span> <span class="type">ToggleTextField</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> text = <span class="string">""</span>
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> showField = <span class="keyword">true</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span> {
+            <span class="type">Toggle</span>(<span class="string">"Show"</span>, isOn: $showField)
+            <span class="keyword">if</span> showField {
+                <span class="type">TextField</span>(<span class="string">"Type"</span>, text: $text)
+            }
+        }
+    }
+}</code></pre>
+    <p>
+        Toggling <code>showField</code> destroys the <code>TextField</code> slot when the branch disappears; when it returns, you get a
+        <em>new</em> structural identity—often resetting focus and sometimes state depending on container behavior.
+    </p>
+
+    <h3>4.5 Code: explicit <code>.id</code> forcing reset</h3>
+<pre><code><span class="keyword">struct</span> <span class="type">ResetDemo</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> draft = <span class="string">""</span>
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> token = <span class="number">0</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span> {
+            <span class="type">TextField</span>(<span class="string">"Draft"</span>, text: $draft)
+                .id(token) <span class="comment">// bump token to recreate field state</span>
+
+            <span class="type">Button</span>(<span class="string">"Reset field"</span>) {
+                token += <span class="number">1</span>
+            }
+        }
+    }
+}</code></pre>
+
+    <h3>4.6 Code: <code>ForEach</code> identity</h3>
+<pre><code><span class="keyword">struct</span> <span class="type">RowModel</span>: <span class="type">Identifiable</span>, <span class="type">Hashable</span> {
+    <span class="keyword">let</span> id: <span class="type">UUID</span>
+    <span class="keyword">var</span> title: <span class="type">String</span>
+}
+
+<span class="keyword">struct</span> <span class="type">ListDemo</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> rows: [<span class="type">RowModel</span>] = [
+        .init(id: .init(), title: <span class="string">"A"</span>),
+        .init(id: .init(), title: <span class="string">"B"</span>)
+    ]
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">List</span> {
+            <span class="type">ForEach</span>(rows) { row <span class="keyword">in</span>
+                <span class="type">Text</span>(row.title)
+            }
+        }
+    }
+}</code></pre>
+    <p>
+        Stable <code>id</code> values let SwiftUI move rows instead of treating every refresh as a wholesale new list—critical for
+        animations and for preserving per-row state.
+    </p>
+
+    <h3>4.7 Comparison table</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Topic</th>
+                <th>Structural identity</th>
+                <th>Explicit identity</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Defined by</td>
+                <td>Hierarchy path, branch order, loop position, modifier chain shape.</td>
+                <td><code>.id</code>, <code>ForEach</code>’s id, navigation paths that carry ids.</td>
+            </tr>
+            <tr>
+                <td>State impact</td>
+                <td>Moving code between branches changes what state survives.</td>
+                <td>Changing id resets state tied to that slot; stable id preserves it.</td>
+            </tr>
+            <tr>
+                <td>Animation</td>
+                <td>Unstable structure causes jank or implicit cross-fades.</td>
+                <td>Stable ids enable matched transitions and move operations.</td>
+            </tr>
+            <tr>
+                <td>Debugging</td>
+                <td>Harder to see in API; infer from view tree.</td>
+                <td>Explicit, intentional—good for repro cases.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ===================== 5. Debugging ===================== -->
+    <h2 id="debugging">5. <code>_ViewDebug</code> &amp; <code>Self._printChanges()</code></h2>
+
+    <h3>5.1 <code>Self._printChanges()</code> usage</h3>
+    <p>
+        In DEBUG, call <code>Self._printChanges()</code> at the top of <code>body</code> to print which tracked fields changed
+        since the last evaluation of this view. It is an underscore API: usable for local debugging, not for production.
+    </p>
+
+<pre><code><span class="keyword">struct</span> <span class="type">DebugMe</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> a = <span class="number">0</span>
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> b = <span class="number">0</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">Self</span>._printChanges()
+        <span class="type">VStack</span> {
+            <span class="type">Text</span>(<span class="string">"a=\(a) b=\(b)"</span>)
+            <span class="type">Button</span>(<span class="string">"a++"</span>) { a += <span class="number">1</span> }
+            <span class="type">Button</span>(<span class="string">"b++"</span>) { b += <span class="number">1</span> }
+        }
+    }
+}</code></pre>
+
+    <h3>5.2 What the output means (reading the tea leaves)</h3>
+    <ul>
+        <li><strong>Lists changed fields</strong> that participate in SwiftUI’s change detection for this view.</li>
+        <li><strong>Helps prove</strong> whether a parent is invalidating a child unnecessarily (over-reading dynamic state).</li>
+        <li><strong>Does not replace</strong> Instruments; it answers “<em>why did this body run?</em>” at small scale.</li>
+        <li><strong>Correlates with AG invalidation</strong> in the sense that listed inputs are the ones whose writes dirtied dependencies for this node’s last evaluation.</li>
+    </ul>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Underscore APIs</div>
+        <p>
+            Private debug hooks can change between OS releases. Guard them with <code>#if DEBUG</code> and never ship them to
+            production binaries.
+        </p>
+    </div>
+
+    <h3>5.3 <code>_ViewDebug</code> environment variable</h3>
+    <p>
+        Apple’s internal view debugging infrastructure is often enabled via environment variables in Xcode schemes
+        (names and values evolve between Xcode and OS releases). Typical goals include dumping view graph diagnostics,
+        highlighting update regions, or logging structural diffs. Treat blog posts as hints, not contracts—verify on your
+        Xcode/SDK pair with a minimal repro app.
+    </p>
+    <p>
+        Practical pattern: create a dedicated scheme for SwiftUI investigations, document the exact variable names you used,
+        and pair env-based logging with <code>_printChanges()</code> so you connect “what changed” to “which subtree updated.”
+    </p>
+
+    <h3>5.4 Practical debugging workflow</h3>
+    <ol>
+        <li><strong>Reproduce</strong> with the smallest possible view tree.</li>
+        <li><strong>Add</strong> <code>_printChanges()</code> to suspect views; map changes to inputs.</li>
+        <li><strong>Check identity</strong> churn (<code>.id</code>, <code>ForEach</code> keys, conditional branches).</li>
+        <li><strong>Profile</strong> with Instruments (SwiftUI template) for layout/render time.</li>
+        <li><strong>Validate fixes</strong> on oldest supported OS; graph optimizations differ by release.</li>
+    </ol>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Staff-level signal</div>
+        <p>
+            Strong candidates narrate a feedback loop: hypothesis → scoped log proof → graph/identity fix → instrumented
+            verification → rollout guardrails.
+        </p>
+    </div>
+
+    <h3>5.5 Code: combine prints and <code>_printChanges()</code></h3>
+<pre><code><span class="keyword">struct</span> <span class="type">InstrumentedRow</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> title: <span class="type">String</span>
+    <span class="keyword">let</span> subtitle: <span class="type">String</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">Self</span>._printChanges()
+        <span class="func">print</span>(<span class="string">"InstrumentedRow.body title=\(title)"</span>)
+        <span class="keyword">return</span> <span class="type">VStack</span>(alignment: .leading) {
+            <span class="type">Text</span>(title).font(.headline)
+            <span class="type">Text</span>(subtitle).font(.subheadline).foregroundStyle(.secondary)
+        }
+    }
+}</code></pre>
+    <p>
+        If <code>subtitle</code> changes but your list identity is unstable, you may see confusing mixtures of structural recreation
+        and dependency updates—this combo helps separate “rebuilt node” from “same node, new inputs.”
+    </p>
+
+    <!-- ===================== 6. Render loop ===================== -->
+    <h2 id="render-loop">6. The SwiftUI render loop</h2>
+
+    <p>
+        The render loop is the bridge from Swift mutation to pixels. It is asynchronous with respect to your button action:
+        you change state <em>now</em>; SwiftUI applies the bulk of work on a coordinated scheduler tied to the run loop and
+        display pipeline.
+    </p>
+
+    <h3>6.1 End-to-end: state → CA commit</h3>
+    <ol>
+        <li><strong>Mutation:</strong> <code>@State</code>, <code>@Binding</code>, observable model, environment injection, etc.</li>
+        <li><strong>Invalidation:</strong> AG marks dependent attributes dirty; ViewGraph may need fresh structure.</li>
+        <li><strong>Coalesced pass:</strong> SwiftUI schedules an update (often merging multiple mutations).</li>
+        <li><strong><code>body</code> / structural diff:</strong> re-evaluate descriptions where needed; compute insert/move/remove.</li>
+        <li><strong>Layout:</strong> resolve proposals and sizes; may be multi-pass for stacks, grids, text.</li>
+        <li><strong>Render plan:</strong> emit Core Animation mutations (properties, animations, layer creation).</li>
+        <li><strong>Commit:</strong> CA transaction flushes to the render server for compositing.</li>
+    </ol>
+
+    <h3>6.2 Integration with RunLoop</h3>
+    <p>
+        SwiftUI batches updates to align with the run loop’s phases, reducing redundant work when many properties change in
+        a single event handler. This is why “I set ten @State properties” often produces one visible frame update.
+    </p>
+    <p>
+        Staff framing: the RunLoop is the <em>temporal zipper</em> that merges model events (gestures, timers, async callbacks)
+        into coherent frames. Fighting that batching—forcing synchronous layout everywhere—usually hurts more than it helps.
+    </p>
+
+    <h3>6.3 Transaction system</h3>
+    <p>
+        <code>withAnimation</code>, <code>transaction</code> modifiers, and implicit animations attach metadata describing
+        <em>how</em> attribute changes should interpolate. Transactions propagate through the view tree, influencing whether
+        changes are animated, immediate, or disabled.
+    </p>
+<pre><code><span class="keyword">struct</span> <span class="type">TxnDemo</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> value = <span class="number">0</span>
+    <span class="keyword">@Environment</span>(\.accessibilityReduceMotion) <span class="keyword">private</span> <span class="keyword">var</span> reduceMotion
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span> {
+            <span class="type">Text</span>(<span class="string">"\(value)"</span>)
+            <span class="type">Button</span>(<span class="string">"Go"</span>) {
+                <span class="keyword">withAnimation</span>(.spring) {
+                    value += <span class="number">1</span>
+                }
+            }
+        }
+        .transaction { txn <span class="keyword">in</span>
+            <span class="keyword">if</span> reduceMotion { txn.disablesAnimations = <span class="keyword">true</span> }
+        }
+    }
+}</code></pre>
+
+    <h3>6.4 Animation integration</h3>
+    <p>
+        Animation is not a layer on top for cosmetic polish—it participates in how attribute updates are applied. Curve,
+        duration, and spring parameters become part of the scheduled CA changes. When animations overlap, SwiftUI resolves
+        them according to transaction rules (another staff talking point: animation conflicts and explicit transactions).
+    </p>
+
+    <h3>6.5 ASCII: full loop</h3>
+    <div class="diagram">User event / timer / async callback
+            |
+            v
+      [ Model mutation ]
+            |
+            v
+ [ AG invalidation + scheduling ]
+            |
+            v
+   RunLoop pass / frame boundary
+            |
+            v
+ [ body (selective) + structural diff ]
+            |
+            v
+      [ Layout attributes ]
+            |
+            v
+ [ Render attribute update ]
+            |
+            v
+ [ Core Animation transaction ]
+            |
+            v
+        GPU compositing</div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Stage</th>
+                <th>Symptom when expensive</th>
+                <th>Typical lever</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Structural diff</td>
+                <td>Hitches when toggling large subtrees</td>
+                <td>Stabilize identity, lazy containers, shrink branches</td>
+            </tr>
+            <tr>
+                <td>Layout</td>
+                <td>Wide <code>VStack</code> of heavy text</td>
+                <td>Flatten, cache, split, use lazy stacks</td>
+            </tr>
+            <tr>
+                <td>Rendering</td>
+                <td>Overdraw, shadows, blur</td>
+                <td>Simplify layer tree, rasterize judiciously</td>
+            </tr>
+            <tr>
+                <td>Animation</td>
+                <td>Jank on main thread</td>
+                <td>Reduce simultaneous animating properties</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ===================== 7. Architect ===================== -->
+    <h2 id="architect-scale">7. Architect callout: AG-aware performance at scale</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect framing</div>
+        <p>
+            At L6/staff, you are expected to debug systems you cannot fully read. AttributeGraph thinking turns “SwiftUI feels
+            slow” into a falsifiable model: <strong>graph size</strong>, <strong>invalidation fan-out</strong>, <strong>structural churn</strong>,
+            and <strong>commit cost</strong>. Your job is to locate which term dominates.
+        </p>
+    </div>
+
+    <h3>7.1 How graph size affects performance</h3>
+    <p>
+        Larger graphs mean more nodes to visit when invalidation propagates, more layout work in worst cases, and higher
+        baseline memory. Features that look innocent—nested observability, environment drilling, or giant modifier
+        chains—multiply nodes. The UI may still be “simple” visually while the graph is not.
+    </p>
+
+    <h3>7.2 Strategies to keep AG manageable</h3>
+    <ul>
+        <li><strong>Shrink dynamic reads:</strong> push observation to the smallest subtree that needs it.</li>
+        <li><strong>Prefer stable identities:</strong> especially in lists and navigation stacks.</li>
+        <li><strong>Avoid type erasure</strong> on hot paths unless necessary; preserve concrete types for optimization.</li>
+        <li><strong>Split modules at UI boundaries:</strong> heavy models shouldn’t force broad invalidations through single
+            shared observables.</li>
+        <li><strong>Use lazy containers</strong> for large content; eager layout is a graph and CPU hazard.</li>
+        <li><strong>Prefer explicit data flow</strong> over ambient environment for high-frequency state.</li>
+    </ul>
+
+    <h3>7.3 Real-world debugging scenarios (narrative)</h3>
+    <p>
+        <strong>Scenario A — “Scrolling stutters”:</strong> Often a combination of eager layout and expensive
+        <code>body</code> work. Verify whether cells recompute due to parent environment changes or unstable
+        <code>ForEach</code> ids. Instruments shows time in layout vs rendering; pair with <code>_printChanges()</code> in
+        suspicious rows.
+    </p>
+    <p>
+        <strong>Scenario B — “Typing lags in a complex screen”:</strong> Each keystroke invalidates bindings; if the screen
+        reads too much shared state high in the tree, large subgraphs may refresh. Fix by scoping text field state locally
+        and deferring model sync (debounce) outside the hot view path.
+    </p>
+    <p>
+        <strong>Scenario C — “Navigation transitions hitch”:</strong> Identity resets recreate heavy child state; matched
+        geometry effects recompute aggressively. Stabilize destination ids, reduce animated properties, and avoid allocating
+        large transient views inside transitions.
+    </p>
+
+    <h3>7.4 Anti-patterns vs mitigations</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Anti-pattern</th>
+                <th>Why it hurts AG / graph</th>
+                <th>Mitigation</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Mega-<code>ObservableObject</code> at root</td>
+                <td>Any <code>objectWillChange</code> fans out broadly.</td>
+                <td>Partition models; use observation scoped to features.</td>
+            </tr>
+            <tr>
+                <td>Random <code>ForEach</code> ids</td>
+                <td>Constant insert/remove churn; state loss.</td>
+                <td>Stable domain ids; explicit diff-friendly models.</td>
+            </tr>
+            <tr>
+                <td>Churning <code>AnyView</code> wrappers</td>
+                <td>Obscures type structure; blocks optimizations.</td>
+                <td>Use <code>@ViewBuilder</code> generics; group with <code>Group</code> carefully.</td>
+            </tr>
+            <tr>
+                <td>Environment overload</td>
+                <td>Deep propagation retriggers dependent subtrees.</td>
+                <td>Localize values; prefer explicit parameters when hot.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>7.5 Closing synthesis</h3>
+    <p>
+        AttributeGraph is the hidden contract behind SwiftUI’s ergonomics: it trades a pleasant API for a sophisticated
+        incremental runtime. Staff engineers reason in terms of <em>invalidation</em>, <em>identity</em>, and <em>commits</em>—then
+        use tools to prove which link in the chain broke. That mental model maps cleanly to how Apple discusses SwiftUI
+        performance internally and how you should narrate large-app war stories in interviews.
+    </p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">One-sentence interview answer</div>
+        <p>
+            “SwiftUI keeps a persistent dependency graph (AttributeGraph) that tracks what each view’s layout and render
+            attributes need; when state changes, it invalidates the smallest subgraph, selectively re-runs
+            <code>body</code>, diffs structure by identity, and commits Core Animation transactions on the run loop—animations
+            and transactions annotate how those attribute updates apply.”
+        </p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="index.html">← Series Overview</a>
+        <a href="02-view-identity-diffing.html">Next: View Identity →</a>
+    </div>
+</div>
+</body>
+</html>

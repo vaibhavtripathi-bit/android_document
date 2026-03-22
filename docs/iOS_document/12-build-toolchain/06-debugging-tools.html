@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Debugging Tools — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Build &amp; Toolchain</a><span class="sep">›</span>
+        Debugging Tools
+    </nav>
+
+    <h1>Debugging Tools</h1>
+    <p class="subtitle">Advanced debugging with LLDB, sanitizers, and Xcode tools — from the critical differences between po, v, and p, through symbolic breakpoints and Chisel extensions, to Address/Thread/UB Sanitizers, malloc debugging, view hierarchy debugging, and memory graph analysis. The tools that separate senior engineers from Staff engineers.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#lldb">1. LLDB Deep Dive</a></li>
+            <li><a href="#po-v-p">2. po vs v vs p</a></li>
+            <li><a href="#breakpoints">3. Breakpoint Actions &amp; Conditions</a></li>
+            <li><a href="#symbolic">4. Symbolic Breakpoints</a></li>
+            <li><a href="#chisel">5. Chisel (Facebook's LLDB Extensions)</a></li>
+            <li><a href="#asan">6. Address Sanitizer (ASan)</a></li>
+            <li><a href="#tsan">7. Thread Sanitizer (TSan)</a></li>
+            <li><a href="#ubsan">8. Undefined Behavior Sanitizer (UBSan)</a></li>
+            <li><a href="#malloc">9. Malloc Debugging</a></li>
+            <li><a href="#xcode-tools">10. Xcode Debugging Features</a></li>
+            <li><a href="#architect">11. Architect: Sanitizers in CI</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="lldb">1. LLDB Deep Dive</h2>
+
+    <p>LLDB is Apple's debugger, built on the LLVM project. It's far more powerful than most developers realize — it can evaluate arbitrary expressions, script with Python, inspect memory layout, and even modify running code.</p>
+
+    <h3>1.1 LLDB Architecture</h3>
+
+    <div class="diagram">
+LLDB Architecture:
+
+┌─────────────────────────────────────────────────────────────┐
+│                      Xcode IDE                               │
+│  (Debug navigator, variables view, console)                  │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ Debug Adapter Protocol
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                        LLDB                                  │
+│                                                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ Command       │  │ Expression   │  │ Python Scripting │   │
+│  │ Interpreter   │  │ Evaluator    │  │ Bridge           │   │
+│  └──────┬───────┘  └──────┬───────┘  └──────────────────┘   │
+│         │                 │                                   │
+│  ┌──────┴─────────────────┴──────────────────────────────┐   │
+│  │              Target / Process / Thread                  │   │
+│  │              Frame / Variable / Type                    │   │
+│  └────────────────────────┬──────────────────────────────┘   │
+│                           │                                   │
+└───────────────────────────┼──────────────────────────────────┘
+                            │ ptrace / Mach exceptions
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Debugged Process                           │
+│  (MyApp running on device/simulator)                         │
+└─────────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>1.2 Essential LLDB Commands</h3>
+
+    <pre><code><span class="comment"># Navigation</span>
+(lldb) thread list                    <span class="comment"># List all threads</span>
+(lldb) thread select 3                <span class="comment"># Switch to thread 3</span>
+(lldb) bt                             <span class="comment"># Backtrace current thread</span>
+(lldb) bt all                         <span class="comment"># Backtrace all threads</span>
+(lldb) frame select 2                 <span class="comment"># Switch to frame 2</span>
+(lldb) frame variable                 <span class="comment"># Show all local variables</span>
+
+<span class="comment"># Execution control</span>
+(lldb) continue                       <span class="comment"># Resume execution (c)</span>
+(lldb) step                           <span class="comment"># Step into (s)</span>
+(lldb) next                           <span class="comment"># Step over (n)</span>
+(lldb) finish                         <span class="comment"># Step out of current function</span>
+(lldb) thread return                  <span class="comment"># Return from current function immediately</span>
+
+<span class="comment"># Memory inspection</span>
+(lldb) memory read 0x7fff5fbff8a0     <span class="comment"># Read memory at address</span>
+(lldb) memory read -s4 -fx -c8 ptr    <span class="comment"># Read 8 x 4-byte hex values</span>
+(lldb) x/16xb ptr                     <span class="comment"># Read 16 bytes in hex (GDB syntax)</span>
+
+<span class="comment"># Type inspection</span>
+(lldb) type lookup MyClass            <span class="comment"># Show type layout</span>
+(lldb) image lookup -t MyProtocol     <span class="comment"># Find type definition</span>
+(lldb) image lookup -n myFunction     <span class="comment"># Find function by name</span>
+(lldb) image lookup -a 0x100004000    <span class="comment"># Find symbol at address</span>
+
+<span class="comment"># Register inspection</span>
+(lldb) register read                  <span class="comment"># All registers</span>
+(lldb) register read x0               <span class="comment"># Specific register (ARM64)</span>
+(lldb) register read rax              <span class="comment"># Specific register (x86_64)</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="po-v-p">2. po vs v vs p</h2>
+
+    <p>These three LLDB commands look similar but work completely differently under the hood. Understanding the differences is critical for efficient debugging.</p>
+
+    <h3>2.1 Comparison</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Command</th>
+                <th>Full Name</th>
+                <th>How It Works</th>
+                <th>Speed</th>
+                <th>Side Effects</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>v</code></td>
+                <td><code>frame variable</code></td>
+                <td>Reads debug info directly from memory — no code execution</td>
+                <td>Fastest</td>
+                <td>None</td>
+            </tr>
+            <tr>
+                <td><code>p</code></td>
+                <td><code>expression</code></td>
+                <td>Compiles and executes a Swift expression in the debuggee</td>
+                <td>Slow</td>
+                <td>Can have side effects</td>
+            </tr>
+            <tr>
+                <td><code>po</code></td>
+                <td><code>expression -O</code></td>
+                <td>Like <code>p</code> but calls <code>debugDescription</code> on the result</td>
+                <td>Slowest</td>
+                <td>Can have side effects</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>2.2 When to Use Each</h3>
+
+    <pre><code><span class="comment">// Given this code paused at a breakpoint:</span>
+<span class="keyword">let</span> user = <span class="type">User</span>(name: <span class="string">"Alice"</span>, age: <span class="number">30</span>)
+<span class="keyword">let</span> items = [<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>, <span class="number">4</span>, <span class="number">5</span>]
+
+<span class="comment">// v — Use for simple variable inspection (FASTEST)</span>
+(lldb) v user
+<span class="comment">// (User) user = (name = "Alice", age = 30)</span>
+<span class="comment">// Reads directly from debug info — no compilation, no execution</span>
+
+(lldb) v user.name
+<span class="comment">// (String) user.name = "Alice"</span>
+
+(lldb) v items
+<span class="comment">// ([Int]) items = 5 values { [0] = 1, [1] = 2, ... }</span>
+
+<span class="comment">// p — Use when you need to evaluate an expression</span>
+(lldb) p user.name.count
+<span class="comment">// (Int) $R0 = 5</span>
+<span class="comment">// Compiles "user.name.count" as Swift, executes it</span>
+
+(lldb) p items.filter { $0 > 2 }
+<span class="comment">// ([Int]) $R1 = [3, 4, 5]</span>
+<span class="comment">// Compiles and runs the filter closure</span>
+
+<span class="comment">// po — Use when you want custom description output</span>
+(lldb) po user
+<span class="comment">// User(name: "Alice", age: 30)</span>
+<span class="comment">// Calls user.debugDescription (or description)</span>
+
+(lldb) po items
+<span class="comment">// [1, 2, 3, 4, 5]</span>
+<span class="comment">// Calls Array's description</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Why v Is So Much Faster</div>
+        <p><code>v</code> reads variable values directly from DWARF debug info and the process's memory. It doesn't compile any code. <code>p</code> and <code>po</code> both spin up a Swift compiler instance, compile your expression, inject the compiled code into the debuggee process, execute it, and read back the result. This is why <code>p</code> can take seconds on the first invocation (compiler warm-up) while <code>v</code> is instant. Use <code>v</code> as your default and only switch to <code>p</code>/<code>po</code> when you need expression evaluation.</p>
+    </div>
+
+    <h3>2.3 Advanced Expression Evaluation</h3>
+
+    <pre><code><span class="comment"># Evaluate multi-line expressions</span>
+(lldb) expression
+Enter expressions, then terminate with an empty line:
+  let filtered = items.filter { $0 > 2 }
+  print("Count: \(filtered.count)")
+
+<span class="comment"># Import a module for expression evaluation</span>
+(lldb) expression import Foundation
+(lldb) expression import UIKit
+
+<span class="comment"># Cast and inspect</span>
+(lldb) expression let vc = unsafeBitCast(0x7f8b2c, to: UIViewController.self)
+(lldb) po vc.view.subviews
+
+<span class="comment"># Modify variables at runtime</span>
+(lldb) expression user.name = "Bob"
+(lldb) expression items.append(6)
+
+<span class="comment"># Call methods</span>
+(lldb) expression UIApplication.shared.windows.first?.rootViewController</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="breakpoints">3. Breakpoint Actions &amp; Conditions</h2>
+
+    <p>Breakpoints in LLDB are far more powerful than simple "stop here" markers. They can have conditions, actions, and auto-continue behavior that turns them into powerful debugging instruments.</p>
+
+    <h3>3.1 Conditional Breakpoints</h3>
+
+    <pre><code><span class="comment"># Break only when condition is true</span>
+(lldb) breakpoint set -f ViewController.swift -l 42 -c "index > 100"
+
+<span class="comment"># Break on Nth hit</span>
+(lldb) breakpoint set -f ViewController.swift -l 42 -i 100
+<span class="comment"># Skips first 99 hits, breaks on 100th</span>
+
+<span class="comment"># Break on function with condition</span>
+(lldb) breakpoint set -n "processItem" -c "item.priority == .high"</code></pre>
+
+    <h3>3.2 Breakpoint Actions</h3>
+
+    <pre><code><span class="comment"># Log and continue (non-intrusive logging)</span>
+(lldb) breakpoint set -f NetworkManager.swift -l 55
+(lldb) breakpoint command add 1
+  expression print("Request URL: \(request.url!)")
+  continue
+  DONE
+
+<span class="comment"># Play a sound on breakpoint hit</span>
+(lldb) breakpoint set -n "didReceiveMemoryWarning"
+(lldb) breakpoint command add 2
+  shell say "Memory warning!"
+  DONE
+
+<span class="comment"># Capture backtrace to file</span>
+(lldb) breakpoint set -n "crash_handler"
+(lldb) breakpoint command add 3
+  bt all
+  script import datetime; open('/tmp/crash_' + str(datetime.datetime.now()) + '.txt', 'w').write(lldb.debugger.HandleCommand('bt all'))
+  DONE</code></pre>
+
+    <h3>3.3 Watchpoints</h3>
+
+    <pre><code><span class="comment"># Break when a variable's value changes</span>
+(lldb) watchpoint set variable user.name
+<span class="comment"># Breaks whenever user.name is written to</span>
+
+<span class="comment"># Watch a memory address</span>
+(lldb) watchpoint set expression -w write -- &amp;myGlobal
+
+<span class="comment"># Watch with condition</span>
+(lldb) watchpoint modify -c "user.name == \"error\""</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="symbolic">4. Symbolic Breakpoints</h2>
+
+    <p>Symbolic breakpoints break on function names rather than file/line locations. They're invaluable for debugging system framework behavior and catching common issues.</p>
+
+    <h3>4.1 Essential Symbolic Breakpoints</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Symbol</th>
+                <th>Purpose</th>
+                <th>When to Use</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>UIViewAlertForUnsatisfiableConstraints</code></td>
+                <td>Auto Layout constraint conflicts</td>
+                <td>Debugging layout issues</td>
+            </tr>
+            <tr>
+                <td><code>-[UIApplication main]</code></td>
+                <td>App launch entry point</td>
+                <td>Debugging launch issues</td>
+            </tr>
+            <tr>
+                <td><code>objc_exception_throw</code></td>
+                <td>ObjC exception thrown</td>
+                <td>Catching NSExceptions before crash</td>
+            </tr>
+            <tr>
+                <td><code>swift_willThrow</code></td>
+                <td>Swift error about to be thrown</td>
+                <td>Catching Swift errors at throw site</td>
+            </tr>
+            <tr>
+                <td><code>-[NSObject doesNotRecognizeSelector:]</code></td>
+                <td>Unrecognized selector sent</td>
+                <td>Debugging selector crashes</td>
+            </tr>
+            <tr>
+                <td><code>malloc_error_break</code></td>
+                <td>Malloc detected corruption</td>
+                <td>Debugging memory corruption</td>
+            </tr>
+            <tr>
+                <td><code>_UIApplicationMainPreparations</code></td>
+                <td>Before UIApplication setup</td>
+                <td>Measuring pre-main time</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment"># Set symbolic breakpoints from LLDB</span>
+(lldb) breakpoint set -n "UIViewAlertForUnsatisfiableConstraints"
+(lldb) breakpoint set -n "objc_exception_throw"
+(lldb) breakpoint set -n "swift_willThrow"
+
+<span class="comment"># Break on all methods of a class</span>
+(lldb) breakpoint set -r "\[MyViewController .*\]"
+
+<span class="comment"># Break on Swift method (mangled name)</span>
+(lldb) breakpoint set -n "$s7MyApp14ViewControllerC12viewDidLoadyyF"
+
+<span class="comment"># Break on any method containing "network" (case insensitive)</span>
+(lldb) breakpoint set -r -i "network"
+
+<span class="comment"># In Xcode: Debug → Breakpoints → Create Symbolic Breakpoint</span>
+<span class="comment"># Symbol: UIViewAlertForUnsatisfiableConstraints</span>
+<span class="comment"># Action: po [[UIWindow keyWindow] _autolayoutTrace]</span></code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Must-Have Symbolic Breakpoints</div>
+        <p>Add these to your Xcode user breakpoints (shared across all projects): <code>UIViewAlertForUnsatisfiableConstraints</code> with action <code>po [[UIWindow keyWindow] _autolayoutTrace]</code>, <code>objc_exception_throw</code>, and <code>swift_willThrow</code>. These catch the most common issues before they become hard-to-debug crashes.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="chisel">5. Chisel (Facebook's LLDB Extensions)</h2>
+
+    <p>Chisel is a collection of LLDB commands created by Facebook that dramatically improve the debugging experience, especially for UI debugging.</p>
+
+    <pre><code><span class="comment"># Install Chisel</span>
+brew install chisel
+
+<span class="comment"># Add to ~/.lldbinit</span>
+command script import /opt/homebrew/opt/chisel/libexec/fbchisellldb.py</code></pre>
+
+    <h3>5.1 Key Chisel Commands</h3>
+
+    <pre><code><span class="comment"># pviews — Print the view hierarchy</span>
+(lldb) pviews
+<span class="comment"># Prints the entire view tree with frames, hidden state, alpha</span>
+
+<span class="comment"># pvc — Print the view controller hierarchy</span>
+(lldb) pvc
+<span class="comment"># Shows presented/child view controller tree</span>
+
+<span class="comment"># fv — Find a view by class name</span>
+(lldb) fv UILabel
+<span class="comment"># Lists all UILabel instances in the hierarchy</span>
+
+<span class="comment"># fvc — Find a view controller by class name</span>
+(lldb) fvc MyViewController
+
+<span class="comment"># visualize — Open an image/view in Preview.app</span>
+(lldb) visualize myImageView
+
+<span class="comment"># border — Add colored border to a view (for debugging layout)</span>
+(lldb) border 0x7f8b2c00 --color red --width 2
+
+<span class="comment"># unborder — Remove border</span>
+(lldb) unborder 0x7f8b2c00
+
+<span class="comment"># hide/show — Toggle view visibility</span>
+(lldb) hide 0x7f8b2c00
+(lldb) show 0x7f8b2c00
+
+<span class="comment"># caflush — Force Core Animation to flush (update screen)</span>
+(lldb) caflush
+
+<span class="comment"># presponder — Print the responder chain</span>
+(lldb) presponder 0x7f8b2c00
+
+<span class="comment"># pinternals — Print internal ivar layout of an object</span>
+(lldb) pinternals 0x7f8b2c00
+
+<span class="comment"># bmessage — Set breakpoint on method even if not in debug symbols</span>
+(lldb) bmessage -[UIViewController viewDidAppear:]</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="asan">6. Address Sanitizer (ASan)</h2>
+
+    <p>ASan detects memory errors at runtime: use-after-free, buffer overflows, stack overflows, and more. It instruments every memory access with bounds checking.</p>
+
+    <h3>6.1 How ASan Works</h3>
+
+    <div class="diagram">
+ASan Memory Layout:
+
+Normal memory:
+  ┌────────────────────────────────────┐
+  │  Application Memory                │
+  │  [allocated] [free] [allocated]    │
+  └────────────────────────────────────┘
+
+With ASan:
+  ┌────────────────────────────────────┐
+  │  Application Memory                │
+  │  [alloc][REDZONE][free][REDZONE]   │  ← Redzones around allocations
+  └──────────────────┬─────────────────┘
+                     │ maps to
+                     ▼
+  ┌────────────────────────────────────┐
+  │  Shadow Memory (1/8 of app memory)│
+  │  Each byte tracks 8 bytes of app  │
+  │  memory: accessible or poisoned    │
+  └────────────────────────────────────┘
+
+Every memory access:
+  1. Compute shadow address: shadow = (addr >> 3) + offset
+  2. Check shadow byte: if poisoned → REPORT ERROR
+  3. If clean → proceed with access
+    </div>
+
+    <h3>6.2 What ASan Detects</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Error Type</th>
+                <th>Description</th>
+                <th>Example</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Heap buffer overflow</td>
+                <td>Reading/writing past allocation end</td>
+                <td><code>array[array.count]</code> in C/ObjC</td>
+            </tr>
+            <tr>
+                <td>Stack buffer overflow</td>
+                <td>Overflowing stack-allocated buffers</td>
+                <td>C array out of bounds</td>
+            </tr>
+            <tr>
+                <td>Use after free</td>
+                <td>Accessing freed memory</td>
+                <td>Dangling pointer dereference</td>
+            </tr>
+            <tr>
+                <td>Use after return</td>
+                <td>Accessing stack memory after function returns</td>
+                <td>Returning pointer to local variable</td>
+            </tr>
+            <tr>
+                <td>Use after scope</td>
+                <td>Accessing variable outside its scope</td>
+                <td>Capturing stack variable in escaping closure</td>
+            </tr>
+            <tr>
+                <td>Double free</td>
+                <td>Freeing the same memory twice</td>
+                <td>Manual memory management errors</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Enable ASan in Xcode:</span>
+<span class="comment">// Product → Scheme → Edit Scheme → Run → Diagnostics → Address Sanitizer</span>
+
+<span class="comment">// Or via build settings:</span>
+OTHER_CFLAGS = -fsanitize=address
+OTHER_SWIFT_FLAGS = -sanitize=address
+OTHER_LDFLAGS = -fsanitize=address
+
+<span class="comment">// ASan overhead:</span>
+<span class="comment">// - 2x memory usage (shadow memory)</span>
+<span class="comment">// - 2-3x CPU slowdown</span>
+<span class="comment">// - Not suitable for production</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">ASan + Swift</div>
+        <p>Pure Swift code has fewer memory safety issues than C/ObjC because of ARC and bounds checking. However, ASan is still valuable for Swift apps that use C/ObjC interop, unsafe pointers, or third-party C libraries. It also catches issues in system frameworks that your app triggers.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="tsan">7. Thread Sanitizer (TSan)</h2>
+
+    <p>TSan detects data races — when two threads access the same memory location concurrently and at least one access is a write, without synchronization. Data races are undefined behavior and can cause crashes, data corruption, and heisenbugs.</p>
+
+    <h3>7.1 How TSan Works</h3>
+
+    <div class="diagram">
+TSan Detection:
+
+For every memory access, TSan records:
+  • Thread ID
+  • Memory address
+  • Access type (read/write)
+  • Timestamp (logical clock)
+
+Thread 1:              Thread 2:
+  write(x)               read(x)
+  timestamp: 5           timestamp: 7
+  
+TSan checks: Is there a happens-before relationship?
+  • If Thread 1's write at T=5 is synchronized with Thread 2's read at T=7 → OK
+  • If no synchronization → DATA RACE DETECTED
+
+TSan reports:
+  WARNING: ThreadSanitizer: data race
+    Write of size 8 at 0x7f8b2c by thread T1:
+      #0 MyClass.updateState() MyClass.swift:42
+    Previous read of size 8 at 0x7f8b2c by thread T2:
+      #0 MyClass.readState() MyClass.swift:58
+    </div>
+
+    <h3>7.2 Common Data Races in Swift</h3>
+
+    <pre><code><span class="comment">// Race 1: Shared mutable state without synchronization</span>
+<span class="keyword">class</span> <span class="type">Counter</span> {
+    <span class="keyword">var</span> count = <span class="number">0</span>  <span class="comment">// ← TSan will flag concurrent access</span>
+
+    <span class="keyword">func</span> <span class="func">increment</span>() {
+        count += <span class="number">1</span>  <span class="comment">// Not atomic — read + write</span>
+    }
+}
+
+<span class="comment">// Fix: Use actor or synchronization</span>
+<span class="keyword">actor</span> <span class="type">Counter</span> {
+    <span class="keyword">var</span> count = <span class="number">0</span>
+    <span class="keyword">func</span> <span class="func">increment</span>() { count += <span class="number">1</span> }
+}
+
+<span class="comment">// Race 2: Dictionary access from multiple threads</span>
+<span class="keyword">var</span> cache = [<span class="type">String</span>: <span class="type">Data</span>]()  <span class="comment">// ← Not thread-safe</span>
+
+<span class="comment">// Fix: Use a serial queue or actor</span>
+<span class="keyword">let</span> cacheQueue = <span class="type">DispatchQueue</span>(label: <span class="string">"cache"</span>)
+cacheQueue.<span class="func">sync</span> { cache[key] = value }
+
+<span class="comment">// Race 3: Delegate callback on wrong thread</span>
+<span class="keyword">class</span> <span class="type">NetworkManager</span> {
+    <span class="keyword">weak var</span> delegate: <span class="type">NetworkDelegate</span>?  <span class="comment">// ← Set on main, called on background</span>
+}</code></pre>
+
+    <pre><code><span class="comment">// Enable TSan:</span>
+<span class="comment">// Product → Scheme → Edit Scheme → Run → Diagnostics → Thread Sanitizer</span>
+
+<span class="comment">// TSan overhead:</span>
+<span class="comment">// - 5-15x CPU slowdown</span>
+<span class="comment">// - 5-10x memory usage</span>
+<span class="comment">// - Cannot combine with ASan (mutually exclusive)</span>
+<span class="comment">// - Simulator only (not supported on device)</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">TSan + Swift Concurrency</div>
+        <p>TSan understands Swift concurrency primitives (actors, async/await, Task). It knows that actor-isolated state is protected and won't report false positives for actor properties. However, it will correctly flag <code>nonisolated</code> access to mutable state and Sendable violations that the compiler doesn't catch (e.g., with <code>@unchecked Sendable</code>).</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="ubsan">8. Undefined Behavior Sanitizer (UBSan)</h2>
+
+    <p>UBSan detects undefined behavior in C, C++, and Objective-C code at runtime. While Swift prevents most UB by design, UBSan is valuable for mixed-language projects and C interop.</p>
+
+    <h3>8.1 What UBSan Detects</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>UB Type</th>
+                <th>Description</th>
+                <th>Swift Relevance</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Integer overflow</td>
+                <td>Signed integer overflow</td>
+                <td>C interop, UnsafePointer arithmetic</td>
+            </tr>
+            <tr>
+                <td>Null pointer dereference</td>
+                <td>Dereferencing NULL</td>
+                <td>C interop, UnsafePointer</td>
+            </tr>
+            <tr>
+                <td>Misaligned pointer</td>
+                <td>Accessing misaligned memory</td>
+                <td>UnsafeRawPointer.load(as:)</td>
+            </tr>
+            <tr>
+                <td>Invalid shift</td>
+                <td>Shift amount >= bit width</td>
+                <td>Bitwise operations in C code</td>
+            </tr>
+            <tr>
+                <td>Invalid enum value</td>
+                <td>Enum with out-of-range value</td>
+                <td>C enums bridged to Swift</td>
+            </tr>
+            <tr>
+                <td>Implicit conversion</td>
+                <td>Value doesn't fit in target type</td>
+                <td>C numeric conversions</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Enable UBSan:</span>
+<span class="comment">// Product → Scheme → Edit Scheme → Run → Diagnostics → Undefined Behavior Sanitizer</span>
+
+<span class="comment">// Build settings:</span>
+OTHER_CFLAGS = -fsanitize=undefined
+OTHER_SWIFT_FLAGS = -sanitize=undefined
+
+<span class="comment">// UBSan overhead: minimal (5-20% CPU, negligible memory)</span>
+<span class="comment">// Can be combined with ASan</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="malloc">9. Malloc Debugging</h2>
+
+    <p>macOS/iOS provide several malloc debugging features that help detect memory corruption, leaks, and use-after-free bugs.</p>
+
+    <h3>9.1 Guard Malloc</h3>
+
+    <pre><code><span class="comment">// Guard Malloc places each allocation on its own virtual memory page</span>
+<span class="comment">// with guard pages before and after. Any overflow immediately crashes</span>
+<span class="comment">// with a clear stack trace.</span>
+
+<span class="comment">// Enable in Xcode:</span>
+<span class="comment">// Product → Scheme → Edit Scheme → Run → Diagnostics → Malloc Guard Edges</span>
+
+<span class="comment">// Or via environment variable:</span>
+<span class="comment">// DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib</span>
+
+<span class="comment">// Guard Malloc overhead: EXTREME</span>
+<span class="comment">// Each allocation uses at least one 16KB page</span>
+<span class="comment">// Only usable for targeted debugging, not general testing</span></code></pre>
+
+    <h3>9.2 Malloc Scribble</h3>
+
+    <pre><code><span class="comment">// Malloc Scribble fills freed memory with 0x55 and allocated memory with 0xAA</span>
+<span class="comment">// This makes use-after-free bugs crash immediately instead of silently corrupting</span>
+
+<span class="comment">// Enable in Xcode:</span>
+<span class="comment">// Product → Scheme → Edit Scheme → Run → Diagnostics → Malloc Scribble</span>
+
+<span class="comment">// Environment variables:</span>
+MallocScribble=1          <span class="comment">// Fill freed memory with 0x55</span>
+MallocPreScribble=1       <span class="comment">// Fill allocated memory with 0xAA</span>
+
+<span class="comment">// Other useful malloc environment variables:</span>
+MallocStackLogging=1      <span class="comment">// Record allocation stack traces</span>
+MallocStackLoggingNoCompact=1  <span class="comment">// Keep all stack traces (for leaks)</span>
+MallocCheckHeapStart=100  <span class="comment">// Check heap integrity every N allocations</span>
+MallocCheckHeapEach=100</code></pre>
+
+    <h3>9.3 Malloc Stack Logging</h3>
+
+    <pre><code><span class="comment">// Enable malloc stack logging for memory leak detection</span>
+<span class="comment">// Xcode: Product → Scheme → Edit Scheme → Run → Diagnostics → Malloc Stack Logging</span>
+
+<span class="comment">// Then use the Memory Graph Debugger or leaks tool:</span>
+<span class="comment">// Debug → Debug Memory Graph (in Xcode)</span>
+
+<span class="comment"># Command-line leak detection</span>
+leaks --atExit -- ./MyApp
+leaks PID                 <span class="comment"># Attach to running process</span>
+
+<span class="comment"># Show allocation history for an address</span>
+malloc_history PID 0x7f8b2c00</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="xcode-tools">10. Xcode Debugging Features</h2>
+
+    <h3>10.1 View Hierarchy Debugger</h3>
+
+    <p>The view hierarchy debugger captures a 3D snapshot of the view hierarchy, showing every view's frame, constraints, and properties.</p>
+
+    <div class="diagram">
+View Hierarchy Debugger:
+
+  Debug → View Debugging → Capture View Hierarchy
+  (or click the "Debug View Hierarchy" button in debug bar)
+
+Features:
+  ┌─────────────────────────────────────────────────────┐
+  │  3D View                                             │
+  │  • Rotate to see view layering                       │
+  │  • Click any view to inspect                         │
+  │  • See clipped content                               │
+  │  • Identify overlapping views                        │
+  ├─────────────────────────────────────────────────────┤
+  │  Object Inspector                                    │
+  │  • Frame, bounds, center                             │
+  │  • Background color, alpha, hidden                   │
+  │  • Auto Layout constraints                           │
+  │  • Accessibility properties                          │
+  ├─────────────────────────────────────────────────────┤
+  │  Constraint Inspector                                │
+  │  • All constraints on selected view                  │
+  │  • Ambiguous constraints highlighted                 │
+  │  • Conflicting constraints shown                     │
+  └─────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>10.2 Memory Graph Debugger</h3>
+
+    <p>The memory graph debugger shows all live objects and their references, making it easy to find retain cycles and unexpected strong references.</p>
+
+    <div class="diagram">
+Memory Graph Debugger:
+
+  Debug → Debug Memory Graph
+  (or click the "Debug Memory Graph" button in debug bar)
+
+  Shows:
+  ┌──────────────────────────────────────────────────────┐
+  │                                                       │
+  │  [ViewController] ──strong──→ [Closure]               │
+  │        │                          │                    │
+  │        │                     strong (capture)          │
+  │        │                          │                    │
+  │        └──────────────────────────┘                    │
+  │                                                       │
+  │  ⚠️ RETAIN CYCLE DETECTED                             │
+  │                                                       │
+  │  Fix: Use [weak self] in closure capture list          │
+  │                                                       │
+  └──────────────────────────────────────────────────────┘
+
+  Features:
+  • Shows all live objects and their reference graph
+  • Highlights retain cycles with warning icons
+  • Shows allocation backtrace (with malloc stack logging)
+  • Filter by class name or module
+  • Export memory graph for offline analysis
+    </div>
+
+    <pre><code><span class="comment">// Export memory graph from command line</span>
+<span class="comment">// (useful for CI or automated analysis)</span>
+
+<span class="comment"># Capture memory graph of running process</span>
+leaks --outputGraph=/tmp/memgraph PID
+
+<span class="comment"># Analyze memory graph</span>
+vmmap --summary PID
+heap PID
+heap --sortBySize PID | head -20</code></pre>
+
+    <h3>10.3 Instruments Integration</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Instrument</th>
+                <th>Detects</th>
+                <th>When to Use</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Leaks</td>
+                <td>Memory leaks (unreachable allocations)</td>
+                <td>Regular memory audits</td>
+            </tr>
+            <tr>
+                <td>Allocations</td>
+                <td>All memory allocations with backtraces</td>
+                <td>Memory growth investigation</td>
+            </tr>
+            <tr>
+                <td>Zombies</td>
+                <td>Messages sent to deallocated objects</td>
+                <td>EXC_BAD_ACCESS crashes</td>
+            </tr>
+            <tr>
+                <td>Time Profiler</td>
+                <td>CPU usage by function</td>
+                <td>Performance optimization</td>
+            </tr>
+            <tr>
+                <td>System Trace</td>
+                <td>Thread scheduling, syscalls, IPC</td>
+                <td>Deep performance analysis</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">11. Architect: Sanitizers in CI</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>At Staff level, you should set up sanitizers in CI to catch memory and threading bugs before they reach production. Here's a production-grade CI sanitizer configuration.</p>
+    </div>
+
+    <h3>11.1 CI Sanitizer Strategy</h3>
+
+    <div class="diagram">
+CI Pipeline with Sanitizers:
+
+PR Opened / Push to main
+       │
+       ├─── Job 1: Regular Tests (fast, every PR)
+       │    └─ xcodebuild test (no sanitizers)
+       │
+       ├─── Job 2: ASan Tests (memory safety)
+       │    └─ xcodebuild test with -enableAddressSanitizer YES
+       │    └─ Runs on: every PR to main
+       │
+       ├─── Job 3: TSan Tests (thread safety)
+       │    └─ xcodebuild test with -enableThreadSanitizer YES
+       │    └─ Runs on: every PR to main
+       │
+       └─── Job 4: UBSan Tests (undefined behavior)
+            └─ xcodebuild test with -enableUndefinedBehaviorSanitizer YES
+            └─ Runs on: nightly (low overhead, but extra coverage)
+    </div>
+
+    <h3>11.2 CI Build Scripts</h3>
+
+    <pre><code><span class="comment">#!/bin/bash</span>
+<span class="comment"># ci-sanitizer-tests.sh</span>
+
+<span class="keyword">set</span> -euo pipefail
+
+WORKSPACE=<span class="string">"MyApp.xcworkspace"</span>
+SCHEME=<span class="string">"MyApp"</span>
+DESTINATION=<span class="string">"platform=iOS Simulator,name=iPhone 15,OS=17.0"</span>
+
+<span class="comment"># ASan test run</span>
+echo <span class="string">"=== Running Address Sanitizer Tests ==="</span>
+xcodebuild test \
+    -workspace <span class="string">"$WORKSPACE"</span> \
+    -scheme <span class="string">"$SCHEME"</span> \
+    -destination <span class="string">"$DESTINATION"</span> \
+    -enableAddressSanitizer YES \
+    -resultBundlePath ./results/asan.xcresult \
+    | xcbeautify
+
+<span class="comment"># TSan test run (separate — can't combine with ASan)</span>
+echo <span class="string">"=== Running Thread Sanitizer Tests ==="</span>
+xcodebuild test \
+    -workspace <span class="string">"$WORKSPACE"</span> \
+    -scheme <span class="string">"$SCHEME"</span> \
+    -destination <span class="string">"$DESTINATION"</span> \
+    -enableThreadSanitizer YES \
+    -resultBundlePath ./results/tsan.xcresult \
+    | xcbeautify
+
+<span class="comment"># UBSan test run</span>
+echo <span class="string">"=== Running UB Sanitizer Tests ==="</span>
+xcodebuild test \
+    -workspace <span class="string">"$WORKSPACE"</span> \
+    -scheme <span class="string">"$SCHEME"</span> \
+    -destination <span class="string">"$DESTINATION"</span> \
+    -enableUndefinedBehaviorSanitizer YES \
+    -resultBundlePath ./results/ubsan.xcresult \
+    | xcbeautify</code></pre>
+
+    <h3>11.3 Handling Sanitizer Failures</h3>
+
+    <pre><code><span class="comment">// Suppress known false positives (use sparingly)</span>
+
+<span class="comment">// TSan suppression file (tsan_suppressions.txt)</span>
+<span class="comment">// race:ThirdPartyLib*</span>
+<span class="comment">// race:legacy_module::*</span>
+
+<span class="comment">// Set via environment variable:</span>
+<span class="comment">// TSAN_OPTIONS=suppressions=tsan_suppressions.txt</span>
+
+<span class="comment">// ASan suppression for known third-party issues:</span>
+<span class="comment">// ASAN_OPTIONS=suppressions=asan_suppressions.txt</span>
+
+<span class="comment">// Better approach: fix the issue or isolate the code</span>
+<span class="comment">// Suppressions should be temporary with tracking tickets</span></code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Sanitizer CI Best Practices</div>
+        <ul>
+            <li>Run ASan and TSan on every PR — they catch the most impactful bugs</li>
+            <li>Run UBSan nightly — lower priority but still valuable</li>
+            <li>ASan and TSan cannot run simultaneously — use separate CI jobs</li>
+            <li>TSan only works on simulator — plan test matrix accordingly</li>
+            <li>Set sanitizer tests as required checks for PR merge</li>
+            <li>Track and fix all sanitizer findings — don't suppress without a ticket</li>
+            <li>Expect 2-3x longer test runs with ASan, 5-15x with TSan</li>
+            <li>Use <code>xcresult</code> bundles to archive sanitizer reports</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="05-binary-size.html">← Binary Size</a>
+        <a href="07-interview-qa.html">Next: Interview Q&amp;A →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,1527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Transport Security &amp; Certificate Pinning — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Security &amp; Privacy</a><span class="sep">›</span>
+        Transport Security
+    </nav>
+
+    <h1>Transport Security &amp; Certificate Pinning</h1>
+    <p class="subtitle">App Transport Security enforcement, TLS 1.2 vs 1.3 internals, programmatic and declarative certificate pinning, SecTrust evaluation, Certificate Transparency, and architect-level rotation strategies for Staff-level iOS interviews.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#ats">1. App Transport Security (ATS)</a></li>
+            <li><a href="#tls-comparison">2. TLS 1.2 vs TLS 1.3</a></li>
+            <li><a href="#cert-pinning">3. Certificate Pinning Implementation</a></li>
+            <li><a href="#pk-vs-cert">4. Public Key Pinning vs Certificate Pinning</a></li>
+            <li><a href="#sectrust">5. SecTrust API Deep Dive</a></li>
+            <li><a href="#ct">6. Certificate Transparency</a></li>
+            <li><a href="#declarative-pinning">7. Declarative Pinning — NSPinnedDomains</a></li>
+            <li><a href="#architect">8. Architect: Certificate Pinning Strategy for Graceful Rotation</a></li>
+        </ul>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 1: APP TRANSPORT SECURITY                                   -->
+    <!-- ================================================================== -->
+
+    <h2 id="ats">1. App Transport Security (ATS)</h2>
+
+    <p>App Transport Security is a system-level policy introduced in iOS 9 that forces all HTTP connections made through <code>URLSession</code>, <code>NSURLConnection</code>, and any framework built on top of them (Alamofire, SDWebImage, etc.) to meet a minimum set of security requirements. ATS operates at the <strong>SecureTransport / Network.framework</strong> layer — it is not a simple URL filter but a TLS policy enforcer embedded in the networking stack.</p>
+
+    <h3>1.1 Default ATS Requirements</h3>
+
+    <p>When ATS is enabled (the default since iOS 9), every HTTPS connection must satisfy <em>all</em> of the following:</p>
+
+    <ul>
+        <li><strong>TLS 1.2 or later</strong> — connections using TLS 1.0 or 1.1 are rejected at the handshake level</li>
+        <li><strong>Forward secrecy</strong> — the cipher suite must use an ephemeral key exchange (ECDHE). Static RSA key exchange is blocked because compromise of the server's private key would decrypt all past traffic</li>
+        <li><strong>Certificate requirements</strong> — the server certificate must be signed with SHA-256 or stronger, and the RSA key must be at least 2048 bits (or ECC 256 bits)</li>
+        <li><strong>No plaintext HTTP</strong> — <code>http://</code> URLs are blocked entirely unless explicitly exempted</li>
+    </ul>
+
+    <p>The specific cipher suites allowed by ATS are:</p>
+
+    <pre><code><span class="comment">// ATS-compliant cipher suites (as of iOS 17)</span>
+TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+
+<span class="comment">// TLS 1.3 cipher suites (always ATS-compliant)</span>
+TLS_AES_256_GCM_SHA384
+TLS_AES_128_GCM_SHA256
+TLS_CHACHA20_POLY1305_SHA256</code></pre>
+
+    <h3>1.2 ATS Enforcement Flow</h3>
+
+    <div class="diagram">
+ATS Enforcement Flow:
+
+URLSession.dataTask(url)
+        │
+        ▼
+┌───────────────────────────┐
+│  URL Scheme Check         │
+│  http:// or https://?     │
+└─────────┬─────────────────┘
+          │
+    ┌─────┴──────┐
+    │            │
+    ▼            ▼
+ http://      https://
+    │            │
+    ▼            ▼
+┌──────────┐  ┌───────────────────────────┐
+│ Check    │  │ TLS Handshake Begins      │
+│ ATS      │  │                           │
+│ Exemption│  │ 1. Check TLS version      │
+│ in plist │  │    ≥ 1.2? ──No──▶ REJECT  │
+└────┬─────┘  │                           │
+     │        │ 2. Check cipher suite     │
+  ┌──┴──┐    │    Forward secrecy? ─No─▶ │ REJECT
+  │     │    │                           │
+  ▼     ▼    │ 3. Check certificate      │
+Allow  BLOCK │    SHA-256+? ──No──▶      │ REJECT
+  │     │    │    RSA 2048+/ECC 256+?    │
+  │     │    │    ──No──▶ REJECT         │
+  ▼     ▼    │                           │
+ OK   Error  │ 4. All checks pass        │
+ -9801       │                           │
+             └─────────┬─────────────────┘
+                       ▼
+                    ALLOW
+                  Connection
+                  Established
+    </div>
+
+    <h3>1.3 Info.plist Configuration Keys</h3>
+
+    <p>ATS is configured through the <code>NSAppTransportSecurity</code> dictionary in <code>Info.plist</code>. These keys form a hierarchy of overrides:</p>
+
+    <pre><code><span class="comment">&lt;!-- Full ATS configuration structure --&gt;</span>
+&lt;key&gt;NSAppTransportSecurity&lt;/key&gt;
+&lt;dict&gt;
+    <span class="comment">&lt;!-- Global kill switch — disables ATS entirely --&gt;</span>
+    &lt;key&gt;NSAllowsArbitraryLoads&lt;/key&gt;
+    &lt;false/&gt;
+
+    <span class="comment">&lt;!-- Allow HTTP for media (AVFoundation) only --&gt;</span>
+    &lt;key&gt;NSAllowsArbitraryLoadsForMedia&lt;/key&gt;
+    &lt;false/&gt;
+
+    <span class="comment">&lt;!-- Allow HTTP for WebViews only --&gt;</span>
+    &lt;key&gt;NSAllowsArbitraryLoadsInWebContent&lt;/key&gt;
+    &lt;false/&gt;
+
+    <span class="comment">&lt;!-- Allow HTTP for local networking (iOS 13+) --&gt;</span>
+    &lt;key&gt;NSAllowsLocalNetworking&lt;/key&gt;
+    &lt;true/&gt;
+
+    <span class="comment">&lt;!-- Per-domain exceptions --&gt;</span>
+    &lt;key&gt;NSExceptionDomains&lt;/key&gt;
+    &lt;dict&gt;
+        &lt;key&gt;legacy-api.example.com&lt;/key&gt;
+        &lt;dict&gt;
+            <span class="comment">&lt;!-- Allow TLS 1.0 for this domain --&gt;</span>
+            &lt;key&gt;NSExceptionMinimumTLSVersion&lt;/key&gt;
+            &lt;string&gt;TLSv1.0&lt;/string&gt;
+
+            <span class="comment">&lt;!-- Allow non-forward-secrecy ciphers --&gt;</span>
+            &lt;key&gt;NSExceptionRequiresForwardSecrecy&lt;/key&gt;
+            &lt;false/&gt;
+
+            <span class="comment">&lt;!-- Include subdomains in this exception --&gt;</span>
+            &lt;key&gt;NSIncludesSubdomains&lt;/key&gt;
+            &lt;true/&gt;
+
+            <span class="comment">&lt;!-- Allow plaintext HTTP --&gt;</span>
+            &lt;key&gt;NSExceptionAllowsInsecureHTTPLoads&lt;/key&gt;
+            &lt;true/&gt;
+        &lt;/dict&gt;
+    &lt;/dict&gt;
+&lt;/dict&gt;</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: App Review and NSAllowsArbitraryLoads</div>
+        <p>Since January 2017, Apple requires a <strong>justification</strong> for <code>NSAllowsArbitraryLoads = YES</code> during App Review. Apps that set this without a valid reason (e.g., a web browser that must load arbitrary content) are routinely rejected. Even with a justification, Apple may request that you use <code>NSExceptionDomains</code> for specific hosts instead of the global kill switch. Starting with iOS 10, if you set <em>both</em> <code>NSAllowsArbitraryLoads</code> and any of the granular keys (<code>NSAllowsArbitraryLoadsForMedia</code>, <code>NSAllowsArbitraryLoadsInWebContent</code>), the granular keys take precedence and <code>NSAllowsArbitraryLoads</code> is ignored.</p>
+    </div>
+
+    <h3>1.4 ATS and Third-Party SDKs</h3>
+
+    <p>ATS applies process-wide — it affects every framework and SDK linked into your app. This creates friction with third-party ad SDKs, analytics providers, and legacy backend services that may not support TLS 1.2. The recommended approach:</p>
+
+    <pre><code><span class="comment">// Diagnosing ATS failures in the console</span>
+<span class="comment">// Set CFNETWORK_DIAGNOSTICS=1 in your scheme's environment variables</span>
+<span class="comment">// This logs detailed TLS negotiation info including:</span>
+<span class="comment">//   - Offered cipher suites</span>
+<span class="comment">//   - Server-selected cipher suite</span>
+<span class="comment">//   - TLS version negotiated</span>
+<span class="comment">//   - Certificate chain details</span>
+<span class="comment">//   - ATS policy evaluation result</span>
+
+<span class="comment">// You can also use nscurl to test ATS compliance from Terminal:</span>
+<span class="comment">// $ /usr/bin/nscurl --ats-diagnostics https://your-server.com</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: ATS Internals</div>
+        <p>ATS is implemented in the <code>CFNetwork</code> framework, specifically in the <code>_CFNetworkHTTPConnectionCacheSetLimit</code> and <code>SSLSetProtocolVersionMin</code> code paths. When <code>URLSession</code> creates a connection, it reads the ATS policy from the app's <code>Info.plist</code> (cached at launch), resolves per-domain exceptions, and configures the underlying <code>sec_protocol_options_t</code> object accordingly. The policy is evaluated <em>before</em> the TLS handshake begins — the system sets the minimum TLS version and allowed cipher suites on the socket, so non-compliant servers fail at the protocol level, not via an application-layer check.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 2: TLS 1.2 vs TLS 1.3                                      -->
+    <!-- ================================================================== -->
+
+    <h2 id="tls-comparison">2. TLS 1.2 vs TLS 1.3</h2>
+
+    <p>iOS 12.2 added TLS 1.3 support, and iOS 13.4 enabled it by default. Understanding the differences is critical for diagnosing connection failures and making informed security architecture decisions.</p>
+
+    <h3>2.1 TLS 1.2 Handshake (2-RTT)</h3>
+
+    <div class="diagram">
+TLS 1.2 Full Handshake (2 Round Trips):
+
+Client                                          Server
+  │                                                │
+  │──── ClientHello ──────────────────────────────▶│  RTT 1
+  │     (TLS version, random, cipher suites,       │  start
+  │      extensions, SNI)                          │
+  │                                                │
+  │◀─── ServerHello ──────────────────────────────│
+  │     (chosen cipher, random, session ID)        │
+  │◀─── Certificate ──────────────────────────────│
+  │     (server cert chain)                        │
+  │◀─── ServerKeyExchange ────────────────────────│  RTT 1
+  │     (ECDHE params, signature)                  │  end
+  │◀─── ServerHelloDone ──────────────────────────│
+  │                                                │
+  │──── ClientKeyExchange ────────────────────────▶│  RTT 2
+  │     (ECDHE public key)                         │  start
+  │──── ChangeCipherSpec ─────────────────────────▶│
+  │──── Finished (encrypted) ─────────────────────▶│
+  │                                                │
+  │◀─── ChangeCipherSpec ─────────────────────────│  RTT 2
+  │◀─── Finished (encrypted) ─────────────────────│  end
+  │                                                │
+  │◀═══ Application Data (encrypted) ═════════════▶│
+    </div>
+
+    <h3>2.2 TLS 1.3 Handshake (1-RTT)</h3>
+
+    <div class="diagram">
+TLS 1.3 Full Handshake (1 Round Trip):
+
+Client                                          Server
+  │                                                │
+  │──── ClientHello ──────────────────────────────▶│  RTT 1
+  │     (TLS version, random, cipher suites,       │  start
+  │      key_share (ECDHE public key),             │
+  │      supported_groups, signature_algorithms)   │
+  │                                                │
+  │◀─── ServerHello ──────────────────────────────│
+  │     (chosen cipher, key_share)                 │
+  │◀─── {EncryptedExtensions} ────────────────────│
+  │◀─── {Certificate} ───────────────────────────│
+  │◀─── {CertificateVerify} ─────────────────────│  RTT 1
+  │◀─── {Finished} ──────────────────────────────│  end
+  │                                                │
+  │──── {Finished} ───────────────────────────────▶│
+  │                                                │
+  │◀═══ Application Data (encrypted) ═════════════▶│
+
+{} = encrypted with handshake keys
+    </div>
+
+    <h3>2.3 TLS 1.3 0-RTT Resumption</h3>
+
+    <div class="diagram">
+TLS 1.3 0-RTT Resumption (Zero Round Trips for first data):
+
+Client                                          Server
+  │                                                │
+  │──── ClientHello ──────────────────────────────▶│
+  │     + early_data extension                     │
+  │     + pre_shared_key (from previous session)   │
+  │──── (0-RTT) Application Data ─────────────────▶│  ← Data sent
+  │     (encrypted with PSK-derived key)           │     BEFORE
+  │                                                │     handshake!
+  │◀─── ServerHello ──────────────────────────────│
+  │◀─── {EncryptedExtensions} ────────────────────│
+  │◀─── {Finished} ──────────────────────────────│
+  │                                                │
+  │──── {Finished} ───────────────────────────────▶│
+  │                                                │
+  │◀═══ Application Data (1-RTT keys) ════════════▶│
+
+⚠️  0-RTT data is NOT forward-secret and is REPLAYABLE
+    </div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: 0-RTT Replay Attacks</div>
+        <p>TLS 1.3's 0-RTT early data is vulnerable to <strong>replay attacks</strong>. An attacker who captures the ClientHello + early data can replay it to the server, potentially causing duplicate side effects (double purchases, duplicate API calls). The server has no cryptographic guarantee that 0-RTT data is fresh. Apple's <code>URLSession</code> does <em>not</em> enable 0-RTT by default. If you use <code>Network.framework</code> directly, you must explicitly opt in via <code>sec_protocol_options_set_tls_early_data_enabled</code> and ensure your server implements replay protection (e.g., single-use tickets, strike registers, or limiting 0-RTT to idempotent requests).</p>
+    </div>
+
+    <h3>2.4 Detailed Comparison</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>TLS 1.2</th>
+                <th>TLS 1.3</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Full handshake</td>
+                <td>2-RTT</td>
+                <td>1-RTT</td>
+            </tr>
+            <tr>
+                <td>Resumption</td>
+                <td>1-RTT (session tickets)</td>
+                <td>0-RTT (PSK, replayable)</td>
+            </tr>
+            <tr>
+                <td>Key exchange</td>
+                <td>RSA, DHE, ECDHE</td>
+                <td>ECDHE, DHE only (no static RSA)</td>
+            </tr>
+            <tr>
+                <td>Forward secrecy</td>
+                <td>Optional (depends on cipher)</td>
+                <td>Mandatory (always ephemeral keys)</td>
+            </tr>
+            <tr>
+                <td>Cipher suites</td>
+                <td>~37 suites (many legacy)</td>
+                <td>5 suites (all AEAD)</td>
+            </tr>
+            <tr>
+                <td>AEAD requirement</td>
+                <td>No (CBC mode allowed)</td>
+                <td>Yes (GCM, ChaCha20-Poly1305 only)</td>
+            </tr>
+            <tr>
+                <td>Handshake encryption</td>
+                <td>Plaintext until ChangeCipherSpec</td>
+                <td>Encrypted after ServerHello</td>
+            </tr>
+            <tr>
+                <td>Certificate visible to</td>
+                <td>Any network observer</td>
+                <td>Only client and server (encrypted)</td>
+            </tr>
+            <tr>
+                <td>Compression</td>
+                <td>Supported (CRIME vulnerability)</td>
+                <td>Removed</td>
+            </tr>
+            <tr>
+                <td>Renegotiation</td>
+                <td>Supported (attack surface)</td>
+                <td>Removed</td>
+            </tr>
+            <tr>
+                <td>Session ID</td>
+                <td>Server-side state</td>
+                <td>Removed (PSK tickets only)</td>
+            </tr>
+            <tr>
+                <td>iOS support</td>
+                <td>iOS 5+</td>
+                <td>iOS 12.2+ (default iOS 13.4+)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Why TLS 1.3 Removed Static RSA Key Exchange</div>
+        <p>In TLS 1.2 with static RSA, the client encrypts the pre-master secret with the server's RSA public key. If the server's private key is later compromised (or obtained via legal compulsion), an attacker who recorded past traffic can decrypt <em>every</em> session. TLS 1.3 mandates ephemeral Diffie-Hellman: each session generates a unique key pair that is discarded after the session ends. Even if the server's long-term key is compromised, past sessions remain confidential. This property — <strong>forward secrecy</strong> — is why TLS 1.3 is a strict security improvement.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 3: CERTIFICATE PINNING IMPLEMENTATION                       -->
+    <!-- ================================================================== -->
+
+    <h2 id="cert-pinning">3. Certificate Pinning Implementation</h2>
+
+    <p>Certificate pinning restricts which certificates your app trusts for a given domain, beyond the system's default trust store. Instead of trusting any certificate signed by any of the ~150 root CAs in Apple's trust store, you pin to a specific certificate or public key. This defends against compromised CAs, rogue certificates, and man-in-the-middle attacks on corporate networks with TLS inspection proxies.</p>
+
+    <h3>3.1 How URLSession Authentication Challenges Work</h3>
+
+    <div class="diagram">
+URLSession Certificate Pinning Flow:
+
+URLSession                    URLSessionDelegate              Your Pinning Logic
+    │                               │                               │
+    │── TLS handshake ──▶ Server    │                               │
+    │◀── Server cert chain ──       │                               │
+    │                               │                               │
+    │── didReceive challenge ──────▶│                               │
+    │   (NSURLAuthenticationMethod  │                               │
+    │    ServerTrust)               │                               │
+    │                               │── Extract SecTrust ──────────▶│
+    │                               │                               │
+    │                               │                  ┌────────────┤
+    │                               │                  │ 1. Standard│
+    │                               │                  │    trust   │
+    │                               │                  │    eval    │
+    │                               │                  │            │
+    │                               │                  │ 2. Extract │
+    │                               │                  │    server  │
+    │                               │                  │    pub key │
+    │                               │                  │            │
+    │                               │                  │ 3. Compare │
+    │                               │                  │    against │
+    │                               │                  │    pinned  │
+    │                               │                  │    keys    │
+    │                               │                  └────────────┤
+    │                               │                               │
+    │                               │◀── Match / No Match ─────────│
+    │                               │                               │
+    │◀── .useCredential ───────────│  (match)                      │
+    │    or                         │                               │
+    │◀── .cancelAuthenticationChallenge  (no match)                │
+    </div>
+
+    <h3>3.2 Complete Certificate Pinning Implementation</h3>
+
+    <pre><code><span class="keyword">import</span> Foundation
+<span class="keyword">import</span> Security
+<span class="keyword">import</span> CommonCrypto
+
+<span class="keyword">final class</span> <span class="type">CertificatePinningManager</span>: <span class="type">NSObject</span>, <span class="type">URLSessionDelegate</span> {
+
+    <span class="keyword">private let</span> pinnedKeyHashes: [<span class="type">String</span>: <span class="type">Set</span>&lt;<span class="type">String</span>&gt;]
+
+    <span class="comment">/// Initialize with a mapping of hostname → set of SHA-256 hashes</span>
+    <span class="comment">/// of the Subject Public Key Info (SPKI).</span>
+    <span class="keyword">init</span>(pinnedKeyHashes: [<span class="type">String</span>: <span class="type">Set</span>&lt;<span class="type">String</span>&gt;]) {
+        <span class="keyword">self</span>.pinnedKeyHashes = pinnedKeyHashes
+        <span class="keyword">super</span>.<span class="func">init</span>()
+    }
+
+    <span class="keyword">func</span> <span class="func">urlSession</span>(
+        _ session: <span class="type">URLSession</span>,
+        didReceive challenge: <span class="type">URLAuthenticationChallenge</span>,
+        completionHandler: <span class="keyword">@escaping</span> (<span class="type">URLSession</span>.<span class="type">AuthChallengeDisposition</span>, <span class="type">URLCredential</span>?) -> <span class="type">Void</span>
+    ) {
+        <span class="keyword">guard</span> challenge.protectionSpace.authenticationMethod
+                == <span class="type">NSURLAuthenticationMethodServerTrust</span>,
+              <span class="keyword">let</span> serverTrust = challenge.protectionSpace.serverTrust,
+              <span class="keyword">let</span> expectedHashes = pinnedKeyHashes[challenge.protectionSpace.host]
+        <span class="keyword">else</span> {
+            completionHandler(.cancelAuthenticationChallenge, <span class="keyword">nil</span>)
+            <span class="keyword">return</span>
+        }
+
+        <span class="comment">// Step 1: Standard X.509 trust evaluation</span>
+        <span class="keyword">var</span> error: <span class="type">CFError</span>?
+        <span class="keyword">let</span> trustValid = <span class="func">SecTrustEvaluateWithError</span>(serverTrust, &amp;error)
+
+        <span class="keyword">guard</span> trustValid <span class="keyword">else</span> {
+            completionHandler(.cancelAuthenticationChallenge, <span class="keyword">nil</span>)
+            <span class="keyword">return</span>
+        }
+
+        <span class="comment">// Step 2: Extract public keys from the certificate chain</span>
+        <span class="keyword">let</span> certCount = <span class="func">SecTrustGetCertificateCount</span>(serverTrust)
+        <span class="keyword">var</span> foundMatch = <span class="keyword">false</span>
+
+        <span class="keyword">for</span> index <span class="keyword">in</span> <span class="number">0</span>..&lt;certCount {
+            <span class="keyword">guard let</span> certificate = <span class="func">SecTrustGetCertificateAtIndex</span>(serverTrust, index),
+                  <span class="keyword">let</span> publicKey = <span class="func">SecCertificateCopyKey</span>(certificate),
+                  <span class="keyword">let</span> publicKeyData = <span class="func">SecKeyCopyExternalRepresentation</span>(publicKey, <span class="keyword">nil</span>) <span class="keyword">as</span>? <span class="type">Data</span>
+            <span class="keyword">else</span> { <span class="keyword">continue</span> }
+
+            <span class="comment">// Step 3: Hash the public key and compare against pins</span>
+            <span class="keyword">let</span> keyHash = <span class="func">sha256</span>(data: publicKeyData)
+            <span class="keyword">let</span> hashString = keyHash.<span class="func">base64EncodedString</span>()
+
+            <span class="keyword">if</span> expectedHashes.<span class="func">contains</span>(hashString) {
+                foundMatch = <span class="keyword">true</span>
+                <span class="keyword">break</span>
+            }
+        }
+
+        <span class="keyword">if</span> foundMatch {
+            <span class="keyword">let</span> credential = <span class="type">URLCredential</span>(trust: serverTrust)
+            completionHandler(.useCredential, credential)
+        } <span class="keyword">else</span> {
+            completionHandler(.cancelAuthenticationChallenge, <span class="keyword">nil</span>)
+        }
+    }
+
+    <span class="keyword">private func</span> <span class="func">sha256</span>(data: <span class="type">Data</span>) -> <span class="type">Data</span> {
+        <span class="keyword">var</span> hash = [<span class="type">UInt8</span>](<span class="func">repeating</span>: <span class="number">0</span>, count: <span class="type">Int</span>(<span class="type">CC_SHA256_DIGEST_LENGTH</span>))
+        data.<span class="func">withUnsafeBytes</span> { buffer <span class="keyword">in</span>
+            _ = <span class="func">CC_SHA256</span>(buffer.baseAddress, <span class="type">CC_LONG</span>(data.count), &amp;hash)
+        }
+        <span class="keyword">return</span> <span class="type">Data</span>(hash)
+    }
+}
+
+<span class="comment">// Usage</span>
+<span class="keyword">let</span> pinManager = <span class="type">CertificatePinningManager</span>(pinnedKeyHashes: [
+    <span class="string">"api.example.com"</span>: [
+        <span class="string">"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="</span>,  <span class="comment">// current key</span>
+        <span class="string">"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC="</span>,  <span class="comment">// backup key</span>
+    ]
+])
+
+<span class="keyword">let</span> session = <span class="type">URLSession</span>(
+    configuration: .default,
+    delegate: pinManager,
+    delegateQueue: <span class="keyword">nil</span>
+)</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: SecTrustGetCertificateAtIndex Deprecation</div>
+        <p><code>SecTrustGetCertificateAtIndex</code> was deprecated in iOS 15. On iOS 15+, use <code>SecTrustCopyCertificateChain</code> to get the full chain as a <code>CFArray</code> of <code>SecCertificate</code> objects. The old API still works but will eventually be removed. Always check availability:</p>
+        <pre><code><span class="keyword">if</span> #<span class="func">available</span>(iOS <span class="number">15.0</span>, *) {
+    <span class="keyword">guard let</span> chain = <span class="func">SecTrustCopyCertificateChain</span>(serverTrust) <span class="keyword">as</span>? [<span class="type">SecCertificate</span>]
+    <span class="keyword">else</span> { <span class="keyword">return</span> }
+    <span class="keyword">for</span> cert <span class="keyword">in</span> chain { <span class="comment">/* pin check */</span> }
+} <span class="keyword">else</span> {
+    <span class="keyword">for</span> i <span class="keyword">in</span> <span class="number">0</span>..&lt;<span class="func">SecTrustGetCertificateCount</span>(serverTrust) {
+        <span class="keyword">guard let</span> cert = <span class="func">SecTrustGetCertificateAtIndex</span>(serverTrust, i)
+        <span class="keyword">else</span> { <span class="keyword">continue</span> }
+        <span class="comment">/* pin check */</span>
+    }
+}</code></pre>
+    </div>
+
+    <h3>3.3 Extracting Pin Hashes from a Live Server</h3>
+
+    <pre><code><span class="comment">// Terminal command to extract SPKI hash for pinning:</span>
+<span class="comment">// $ openssl s_client -connect api.example.com:443 -servername api.example.com \</span>
+<span class="comment">//     | openssl x509 -pubkey -noout \</span>
+<span class="comment">//     | openssl pkey -pubin -outform DER \</span>
+<span class="comment">//     | openssl dgst -sha256 -binary \</span>
+<span class="comment">//     | base64</span>
+
+<span class="comment">// Programmatic extraction for debugging:</span>
+<span class="keyword">func</span> <span class="func">extractPinHash</span>(from certificate: <span class="type">SecCertificate</span>) -> <span class="type">String</span>? {
+    <span class="keyword">guard let</span> publicKey = <span class="func">SecCertificateCopyKey</span>(certificate),
+          <span class="keyword">let</span> keyData = <span class="func">SecKeyCopyExternalRepresentation</span>(publicKey, <span class="keyword">nil</span>) <span class="keyword">as</span>? <span class="type">Data</span>
+    <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+
+    <span class="keyword">var</span> hash = [<span class="type">UInt8</span>](<span class="func">repeating</span>: <span class="number">0</span>, count: <span class="type">Int</span>(<span class="type">CC_SHA256_DIGEST_LENGTH</span>))
+    keyData.<span class="func">withUnsafeBytes</span> { _ = <span class="func">CC_SHA256</span>($0.baseAddress, <span class="type">CC_LONG</span>(keyData.count), &amp;hash) }
+    <span class="keyword">return</span> <span class="type">Data</span>(hash).<span class="func">base64EncodedString</span>()
+}</code></pre>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 4: PUBLIC KEY vs CERTIFICATE PINNING                        -->
+    <!-- ================================================================== -->
+
+    <h2 id="pk-vs-cert">4. Public Key Pinning vs Certificate Pinning</h2>
+
+    <p>There are two fundamental approaches to pinning, and the choice has major operational implications for certificate rotation and incident response.</p>
+
+    <h3>4.1 What Each Approach Pins</h3>
+
+    <div class="diagram">
+Certificate Pinning:
+┌─────────────────────────────────────────────────┐
+│              X.509 Certificate                   │
+│  ┌───────────────────────────────────────────┐  │
+│  │ Subject: api.example.com                  │  │
+│  │ Issuer: Let's Encrypt R3                  │  │
+│  │ Valid: 2024-01-01 to 2024-03-31           │  │  ◄── Pins the
+│  │ Serial: 0x3A7F...                         │  │      ENTIRE cert
+│  │ ┌─────────────────────────────────────┐   │  │      (DER hash)
+│  │ │ Subject Public Key Info (SPKI)      │   │  │
+│  │ │ Algorithm: RSA 2048                 │   │  │
+│  │ │ Public Key: 0x30820122...           │   │  │
+│  │ └─────────────────────────────────────┘   │  │
+│  │ Signature: 0x5C3B...                      │  │
+│  └───────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────┘
+
+Public Key Pinning:
+┌─────────────────────────────────────────────────┐
+│              X.509 Certificate                   │
+│  ┌───────────────────────────────────────────┐  │
+│  │ Subject: api.example.com                  │  │
+│  │ Issuer: Let's Encrypt R3                  │  │
+│  │ Valid: 2024-01-01 to 2024-03-31           │  │
+│  │ Serial: 0x3A7F...                         │  │
+│  │ ┌─────────────────────────────────────┐   │  │
+│  │ │ Subject Public Key Info (SPKI)      │   │  │  ◄── Pins ONLY
+│  │ │ Algorithm: RSA 2048                 │   │  │      the public
+│  │ │ Public Key: 0x30820122...           │   │  │      key (SPKI hash)
+│  │ └─────────────────────────────────────┘   │  │
+│  │ Signature: 0x5C3B...                      │  │
+│  └───────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────┘
+    </div>
+
+    <h3>4.2 Comparison</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Certificate Pinning</th>
+                <th>Public Key Pinning</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>What is pinned</td>
+                <td>SHA-256 of the DER-encoded certificate</td>
+                <td>SHA-256 of the SPKI (Subject Public Key Info)</td>
+            </tr>
+            <tr>
+                <td>Survives cert renewal</td>
+                <td>No — new cert = new hash, app breaks</td>
+                <td>Yes — if you reuse the same key pair during renewal</td>
+            </tr>
+            <tr>
+                <td>Survives CA change</td>
+                <td>No</td>
+                <td>Yes — public key is independent of the issuing CA</td>
+            </tr>
+            <tr>
+                <td>Rotation complexity</td>
+                <td>High — requires app update for every cert renewal</td>
+                <td>Low — only changes when the key pair changes</td>
+            </tr>
+            <tr>
+                <td>Security granularity</td>
+                <td>Strictest — pins exact cert identity</td>
+                <td>Slightly less strict — any cert with the same key matches</td>
+            </tr>
+            <tr>
+                <td>Recommended for</td>
+                <td>Short-lived certs with forced app updates</td>
+                <td>Production apps with independent cert lifecycle</td>
+            </tr>
+            <tr>
+                <td>Backup pin strategy</td>
+                <td>Pin current + next cert (requires pre-issuance)</td>
+                <td>Pin current key + offline backup key (CSR generated, never deployed)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Always Pin the Public Key</div>
+        <p>Public key pinning is the industry standard for mobile apps. It decouples your pinning from the certificate lifecycle: you can renew certificates, switch CAs, and even switch between RSA and ECDSA — as long as you reuse the same key pair (or pre-pin the new key), the app continues to work. Certificate pinning is fragile and has caused major outages at companies that forgot to update pins before cert expiry.</p>
+    </div>
+
+    <h3>4.3 HPKP: A Cautionary Tale</h3>
+
+    <p><strong>HTTP Public Key Pinning (HPKP)</strong> was a browser-based pinning mechanism defined in RFC 7469. The server sent a <code>Public-Key-Pins</code> header telling browsers to remember specific key hashes for a given duration. It was deprecated in 2018 and removed from Chrome 72 because:</p>
+
+    <ul>
+        <li><strong>Hostile pinning</strong> — an attacker who compromised a site could set HPKP headers pinning to their own keys, permanently locking out the legitimate owner</li>
+        <li><strong>Self-denial-of-service</strong> — operators who lost their pinned keys (or forgot to rotate) bricked their own sites for the pin duration (up to 60 days)</li>
+        <li><strong>Low adoption</strong> — the risk/reward ratio was too unfavorable; fewer than 0.1% of sites used it</li>
+        <li><strong>Certificate Transparency</strong> provided a less dangerous alternative for detecting rogue certificates</li>
+    </ul>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Why Mobile Pinning Is Different from HPKP</div>
+        <p>Mobile certificate pinning avoids HPKP's worst problems because the pins are embedded in the app binary, not received from the server. An attacker cannot inject hostile pins. The risk of self-denial-of-service remains, but it is mitigated by app update mechanisms and remote kill switches. This is why pinning is still recommended for mobile apps even though HPKP was abandoned for browsers.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 5: SecTrust API                                             -->
+    <!-- ================================================================== -->
+
+    <h2 id="sectrust">5. SecTrust API Deep Dive</h2>
+
+    <p>The <code>SecTrust</code> API is the foundation of all certificate evaluation on Apple platforms. It lives in the Security framework and provides a rich interface for building custom trust policies beyond what ATS offers.</p>
+
+    <h3>5.1 Core SecTrust Functions</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Function</th>
+                <th>Purpose</th>
+                <th>iOS Version</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>SecTrustEvaluateWithError</code></td>
+                <td>Evaluate trust synchronously, returns Bool + CFError</td>
+                <td>iOS 12+</td>
+            </tr>
+            <tr>
+                <td><code>SecTrustGetCertificateCount</code></td>
+                <td>Number of certificates in the evaluated chain</td>
+                <td>iOS 2+</td>
+            </tr>
+            <tr>
+                <td><code>SecTrustGetCertificateAtIndex</code></td>
+                <td>Get certificate at index (deprecated iOS 15)</td>
+                <td>iOS 2–15</td>
+            </tr>
+            <tr>
+                <td><code>SecTrustCopyCertificateChain</code></td>
+                <td>Get full certificate chain as CFArray</td>
+                <td>iOS 15+</td>
+            </tr>
+            <tr>
+                <td><code>SecTrustCopyPublicKey</code></td>
+                <td>Extract the leaf certificate's public key</td>
+                <td>iOS 2+</td>
+            </tr>
+            <tr>
+                <td><code>SecTrustCopyResult</code></td>
+                <td>Detailed evaluation result dictionary</td>
+                <td>iOS 7+</td>
+            </tr>
+            <tr>
+                <td><code>SecTrustSetPolicies</code></td>
+                <td>Set custom trust evaluation policies</td>
+                <td>iOS 2+</td>
+            </tr>
+            <tr>
+                <td><code>SecTrustSetAnchorCertificates</code></td>
+                <td>Override the trusted root CA set</td>
+                <td>iOS 2+</td>
+            </tr>
+            <tr>
+                <td><code>SecTrustSetVerifyDate</code></td>
+                <td>Evaluate trust as of a specific date</td>
+                <td>iOS 2+</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>5.2 Custom Trust Evaluation</h3>
+
+    <pre><code><span class="keyword">func</span> <span class="func">evaluateServerTrust</span>(
+    _ trust: <span class="type">SecTrust</span>,
+    forHost host: <span class="type">String</span>
+) -> <span class="type">Bool</span> {
+    <span class="comment">// Create an SSL policy that validates the hostname</span>
+    <span class="keyword">let</span> policy = <span class="func">SecPolicyCreateSSL</span>(<span class="keyword">true</span>, host <span class="keyword">as</span> <span class="type">CFString</span>)
+    <span class="func">SecTrustSetPolicies</span>(trust, policy)
+
+    <span class="comment">// Evaluate against the system trust store</span>
+    <span class="keyword">var</span> error: <span class="type">CFError</span>?
+    <span class="keyword">let</span> isValid = <span class="func">SecTrustEvaluateWithError</span>(trust, &amp;error)
+
+    <span class="keyword">if</span> !isValid {
+        <span class="keyword">let</span> nsError = error <span class="keyword">as</span>? <span class="type">NSError</span>
+        <span class="func">print</span>(<span class="string">"Trust evaluation failed: \(nsError?.localizedDescription ?? "unknown")"</span>)
+        <span class="func">print</span>(<span class="string">"Error code: \(nsError?.code ?? -1)"</span>)
+    }
+
+    <span class="keyword">return</span> isValid
+}</code></pre>
+
+    <h3>5.3 Custom Anchor Certificates (Self-Signed / Private CA)</h3>
+
+    <pre><code><span class="keyword">func</span> <span class="func">evaluateWithCustomCA</span>(
+    trust: <span class="type">SecTrust</span>,
+    customCACertificate: <span class="type">SecCertificate</span>
+) -> <span class="type">Bool</span> {
+    <span class="comment">// Replace the system trust store with our custom CA</span>
+    <span class="keyword">let</span> anchors = [customCACertificate] <span class="keyword">as</span> <span class="type">CFArray</span>
+    <span class="func">SecTrustSetAnchorCertificates</span>(trust, anchors)
+
+    <span class="comment">// IMPORTANT: By default, SetAnchorCertificates disables the</span>
+    <span class="comment">// system trust store. To trust BOTH custom + system roots:</span>
+    <span class="func">SecTrustSetAnchorCertificatesOnly</span>(trust, <span class="keyword">false</span>)
+
+    <span class="keyword">var</span> error: <span class="type">CFError</span>?
+    <span class="keyword">return</span> <span class="func">SecTrustEvaluateWithError</span>(trust, &amp;error)
+}
+
+<span class="comment">// Loading a CA certificate from the app bundle</span>
+<span class="keyword">func</span> <span class="func">loadCertificate</span>(named name: <span class="type">String</span>) -> <span class="type">SecCertificate</span>? {
+    <span class="keyword">guard let</span> url = <span class="type">Bundle</span>.main.<span class="func">url</span>(forResource: name, withExtension: <span class="string">"der"</span>),
+          <span class="keyword">let</span> data = <span class="keyword">try</span>? <span class="type">Data</span>(contentsOf: url),
+          <span class="keyword">let</span> certificate = <span class="func">SecCertificateCreateWithData</span>(<span class="keyword">nil</span>, data <span class="keyword">as</span> <span class="type">CFData</span>)
+    <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+    <span class="keyword">return</span> certificate
+}</code></pre>
+
+    <h3>5.4 Inspecting the Evaluation Result</h3>
+
+    <pre><code><span class="keyword">func</span> <span class="func">inspectTrustResult</span>(_ trust: <span class="type">SecTrust</span>) {
+    <span class="keyword">var</span> error: <span class="type">CFError</span>?
+    <span class="keyword">let</span> isValid = <span class="func">SecTrustEvaluateWithError</span>(trust, &amp;error)
+
+    <span class="comment">// Get detailed result dictionary</span>
+    <span class="keyword">if let</span> resultDict = <span class="func">SecTrustCopyResult</span>(trust) <span class="keyword">as</span>? [<span class="type">String</span>: <span class="type">Any</span>] {
+        <span class="func">print</span>(<span class="string">"Trust result: \(resultDict)"</span>)
+        <span class="comment">// Contains keys like:</span>
+        <span class="comment">//   "TrustResultValue" → 4 (kSecTrustResultUnspecified = valid)</span>
+        <span class="comment">//   "TrustRevocationChecked" → true/false</span>
+        <span class="comment">//   "TrustExpirationDate" → date</span>
+        <span class="comment">//   "TrustCertificateTransparency" → true/false</span>
+    }
+
+    <span class="comment">// Extract the leaf certificate's public key</span>
+    <span class="keyword">if let</span> publicKey = <span class="func">SecTrustCopyPublicKey</span>(trust) {
+        <span class="keyword">let</span> attributes = <span class="func">SecKeyCopyAttributes</span>(publicKey) <span class="keyword">as</span>? [<span class="type">String</span>: <span class="type">Any</span>]
+        <span class="func">print</span>(<span class="string">"Key type: \(attributes?[kSecAttrKeyType as String] ?? "unknown")"</span>)
+        <span class="func">print</span>(<span class="string">"Key size: \(attributes?[kSecAttrKeySizeInBits as String] ?? "unknown")"</span>)
+    }
+
+    <span class="comment">// Get certificate chain (iOS 15+)</span>
+    <span class="keyword">if</span> #<span class="func">available</span>(iOS <span class="number">15.0</span>, *) {
+        <span class="keyword">if let</span> chain = <span class="func">SecTrustCopyCertificateChain</span>(trust) <span class="keyword">as</span>? [<span class="type">SecCertificate</span>] {
+            <span class="keyword">for</span> (i, cert) <span class="keyword">in</span> chain.<span class="func">enumerated</span>() {
+                <span class="keyword">let</span> summary = <span class="func">SecCertificateCopySubjectSummary</span>(cert) <span class="keyword">as</span>? <span class="type">String</span>
+                <span class="func">print</span>(<span class="string">"  [\(i)] \(summary ?? "unknown")"</span>)
+            }
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: SecTrustEvaluate (Deprecated) vs SecTrustEvaluateWithError</div>
+        <p>The old <code>SecTrustEvaluate(_:_:)</code> function (deprecated in iOS 15) returned a <code>SecTrustResultType</code> enum that was notoriously confusing. Both <code>.unspecified</code> and <code>.proceed</code> meant "trusted," while <code>.recoverableTrustFailure</code> meant "untrusted but you can override." Many developers incorrectly treated <code>.unspecified</code> as a failure. Use <code>SecTrustEvaluateWithError</code> (iOS 12+) which returns a simple Bool — <code>true</code> means trusted, <code>false</code> means not trusted, with a descriptive <code>CFError</code>.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 6: CERTIFICATE TRANSPARENCY                                 -->
+    <!-- ================================================================== -->
+
+    <h2 id="ct">6. Certificate Transparency</h2>
+
+    <p>Certificate Transparency (CT) is a public auditing framework (RFC 6962) that makes it possible to detect misissued or rogue certificates. It was created by Google after the DigiNotar breach (2011) where a compromised CA issued fraudulent certificates for google.com and other high-profile domains.</p>
+
+    <h3>6.1 How Certificate Transparency Works</h3>
+
+    <div class="diagram">
+Certificate Transparency Ecosystem:
+
+Certificate Authority                CT Log Servers              Monitors/Auditors
+       │                              (append-only               (Google, Facebook,
+       │                               Merkle trees)              CertSpotter, etc.)
+       │                                    │                          │
+       │  1. CA issues certificate          │                          │
+       │     and submits it to CT logs      │                          │
+       │────────────────────────────────────▶│                          │
+       │                                    │                          │
+       │  2. CT log returns SCT             │                          │
+       │     (Signed Certificate            │                          │
+       │      Timestamp)                    │                          │
+       │◀────────────────────────────────────│                          │
+       │                                    │                          │
+       │  3. CA embeds SCT in the           │                          │
+       │     certificate (or serves         │                          │
+       │     via TLS extension / OCSP)      │                          │
+       │                                    │                          │
+       │                                    │  4. Monitors continuously│
+       │                                    │     scan CT logs for     │
+       │                                    │     suspicious certs     │
+       │                                    │◀─────────────────────────│
+       │                                    │                          │
+       ▼                                    │                          │
+   TLS Client (iOS)                         │                          │
+       │                                    │                          │
+       │  5. Client verifies SCT            │                          │
+       │     proves certificate was         │                          │
+       │     logged BEFORE issuance         │                          │
+       │     (prevents secret certs)        │                          │
+       │                                    │                          │
+       ▼                                    │                          │
+   Connection allowed                       │                          │
+   (cert is publicly auditable)             │                          │
+    </div>
+
+    <h3>6.2 SCT Delivery Methods</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Method</th>
+                <th>How It Works</th>
+                <th>Pros</th>
+                <th>Cons</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Embedded in certificate</td>
+                <td>CA submits pre-certificate to CT logs, embeds SCTs in the final cert as an X.509 extension</td>
+                <td>No server changes needed; works everywhere</td>
+                <td>Requires CA cooperation; increases cert size</td>
+            </tr>
+            <tr>
+                <td>TLS extension</td>
+                <td>Server sends SCTs in the <code>signed_certificate_timestamp</code> TLS extension during handshake</td>
+                <td>No cert modification; server controls which logs</td>
+                <td>Requires server configuration</td>
+            </tr>
+            <tr>
+                <td>OCSP stapling</td>
+                <td>SCTs are included in the OCSP response stapled to the TLS handshake</td>
+                <td>Leverages existing OCSP infrastructure</td>
+                <td>Requires OCSP stapling support; adds latency</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>6.3 CT on iOS</h3>
+
+    <p>Apple has required Certificate Transparency for all publicly-trusted certificates since <strong>October 15, 2018</strong>. Any certificate issued after this date by a CA in Apple's trust store must have at least two SCTs from approved CT logs. Certificates without valid SCTs are treated as untrusted.</p>
+
+    <pre><code><span class="comment">// Checking CT status in SecTrust evaluation</span>
+<span class="keyword">func</span> <span class="func">checkCertificateTransparency</span>(_ trust: <span class="type">SecTrust</span>) {
+    <span class="keyword">var</span> error: <span class="type">CFError</span>?
+    <span class="keyword">let</span> isValid = <span class="func">SecTrustEvaluateWithError</span>(trust, &amp;error)
+
+    <span class="keyword">if let</span> result = <span class="func">SecTrustCopyResult</span>(trust) <span class="keyword">as</span>? [<span class="type">String</span>: <span class="type">Any</span>] {
+        <span class="keyword">let</span> ctStatus = result[<span class="string">"TrustCertificateTransparency"</span>] <span class="keyword">as</span>? <span class="type">Bool</span>
+        <span class="func">print</span>(<span class="string">"CT compliant: \(ctStatus ?? false)"</span>)
+    }
+}
+
+<span class="comment">// CT enforcement means:</span>
+<span class="comment">// - Rogue CAs cannot secretly issue certs (they'd be logged)</span>
+<span class="comment">// - Domain owners can monitor CT logs for unauthorized certs</span>
+<span class="comment">// - Misissued certs are detectable within hours, not months</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: CT and Pinning Are Complementary</div>
+        <p>Certificate Transparency and certificate pinning solve different problems. CT ensures that every certificate is publicly logged and auditable — it detects rogue certificates <em>after</em> issuance. Pinning ensures your app only trusts <em>specific</em> certificates — it prevents MITM even if a rogue cert is issued. For maximum security, use both: CT catches CA compromises at the ecosystem level, while pinning provides app-level defense-in-depth. Apple's CT requirement applies to the system trust evaluation; your pinning logic runs on top of it.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 7: DECLARATIVE PINNING — NSPinnedDomains                    -->
+    <!-- ================================================================== -->
+
+    <h2 id="declarative-pinning">7. Declarative Pinning — NSPinnedDomains (iOS 14+)</h2>
+
+    <p>iOS 14 introduced <code>NSPinnedDomains</code>, a declarative way to configure certificate pinning directly in <code>Info.plist</code> without writing any <code>URLSessionDelegate</code> code. This is Apple's recommended approach for new projects.</p>
+
+    <h3>7.1 Info.plist Configuration</h3>
+
+    <pre><code><span class="comment">&lt;!-- NSPinnedDomains in Info.plist --&gt;</span>
+&lt;key&gt;NSAppTransportSecurity&lt;/key&gt;
+&lt;dict&gt;
+    &lt;key&gt;NSPinnedDomains&lt;/key&gt;
+    &lt;dict&gt;
+        &lt;key&gt;api.example.com&lt;/key&gt;
+        &lt;dict&gt;
+            <span class="comment">&lt;!-- Include subdomains like staging.api.example.com --&gt;</span>
+            &lt;key&gt;NSIncludesSubdomains&lt;/key&gt;
+            &lt;true/&gt;
+
+            <span class="comment">&lt;!-- Pin the CA certificate's public key --&gt;</span>
+            &lt;key&gt;NSPinnedCAIdentities&lt;/key&gt;
+            &lt;array&gt;
+                &lt;dict&gt;
+                    <span class="comment">&lt;!-- SPKI hash in base64 --&gt;</span>
+                    &lt;key&gt;SPKI-SHA256-BASE64&lt;/key&gt;
+                    &lt;string&gt;YLh1dUR9y6Kja30RrAn7JKnbQG/uEtLMkBgFF2Fuihg=&lt;/string&gt;
+                &lt;/dict&gt;
+                &lt;dict&gt;
+                    <span class="comment">&lt;!-- Backup CA pin --&gt;</span>
+                    &lt;key&gt;SPKI-SHA256-BASE64&lt;/key&gt;
+                    &lt;string&gt;Vjs8r4z+80wjNcr1YKepWQboSIRi63WsWXhIMN+eWys=&lt;/string&gt;
+                &lt;/dict&gt;
+            &lt;/array&gt;
+
+            <span class="comment">&lt;!-- OR pin the leaf certificate's public key --&gt;</span>
+            &lt;key&gt;NSPinnedLeafIdentities&lt;/key&gt;
+            &lt;array&gt;
+                &lt;dict&gt;
+                    &lt;key&gt;SPKI-SHA256-BASE64&lt;/key&gt;
+                    &lt;string&gt;kQ0mwKkBT8wz3gPOmGXECDRM/1FiJpIFg2R8Js3kYWs=&lt;/string&gt;
+                &lt;/dict&gt;
+            &lt;/array&gt;
+        &lt;/dict&gt;
+    &lt;/dict&gt;
+&lt;/dict&gt;</code></pre>
+
+    <h3>7.2 NSPinnedCAIdentities vs NSPinnedLeafIdentities</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>NSPinnedCAIdentities</th>
+                <th>NSPinnedLeafIdentities</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>What it pins</td>
+                <td>CA (intermediate or root) public key</td>
+                <td>Leaf (server) certificate public key</td>
+            </tr>
+            <tr>
+                <td>Flexibility</td>
+                <td>High — any cert issued by the pinned CA is accepted</td>
+                <td>Low — only the exact server key is accepted</td>
+            </tr>
+            <tr>
+                <td>Rotation impact</td>
+                <td>Transparent if same CA issues the new cert</td>
+                <td>Breaks if server key changes</td>
+            </tr>
+            <tr>
+                <td>Security level</td>
+                <td>Moderate — trusts the CA's issuance practices</td>
+                <td>Highest — trusts only the specific server key</td>
+            </tr>
+            <tr>
+                <td>Recommended for</td>
+                <td>Most production apps</td>
+                <td>High-security apps with tight key control</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>7.3 Declarative vs Programmatic Pinning</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>NSPinnedDomains (Declarative)</th>
+                <th>URLSessionDelegate (Programmatic)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Code required</td>
+                <td>None — plist only</td>
+                <td>Full delegate implementation</td>
+            </tr>
+            <tr>
+                <td>Bypass risk</td>
+                <td>Low — enforced by the system before your code runs</td>
+                <td>Higher — delegate bugs can skip validation</td>
+            </tr>
+            <tr>
+                <td>Dynamic pins</td>
+                <td>No — pins are static in the binary</td>
+                <td>Yes — pins can be loaded from remote config</td>
+            </tr>
+            <tr>
+                <td>Failure reporting</td>
+                <td>Generic connection error</td>
+                <td>Custom error handling and telemetry</td>
+            </tr>
+            <tr>
+                <td>WebView support</td>
+                <td>Yes — applies to WKWebView automatically</td>
+                <td>Requires WKNavigationDelegate</td>
+            </tr>
+            <tr>
+                <td>Minimum iOS</td>
+                <td>iOS 14</td>
+                <td>iOS 2+</td>
+            </tr>
+            <tr>
+                <td>Emergency disable</td>
+                <td>Requires app update</td>
+                <td>Can disable via remote config flag</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Layered Pinning Strategy</div>
+        <p>For production apps, use <strong>both</strong> declarative and programmatic pinning. Set <code>NSPinnedDomains</code> as a baseline — it catches cases where developers forget to implement the delegate, and it protects WKWebView traffic automatically. Then add programmatic pinning in your <code>URLSessionDelegate</code> for custom error reporting, telemetry on pin failures, and the ability to dynamically update pins via remote configuration.</p>
+    </div>
+
+    <!-- ================================================================== -->
+    <!-- SECTION 8: ARCHITECT — ROTATION STRATEGY                            -->
+    <!-- ================================================================== -->
+
+    <h2 id="architect">8. Architect: Certificate Pinning Strategy for Graceful Rotation</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>At the Staff/L6 level, you must design a pinning strategy that balances security with operational resilience. A naive pinning implementation is a ticking time bomb — when the certificate rotates and the app hasn't been updated, every user is locked out. This section covers the full architecture for a production-grade pinning system.</p>
+    </div>
+
+    <h3>8.1 The Multi-Pin Architecture</h3>
+
+    <div class="diagram">
+Certificate Pinning Rotation Architecture:
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                        App Binary (v3.2)                            │
+│                                                                     │
+│  Embedded Pins:                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │ Pin Set for api.example.com:                                  │  │
+│  │                                                               │  │
+│  │  1. Current Key  → SHA256/AAAA... (active server key)         │  │
+│  │  2. Next Key     → SHA256/BBBB... (pre-generated backup)      │  │
+│  │  3. Backup Key   → SHA256/CCCC... (offline cold storage)      │  │
+│  │  4. CA Pin       → SHA256/DDDD... (intermediate CA fallback)  │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  Remote Config Override:                                            │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │ Fetch from: https://config.example.com/pins.json              │  │
+│  │ (This endpoint is NOT pinned — uses system trust only)        │  │
+│  │                                                               │  │
+│  │ Can: add new pins, disable pinning entirely                   │  │
+│  │ Cannot: remove embedded pins (defense in depth)               │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  Telemetry:                                                         │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │ On pin failure: report to analytics (unpinned endpoint)       │  │
+│  │ Metrics: pin_match_index, server_cert_hash, failure_count     │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+
+Rotation Timeline:
+
+Phase 1: Normal Operation
+  Server uses Key A ──▶ App matches Pin #1 (Current) ✓
+
+Phase 2: Key Rotation
+  Server switches to Key B ──▶ App matches Pin #2 (Next) ✓
+  Ship app update with:
+    Pin #1 = Key B (now current)
+    Pin #2 = Key D (new next)
+    Pin #3 = Key C (unchanged backup)
+
+Phase 3: Emergency (Key Compromise)
+  Server switches to Key C (cold backup) ──▶ App matches Pin #3 ✓
+  OR: Remote config disables pinning temporarily
+    </div>
+
+    <h3>8.2 Complete Production Implementation</h3>
+
+    <pre><code><span class="keyword">import</span> Foundation
+<span class="keyword">import</span> Security
+<span class="keyword">import</span> CommonCrypto
+
+<span class="keyword">final class</span> <span class="type">ProductionPinningManager</span>: <span class="type">NSObject</span>, <span class="type">URLSessionDelegate</span>, <span class="type">Sendable</span> {
+
+    <span class="keyword">struct</span> <span class="type">PinSet</span>: <span class="type">Codable</span>, <span class="type">Sendable</span> {
+        <span class="keyword">let</span> hostname: <span class="type">String</span>
+        <span class="keyword">let</span> spkiHashes: [<span class="type">String</span>]
+        <span class="keyword">let</span> includesSubdomains: <span class="type">Bool</span>
+        <span class="keyword">let</span> enforcementMode: <span class="type">EnforcementMode</span>
+        <span class="keyword">let</span> expiresAt: <span class="type">Date</span>?
+    }
+
+    <span class="keyword">enum</span> <span class="type">EnforcementMode</span>: <span class="type">String</span>, <span class="type">Codable</span>, <span class="type">Sendable</span> {
+        <span class="keyword">case</span> enforce
+        <span class="keyword">case</span> reportOnly
+        <span class="keyword">case</span> disabled
+    }
+
+    <span class="keyword">struct</span> <span class="type">PinFailureReport</span>: <span class="type">Codable</span>, <span class="type">Sendable</span> {
+        <span class="keyword">let</span> hostname: <span class="type">String</span>
+        <span class="keyword">let</span> serverKeyHash: <span class="type">String</span>
+        <span class="keyword">let</span> expectedHashes: [<span class="type">String</span>]
+        <span class="keyword">let</span> certChainSummary: [<span class="type">String</span>]
+        <span class="keyword">let</span> timestamp: <span class="type">Date</span>
+        <span class="keyword">let</span> appVersion: <span class="type">String</span>
+        <span class="keyword">let</span> osVersion: <span class="type">String</span>
+    }
+
+    <span class="keyword">private let</span> embeddedPins: [<span class="type">PinSet</span>]
+    <span class="keyword">private let</span> remotePinOverrides: <span class="type">RemotePinStore</span>
+    <span class="keyword">private let</span> telemetry: <span class="type">PinningTelemetry</span>
+
+    <span class="keyword">init</span>(
+        embeddedPins: [<span class="type">PinSet</span>],
+        remotePinStore: <span class="type">RemotePinStore</span>,
+        telemetry: <span class="type">PinningTelemetry</span>
+    ) {
+        <span class="keyword">self</span>.embeddedPins = embeddedPins
+        <span class="keyword">self</span>.remotePinOverrides = remotePinStore
+        <span class="keyword">self</span>.telemetry = telemetry
+        <span class="keyword">super</span>.<span class="func">init</span>()
+    }
+
+    <span class="keyword">func</span> <span class="func">urlSession</span>(
+        _ session: <span class="type">URLSession</span>,
+        didReceive challenge: <span class="type">URLAuthenticationChallenge</span>,
+        completionHandler: <span class="keyword">@escaping</span> (<span class="type">URLSession</span>.<span class="type">AuthChallengeDisposition</span>, <span class="type">URLCredential</span>?) -> <span class="type">Void</span>
+    ) {
+        <span class="keyword">let</span> host = challenge.protectionSpace.host
+
+        <span class="keyword">guard</span> challenge.protectionSpace.authenticationMethod
+                == <span class="type">NSURLAuthenticationMethodServerTrust</span>,
+              <span class="keyword">let</span> serverTrust = challenge.protectionSpace.serverTrust
+        <span class="keyword">else</span> {
+            completionHandler(.performDefaultHandling, <span class="keyword">nil</span>)
+            <span class="keyword">return</span>
+        }
+
+        <span class="comment">// Resolve effective pin set: remote overrides take precedence</span>
+        <span class="keyword">let</span> effectivePinSet = <span class="func">resolveEffectivePins</span>(for: host)
+
+        <span class="keyword">guard let</span> pinSet = effectivePinSet <span class="keyword">else</span> {
+            completionHandler(.performDefaultHandling, <span class="keyword">nil</span>)
+            <span class="keyword">return</span>
+        }
+
+        <span class="comment">// Check if pinning is disabled via remote config</span>
+        <span class="keyword">if</span> pinSet.enforcementMode == .disabled {
+            completionHandler(.performDefaultHandling, <span class="keyword">nil</span>)
+            <span class="keyword">return</span>
+        }
+
+        <span class="comment">// Check pin expiration</span>
+        <span class="keyword">if let</span> expiresAt = pinSet.expiresAt, <span class="type">Date</span>() > expiresAt {
+            telemetry.<span class="func">reportExpiredPins</span>(hostname: host)
+            completionHandler(.performDefaultHandling, <span class="keyword">nil</span>)
+            <span class="keyword">return</span>
+        }
+
+        <span class="comment">// Step 1: Standard trust evaluation</span>
+        <span class="keyword">var</span> error: <span class="type">CFError</span>?
+        <span class="keyword">guard</span> <span class="func">SecTrustEvaluateWithError</span>(serverTrust, &amp;error) <span class="keyword">else</span> {
+            completionHandler(.cancelAuthenticationChallenge, <span class="keyword">nil</span>)
+            <span class="keyword">return</span>
+        }
+
+        <span class="comment">// Step 2: Extract and hash server public keys from the chain</span>
+        <span class="keyword">let</span> serverKeyHashes = <span class="func">extractKeyHashes</span>(from: serverTrust)
+
+        <span class="comment">// Step 3: Check if any server key matches any pin</span>
+        <span class="keyword">let</span> matchingHash = serverKeyHashes.<span class="func">first</span> { pinSet.spkiHashes.<span class="func">contains</span>($0) }
+
+        <span class="keyword">if let</span> _ = matchingHash {
+            <span class="keyword">let</span> credential = <span class="type">URLCredential</span>(trust: serverTrust)
+            completionHandler(.useCredential, credential)
+        } <span class="keyword">else</span> {
+            <span class="comment">// Pin mismatch — report and potentially block</span>
+            <span class="keyword">let</span> report = <span class="func">buildFailureReport</span>(
+                host: host,
+                serverKeyHashes: serverKeyHashes,
+                expectedHashes: pinSet.spkiHashes,
+                trust: serverTrust
+            )
+            telemetry.<span class="func">reportPinFailure</span>(report)
+
+            <span class="keyword">switch</span> pinSet.enforcementMode {
+            <span class="keyword">case</span> .enforce:
+                completionHandler(.cancelAuthenticationChallenge, <span class="keyword">nil</span>)
+            <span class="keyword">case</span> .reportOnly:
+                <span class="keyword">let</span> credential = <span class="type">URLCredential</span>(trust: serverTrust)
+                completionHandler(.useCredential, credential)
+            <span class="keyword">case</span> .disabled:
+                completionHandler(.performDefaultHandling, <span class="keyword">nil</span>)
+            }
+        }
+    }
+
+    <span class="keyword">private func</span> <span class="func">resolveEffectivePins</span>(for host: <span class="type">String</span>) -> <span class="type">PinSet</span>? {
+        <span class="keyword">if let</span> remotePins = remotePinOverrides.<span class="func">pins</span>(for: host) {
+            <span class="comment">// Merge: remote can ADD pins or change mode, but</span>
+            <span class="comment">// cannot REMOVE embedded pins (defense in depth)</span>
+            <span class="keyword">if let</span> embedded = <span class="func">findEmbeddedPinSet</span>(for: host) {
+                <span class="keyword">let</span> mergedHashes = <span class="type">Array</span>(<span class="type">Set</span>(embedded.spkiHashes + remotePins.spkiHashes))
+                <span class="keyword">return</span> <span class="type">PinSet</span>(
+                    hostname: host,
+                    spkiHashes: mergedHashes,
+                    includesSubdomains: embedded.includesSubdomains,
+                    enforcementMode: remotePins.enforcementMode,
+                    expiresAt: remotePins.expiresAt
+                )
+            }
+            <span class="keyword">return</span> remotePins
+        }
+        <span class="keyword">return</span> <span class="func">findEmbeddedPinSet</span>(for: host)
+    }
+
+    <span class="keyword">private func</span> <span class="func">findEmbeddedPinSet</span>(for host: <span class="type">String</span>) -> <span class="type">PinSet</span>? {
+        embeddedPins.<span class="func">first</span> { pinSet <span class="keyword">in</span>
+            <span class="keyword">if</span> pinSet.hostname == host { <span class="keyword">return true</span> }
+            <span class="keyword">if</span> pinSet.includesSubdomains &amp;&amp; host.<span class="func">hasSuffix</span>(<span class="string">".\(pinSet.hostname)"</span>) {
+                <span class="keyword">return true</span>
+            }
+            <span class="keyword">return false</span>
+        }
+    }
+
+    <span class="keyword">private func</span> <span class="func">extractKeyHashes</span>(from trust: <span class="type">SecTrust</span>) -> [<span class="type">String</span>] {
+        <span class="keyword">var</span> hashes: [<span class="type">String</span>] = []
+
+        <span class="keyword">if</span> #<span class="func">available</span>(iOS <span class="number">15.0</span>, *) {
+            <span class="keyword">guard let</span> chain = <span class="func">SecTrustCopyCertificateChain</span>(trust) <span class="keyword">as</span>? [<span class="type">SecCertificate</span>]
+            <span class="keyword">else</span> { <span class="keyword">return</span> [] }
+            <span class="keyword">for</span> cert <span class="keyword">in</span> chain {
+                <span class="keyword">if let</span> hash = <span class="func">hashPublicKey</span>(of: cert) {
+                    hashes.<span class="func">append</span>(hash)
+                }
+            }
+        } <span class="keyword">else</span> {
+            <span class="keyword">for</span> i <span class="keyword">in</span> <span class="number">0</span>..&lt;<span class="func">SecTrustGetCertificateCount</span>(trust) {
+                <span class="keyword">guard let</span> cert = <span class="func">SecTrustGetCertificateAtIndex</span>(trust, i)
+                <span class="keyword">else</span> { <span class="keyword">continue</span> }
+                <span class="keyword">if let</span> hash = <span class="func">hashPublicKey</span>(of: cert) {
+                    hashes.<span class="func">append</span>(hash)
+                }
+            }
+        }
+        <span class="keyword">return</span> hashes
+    }
+
+    <span class="keyword">private func</span> <span class="func">hashPublicKey</span>(of certificate: <span class="type">SecCertificate</span>) -> <span class="type">String</span>? {
+        <span class="keyword">guard let</span> key = <span class="func">SecCertificateCopyKey</span>(certificate),
+              <span class="keyword">let</span> keyData = <span class="func">SecKeyCopyExternalRepresentation</span>(key, <span class="keyword">nil</span>) <span class="keyword">as</span>? <span class="type">Data</span>
+        <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+
+        <span class="keyword">var</span> hash = [<span class="type">UInt8</span>](<span class="func">repeating</span>: <span class="number">0</span>, count: <span class="type">Int</span>(<span class="type">CC_SHA256_DIGEST_LENGTH</span>))
+        keyData.<span class="func">withUnsafeBytes</span> { buffer <span class="keyword">in</span>
+            _ = <span class="func">CC_SHA256</span>(buffer.baseAddress, <span class="type">CC_LONG</span>(keyData.count), &amp;hash)
+        }
+        <span class="keyword">return</span> <span class="type">Data</span>(hash).<span class="func">base64EncodedString</span>()
+    }
+
+    <span class="keyword">private func</span> <span class="func">buildFailureReport</span>(
+        host: <span class="type">String</span>,
+        serverKeyHashes: [<span class="type">String</span>],
+        expectedHashes: [<span class="type">String</span>],
+        trust: <span class="type">SecTrust</span>
+    ) -> <span class="type">PinFailureReport</span> {
+        <span class="keyword">var</span> chainSummary: [<span class="type">String</span>] = []
+        <span class="keyword">if</span> #<span class="func">available</span>(iOS <span class="number">15.0</span>, *) {
+            <span class="keyword">if let</span> chain = <span class="func">SecTrustCopyCertificateChain</span>(trust) <span class="keyword">as</span>? [<span class="type">SecCertificate</span>] {
+                chainSummary = chain.<span class="func">compactMap</span> {
+                    <span class="func">SecCertificateCopySubjectSummary</span>($0) <span class="keyword">as</span>? <span class="type">String</span>
+                }
+            }
+        }
+
+        <span class="keyword">return</span> <span class="type">PinFailureReport</span>(
+            hostname: host,
+            serverKeyHash: serverKeyHashes.<span class="func">first</span> ?? <span class="string">"unknown"</span>,
+            expectedHashes: expectedHashes,
+            certChainSummary: chainSummary,
+            timestamp: <span class="type">Date</span>(),
+            appVersion: <span class="type">Bundle</span>.main.infoDictionary?[<span class="string">"CFBundleShortVersionString"</span>] <span class="keyword">as</span>? <span class="type">String</span> ?? <span class="string">"?"</span>,
+            osVersion: <span class="type">ProcessInfo</span>.processInfo.operatingSystemVersionString
+        )
+    }
+}
+
+<span class="comment">// Protocol for remote pin storage</span>
+<span class="keyword">protocol</span> <span class="type">RemotePinStore</span>: <span class="type">Sendable</span> {
+    <span class="keyword">func</span> <span class="func">pins</span>(for hostname: <span class="type">String</span>) -> <span class="type">ProductionPinningManager</span>.<span class="type">PinSet</span>?
+    <span class="keyword">func</span> <span class="func">refresh</span>() <span class="keyword">async</span>
+}
+
+<span class="comment">// Protocol for telemetry reporting</span>
+<span class="keyword">protocol</span> <span class="type">PinningTelemetry</span>: <span class="type">Sendable</span> {
+    <span class="keyword">func</span> <span class="func">reportPinFailure</span>(_ report: <span class="type">ProductionPinningManager</span>.<span class="type">PinFailureReport</span>)
+    <span class="keyword">func</span> <span class="func">reportExpiredPins</span>(hostname: <span class="type">String</span>)
+}</code></pre>
+
+    <h3>8.3 Remote Pin Configuration Service</h3>
+
+    <pre><code><span class="keyword">final class</span> <span class="type">RemotePinConfigService</span>: <span class="type">RemotePinStore</span> {
+
+    <span class="keyword">private struct</span> <span class="type">RemoteConfig</span>: <span class="type">Codable</span> {
+        <span class="keyword">let</span> version: <span class="type">Int</span>
+        <span class="keyword">let</span> pins: [<span class="type">ProductionPinningManager</span>.<span class="type">PinSet</span>]
+        <span class="keyword">let</span> signature: <span class="type">String</span>
+    }
+
+    <span class="keyword">private let</span> configURL: <span class="type">URL</span>
+    <span class="keyword">private let</span> signaturePublicKey: <span class="type">SecKey</span>
+    <span class="keyword">private var</span> cachedPins: [<span class="type">String</span>: <span class="type">ProductionPinningManager</span>.<span class="type">PinSet</span>] = [:]
+    <span class="keyword">private let</span> queue = <span class="type">DispatchQueue</span>(label: <span class="string">"com.app.remotepins"</span>)
+
+    <span class="keyword">init</span>(configURL: <span class="type">URL</span>, signaturePublicKey: <span class="type">SecKey</span>) {
+        <span class="keyword">self</span>.configURL = configURL
+        <span class="keyword">self</span>.signaturePublicKey = signaturePublicKey
+    }
+
+    <span class="keyword">func</span> <span class="func">pins</span>(for hostname: <span class="type">String</span>) -> <span class="type">ProductionPinningManager</span>.<span class="type">PinSet</span>? {
+        queue.<span class="func">sync</span> { cachedPins[hostname] }
+    }
+
+    <span class="keyword">func</span> <span class="func">refresh</span>() <span class="keyword">async</span> {
+        <span class="keyword">do</span> {
+            <span class="comment">// Use a SEPARATE unpinned session for config fetches</span>
+            <span class="keyword">let</span> (data, _) = <span class="keyword">try await</span> <span class="type">URLSession</span>.shared.<span class="func">data</span>(from: configURL)
+            <span class="keyword">let</span> config = <span class="keyword">try</span> <span class="type">JSONDecoder</span>().<span class="func">decode</span>(<span class="type">RemoteConfig</span>.<span class="keyword">self</span>, from: data)
+
+            <span class="comment">// Verify the config signature to prevent tampering</span>
+            <span class="keyword">guard</span> <span class="func">verifySignature</span>(config.signature, for: data) <span class="keyword">else</span> {
+                <span class="keyword">return</span>
+            }
+
+            queue.<span class="func">async</span> { [<span class="keyword">weak self</span>] <span class="keyword">in</span>
+                <span class="keyword">self</span>?.cachedPins = <span class="type">Dictionary</span>(
+                    uniqueKeysWithValues: config.pins.<span class="func">map</span> { ($0.hostname, $0) }
+                )
+            }
+        } <span class="keyword">catch</span> {
+            <span class="comment">// Config fetch failure is non-fatal; embedded pins remain active</span>
+        }
+    }
+
+    <span class="keyword">private func</span> <span class="func">verifySignature</span>(_ signature: <span class="type">String</span>, for data: <span class="type">Data</span>) -> <span class="type">Bool</span> {
+        <span class="keyword">guard let</span> sigData = <span class="type">Data</span>(base64Encoded: signature) <span class="keyword">else</span> { <span class="keyword">return false</span> }
+        <span class="keyword">let</span> algorithm: <span class="type">SecKeyAlgorithm</span> = .ecdsaSignatureMessageX962SHA256
+        <span class="keyword">var</span> error: <span class="type">Unmanaged</span>&lt;<span class="type">CFError</span>&gt;?
+        <span class="keyword">let</span> isValid = <span class="func">SecKeyVerifySignature</span>(
+            signaturePublicKey, algorithm,
+            data <span class="keyword">as</span> <span class="type">CFData</span>, sigData <span class="keyword">as</span> <span class="type">CFData</span>, &amp;error
+        )
+        <span class="keyword">return</span> isValid
+    }
+}</code></pre>
+
+    <h3>8.4 Rotation Runbook</h3>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: The Rotation Playbook</div>
+        <p>Certificate rotation is an operational procedure, not just a code problem. Here is the step-by-step playbook that prevents outages:</p>
+    </div>
+
+    <div class="diagram">
+Certificate Rotation Runbook (6-Step Process):
+
+Step 1: PRE-GENERATE BACKUP KEY (Day 0 — do this NOW)
+  ┌──────────────────────────────────────────────────────────┐
+  │ $ openssl ecparam -genkey -name prime256v1 \             │
+  │     -out backup-key.pem                                  │
+  │ $ openssl req -new -key backup-key.pem \                 │
+  │     -out backup-key.csr -subj "/CN=api.example.com"      │
+  │                                                          │
+  │ Store backup-key.pem in HSM / secure vault               │
+  │ Extract SPKI hash → embed in app as backup pin           │
+  └──────────────────────────────────────────────────────────┘
+
+Step 2: EMBED MULTI-PIN SET (App Release)
+  ┌──────────────────────────────────────────────────────────┐
+  │ Pin #1: Current production key hash                      │
+  │ Pin #2: Backup key hash (from Step 1)                    │
+  │ Pin #3: Intermediate CA key hash (fallback)              │
+  └──────────────────────────────────────────────────────────┘
+
+Step 3: MONITOR PIN MATCH INDEX (Ongoing)
+  ┌──────────────────────────────────────────────────────────┐
+  │ Telemetry should report WHICH pin matched:               │
+  │   pin_index=0 → 99.9% (normal, current key)             │
+  │   pin_index=1 → 0%    (backup, not yet deployed)        │
+  │   pin_index=2 → 0.1%  (CA pin, edge cases)              │
+  │   no_match   → 0%     (should trigger alert)            │
+  └──────────────────────────────────────────────────────────┘
+
+Step 4: ROTATE SERVER CERTIFICATE (When needed)
+  ┌──────────────────────────────────────────────────────────┐
+  │ Option A: Reuse same key pair → no pin change needed     │
+  │ Option B: Use backup key → matches Pin #2                │
+  │ Option C: New key → push via remote config first         │
+  └──────────────────────────────────────────────────────────┘
+
+Step 5: UPDATE APP PINS (Next release)
+  ┌──────────────────────────────────────────────────────────┐
+  │ Pin #1: New production key hash                          │
+  │ Pin #2: NEW backup key hash (generate another)           │
+  │ Pin #3: Intermediate CA key hash (unchanged)             │
+  └──────────────────────────────────────────────────────────┘
+
+Step 6: EMERGENCY PROCEDURE (Key compromise)
+  ┌──────────────────────────────────────────────────────────┐
+  │ 1. Deploy backup key to server immediately               │
+  │ 2. Push remote config: add new emergency pin             │
+  │ 3. If all pins compromised: remote config → disabled     │
+  │ 4. Ship emergency app update with new pins               │
+  │ 5. Re-enable enforcement via remote config               │
+  └──────────────────────────────────────────────────────────┘
+    </div>
+
+    <h3>8.5 Gradual Rollout Strategy</h3>
+
+    <pre><code><span class="keyword">enum</span> <span class="type">PinningRolloutPhase</span> {
+    <span class="keyword">case</span> reportOnly
+    <span class="keyword">case</span> enforceForBeta
+    <span class="keyword">case</span> enforceForPercentage(<span class="type">Int</span>)
+    <span class="keyword">case</span> enforceForAll
+}
+
+<span class="keyword">final class</span> <span class="type">PinningRolloutController</span> {
+
+    <span class="keyword">private let</span> phase: <span class="type">PinningRolloutPhase</span>
+    <span class="keyword">private let</span> deviceID: <span class="type">String</span>
+
+    <span class="keyword">func</span> <span class="func">shouldEnforce</span>() -> <span class="type">Bool</span> {
+        <span class="keyword">switch</span> phase {
+        <span class="keyword">case</span> .reportOnly:
+            <span class="keyword">return false</span>
+
+        <span class="keyword">case</span> .enforceForBeta:
+            <span class="keyword">return</span> <span class="type">Bundle</span>.main.appStoreReceiptURL?.lastPathComponent
+                == <span class="string">"sandboxReceipt"</span>
+
+        <span class="keyword">case</span> .enforceForPercentage(<span class="keyword">let</span> percent):
+            <span class="keyword">let</span> hash = <span class="func">abs</span>(deviceID.<span class="func">hashValue</span>) % <span class="number">100</span>
+            <span class="keyword">return</span> hash &lt; percent
+
+        <span class="keyword">case</span> .enforceForAll:
+            <span class="keyword">return true</span>
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Pinning Architecture Checklist</div>
+        <ul>
+            <li><strong>Pin the public key, not the certificate</strong> — survives cert renewal with same key pair</li>
+            <li><strong>Always have at least 2 backup pins</strong> — one pre-generated backup key, one intermediate CA pin</li>
+            <li><strong>Implement remote pin updates</strong> — signed configuration fetched over an unpinned (but TLS-validated) channel</li>
+            <li><strong>Start in report-only mode</strong> — collect telemetry for 2+ weeks before enforcing</li>
+            <li><strong>Gradual rollout</strong> — beta → 1% → 10% → 50% → 100%, monitoring failure rates at each stage</li>
+            <li><strong>Emergency kill switch</strong> — remote config can disable pinning entirely within minutes</li>
+            <li><strong>Monitor pin match index</strong> — alert if traffic shifts from Pin #1 to Pin #2 unexpectedly</li>
+            <li><strong>Set pin expiration dates</strong> — pins that auto-expire prevent permanent lockout if remote config is unreachable</li>
+            <li><strong>Never pin the root CA alone</strong> — root CAs sign millions of certificates; pinning them provides minimal security</li>
+            <li><strong>Test with Charles/Proxyman</strong> — verify that pinning actually blocks proxy interception in debug builds</li>
+        </ul>
+    </div>
+
+    <h3>8.6 Interview Questions <span class="tag-l6">L6</span> <span class="tag-architect">Architect</span></h3>
+
+    <p><strong>Q: Your app uses certificate pinning and a certificate rotation is scheduled for next week. 30% of your users are on app versions older than 6 months. How do you handle this?</strong></p>
+
+    <p>This is a classic Staff-level question that tests operational thinking. The answer involves multiple layers:</p>
+
+    <ol>
+        <li><strong>If you pinned the public key</strong> and are reusing the same key pair for the new certificate, no action is needed — all app versions will continue to work.</li>
+        <li><strong>If the key is changing</strong>, check whether the new key's hash was embedded as a backup pin in older app versions. If yes, the rotation is safe.</li>
+        <li><strong>If older versions don't have the new pin</strong>, use the remote config channel to push the new pin hash to all connected clients before rotating the server certificate.</li>
+        <li><strong>For truly old versions</strong> that predate the remote config feature, you have two options: (a) keep the old key active on a parallel server endpoint during a transition period, or (b) accept that those users will be temporarily blocked and will need to update the app.</li>
+        <li><strong>Monitor the rollout</strong>: deploy the new certificate to a canary server first, watch pin failure telemetry for 24 hours, then roll out to production.</li>
+    </ol>
+
+    <p><strong>Q: An attacker has compromised your intermediate CA. How does your pinning architecture respond?</strong> <span class="tag-l6">L6</span></p>
+
+    <p>If you pinned the <em>leaf</em> public key, the CA compromise has no immediate impact — the attacker cannot forge a certificate with your pinned key. If you pinned the <em>CA</em> key, you are vulnerable: the attacker can issue a certificate for your domain that matches the CA pin. The correct architecture pins the leaf key as primary and the CA key only as a last-resort fallback. Additionally, Certificate Transparency will expose the rogue certificate in CT logs within hours, giving you time to respond.</p>
+
+    <p><strong>Q: Why shouldn't the remote pin configuration endpoint itself be pinned?</strong> <span class="tag-senior">Senior</span></p>
+
+    <p>Circular dependency: if the config endpoint is pinned and the pin becomes invalid (because the server's certificate rotated), you cannot fetch the updated pins. The config endpoint must use standard system trust evaluation (ATS) without pinning. To prevent tampering, the config payload is cryptographically signed with a key embedded in the app binary — an attacker who intercepts the config cannot modify it without the signing key.</p>
+
+    <div class="nav-footer">
+        <a href="01-app-sandbox.html">← Previous: App Sandbox</a>
+        <a href="03-keychain-crypto.html">Next: Keychain &amp; Crypto →</a>
+    </div>
+</div>
+</body>
+</html>

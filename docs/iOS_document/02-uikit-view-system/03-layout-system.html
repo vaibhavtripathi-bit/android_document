@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Layout System — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">UIKit View System</a><span class="sep">›</span>
+        Layout System
+    </nav>
+
+    <h1>Layout System</h1>
+    <p class="subtitle">Auto Layout's Cassowary simplex solver, constraint priorities, intrinsicContentSize, the three-pass layout cycle, UIStackView internals, and performance at scale — everything you need for L6 layout questions.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#cassowary">1. Auto Layout &amp; the Cassowary Algorithm</a></li>
+            <li><a href="#constraint-priorities">2. Constraint Priorities</a></li>
+            <li><a href="#intrinsic-content-size">3. intrinsicContentSize Contract</a></li>
+            <li><a href="#hugging-compression">4. Content Hugging &amp; Compression Resistance</a></li>
+            <li><a href="#layout-cycle">5. The Layout Cycle</a></li>
+            <li><a href="#update-constraints">6. updateConstraints() Cycle</a></li>
+            <li><a href="#layout-passes">7. Layout Passes: Constraints → Layout → Display</a></li>
+            <li><a href="#stack-view">8. UIStackView Internals</a></li>
+            <li><a href="#translates">9. translatesAutoresizingMaskIntoConstraints</a></li>
+            <li><a href="#performance">10. Performance at Scale</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="cassowary">1. Auto Layout &amp; the Cassowary Algorithm</h2>
+    <!-- ============================================================ -->
+
+    <p>Auto Layout is a <strong>constraint-based layout system</strong> built on the Cassowary linear arithmetic constraint-solving algorithm, originally developed at the University of Washington in 1998. It solves a system of linear equations and inequalities to determine view positions and sizes.</p>
+
+    <h3>How Cassowary Works</h3>
+
+    <p>Each constraint is a linear equation or inequality of the form:</p>
+
+    <div class="diagram">
+view1.attribute = multiplier × view2.attribute + constant
+
+Examples:
+  button.leading = container.leading + 16
+  label.width ≤ 200
+  imageView.height = imageView.width × 0.75
+  button.centerY = container.centerY + 0
+
+In matrix form, the solver finds values for all view attributes
+(x, y, width, height) that satisfy ALL constraints simultaneously.
+
+The Cassowary algorithm uses an incremental simplex method:
+┌─────────────────────────────────────────────────────┐
+│  1. Convert constraints to a tableau (matrix)        │
+│  2. Add slack variables for inequalities             │
+│  3. Use simplex pivoting to find feasible solution   │
+│  4. Optimize for "stay" constraints (minimize change)│
+│  5. When constraints change, incrementally update    │
+│     (don't resolve from scratch)                     │
+└─────────────────────────────────────────────────────┘
+    </div>
+
+    <pre><code><span class="comment">// Each NSLayoutConstraint maps to one Cassowary equation</span>
+<span class="keyword">let</span> constraint = <span class="type">NSLayoutConstraint</span>(
+    item: button,                        <span class="comment">// view1</span>
+    attribute: .leading,                 <span class="comment">// view1.attribute</span>
+    relatedBy: .equal,                   <span class="comment">// = (or ≤, ≥)</span>
+    toItem: container,                   <span class="comment">// view2</span>
+    attribute: .leading,                 <span class="comment">// view2.attribute</span>
+    multiplier: <span class="number">1.0</span>,                     <span class="comment">// multiplier</span>
+    constant: <span class="number">16</span>                          <span class="comment">// constant</span>
+)
+<span class="comment">// Equation: button.leading = 1.0 × container.leading + 16</span>
+
+<span class="comment">// Modern anchor syntax (preferred)</span>
+button.leadingAnchor.<span class="func">constraint</span>(
+    equalTo: container.leadingAnchor,
+    constant: <span class="number">16</span>
+).isActive = <span class="keyword">true</span>
+
+<span class="comment">// The solver needs enough constraints to determine all 4 attributes:</span>
+<span class="comment">// x (leading/trailing/centerX), y (top/bottom/centerY),</span>
+<span class="comment">// width, height</span>
+<span class="comment">// Underconstrained → ambiguous layout</span>
+<span class="comment">// Overconstrained → unsatisfiable (constraint conflict)</span></code></pre>
+
+    <h3>Constraint Activation</h3>
+
+    <pre><code><span class="comment">// Batch activation is more efficient than individual activation</span>
+<span class="comment">// because the solver processes all constraints in one pass</span>
+
+<span class="comment">// BAD: Each activation triggers a solver pass</span>
+constraint1.isActive = <span class="keyword">true</span>
+constraint2.isActive = <span class="keyword">true</span>
+constraint3.isActive = <span class="keyword">true</span>
+
+<span class="comment">// GOOD: Single solver pass for all constraints</span>
+<span class="type">NSLayoutConstraint</span>.<span class="func">activate</span>([
+    button.leadingAnchor.<span class="func">constraint</span>(equalTo: container.leadingAnchor, constant: <span class="number">16</span>),
+    button.trailingAnchor.<span class="func">constraint</span>(equalTo: container.trailingAnchor, constant: -<span class="number">16</span>),
+    button.topAnchor.<span class="func">constraint</span>(equalTo: label.bottomAnchor, constant: <span class="number">12</span>),
+    button.heightAnchor.<span class="func">constraint</span>(equalToConstant: <span class="number">44</span>)
+])
+
+<span class="comment">// Deactivation + reactivation for layout changes</span>
+<span class="type">NSLayoutConstraint</span>.<span class="func">deactivate</span>(portraitConstraints)
+<span class="type">NSLayoutConstraint</span>.<span class="func">activate</span>(landscapeConstraints)</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="constraint-priorities">2. Constraint Priorities</h2>
+    <!-- ============================================================ -->
+
+    <p>Every constraint has a priority from 1 to 1000. The solver tries to satisfy all constraints, but when conflicts arise, lower-priority constraints are broken first.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Priority</th>
+                <th>Name</th>
+                <th>Value</th>
+                <th>Usage</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>.required</code></td>
+                <td>Required</td>
+                <td>1000</td>
+                <td>Must be satisfied — unsatisfiable if conflicting</td>
+            </tr>
+            <tr>
+                <td><code>.defaultHigh</code></td>
+                <td>Default High</td>
+                <td>750</td>
+                <td>Default content hugging priority</td>
+            </tr>
+            <tr>
+                <td><code>.dragThatCanResizeScene</code></td>
+                <td>Drag Resize</td>
+                <td>510</td>
+                <td>Window resizing on macOS/iPad</td>
+            </tr>
+            <tr>
+                <td><code>.sceneSizeStayPut</code></td>
+                <td>Scene Stay</td>
+                <td>500</td>
+                <td>Scene size preference</td>
+            </tr>
+            <tr>
+                <td><code>.defaultLow</code></td>
+                <td>Default Low</td>
+                <td>250</td>
+                <td>Default compression resistance</td>
+            </tr>
+            <tr>
+                <td><code>.fittingSizeLevel</code></td>
+                <td>Fitting Size</td>
+                <td>50</td>
+                <td>Used by systemLayoutSizeFitting</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Setting constraint priority</span>
+<span class="keyword">let</span> widthConstraint = view.widthAnchor.<span class="func">constraint</span>(equalToConstant: <span class="number">200</span>)
+widthConstraint.priority = .defaultHigh  <span class="comment">// 750 — can be broken if needed</span>
+widthConstraint.isActive = <span class="keyword">true</span>
+
+<span class="comment">// Custom priority values</span>
+widthConstraint.priority = <span class="type">UILayoutPriority</span>(rawValue: <span class="number">999</span>)
+
+<span class="comment">// CRITICAL: You cannot change a required (1000) constraint's priority</span>
+<span class="comment">// after activation. Set it to 999 if you might need to change it later.</span>
+widthConstraint.priority = <span class="type">UILayoutPriority</span>(rawValue: <span class="number">999</span>)  <span class="comment">// Can change later</span>
+widthConstraint.isActive = <span class="keyword">true</span>
+widthConstraint.priority = .defaultLow  <span class="comment">// OK — was 999, not 1000</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall</div>
+        <p><strong>Never change a required constraint's priority at runtime.</strong> If a constraint is activated with priority 1000 (required), attempting to change its priority crashes. Always use 999 for constraints you might need to adjust. The solver treats 999 and 1000 nearly identically, but 999 allows runtime modification.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="intrinsic-content-size">3. intrinsicContentSize Contract</h2>
+    <!-- ============================================================ -->
+
+    <p><code>intrinsicContentSize</code> is a view's natural size based on its content. It acts as implicit width and/or height constraints.</p>
+
+    <pre><code><span class="comment">// Views with intrinsic content size:</span>
+<span class="comment">// UILabel       — width and height (based on text + font)</span>
+<span class="comment">// UIButton      — width and height (based on title + image + insets)</span>
+<span class="comment">// UIImageView   — width and height (based on image size)</span>
+<span class="comment">// UITextField   — height only (width is ambiguous)</span>
+<span class="comment">// UITextView    — neither (scrollable content)</span>
+<span class="comment">// UISwitch      — width and height (fixed size)</span>
+<span class="comment">// UISlider      — height only</span>
+<span class="comment">// Plain UIView  — neither (noIntrinsicMetric for both)</span>
+
+<span class="keyword">class</span> <span class="type">BadgeView</span>: <span class="type">UIView</span> {
+    <span class="keyword">var</span> text: <span class="type">String</span> = <span class="string">""</span> {
+        <span class="keyword">didSet</span> {
+            <span class="comment">// MUST invalidate when content changes</span>
+            <span class="func">invalidateIntrinsicContentSize</span>()
+            <span class="func">setNeedsDisplay</span>()
+        }
+    }
+
+    <span class="keyword">override var</span> intrinsicContentSize: <span class="type">CGSize</span> {
+        <span class="keyword">let</span> textSize = (text <span class="keyword">as</span> <span class="type">NSString</span>).<span class="func">size</span>(
+            withAttributes: [.font: <span class="type">UIFont</span>.<span class="func">systemFont</span>(ofSize: <span class="number">12</span>)]
+        )
+        <span class="keyword">return</span> <span class="type">CGSize</span>(
+            width: textSize.width + <span class="number">16</span>,  <span class="comment">// padding</span>
+            height: textSize.height + <span class="number">8</span>
+        )
+    }
+}
+
+<span class="comment">// intrinsicContentSize creates implicit constraints:</span>
+<span class="comment">// width constraint at contentHuggingPriority(.horizontal)</span>
+<span class="comment">// height constraint at contentHuggingPriority(.vertical)</span>
+<span class="comment">// These are "soft" constraints — they can be overridden by explicit constraints</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="hugging-compression">4. Content Hugging &amp; Compression Resistance</h2>
+    <!-- ============================================================ -->
+
+    <div class="diagram">
+Content Hugging vs Compression Resistance:
+
+  Content Hugging — "Don't stretch me beyond my intrinsic size"
+  ═══════════════════════════════════════════════════════════════
+
+  intrinsicContentSize.width = 100
+
+  High hugging (750):    [  Hello  ]     ← stays at 100pt
+  Low hugging (250):     [  Hello          ]  ← stretches to fill
+
+  Compression Resistance — "Don't shrink me below my intrinsic size"
+  ═══════════════════════════════════════════════════════════════
+
+  intrinsicContentSize.width = 200, available space = 100
+
+  High resistance (750): [This is a long te…]  ← truncates at 200pt min
+  Low resistance (250):  [This…]               ← compressed to 100pt
+    </div>
+
+    <pre><code><span class="comment">// Two labels side by side — which one stretches?</span>
+<span class="keyword">let</span> titleLabel = <span class="type">UILabel</span>()
+<span class="keyword">let</span> dateLabel = <span class="type">UILabel</span>()
+
+<span class="comment">// Title should stretch, date should stay at intrinsic size</span>
+titleLabel.<span class="func">setContentHuggingPriority</span>(.defaultLow, for: .horizontal)    <span class="comment">// 250</span>
+dateLabel.<span class="func">setContentHuggingPriority</span>(.defaultHigh, for: .horizontal)    <span class="comment">// 750</span>
+
+<span class="comment">// If space is tight, title should compress first</span>
+titleLabel.<span class="func">setContentCompressionResistancePriority</span>(.defaultLow, for: .horizontal)
+dateLabel.<span class="func">setContentCompressionResistancePriority</span>(.required, for: .horizontal)
+
+<span class="comment">// The solver creates these implicit constraints from intrinsicContentSize:</span>
+<span class="comment">// Hugging:     view.width ≤ intrinsicWidth  @ huggingPriority</span>
+<span class="comment">// Compression: view.width ≥ intrinsicWidth  @ compressionResistancePriority</span>
+
+<span class="comment">// So for titleLabel (hugging=250, compression=250):</span>
+<span class="comment">// titleLabel.width ≤ intrinsicWidth @ 250  (easily broken → stretches)</span>
+<span class="comment">// titleLabel.width ≥ intrinsicWidth @ 250  (easily broken → compresses)</span>
+
+<span class="comment">// For dateLabel (hugging=750, compression=1000):</span>
+<span class="comment">// dateLabel.width ≤ intrinsicWidth @ 750   (hard to break → won't stretch)</span>
+<span class="comment">// dateLabel.width ≥ intrinsicWidth @ 1000  (required → never compresses)</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="layout-cycle">5. The Layout Cycle</h2>
+    <!-- ============================================================ -->
+
+    <pre><code><span class="comment">// The layout cycle has three key methods:</span>
+
+<span class="comment">// 1. setNeedsLayout() — marks the view as needing layout</span>
+<span class="comment">//    Does NOT trigger layout immediately</span>
+<span class="comment">//    Coalesces multiple calls into a single layout pass</span>
+view.<span class="func">setNeedsLayout</span>()
+
+<span class="comment">// 2. layoutIfNeeded() — triggers layout IMMEDIATELY if needed</span>
+<span class="comment">//    Synchronous — blocks until layout is complete</span>
+<span class="comment">//    Used to animate constraint changes</span>
+view.<span class="func">layoutIfNeeded</span>()
+
+<span class="comment">// 3. layoutSubviews() — called by the system to perform layout</span>
+<span class="comment">//    Override this to do custom layout</span>
+<span class="comment">//    NEVER call this directly — use setNeedsLayout()</span>
+
+<span class="keyword">class</span> <span class="type">CustomLayoutView</span>: <span class="type">UIView</span> {
+    <span class="keyword">override func</span> <span class="func">layoutSubviews</span>() {
+        <span class="keyword">super</span>.<span class="func">layoutSubviews</span>()  <span class="comment">// MUST call super — triggers Auto Layout</span>
+
+        <span class="comment">// At this point, Auto Layout has resolved all constraints</span>
+        <span class="comment">// Subview frames are set — do manual adjustments here</span>
+
+        <span class="comment">// Example: round a view's corners based on its resolved height</span>
+        avatarView.layer.cornerRadius = avatarView.bounds.height / <span class="number">2</span>
+    }
+}
+
+<span class="comment">// Animating constraint changes:</span>
+heightConstraint.constant = <span class="number">200</span>
+<span class="type">UIView</span>.<span class="func">animate</span>(withDuration: <span class="number">0.3</span>) {
+    <span class="comment">// layoutIfNeeded() inside animation block captures the layout change</span>
+    self.view.<span class="func">layoutIfNeeded</span>()
+}</code></pre>
+
+    <div class="diagram">
+Layout Cycle Timing:
+
+  RunLoop Iteration
+  ════════════════════════════════════════════════════════
+
+  ┌─────────────┐   ┌──────────────┐   ┌─────────────┐
+  │  Constraints  │──▶│  Layout       │──▶│  Display     │
+  │  Pass         │   │  Pass         │   │  Pass        │
+  │               │   │               │   │              │
+  │ updateCon-    │   │ layoutSub-    │   │ draw(_:)     │
+  │ straints()    │   │ views()       │   │              │
+  │               │   │               │   │ setNeeds-    │
+  │ setNeeds-     │   │ setNeeds-     │   │ Display()    │
+  │ UpdateCon-    │   │ Layout()      │   │              │
+  │ straints()    │   │ layoutIf-     │   │              │
+  │               │   │ Needed()      │   │              │
+  └─────────────┘   └──────────────┘   └─────────────┘
+
+  All three passes happen in a single RunLoop iteration
+  (at the end of the current event processing)
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="update-constraints">6. updateConstraints() Cycle</h2>
+    <!-- ============================================================ -->
+
+    <pre><code><span class="keyword">class</span> <span class="type">AdaptiveView</span>: <span class="type">UIView</span> {
+    <span class="keyword">private var</span> compactConstraints: [<span class="type">NSLayoutConstraint</span>] = []
+    <span class="keyword">private var</span> regularConstraints: [<span class="type">NSLayoutConstraint</span>] = []
+
+    <span class="keyword">override func</span> <span class="func">updateConstraints</span>() {
+        <span class="comment">// Called bottom-up (leaves first, then parents)</span>
+        <span class="comment">// Batch constraint changes here for efficiency</span>
+
+        <span class="keyword">if</span> traitCollection.horizontalSizeClass == .compact {
+            <span class="type">NSLayoutConstraint</span>.<span class="func">deactivate</span>(regularConstraints)
+            <span class="type">NSLayoutConstraint</span>.<span class="func">activate</span>(compactConstraints)
+        } <span class="keyword">else</span> {
+            <span class="type">NSLayoutConstraint</span>.<span class="func">deactivate</span>(compactConstraints)
+            <span class="type">NSLayoutConstraint</span>.<span class="func">activate</span>(regularConstraints)
+        }
+
+        <span class="keyword">super</span>.<span class="func">updateConstraints</span>()  <span class="comment">// MUST call super at the END</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">someStateChange</span>() {
+        <span class="comment">// Trigger constraint update on next layout pass</span>
+        <span class="func">setNeedsUpdateConstraints</span>()
+    }
+}
+
+<span class="comment">// IMPORTANT: Apple recommends AGAINST overriding updateConstraints()</span>
+<span class="comment">// for most cases. It's only beneficial when you have a large number</span>
+<span class="comment">// of constraints that change together and you want to batch the update.</span>
+<span class="comment">// For simple constraint changes, modify constraints directly.</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="layout-passes">7. Layout Passes: Constraints → Layout → Display</h2>
+    <!-- ============================================================ -->
+
+    <div class="diagram">
+The Three Passes in Detail:
+
+  PASS 1: CONSTRAINT UPDATE (bottom-up)
+  ─────────────────────────────────────
+  Leaf views → Parent views → Root view
+  • updateConstraints() called on each view that needs it
+  • Solver incorporates constraint changes
+  • Triggered by setNeedsUpdateConstraints()
+
+  PASS 2: LAYOUT (top-down)
+  ─────────────────────────────────────
+  Root view → Parent views → Leaf views
+  • layoutSubviews() called on each view that needs it
+  • Solver results applied to view frames
+  • Triggered by setNeedsLayout()
+
+  PASS 3: DISPLAY (top-down)
+  ─────────────────────────────────────
+  Root view → Parent views → Leaf views
+  • draw(_:) called on each view that needs it
+  • Views render their content to backing layers
+  • Triggered by setNeedsDisplay()
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="stack-view">8. UIStackView Internals</h2>
+    <!-- ============================================================ -->
+
+    <p><code>UIStackView</code> is a non-rendering view that manages Auto Layout constraints for its arranged subviews. It doesn't draw anything — it has no backing layer content.</p>
+
+    <pre><code><span class="comment">// UIStackView manages constraints automatically</span>
+<span class="keyword">let</span> stack = <span class="type">UIStackView</span>(arrangedSubviews: [label1, label2, button])
+stack.axis = .vertical
+stack.spacing = <span class="number">12</span>
+stack.alignment = .fill
+stack.distribution = .fill
+
+<span class="comment">// What UIStackView creates internally (approximately):</span>
+<span class="comment">// For .vertical axis, .fill distribution, .fill alignment:</span>
+<span class="comment">//</span>
+<span class="comment">// label1.top = stack.top</span>
+<span class="comment">// label2.top = label1.bottom + 12 (spacing)</span>
+<span class="comment">// button.top = label2.bottom + 12</span>
+<span class="comment">// button.bottom = stack.bottom</span>
+<span class="comment">//</span>
+<span class="comment">// label1.leading = stack.leading</span>
+<span class="comment">// label1.trailing = stack.trailing</span>
+<span class="comment">// (same for label2, button)</span>
+
+<span class="comment">// Distribution options and their constraint implications:</span>
+<span class="comment">// .fill           — one view stretches (lowest hugging priority wins)</span>
+<span class="comment">// .fillEqually    — all views same size (equal height/width constraints)</span>
+<span class="comment">// .fillProportionally — sizes proportional to intrinsicContentSize</span>
+<span class="comment">// .equalSpacing   — equal spacing between views</span>
+<span class="comment">// .equalCentering  — equal spacing between view centers</span></code></pre>
+
+    <pre><code><span class="comment">// Hiding views in a stack view — constraints automatically update</span>
+<span class="type">UIView</span>.<span class="func">animate</span>(withDuration: <span class="number">0.3</span>) {
+    label2.isHidden = <span class="keyword">true</span>  <span class="comment">// Stack view removes spacing + constraints</span>
+}
+
+<span class="comment">// Adding/removing arranged subviews</span>
+stack.<span class="func">addArrangedSubview</span>(newView)
+stack.<span class="func">removeArrangedSubview</span>(label1)  <span class="comment">// Removes from arrangement but NOT from superview</span>
+label1.<span class="func">removeFromSuperview</span>()          <span class="comment">// Must also remove from superview</span>
+
+<span class="comment">// Custom spacing (iOS 11+)</span>
+stack.<span class="func">setCustomSpacing</span>(<span class="number">24</span>, after: label1)  <span class="comment">// Extra space after label1</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive</div>
+        <p><strong>UIStackView doesn't render.</strong> It overrides <code>layerClass</code> to return <code>CATransformLayer</code>, which is a non-rendering layer that exists only to host sublayers. This means <code>backgroundColor</code>, <code>cornerRadius</code>, etc. have no effect on a stack view. If you need a background, add a background view behind the stack view or embed the stack in a container view.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="translates">9. translatesAutoresizingMaskIntoConstraints</h2>
+    <!-- ============================================================ -->
+
+    <pre><code><span class="comment">// When you create a view in code and want to use Auto Layout:</span>
+<span class="keyword">let</span> view = <span class="type">UIView</span>()
+view.translatesAutoresizingMaskIntoConstraints = <span class="keyword">false</span>
+
+<span class="comment">// WHY: By default, UIKit creates constraints from the autoresizing mask</span>
+<span class="comment">// (the old springs-and-struts system). These auto-generated constraints</span>
+<span class="comment">// conflict with your manual Auto Layout constraints.</span>
+
+<span class="comment">// When translatesAutoresizingMaskIntoConstraints = true (default):</span>
+<span class="comment">// Setting view.frame creates constraints like:</span>
+<span class="comment">//   view.width = 200 @ 1000</span>
+<span class="comment">//   view.height = 100 @ 1000</span>
+<span class="comment">//   view.leading = superview.leading + 50 @ 1000</span>
+<span class="comment">//   view.top = superview.top + 100 @ 1000</span>
+<span class="comment">// These are REQUIRED constraints — they conflict with your constraints!</span>
+
+<span class="comment">// Views created in Interface Builder automatically have this set to false</span>
+<span class="comment">// Views created in code have it set to true by default</span>
+
+<span class="comment">// UIStackView's arranged subviews: translates is set to false automatically</span>
+<span class="comment">// when you call addArrangedSubview()</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="performance">10. Performance at Scale</h2>
+    <!-- ============================================================ -->
+
+    <h3>Constraint Complexity</h3>
+
+    <p>The Cassowary solver's time complexity is approximately <strong>O(n²)</strong> in the number of constraints, where n is the number of constraints that change. This means constraint churn (frequently adding/removing constraints) is expensive.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Constraint Count</th>
+                <th>Layout Time (approximate)</th>
+                <th>Impact</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>&lt; 100</td>
+                <td>&lt; 1ms</td>
+                <td>Negligible</td>
+            </tr>
+            <tr>
+                <td>100–500</td>
+                <td>1–5ms</td>
+                <td>Fine for static layouts</td>
+            </tr>
+            <tr>
+                <td>500–1000</td>
+                <td>5–16ms</td>
+                <td>Can cause frame drops during animation</td>
+            </tr>
+            <tr>
+                <td>&gt; 1000</td>
+                <td>&gt; 16ms</td>
+                <td>Guaranteed frame drops at 60fps</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Measuring layout performance</span>
+<span class="keyword">let</span> start = <span class="type">CFAbsoluteTimeGetCurrent</span>()
+view.<span class="func">layoutIfNeeded</span>()
+<span class="keyword">let</span> elapsed = <span class="type">CFAbsoluteTimeGetCurrent</span>() - start
+<span class="func">print</span>(<span class="string">"Layout took \(elapsed * 1000)ms"</span>)
+
+<span class="comment">// systemLayoutSizeFitting — measures a view's size under constraints</span>
+<span class="keyword">let</span> size = cell.contentView.<span class="func">systemLayoutSizeFitting</span>(
+    <span class="type">CGSize</span>(width: tableView.bounds.width, height: <span class="number">0</span>),
+    withHorizontalFittingPriority: .required,
+    verticalFittingPriority: .fittingSizeLevel
+)
+<span class="comment">// This is expensive — it creates a temporary constraint environment</span>
+<span class="comment">// Cache the result when possible</span></code></pre>
+
+    <h3>Optimization Strategies</h3>
+
+    <pre><code><span class="comment">// 1. Modify constraint constants instead of deactivating/reactivating</span>
+<span class="comment">// BAD: Constraint churn</span>
+<span class="type">NSLayoutConstraint</span>.<span class="func">deactivate</span>([oldConstraint])
+<span class="keyword">let</span> newConstraint = view.heightAnchor.<span class="func">constraint</span>(equalToConstant: <span class="number">200</span>)
+newConstraint.isActive = <span class="keyword">true</span>
+
+<span class="comment">// GOOD: Modify constant (incremental solver update)</span>
+heightConstraint.constant = <span class="number">200</span>
+
+<span class="comment">// 2. Use constraint references for dynamic layouts</span>
+<span class="keyword">class</span> <span class="type">ExpandableView</span>: <span class="type">UIView</span> {
+    <span class="keyword">private var</span> heightConstraint: <span class="type">NSLayoutConstraint</span>!
+
+    <span class="keyword">func</span> <span class="func">setup</span>() {
+        heightConstraint = heightAnchor.<span class="func">constraint</span>(equalToConstant: <span class="number">44</span>)
+        heightConstraint.isActive = <span class="keyword">true</span>
+    }
+
+    <span class="keyword">func</span> <span class="func">expand</span>() {
+        heightConstraint.constant = <span class="number">200</span>  <span class="comment">// Cheap — just updates the constant</span>
+    }
+}
+
+<span class="comment">// 3. For collection view cells, prefer manual layout over Auto Layout</span>
+<span class="keyword">class</span> <span class="type">PerformantCell</span>: <span class="type">UICollectionViewCell</span> {
+    <span class="keyword">override func</span> <span class="func">layoutSubviews</span>() {
+        <span class="keyword">super</span>.<span class="func">layoutSubviews</span>()
+        <span class="keyword">let</span> bounds = contentView.bounds
+        <span class="comment">// Manual frame calculation — O(1) per cell, no solver involved</span>
+        imageView.frame = <span class="type">CGRect</span>(x: <span class="number">16</span>, y: <span class="number">12</span>, width: <span class="number">48</span>, height: <span class="number">48</span>)
+        titleLabel.frame = <span class="type">CGRect</span>(
+            x: <span class="number">76</span>, y: <span class="number">12</span>,
+            width: bounds.width - <span class="number">92</span>, height: <span class="number">22</span>
+        )
+    }
+
+    <span class="keyword">override func</span> <span class="func">sizeThatFits</span>(_ size: <span class="type">CGSize</span>) -> <span class="type">CGSize</span> {
+        <span class="comment">// For self-sizing cells without Auto Layout</span>
+        <span class="keyword">let</span> titleSize = titleLabel.<span class="func">sizeThatFits</span>(
+            <span class="type">CGSize</span>(width: size.width - <span class="number">92</span>, height: .greatestFiniteMagnitude)
+        )
+        <span class="keyword">return</span> <span class="type">CGSize</span>(width: size.width, height: <span class="func">max</span>(<span class="number">72</span>, titleSize.height + <span class="number">24</span>))
+    }
+}</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p><strong>Layout performance at scale — avoiding constraint explosion:</strong></p>
+        <ul>
+            <li><strong>Flatten hierarchies</strong> — Deep nesting multiplies constraint count. A 5-level deep hierarchy with 4 constraints per level = 20 constraints per leaf path. Flatten to 2 levels = 8 constraints.</li>
+            <li><strong>Use manual layout for cells</strong> — In a table/collection view with 50+ visible cells, Auto Layout constraints can exceed 1000. Manual <code>layoutSubviews()</code> is O(1) per cell.</li>
+            <li><strong>Cache sizing calculations</strong> — <code>systemLayoutSizeFitting</code> is expensive. Cache cell heights keyed by content hash.</li>
+            <li><strong>Profile with Instruments</strong> — Use the "Layout" instrument to see constraint solving time per frame. Target &lt; 4ms for 60fps (leaving 12ms for rendering).</li>
+            <li><strong>Consider UIStackView carefully</strong> — Each stack view adds constraints proportional to its arranged subview count. Nested stacks multiply this. For complex cells, manual layout is often faster.</li>
+        </ul>
+    </div>
+
+    <div class="nav-footer">
+        <a href="02-touch-event-flow.html">← Touch &amp; Event Flow</a>
+        <a href="04-rendering-pipeline.html">Rendering Pipeline →</a>
+    </div>
+</div>
+</body>
+</html>

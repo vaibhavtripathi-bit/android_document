@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Navigation Evolution — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">SwiftUI Internals</a><span class="sep">›</span>
+        Navigation Evolution
+    </nav>
+
+    <p>
+        <span class="tag tag-l6">L6 / Staff</span>
+        <span class="tag tag-senior">Senior+</span>
+        <span class="tag tag-architect">Navigation architecture</span>
+    </p>
+
+    <h1>Navigation Evolution in SwiftUI</h1>
+    <p class="subtitle">From <code>NavigationView</code> quirks to <code>NavigationStack</code>, type-erased paths, destination registration, deep links, and coordinator-style routers — the full story interviewers expect when they say “how would you structure navigation in a large SwiftUI app?”</p>
+
+    <p>SwiftUI’s navigation APIs changed materially between iOS 13–16 and again with observation and macro-driven models in iOS 17+. Staff-level interviews rarely stop at “I use <code>NavigationStack</code>.” They probe <em>why</em> the old APIs were unreliable across size classes, <em>how</em> destination registration resolves types at runtime, <em>where</em> state must live for restoration and deep links, and <em>how</em> you isolate navigation per feature module without turning every screen into a global enum.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">What this chapter optimizes for</div>
+        <p>You should leave able to whiteboard a tab + stack system, explain <code>NavigationPath</code> encoding tradeoffs, debug “blank push” bugs from mis-scoped <code>navigationDestination</code>, and describe a coordinator that owns path state while views stay dumb. The code is illustrative — adapt naming to your codebase, but preserve the invariants.</p>
+    </div>
+
+    <nav class="toc" aria-label="Table of contents">
+        <h3>On this page</h3>
+        <ul>
+            <li><a href="#nav-view-to-stack">NavigationView → NavigationStack / NavigationSplitView</a></li>
+            <li><a href="#navigation-path">NavigationPath &amp; type-erased navigation</a></li>
+            <li><a href="#navigation-destination">navigationDestination(for:) registration</a></li>
+            <li><a href="#programmatic-patterns">Programmatic navigation patterns</a></li>
+            <li><a href="#deep-linking">Deep linking with NavigationStack</a></li>
+            <li><a href="#navigation-link-styles">NavigationLink: value-based vs view-based</a></li>
+            <li><a href="#coordinator-pattern">Coordinator pattern in SwiftUI</a></li>
+            <li><a href="#scalable-nav">Scalable navigation for 100+ screens</a></li>
+        </ul>
+    </nav>
+
+    <h2 id="nav-view-to-stack">1. NavigationView (Deprecated) → NavigationStack / NavigationSplitView</h2>
+
+    <h3>Why NavigationView was problematic</h3>
+    <p><code>NavigationView</code> was introduced as SwiftUI’s first container for hierarchical navigation. Its fatal flaw for architecture discussions is <strong>platform- and context-dependent column behavior</strong>: on compact width you typically saw a single navigation stack, while on regular width (large iPhone landscape, iPad) the system could present a multi-column “split” style <em>without your code explicitly opting into a different data model</em>. Teams shipped “works on my phone” flows that broke on iPad or in split-screen multitasking.</p>
+
+    <p>Additional pain points that still matter in legacy code reviews:</p>
+    <ul>
+        <li><strong>Implicit layout contracts.</strong> Nested <code>NavigationView</code> instances, or mixing with UIKit split containers, produced double bars, lost back buttons, or incorrect title display modes.</li>
+        <li><strong>Weak programmatic story.</strong> Pushing arbitrary destinations from a view model without a central path was awkward; many apps leaned on invisible <code>NavigationLink</code> hacks or UIKit bridges.</li>
+        <li><strong>Inconsistent preview of navigation state.</strong> Previews and tests struggled to mirror device-class behavior, so regressions slipped through.</li>
+        <li><strong>Stack style overrides were a smell.</strong> Teams forced <code>navigationViewStyle(.stack)</code> to paper over split behavior on iPad, trading away the very layout the product wanted — and still had to reason about double stacks when a child also wrapped content in <code>NavigationView</code>.</li>
+        <li><strong>Three-column ambiguity on macOS.</strong> Some configurations effectively behaved like master–detail with an inspector lane, but without a first-class selection model in SwiftUI early on, engineers recreated state in ad-hoc bindings.</li>
+    </ul>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Interview sound bite</div>
+        <p>“We deprecated the mental model of ‘one NavigationView that might be one or two columns.’ We replaced it with explicit stack vs split APIs so navigation topology is a deliberate choice, not a side effect of horizontal size class.”</p>
+    </div>
+
+    <h3>NavigationStack: stack-based and programmatic</h3>
+    <p><code>NavigationStack</code> (iOS 16+) always models a <strong>stack</strong> of destinations rooted at a root view. You bind a <code>NavigationPath</code> (or use type-erased path with <code>navigationDestination</code>) to push and pop programmatically. The stack semantics match user expectations on iPhone and scale to larger devices when embedded inside a column of <code>NavigationSplitView</code>.</p>
+
+    <h3>NavigationSplitView: sidebar / content / detail</h3>
+    <p><code>NavigationSplitView</code> is the first-class API for sidebar + inspector patterns. It separates <em>selection</em> in a sidebar from <em>stack depth</em> in the detail column. At Staff level, emphasize that split view navigation state is inherently <strong>multi-dimensional</strong> (selected row, optional stack in detail) and must be modeled explicitly — a single flat path enum often becomes a smell.</p>
+
+    <h3>Comparison: stack vs split vs legacy</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>API</th>
+                <th>Topology</th>
+                <th>Best fit</th>
+                <th>Programmatic model</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>NavigationView</code> (deprecated)</td>
+                <td>Implicit 1- vs 2-column</td>
+                <td>Legacy only</td>
+                <td>Links + hacks</td>
+            </tr>
+            <tr>
+                <td><code>NavigationStack</code></td>
+                <td>Single stack</td>
+                <td>iPhone primary flows, detail column</td>
+                <td><code>NavigationPath</code> / value pushes</td>
+            </tr>
+            <tr>
+                <td><code>NavigationSplitView</code></td>
+                <td>Sidebar + optional columns</td>
+                <td>iPad, macOS, productivity UIs</td>
+                <td>Selection + nested stacks</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>Migration guide (conceptual)</h3>
+    <ol>
+        <li>Replace the outer <code>NavigationView</code> with <code>NavigationStack</code> for phone-first stacks.</li>
+        <li>If you relied on automatic two-column behavior on iPad, re-express it as <code>NavigationSplitView</code> with an explicit sidebar.</li>
+        <li>Replace <code>NavigationLink(destination:)</code> with <code>NavigationLink(value:)</code> + <code>navigationDestination(for:)</code> where possible.</li>
+        <li>Centralize push/pop in a path or router rather than scattering boolean flags per screen.</li>
+    </ol>
+
+    <h3>Typed stack alternative: <code>NavigationStack(path:)</code> with <code>[Route]</code></h3>
+    <p>Besides <code>NavigationPath</code>, <code>NavigationStack</code> supports a <strong>homogeneous typed path</strong> such as <code>[InboxRoute]</code>. You gain compiler exhaustiveness on <em>what can be on the stack</em> at the cost of a single route sum type per stack. Staff interviewers often ask when you would pick typed arrays over <code>NavigationPath</code>: choose typed paths for a single feature flow with rigid allowed transitions; choose <code>NavigationPath</code> when multiple unrelated types must coexist or you are bridging serialized restoration payloads that are not modeled as one enum.</p>
+
+    <h4>Code: Typed <code>[Route]</code> stack (compile-time exhaustiveness)</h4>
+<pre><code><span class="keyword">enum</span> <span class="type">InboxRoute</span>: <span class="type">Hashable</span>, <span class="type">Codable</span> {
+    <span class="keyword">case</span> message(<span class="type">Int</span>)
+    <span class="keyword">case</span> compose
+}
+
+<span class="keyword">struct</span> <span class="type">TypedInboxStack</span>: <span class="type">View</span> {
+    <span class="comment">// Empty path => root only. Pushed segments are non-root routes.</span>
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> path: [<span class="type">InboxRoute</span>] = []
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">NavigationStack</span>(path: $path) {
+            <span class="type">InboxListView</span>(
+                onOpenMessage: { id <span class="keyword">in</span> path.<span class="func">append</span>(.message(id)) },
+                onCompose: { path.<span class="func">append</span>(.compose) }
+            )
+            .<span class="func">navigationDestination</span>(<span class="keyword">for</span>: <span class="type">InboxRoute</span>.<span class="keyword">self</span>) { route <span class="keyword">in</span>
+                <span class="keyword">switch</span> route {
+                <span class="keyword">case</span> .message(<span class="keyword">let</span> id):
+                    <span class="type">MessageDetailView</span>(id: id)
+                <span class="keyword">case</span> .compose:
+                    <span class="type">ComposeView</span>()
+                }
+            }
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Interview contrast</div>
+        <p><code>NavigationPath</code> optimizes for <em>heterogeneous runtime stacks</em> and <code>Codable</code> snapshots. Typed <code>[Route]</code> optimizes for <em>invariants inside one feature</em>. Large apps frequently use both: a typed array inside a feature module, and a thin shell path or per-tab path at the app level.</p>
+    </div>
+
+    <h4>Code: NavigationStack root</h4>
+<pre><code><span class="keyword">import</span> <span class="type">SwiftUI</span>
+
+<span class="keyword">struct</span> <span class="type">RootStackView</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> path = <span class="type">NavigationPath</span>()
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">NavigationStack</span>(path: $path) {
+            <span class="type">InboxListView</span>()
+                .<span class="func">navigationDestination</span>(<span class="keyword">for</span>: <span class="type">MessageID</span>.<span class="keyword">self</span>) { id <span class="keyword">in</span>
+                    <span class="type">MessageDetailView</span>(id: id)
+                }
+        }
+        .<span class="func">toolbar</span> {
+            <span class="type">ToolbarItem</span>(placement: .primaryAction) {
+                <span class="type">Button</span>(<span class="string">"Simulate push"</span>) {
+                    path.<span class="func">append</span>(<span class="type">MessageID</span>(rawValue: <span class="number">1</span>))
+                }
+            }
+        }
+    }
+}
+
+<span class="keyword">struct</span> <span class="type">MessageID</span>: <span class="type">Hashable</span>, <span class="type">Codable</span> {
+    <span class="keyword">let</span> rawValue: <span class="type">Int</span>
+}</code></pre>
+
+    <h4>Code: NavigationSplitView skeleton</h4>
+<pre><code><span class="keyword">struct</span> <span class="type">MailSplitView</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> selectedFolder: <span class="type">Folder</span>?
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> columnVisibility: <span class="type">NavigationSplitViewVisibility</span> = .all
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">NavigationSplitView</span>(columnVisibility: $columnVisibility) {
+            <span class="type">FolderSidebar</span>(selection: $selectedFolder)
+        } content: {
+            <span class="type">MessageList</span>(folder: selectedFolder)
+        } detail: {
+            <span class="type">NavigationStack</span> {
+                <span class="type">Text</span>(<span class="string">"Select a message"</span>)
+            }
+        }
+    }
+}</code></pre>
+
+    <div class="diagram" role="img" aria-label="ASCII diagram comparing NavigationView implicit columns vs explicit split and stack">
+<pre>
+Legacy NavigationView (conceptual)
++------------------+------------------+
+|   Master list  |  Detail (maybe)  |  &lt;-- column count varies by size class
++------------------+------------------+
+
+Explicit model (iOS 16+)
+NavigationSplitView
++----------+---------------+----------------+
+| Sidebar  |   Content     | NavigationStack|
+| (folders)|  (messages)   | (message path) |
++----------+---------------+----------------+
+              explicit columns + nested stack
+</pre>
+    </div>
+
+    <h2 id="navigation-path">2. NavigationPath and Type-Erased Navigation</h2>
+
+    <p><code>NavigationPath</code> is SwiftUI’s answer to “push heterogeneous screens onto one stack.” Instead of exposing a generic <code>[Route]</code> at the type-system boundary everywhere, the framework stores a <strong>type-erased sequence of hashable values</strong> the runtime can replay to rebuild destinations.</p>
+
+    <h3>How it stores heterogeneous Hashable values</h3>
+    <p>Conceptually, the path is a FIFO stack of small, stable identifiers — not full view graphs. Each segment must be something the navigation machinery can hash, compare, and (when using Codable restoration) serialize. Under the hood, the path maintains erased entries tied to runtime type information so the correct <code>navigationDestination(for:)</code> overload can fire as the stack is rebuilt.</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Staff framing</div>
+        <p>Type erasure trades compile-time exhaustiveness for flexibility. Strong teams pair <code>NavigationPath</code> with <strong>disciplined route types</strong> (enums with associated values, or small structs) so serialization stays predictable — you are not storing arbitrary closures or reference types in the path.</p>
+    </div>
+
+    <h3>Codable conformance and state restoration</h3>
+    <p><code>NavigationPath</code> conforms to <code>Codable</code> so you can persist the stack (UserDefaults, scene state, handoff payloads) and rehydrate after relaunch. The interview nuance: <strong>every concrete type you append must be Codable</strong> for the aggregate encoding to succeed, and you must register compatible destinations before the path replays or users see empty or popped screens.</p>
+
+    <p>Restoration is not “free correctness.” Encoding captures the <em>identifiers</em> you pushed, not arbitrary view-local <code>@State</code>. After decode, detail screens must reload their models from disk or network. Discuss idempotency: decoding the same payload twice should not fork navigation into duplicate logical destinations unless your product requires it.</p>
+
+    <h4>Code: Rehydrating from <code>Codable</code> representation</h4>
+<pre><code><span class="keyword">extension</span> <span class="type">NavigationPath</span> {
+    <span class="comment">/// When all appended types share a single Codable wrapper, prefer a dedicated envelope.</span>
+    <span class="keyword">init</span>(<span class="keyword">_</span> routes: [<span class="type">AppRoute</span>]) {
+        <span class="keyword">self</span>.<span class="func">init</span>()
+        routes.<span class="func">forEach</span> { <span class="keyword">self</span>.<span class="func">append</span>($0) }
+    }
+}
+
+<span class="keyword">func</span> <span class="func">encodePath</span>(_ path: <span class="type">NavigationPath</span>) <span class="keyword">throws</span> -> <span class="type">Data</span> {
+    <span class="keyword">try</span> <span class="type">JSONEncoder</span>().<span class="func">encode</span>(path)
+}
+
+<span class="keyword">func</span> <span class="func">decodePath</span>(_ data: <span class="type">Data</span>) <span class="keyword">throws</span> -> <span class="type">NavigationPath</span> {
+    <span class="keyword">try</span> <span class="type">JSONDecoder</span>().<span class="func">decode</span>(<span class="type">NavigationPath</span>.<span class="keyword">self</span>, <span class="keyword">from</span>: data)
+}</code></pre>
+
+    <h3>NavigationPath vs typed array</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Representation</th>
+                <th>Pros</th>
+                <th>Cons</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>NavigationPath</code></td>
+                <td>Mix multiple destination types; system helpers; Codable</td>
+                <td>Less compile-time enforcement; harder “switch exhaustiveness”</td>
+            </tr>
+            <tr>
+                <td><code>[Route]</code> enum with associated values</td>
+                <td>Exhaustive handling; clear deep link mapping</td>
+                <td>One mega-enum can become a module coupling point</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h4>Code: Appending mixed Codable routes</h4>
+<pre><code><span class="keyword">enum</span> <span class="type">AppRoute</span>: <span class="type">Hashable</span>, <span class="type">Codable</span> {
+    <span class="keyword">case</span> profile(userId: <span class="type">UUID</span>)
+    <span class="keyword">case</span> thread(threadId: <span class="type">String</span>)
+}
+
+<span class="keyword">struct</span> <span class="type">MixedPathDemo</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> path = <span class="type">NavigationPath</span>()
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">NavigationStack</span>(path: $path) {
+            <span class="type">VStack</span>(spacing: <span class="number">16</span>) {
+                <span class="type">Button</span>(<span class="string">"Open profile"</span>) {
+                    path.<span class="func">append</span>(<span class="type">AppRoute</span>.profile(userId: .init()))
+                }
+                <span class="type">Button</span>(<span class="string">"Open thread"</span>) {
+                    path.<span class="func">append</span>(<span class="type">AppRoute</span>.thread(threadId: <span class="string">"abc"</span>))
+                }
+            }
+            .<span class="func">navigationDestination</span>(<span class="keyword">for</span>: <span class="type">AppRoute</span>.<span class="keyword">self</span>) { route <span class="keyword">in</span>
+                <span class="keyword">switch</span> route {
+                <span class="keyword">case</span> .profile(<span class="keyword">let</span> id):
+                    <span class="type">ProfileView</span>(userId: id)
+                <span class="keyword">case</span> .thread(<span class="keyword">let</span> tid):
+                    <span class="type">ThreadView</span>(id: tid)
+                }
+            }
+        }
+    }
+}</code></pre>
+
+    <h4>Code: Encoding / decoding path</h4>
+<pre><code><span class="keyword">func</span> <span class="func">persist</span>(path: <span class="type">NavigationPath</span>) <span class="keyword">throws</span> -> <span class="type">Data</span> {
+    <span class="keyword">let</span> encoder = <span class="type">JSONEncoder</span>()
+    <span class="keyword">return try</span> encoder.<span class="func">encode</span>(path)
+}
+
+<span class="keyword">func</span> <span class="func">restore</span>(<span class="keyword">from</span> data: <span class="type">Data</span>) <span class="keyword">throws</span> -> <span class="type">NavigationPath</span> {
+    <span class="keyword">let</span> decoder = <span class="type">JSONDecoder</span>()
+    <span class="keyword">return try</span> decoder.<span class="func">decode</span>(<span class="type">NavigationPath</span>.<span class="keyword">self</span>, <span class="keyword">from</span>: data)
+}</code></pre>
+
+    <h2 id="navigation-destination">3. navigationDestination(for:) Registration</h2>
+
+    <p>Value-based navigation resolves destinations through <strong>registrations</strong>: pairs of “when the path contains type <em>T</em>, build this closure.” SwiftUI searches for registrations attached to the view hierarchy containing the active <code>NavigationStack</code>.</p>
+
+    <h3>Mechanism (how registration works)</h3>
+    <p>When the path mutates, the stack compares the new suffix to the previous one and asks the graph for a builder for each element’s dynamic type. The builder comes from the <code>navigationDestination(for:destination:)</code> modifier. Multiple registrations can coexist for different types; the one matching the pushed value’s type wins.</p>
+
+    <h3>Scope: nearest enclosing NavigationStack</h3>
+    <p>Registration is <strong>not global</strong>. If you attach <code>navigationDestination</code> to a view that is <em>outside</em> the <code>NavigationStack</code> that owns the path, the pushed value will not find a destination — a classic “blank navigation” or instant pop. The modifier must appear on a descendant of the stack’s root content (or the stack itself), typically wrapping the root scene content.</p>
+
+    <h3>Multiple registrations</h3>
+    <p>You may chain several <code>navigationDestination(for:)</code> modifiers for distinct types, or use one enum route with a single switch. For large apps, multiple registrations per feature subtree can improve locality, but beware duplicate type registrations at different depths — the evaluation order follows SwiftUI’s usual outer-to-inner modifier composition rules.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Symptom</th>
+                <th>Likely cause</th>
+                <th>Fix</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Push animates then shows empty view</td>
+                <td><code>navigationDestination</code> attached outside owning <code>NavigationStack</code></td>
+                <td>Move registration under the stack root content</td>
+            </tr>
+            <tr>
+                <td>Wrong destination for same type</td>
+                <td>Two stacks, copied modifier from another feature</td>
+                <td>Scope destinations per stack; avoid global modifiers on <code>WindowGroup</code> unless intentional</td>
+            </tr>
+            <tr>
+                <td>Restoration drops after second screen</td>
+                <td>Non-<code>Codable</code> payload type in path</td>
+                <td>Wrap in <code>Codable</code> struct or enum; validate before append</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3><code>navigationDestination(isPresented:destination:)</code> (boolean pushes)</h3>
+    <p>Separate from value-based pushes, SwiftUI still supports <strong>boolean-driven</strong> destinations tied to a binding. These are easy to misuse: two booleans can both be <code>true</code> and fight for stack semantics. Prefer a single path source of truth for deep flows; reserve boolean destinations for simple wizard steps or legacy bridges.</p>
+
+    <h4>Code: Boolean destination (use sparingly)</h4>
+<pre><code><span class="keyword">struct</span> <span class="type">FlagPushDemo</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> showDetail = <span class="keyword">false</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">NavigationStack</span> {
+            <span class="type">Button</span>(<span class="string">"Open"</span>) { showDetail = <span class="keyword">true</span> }
+                .<span class="func">navigationDestination</span>(isPresented: $showDetail) {
+                    <span class="type">Text</span>(<span class="string">"Detail"</span>)
+                }
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common pitfall: sheet vs stack scope</div>
+        <p>Opening a sheet that contains its own <code>NavigationStack</code> requires destinations <em>inside that inner stack</em>. Copy-pasting a feature view that assumes an outer registration silently fails.</p>
+    </div>
+
+    <h4>Code: Correct registration placement</h4>
+<pre><code><span class="keyword">struct</span> <span class="type">ScopedCorrect</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> path = <span class="type">NavigationPath</span>()
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">NavigationStack</span>(path: $path) {
+            <span class="type">Color</span>.blue
+                .<span class="func">navigationDestination</span>(<span class="keyword">for</span>: <span class="type">Int</span>.<span class="keyword">self</span>) { value <span class="keyword">in</span>
+                    <span class="type">Text</span>(<span class="string">"Detail </span>\(value)<span class="string">"</span>)
+                }
+        }
+    }
+}</code></pre>
+
+    <h4>Code: Wrong scope (illustrative anti-pattern)</h4>
+<pre><code><span class="comment">// Destination registered OUTSIDE the NavigationStack — unreliable / blank.</span>
+<span class="keyword">struct</span> <span class="type">ScopedWrong</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> path = <span class="type">NavigationPath</span>()
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">VStack</span> {
+            <span class="type">NavigationStack</span>(path: $path) {
+                <span class="type">Color</span>.green
+            }
+        }
+        .<span class="func">navigationDestination</span>(<span class="keyword">for</span>: <span class="type">Int</span>.<span class="keyword">self</span>) { value <span class="keyword">in</span>
+            <span class="type">Text</span>(<span class="string">"Never reached for pushes from this stack"</span>)
+        }
+    }
+}</code></pre>
+
+    <h2 id="programmatic-patterns">4. Programmatic Navigation Patterns</h2>
+
+    <p>Staff interviews reward clarity about <strong>sources of truth</strong>. SwiftUI allows several idioms; mixing them without hierarchy produces double pushes, lost state, and non-deterministic restoration.</p>
+
+    <h3>Path-based navigation with @State</h3>
+    <p>Local <code>@State private var path: NavigationPath</code> (or typed array) is ideal for self-contained flows. The view owning the stack owns the path. Pros: simple. Cons: hard to drive from distant siblings without lifting state or an observable router.</p>
+
+    <h3>Binding-based presentation</h3>
+    <p>For modal overlays, use <code>.sheet(isPresented:)</code>, <code>fullScreenCover</code>, or item-based sheets. These are not substitutes for stack depth — interviewers like hearing you separate “stack drill-down” from “ephemeral modal context.”</p>
+
+    <p>Staff-level clarity: <strong>modals own their own presentation state</strong>, while <strong>stacks own hierarchical drill-down</strong>. Mixing them on the same user action (sheet + simultaneous path append) creates ambiguous back behavior and broken restoration. Pick one primary transition per intent unless the design explicitly layers a sheet above an existing stack (e.g., share sheet from a pushed screen).</p>
+
+    <h4>Code: <code>sheet(isPresented:)</code> alongside a stack</h4>
+<pre><code><span class="keyword">struct</span> <span class="type">StackPlusSheet</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> path = <span class="type">NavigationPath</span>()
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> showPaywall = <span class="keyword">false</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">NavigationStack</span>(path: $path) {
+            <span class="type">HomeView</span>()
+                .<span class="func">toolbar</span> {
+                    <span class="type">Button</span>(<span class="string">"Upgrade"</span>) { showPaywall = <span class="keyword">true</span> }
+                }
+                .<span class="func">navigationDestination</span>(<span class="keyword">for</span>: <span class="type">Int</span>.<span class="keyword">self</span>) { id <span class="keyword">in</span>
+                    <span class="type">FeatureView</span>(id: id)
+                }
+        }
+        .<span class="func">sheet</span>(isPresented: $showPaywall) {
+            <span class="type">PaywallView</span>()
+        }
+    }
+}</code></pre>
+
+    <h4>Code: <code>sheet(item:)</code> for optional Identifiable payloads</h4>
+<pre><code><span class="keyword">struct</span> <span class="type">EditSheetPayload</span>: <span class="type">Identifiable</span> {
+    <span class="keyword">let</span> id: <span class="type">UUID</span>
+}
+
+<span class="keyword">struct</span> <span class="type">ItemSheetDemo</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> editor: <span class="type">EditSheetPayload</span>?
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">NavigationStack</span> {
+            <span class="type">Button</span>(<span class="string">"Edit"</span>) {
+                editor = <span class="type">EditSheetPayload</span>(id: .init())
+            }
+            .<span class="func">sheet</span>(item: $editor) { payload <span class="keyword">in</span>
+                <span class="type">EditorView</span>(id: payload.id)
+            }
+        }
+    }
+}</code></pre>
+
+    <div class="diagram" role="img" aria-label="ASCII diagram stack vs modal ownership">
+<pre>
+User intent: "drill into record"     -> append to NavigationPath / typed path
+User intent: "temporary task"        -> sheet / fullScreenCover (own binding)
+User intent: "replace whole context" -> window / tab switch (shell state)
+
+Avoid: same button sets path.append AND isPresented = true without a documented stack rule
+</pre>
+    </div>
+
+    <h3>Navigation state as source of truth</h3>
+    <p>In production, path state often lives in an <code>ObservableObject</code> or <code>@Observable</code> model injected via environment. Views render from the model; intents call <code>router.push(...)</code>. The invariant: <strong>no screen pushes itself by mutating a path it does not own</strong>.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Pattern</th>
+                <th>Ownership</th>
+                <th>Good for</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>@State</code> path in root feature view</td>
+                <td>Local subtree</td>
+                <td>Prototypes, small features</td>
+            </tr>
+            <tr>
+                <td>Router in <code>ObservableObject</code></td>
+                <td>Injected object</td>
+                <td>UIKit interop, centralized analytics</td>
+            </tr>
+            <tr>
+                <td><code>@Observable</code> router (iOS 17+)</td>
+                <td>Reference type + fine-grained updates</td>
+                <td>Large SwiftUI-only apps</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h4>Code: @State path</h4>
+<pre><code><span class="keyword">struct</span> <span class="type">StatePathDemo</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> path = <span class="type">NavigationPath</span>()
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">NavigationStack</span>(path: $path) {
+            <span class="type">Button</span>(<span class="string">"Go"</span>) { path.<span class="func">append</span>(<span class="string">"detail"</span>) }
+                .<span class="func">navigationDestination</span>(<span class="keyword">for</span>: <span class="type">String</span>.<span class="keyword">self</span>) { _ <span class="keyword">in</span>
+                    <span class="type">Text</span>(<span class="string">"Detail"</span>)
+                }
+        }
+    }
+}</code></pre>
+
+    <h4>Code: ObservableObject router sketch</h4>
+<pre><code><span class="keyword">final</span> <span class="keyword">class</span> <span class="type">NavRouter</span>: <span class="type">ObservableObject</span> {
+    <span class="keyword">@Published</span> <span class="keyword">var</span> path = <span class="type">NavigationPath</span>()
+
+    <span class="keyword">func</span> <span class="func">openSettings</span>() {
+        path.<span class="func">append</span>(<span class="string">"settings"</span>)
+    }
+
+    <span class="keyword">func</span> <span class="func">popToRoot</span>() {
+        path = <span class="type">NavigationPath</span>()
+    }
+}
+
+<span class="keyword">struct</span> <span class="type">RouterHost</span>: <span class="type">View</span> {
+    <span class="keyword">@StateObject</span> <span class="keyword">private</span> <span class="keyword">var</span> router = <span class="type">NavRouter</span>()
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">NavigationStack</span>(path: $router.path) {
+            <span class="type">HomeView</span>()
+                .<span class="func">environmentObject</span>(router)
+                .<span class="func">navigationDestination</span>(<span class="keyword">for</span>: <span class="type">String</span>.<span class="keyword">self</span>) { _ <span class="keyword">in</span>
+                    <span class="type">SettingsView</span>()
+                        .<span class="func">environmentObject</span>(router)
+                }
+        }
+    }
+}</code></pre>
+
+    <h2 id="deep-linking">5. Deep Linking with NavigationStack</h2>
+
+    <p>Deep linking is the proof that your navigation model is real: URLs (or push notification payloads) must deterministically rebuild stacks without manual tapping.</p>
+
+    <h3>Reconstructing path from URL</h3>
+    <p>Parse the URL into a sequence of route values — typically a small struct or enum cases. Append them to <code>NavigationPath</code> in order. If a segment requires async data validation (e.g., permissions), resolve <em>before</em> mutating path or handle failure with a fallback screen.</p>
+
+    <h3>Codable path and restoration</h3>
+    <p>On scene disconnect, encode <code>NavigationPath</code> alongside tab selection and sidebar visibility. On launch, decode after you register all destinations; otherwise restoration pops early.</p>
+
+    <h3>onOpenURL integration</h3>
+    <p>At the app entry, use <code>.onOpenURL</code> (or the SwiftUI App protocol hooks) to forward URLs to a router. Keep parsing pure; side effects belong in services.</p>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Checklist</div>
+        <ul>
+            <li>Canonical URL → route parser is unit tested.</li>
+            <li>Invalid segments degrade gracefully (root + banner).</li>
+            <li>Same URL applied twice does not duplicate stack entries unless intended.</li>
+        </ul>
+    </div>
+
+    <h4>Code: URL → path pipeline</h4>
+<pre><code><span class="keyword">struct</span> <span class="type">DeepLinkRouter</span> {
+    <span class="keyword">func</span> <span class="func">path</span>(<span class="keyword">for</span> url: <span class="type">URL</span>) -> <span class="type">NavigationPath</span>? {
+        <span class="keyword">guard</span> url.<span class="func">scheme</span> == <span class="string">"myapp"</span>, url.<span class="func">host</span> == <span class="string">"inbox"</span> <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+        <span class="keyword">var</span> components = url.<span class="func">pathComponents</span>.<span class="func">filter</span> { $0 != <span class="string">"/"</span> }
+        <span class="keyword">guard</span> components.<span class="func">first</span> == <span class="string">"message"</span> <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+        components.<span class="func">removeFirst</span>()
+        <span class="keyword">guard let</span> idString = components.<span class="func">first</span>, <span class="keyword">let</span> id = <span class="type">Int</span>(idString) <span class="keyword">else</span> { <span class="keyword">return nil</span> }
+        <span class="keyword">var</span> p = <span class="type">NavigationPath</span>()
+        p.<span class="func">append</span>(<span class="type">MessageID</span>(rawValue: id))
+        <span class="keyword">return</span> p
+    }
+}
+
+<span class="keyword">struct</span> <span class="type">DeepLinkApp</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> path = <span class="type">NavigationPath</span>()
+    <span class="keyword">private let</span> linker = <span class="type">DeepLinkRouter</span>()
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">NavigationStack</span>(path: $path) {
+            <span class="type">InboxListView</span>()
+                .<span class="func">navigationDestination</span>(<span class="keyword">for</span>: <span class="type">MessageID</span>.<span class="keyword">self</span>) { id <span class="keyword">in</span>
+                    <span class="type">MessageDetailView</span>(id: id)
+                }
+        }
+        .<span class="func">onOpenURL</span> { url <span class="keyword">in</span>
+            <span class="keyword">guard let</span> newPath = linker.<span class="func">path</span>(<span class="keyword">for</span>: url) <span class="keyword">else</span> { <span class="keyword">return</span> }
+            path = newPath
+        }
+    }
+}</code></pre>
+
+    <h3>Complete pattern: <code>SceneStorage</code> + relaunch restoration</h3>
+    <p>For single-scene apps, persisting encoded <code>NavigationPath</code> data in <code>@SceneStorage</code> lets the system restore after process death. The critical ordering invariant: <strong>decode only after all <code>navigationDestination</code> registrations exist</strong> in the body that builds the stack — which is naturally satisfied if registrations live on the stack’s root content.</p>
+
+    <h4>Code: <code>SceneStorage</code> for path bytes</h4>
+<pre><code><span class="keyword">struct</span> <span class="type">RestoringInboxView</span>: <span class="type">View</span> {
+    <span class="keyword">@SceneStorage</span>(<span class="string">"inbox.path.data"</span>) <span class="keyword">private</span> <span class="keyword">var</span> pathData: <span class="type">Data</span>?
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> path = <span class="type">NavigationPath</span>()
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">NavigationStack</span>(path: $path) {
+            <span class="type">InboxListView</span>()
+                .<span class="func">navigationDestination</span>(<span class="keyword">for</span>: <span class="type">MessageID</span>.<span class="keyword">self</span>) { id <span class="keyword">in</span>
+                    <span class="type">MessageDetailView</span>(id: id)
+                }
+        }
+        .<span class="func">onAppear</span> {
+            <span class="keyword">if</span> path.<span class="func">isEmpty</span>, <span class="keyword">let</span> pathData,
+               <span class="keyword">let</span> restored = <span class="keyword">try</span>? <span class="type">JSONDecoder</span>().<span class="func">decode</span>(<span class="type">NavigationPath</span>.<span class="keyword">self</span>, <span class="keyword">from</span>: pathData) {
+                path = restored
+            }
+        }
+        .<span class="func">onChange</span>(<span class="keyword">of</span>: path) { _, newValue <span class="keyword">in</span>
+            pathData = <span class="keyword">try</span>? <span class="type">JSONEncoder</span>().<span class="func">encode</span>(newValue)
+        }
+    }
+}</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Production caveat</div>
+        <p><code>SceneStorage</code> is not a document store. Cap payload size, version your encoding, and never persist sensitive identifiers unencrypted. For multi-window macOS or iPad scenes, decide whether each scene owns an independent path or mirrors a shared model — that choice belongs in the architecture review, not in a view modifier.</p>
+    </div>
+
+    <h3>Universal Links and authentication gates</h3>
+    <p>Deep links often hit <strong>unauthenticated</strong> or <strong>missing entitlements</strong> states. A Staff answer describes a router that queues pending routes until login completes, then replays them once — avoiding duplicate pushes if the user backgrounded during sign-in.</p>
+
+    <div class="diagram" role="img" aria-label="Flow from URL to NavigationPath">
+<pre>
+URL (myapp://inbox/message/42)
+        |
+        v
+   Parse + validate
+        |
+        v
+ Build NavigationPath([MessageID(42)])
+        |
+        v
+ SwiftUI matches navigationDestination(for: MessageID.self)
+        |
+        v
+ MessageDetailView appears on stack
+</pre>
+    </div>
+
+    <h2 id="navigation-link-styles">6. NavigationLink: Value-Based vs View-Based</h2>
+
+    <h3>Legacy: NavigationLink(destination:label:)</h3>
+    <p>The destination view was part of the link’s initializer. SwiftUI constructed destination infrastructure eagerly in many cases, causing work for off-screen rows and complicating dependency graphs inside lists. It also tightly coupled the row UI to the exact destination type, hurting reuse.</p>
+
+    <h3>Modern: NavigationLink(value:label:)</h3>
+    <p>The link only emits a <strong>value</strong> into the surrounding stack’s path. The stack’s registered destination builder turns the value into a view lazily when needed. This decouples list cells from feature graphs and aligns with programmatic pushes (same code path).</p>
+
+    <h3>Why value-based wins architecturally</h3>
+    <ul>
+        <li><strong>Single resolver</strong> for taps and deep links.</li>
+        <li><strong>Lazy construction</strong> of heavy destinations.</li>
+        <li><strong>Testability</strong>: push values without instantiating full SwiftUI trees.</li>
+    </ul>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Style</th>
+                <th>API shape</th>
+                <th>Eagerness</th>
+                <th>Coupling</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>View-based</td>
+                <td><code>NavigationLink(destination:label:)</code></td>
+                <td>Higher upfront work</td>
+                <td>Cell knows destination view</td>
+            </tr>
+            <tr>
+                <td>Value-based</td>
+                <td><code>NavigationLink(value:label:)</code></td>
+                <td>Lazier resolution</td>
+                <td>Cell knows only Hashable payload</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h4>Code: Side-by-side comparison</h4>
+<pre><code><span class="comment">// View-based (avoid for new code)</span>
+<span class="type">NavigationLink</span> {
+    <span class="type">LegacyDetailView</span>(id: item.id)
+} label: {
+    <span class="type">Text</span>(item.title)
+}
+
+<span class="comment">// Value-based (preferred)</span>
+<span class="type">NavigationLink</span>(value: item.id) {
+    <span class="type">Text</span>(item.title)
+}
+<span class="comment">// + navigationDestination(for: Item.ID.self) { ... } on the stack root</span></code></pre>
+
+    <h2 id="coordinator-pattern">7. Coordinator Pattern in SwiftUI</h2>
+
+    <p>UIKit teams traditionally used coordinators to isolate transition logic from view controllers. SwiftUI did not remove that need — it <strong>relocated</strong> it. Without a coordinator (or router), navigation intents leak into every view, previews become noisy, and modules acquire hidden dependencies on each other’s concrete screens.</p>
+
+    <h3>Why coordinators remain useful</h3>
+    <ul>
+        <li><strong>Centralized transitions</strong> and logging of navigation events.</li>
+        <li><strong>Feature boundaries</strong>: public routes vs private screens.</li>
+        <li><strong>Test doubles</strong>: replace router with spy in unit tests.</li>
+    </ul>
+
+    <h3>Router with NavigationStack</h3>
+    <p>The coordinator exposes intent methods (<code>showProfile</code>, <code>handle(url:)</code>) and mutates path state. SwiftUI views bind to <code>$router.path</code> through the stack.</p>
+
+    <h3>ObservableObject coordinator</h3>
+    <p>Use <code>@Published var path</code> for broad compatibility with iOS 16–16.x patterns and straightforward <code>environmentObject</code> injection.</p>
+
+    <h3>@Observable coordinator (iOS 17+)</h3>
+    <p>Macro observation reduces invalidation fan-out compared to whole-object publishes when you add unrelated fields. Pair with <code>@Bindable</code> for <code>$path</code> bindings into <code>NavigationStack</code>.</p>
+
+    <h4>Code: @Observable coordinator (complete sketch)</h4>
+<pre><code><span class="keyword">import</span> <span class="type">SwiftUI</span>
+
+<span class="keyword">@Observable</span>
+<span class="keyword">final</span> <span class="keyword">class</span> <span class="type">AppCoordinator</span> {
+    <span class="keyword">var</span> path = <span class="type">NavigationPath</span>()
+
+    <span class="keyword">func</span> <span class="func">openOrder</span>(id: <span class="type">UUID</span>) {
+        path.<span class="func">append</span>(<span class="type">OrderRoute</span>.detail(id))
+    }
+
+    <span class="keyword">func</span> <span class="func">openCart</span>() {
+        path.<span class="func">append</span>(<span class="type">OrderRoute</span>.cart)
+    }
+
+    <span class="keyword">func</span> <span class="func">reset</span>() {
+        path = <span class="type">NavigationPath</span>()
+    }
+}
+
+<span class="keyword">enum</span> <span class="type">OrderRoute</span>: <span class="type">Hashable</span>, <span class="type">Codable</span> {
+    <span class="keyword">case</span> cart
+    <span class="keyword">case</span> detail(<span class="type">UUID</span>)
+}
+
+<span class="keyword">struct</span> <span class="type">CoordinatorRootView</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> coordinator = <span class="type">AppCoordinator</span>()
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">NavigationStack</span>(path: $coordinator.path) {
+            <span class="type">OrderListView</span>()
+                .<span class="func">environment</span>(coordinator)
+                .<span class="func">navigationDestination</span>(<span class="keyword">for</span>: <span class="type">OrderRoute</span>.<span class="keyword">self</span>) { route <span class="keyword">in</span>
+                    <span class="keyword">switch</span> route {
+                    <span class="keyword">case</span> .cart:
+                        <span class="type">CartView</span>()
+                    <span class="keyword">case</span> .detail(<span class="keyword">let</span> id):
+                        <span class="type">OrderDetailView</span>(id: id)
+                    }
+                }
+        }
+    }
+}</code></pre>
+
+    <p>With <code>@Observable</code>, <code>@State</code> holds the coordinator instance and SwiftUI exposes bindable projections to individual mutable properties — hence <code>$coordinator.path</code> without manually instantiating <code>@Bindable</code> in the body. When you need many bindings in the same subtree, you can still write <code>@Bindable var coordinator = coordinator</code> as a local in <code>body</code> (shadowing intentionally) for ergonomics; the navigation stack only needs the path binding.</p>
+
+    <h4>Code: Protocol-facing coordinator for tests</h4>
+<pre><code><span class="keyword">protocol</span> <span class="type">OrderCoordinating</span>: <span class="type">AnyObject</span> {
+    <span class="keyword">func</span> <span class="func">openOrder</span>(id: <span class="type">UUID</span>)
+    <span class="keyword">func</span> <span class="func">reset</span>()
+}
+
+<span class="keyword">extension</span> <span class="type">AppCoordinator</span>: <span class="type">OrderCoordinating</span> {}
+
+<span class="comment">// Inject real coordinator in production, `SpyCoordinator` in unit tests.</span>
+<span class="keyword">struct</span> <span class="type">OrderListScreen</span>: <span class="type">View</span> {
+    <span class="keyword">let</span> coordinator: <span class="keyword">any</span> <span class="type">OrderCoordinating</span>
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">Button</span>(<span class="string">"Open"</span>) { coordinator.<span class="func">openOrder</span>(id: .init()) }
+    }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">UIKit interop note</div>
+        <p>When embedding UIKit navigation, coordinators often become the seam that translates <code>UINavigationController</code> events into SwiftUI path updates (and vice versa). Mentioning that boundary unprompted signals production experience.</p>
+    </div>
+
+    <h2 id="scalable-nav">8. Building a Scalable Navigation System (100+ Screens)</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect bar — navigation at scale</div>
+        <p>At L6, “we use NavigationStack” is insufficient. You must articulate <strong>module boundaries</strong>, <strong>route namespaces</strong>, <strong>deep link ownership</strong>, and <strong>tab vs stack invariants</strong>. The goal is composable routers: each major feature exposes a small factory that registers its own destinations inside a private stack scope, while an app shell coordinates tab selection and cross-tab routing policy.</p>
+    </div>
+
+    <h3>Navigation architecture for large apps</h3>
+    <ul>
+        <li><strong>Shell layer</strong>: tab bar or split view, scene phase, global modals.</li>
+        <li><strong>Feature routers</strong>: path segments typed per feature (<code>SettingsRoute</code>, <code>ShopRoute</code>).</li>
+        <li><strong>Link layer</strong>: URL → structured route DTO → validated append.</li>
+        <li><strong>Analytics hooks</strong>: single choke point on path changes.</li>
+    </ul>
+
+    <h3>Feature module isolation</h3>
+    <p>Avoid one application-wide enum with hundreds of cases unless you enforce strict ownership via extensions per module. Alternatives: protocol-typed destinations with erased boxes (advanced), or mirrored lightweight URL paths per feature. The interview tradeoff story: compile-time safety vs build graph coupling.</p>
+
+    <h3>Deep link routing at scale</h3>
+    <p>Use a two-phase pipeline: (1) parse and authorize, (2) map to router intents. Never let view controllers or SwiftUI views parse URLs directly. Keep a registry of parsers keyed by URL host/path pattern.</p>
+
+    <h3>Tab + stack patterns</h3>
+    <p>Each tab owns an independent <code>NavigationStack</code> path. Cross-tab navigation clears or preserves stacks based on product rules — document the policy. Common pattern: <code>TabView</code> with per-tab <code>@State</code> or a tab model holding multiple paths.</p>
+
+    <h4>Code: Per-tab <code>NavigationStack</code> paths</h4>
+<pre><code><span class="keyword">struct</span> <span class="type">TabShellView</span>: <span class="type">View</span> {
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> homePath = <span class="type">NavigationPath</span>()
+    <span class="keyword">@State</span> <span class="keyword">private</span> <span class="keyword">var</span> searchPath = <span class="type">NavigationPath</span>()
+
+    <span class="keyword">var</span> body: <span class="keyword">some</span> <span class="type">View</span> {
+        <span class="type">TabView</span> {
+            <span class="type">NavigationStack</span>(path: $homePath) {
+                <span class="type">HomeRootView</span>()
+                    .<span class="func">navigationDestination</span>(<span class="keyword">for</span>: <span class="type">UUID</span>.<span class="keyword">self</span>) { id <span class="keyword">in</span>
+                        <span class="type">ProfileView</span>(id: id)
+                    }
+            }
+            .<span class="func">tabItem</span> { <span class="type">Label</span>(<span class="string">"Home"</span>, systemImage: <span class="string">"house"</span>) }
+
+            <span class="type">NavigationStack</span>(path: $searchPath) {
+                <span class="type">SearchRootView</span>()
+                    .<span class="func">navigationDestination</span>(<span class="keyword">for</span>: <span class="type">String</span>.<span class="keyword">self</span>) { query <span class="keyword">in</span>
+                        <span class="type">SearchResultsView</span>(query: query)
+                    }
+            }
+            .<span class="func">tabItem</span> { <span class="type">Label</span>(<span class="string">"Search"</span>, systemImage: <span class="string">"magnifyingglass"</span>) }
+        }
+    }
+}</code></pre>
+
+    <p>Cross-tab deep links pick a tab first, then append to <em>that</em> tab’s path. If you append without switching <code>TabView</code> selection, users can land on the wrong tab with a mutated stack they cannot see — a classic bug in large apps.</p>
+
+    <div class="diagram" role="img" aria-label="ASCII architecture diagram for large app navigation">
+<pre>
++------------------- App Shell -------------------+
+|  TabView (selection + optional badge state)      |
+|  +-------------+ +-------------+ +-------------+ |
+|  | NavStack A  | | NavStack B  | | NavStack C  | |
+|  | path: PathA | | path: PathB | | path: PathC | |
+|  | +feature    | | +feature    | | +feature    | |
+|  |  destinations| |  destinations| |  destinations|
+|  +-------------+ +-------------+ +-------------+ |
+|           ^                    DeepLinkService     |
+|           |                         |              |
+|    onOpenURL / notification payload |              |
++---------------------------------------+--------------+
+        Each feature module:
+        - defines Route enum (Codable)
+        - registers navigationDestination inside its root
+        - exposes Router protocol to sibling modules via DI
+</pre>
+    </div>
+
+    <h3>Staff-level discussion prompts (practice)</h3>
+    <ol>
+        <li>How do you prevent duplicate registration of the same type in nested stacks?</li>
+        <li>When do you choose <code>NavigationSplitView</code> over a stack-only iPad layout?</li>
+        <li>How does your team test deep links without UI tests?</li>
+        <li>What happens to navigation state on user switch / logout?</li>
+        <li>How do you migrate a UIKit coordinator to SwiftUI without double navigation bars?</li>
+    </ol>
+
+    <p>Mastering navigation evolution is partly API recall and partly <strong>systems design</strong>: explicit topology, single sources of truth, lazy destination resolution, and serialization-aware route models. In interviews, connect each decision to user-visible outcomes (correct back behavior, restoration after kill, predictable iPad layouts) and engineering outcomes (module compile times, test seams, analytics consistency).</p>
+
+    <div class="nav-footer">
+        <a href="05-rendering-integration.html">← Rendering</a>
+        <a href="07-performance.html">Next: Performance →</a>
+    </div>
+</div>
+</body>
+</html>

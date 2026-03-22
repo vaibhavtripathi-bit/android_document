@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jetsam &amp; Memory Pressure — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Memory &amp; Performance</a><span class="sep">›</span>
+        Jetsam &amp; Memory Pressure
+    </nav>
+
+    <h1>Jetsam &amp; Memory Pressure</h1>
+    <p class="subtitle">The iOS OOM killer — how it decides which apps to terminate, what memory categories matter, and how to build a memory budget system for large apps.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#what-is-jetsam">What Is Jetsam?</a></li>
+            <li><a href="#memory-footprint">Memory Footprint Categories</a></li>
+            <li><a href="#dirty-compressed-clean">Dirty, Compressed, and Clean Memory</a></li>
+            <li><a href="#os-proc">os_proc_available_memory()</a></li>
+            <li><a href="#memory-warning">didReceiveMemoryWarning Unreliability</a></li>
+            <li><a href="#priority-bands">Jetsam Priority Bands</a></li>
+            <li><a href="#background-limits">Background Memory Limits</a></li>
+            <li><a href="#metrickit">MetricKit Memory Reports</a></li>
+            <li><a href="#dispatch-source">Memory Pressure Dispatch Source</a></li>
+            <li><a href="#memory-budget">Building a Memory Budget System</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="what-is-jetsam">What Is Jetsam?</h2>
+
+    <p>Jetsam is the iOS kernel's out-of-memory (OOM) killer. Unlike desktop operating systems that use swap space (virtual memory backed by disk), iOS has <strong>no swap</strong>. When physical memory runs low, Jetsam terminates processes to free memory. There is no negotiation — the process is killed with <code>SIGKILL</code>, which cannot be caught or handled.</p>
+
+    <div class="diagram">
+Jetsam Decision Flow:
+┌─────────────────────────────────────┐
+│ System Memory Pressure Increases    │
+└──────────────┬──────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────┐
+│ Jetsam evaluates all processes      │
+│ by priority band + memory footprint │
+└──────────────┬──────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────┐
+│ Kill lowest-priority processes      │
+│ with highest memory footprint first │
+└──────────────┬──────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────┐
+│ If still under pressure:            │
+│ Move up priority bands              │
+│ Eventually kill foreground app      │
+└─────────────────────────────────────┘
+
+Key: Jetsam uses DIRTY memory, not total allocation
+    </div>
+
+    <p>Jetsam events are logged in the device's crash logs with the <code>jetsam</code> reason. They look like crashes but have no stack trace — the process was killed externally by the kernel.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Jetsam Kills Look Like Crashes</div>
+        <p>Jetsam terminations appear in crash reporting tools as <code>EXC_RESOURCE</code> or simply as process terminations with no exception. They have no stack trace because the kill signal comes from the kernel, not from within the app. Many teams misclassify Jetsam kills as "random crashes" because they don't check the <code>termination_reason</code> field. Always check for <code>jetsam</code> in crash logs and use MetricKit's <code>MXDiskWriteExceptionDiagnostic</code> and memory metrics to identify OOM patterns.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="memory-footprint">Memory Footprint Categories</h2>
+
+    <p>Understanding what Jetsam actually measures is critical. It doesn't care about your total allocation — it cares about your <strong>memory footprint</strong>, which is the amount of physical memory your process is using.</p>
+
+    <div class="diagram">
+Memory Categories:
+┌─────────────────────────────────────────────────────────┐
+│                  Virtual Memory                          │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │              Resident Memory                       │  │
+│  │  ┌─────────────────────────────────────────────┐  │  │
+│  │  │           Memory Footprint                   │  │  │
+│  │  │  ┌───────────────┐  ┌───────────────────┐   │  │  │
+│  │  │  │ Dirty Memory  │  │ Compressed Memory │   │  │  │
+│  │  │  │ (modified     │  │ (dirty pages      │   │  │  │
+│  │  │  │  pages)       │  │  compressed by    │   │  │  │
+│  │  │  │               │  │  the kernel)      │   │  │  │
+│  │  │  └───────────────┘  └───────────────────┘   │  │  │
+│  │  └─────────────────────────────────────────────┘  │  │
+│  │  ┌─────────────────────────────────────────────┐  │  │
+│  │  │           Clean Memory                       │  │  │
+│  │  │  (memory-mapped files, purgeable, etc.)      │  │  │
+│  │  │  Can be evicted and reloaded from disk       │  │  │
+│  │  └─────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │           Non-Resident (paged out / not loaded)    │  │
+│  └───────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+
+Jetsam cares about: Footprint = Dirty + Compressed
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="dirty-compressed-clean">Dirty, Compressed, and Clean Memory</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Category</th>
+                <th>What It Is</th>
+                <th>Examples</th>
+                <th>Jetsam Impact</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Dirty</strong></td>
+                <td>Memory written to by the app that can't be evicted</td>
+                <td>Heap objects, stack, decoded images, malloc'd buffers</td>
+                <td>Counts toward footprint</td>
+            </tr>
+            <tr>
+                <td><strong>Compressed</strong></td>
+                <td>Dirty pages compressed by the kernel's compressor</td>
+                <td>Inactive dirty pages the kernel compressed to save space</td>
+                <td>Counts toward footprint (at compressed size)</td>
+            </tr>
+            <tr>
+                <td><strong>Clean</strong></td>
+                <td>Memory that can be evicted and reloaded from disk</td>
+                <td>Memory-mapped files, framework __TEXT segments, read-only data</td>
+                <td>Does NOT count toward footprint</td>
+            </tr>
+            <tr>
+                <td><strong>Purgeable</strong></td>
+                <td>Memory the app marks as discardable under pressure</td>
+                <td>NSPurgeableData, NSCache contents</td>
+                <td>Can be reclaimed without killing the app</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>What Creates Dirty Memory</h3>
+
+    <pre><code><span class="comment">// Each of these creates dirty memory:</span>
+
+<span class="comment">// 1. Heap allocations (class instances)</span>
+<span class="keyword">let</span> object = <span class="type">MyClass</span>()  <span class="comment">// Dirty: object + metadata</span>
+
+<span class="comment">// 2. Decoded image bitmaps</span>
+<span class="keyword">let</span> image = <span class="type">UIImage</span>(named: <span class="string">"photo"</span>)
+<span class="comment">// The compressed JPEG is clean (mapped from disk)</span>
+<span class="comment">// The decoded RGBA bitmap is DIRTY</span>
+<span class="comment">// A 4000x3000 photo = 4000 * 3000 * 4 bytes = 48MB dirty!</span>
+
+<span class="comment">// 3. Data buffers</span>
+<span class="keyword">var</span> buffer = <span class="type">Data</span>(count: <span class="number">10_000_000</span>)  <span class="comment">// 10MB dirty</span>
+
+<span class="comment">// 4. Array/Dictionary storage</span>
+<span class="keyword">var</span> cache: [<span class="type">String</span>: <span class="type">Data</span>] = [:]  <span class="comment">// Dirty: hash table + values</span>
+
+<span class="comment">// 5. String buffers (for non-small strings)</span>
+<span class="keyword">let</span> longString = <span class="type">String</span>(repeating: <span class="string">"x"</span>, count: <span class="number">100_000</span>)  <span class="comment">// Dirty</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Deep Dive: Image Memory is the #1 Dirty Memory Source</div>
+        <p>The single biggest source of dirty memory in most iOS apps is decoded image bitmaps. A single 12MP photo (4032×3024) consumes <strong>48MB</strong> of dirty memory when decoded to RGBA. Common mistakes: (1) loading full-resolution images for thumbnails, (2) keeping decoded images in memory after they scroll off screen, (3) not using <code>ImageIO</code> for downsampled loading. Use <code>CGImageSourceCreateThumbnailAtIndex</code> to load images at the exact size needed.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="os-proc">os_proc_available_memory()</h2>
+
+    <p>Introduced in iOS 13, <code>os_proc_available_memory()</code> returns the number of bytes the app can allocate before Jetsam kills it. This is the most reliable way to know how close you are to the limit.</p>
+
+    <pre><code><span class="keyword">import</span> <span class="type">os</span>
+
+<span class="keyword">func</span> <span class="func">checkMemoryBudget</span>() {
+    <span class="keyword">let</span> available = <span class="func">os_proc_available_memory</span>()
+    <span class="keyword">let</span> availableMB = available / (<span class="number">1024</span> * <span class="number">1024</span>)
+
+    <span class="func">print</span>(<span class="string">"Available memory: \(availableMB) MB"</span>)
+
+    <span class="keyword">if</span> availableMB &lt; <span class="number">50</span> {
+        <span class="comment">// Critical: purge caches immediately</span>
+        <span class="func">purgeCaches</span>()
+    } <span class="keyword">else if</span> availableMB &lt; <span class="number">100</span> {
+        <span class="comment">// Warning: reduce memory usage</span>
+        <span class="func">reduceImageCache</span>()
+    }
+}
+
+<span class="comment">// Typical values on modern devices:</span>
+<span class="comment">// iPhone 15 Pro (8GB RAM): ~2-3GB available for foreground app</span>
+<span class="comment">// iPhone SE 3 (4GB RAM):   ~1-1.5GB available</span>
+<span class="comment">// iPad Pro (16GB RAM):     ~5-6GB available</span>
+<span class="comment">// These vary based on system load, other apps, extensions</span></code></pre>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Best Practice: Periodic Memory Budget Checks</div>
+        <p>Call <code>os_proc_available_memory()</code> periodically (e.g., every 5 seconds via a timer, or before large allocations) to proactively manage memory. Don't wait for <code>didReceiveMemoryWarning</code> — by the time it fires, you may have milliseconds before Jetsam kills you. Build a tiered response: at 50% budget, stop prefetching; at 25%, purge caches; at 10%, drop everything non-essential.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="memory-warning">didReceiveMemoryWarning Unreliability</h2>
+
+    <p><code>UIViewController.didReceiveMemoryWarning()</code> and <code>UIApplication.didReceiveMemoryWarningNotification</code> are <strong>not reliable</strong> for preventing Jetsam kills. Here's why:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Problem</th>
+                <th>Details</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Timing</td>
+                <td>May fire too late — Jetsam can kill before the warning is delivered</td>
+            </tr>
+            <tr>
+                <td>Not guaranteed</td>
+                <td>If memory spikes rapidly (e.g., large image decode), Jetsam may kill without warning</td>
+            </tr>
+            <tr>
+                <td>Main thread only</td>
+                <td>Delivered on the main thread — if main thread is blocked, warning is delayed</td>
+            </tr>
+            <tr>
+                <td>Insufficient info</td>
+                <td>Doesn't tell you how much memory to free or how urgent the situation is</td>
+            </tr>
+            <tr>
+                <td>Background apps</td>
+                <td>Background apps may be killed without any warning at all</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="keyword">class</span> <span class="type">ViewController</span>: <span class="type">UIViewController</span> {
+    <span class="keyword">override func</span> <span class="func">didReceiveMemoryWarning</span>() {
+        <span class="keyword">super</span>.<span class="func">didReceiveMemoryWarning</span>()
+        <span class="comment">// This may never be called before Jetsam kills you!</span>
+        <span class="comment">// Use os_proc_available_memory() proactively instead</span>
+        <span class="func">purgeImageCache</span>()
+        <span class="func">releaseReusableBuffers</span>()
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="priority-bands">Jetsam Priority Bands</h2>
+
+    <p>Jetsam assigns each process a priority band. When memory pressure occurs, it kills processes starting from the lowest priority band, choosing the highest-memory process within each band.</p>
+
+    <div class="diagram">
+Jetsam Priority Bands (lowest → highest):
+┌────────────────────────────────────────────────────────┐
+│ Band 0:  IDLE                                          │
+│          Suspended apps with no active sessions         │
+├────────────────────────────────────────────────────────┤
+│ Band 1:  BACKGROUND                                    │
+│          Apps in background (recently used)             │
+├────────────────────────────────────────────────────────┤
+│ Band 3:  BACKGROUND (elevated)                         │
+│          Apps doing background work (audio, location)   │
+├────────────────────────────────────────────────────────┤
+│ Band 5:  MAIL / DAEMON                                 │
+│          System daemons, mail fetch                     │
+├────────────────────────────────────────────────────────┤
+│ Band 10: FOREGROUND                                    │
+│          The currently visible app                      │
+├────────────────────────────────────────────────────────┤
+│ Band 17: FOREGROUND (critical)                         │
+│          Phone, FaceTime during active call             │
+├────────────────────────────────────────────────────────┤
+│ Band 18: JETSAM (kernel)                               │
+│          Kernel and critical system processes            │
+│          (never killed — system panics instead)         │
+└────────────────────────────────────────────────────────┘
+
+Kill order: Band 0 first → Band 1 → ... → Band 10 (last resort)
+Within each band: highest memory footprint killed first
+    </div>
+
+    <h3>What Determines Your Band</h3>
+
+    <ul>
+        <li><strong>Foreground</strong> — app is visible and receiving events</li>
+        <li><strong>Background (elevated)</strong> — app has active background mode (audio, location, VoIP)</li>
+        <li><strong>Background</strong> — app was recently backgrounded</li>
+        <li><strong>Suspended</strong> — app has been suspended by the system (no code running)</li>
+        <li><strong>Idle</strong> — app has no active scenes or sessions</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2 id="background-limits">Background Memory Limits</h2>
+
+    <p>Background apps have significantly lower memory limits than foreground apps. Exceeding these limits results in immediate Jetsam termination.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>State</th>
+                <th>Approximate Limit</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Foreground</td>
+                <td>~50-70% of device RAM</td>
+                <td>Varies by device and system load</td>
+            </tr>
+            <tr>
+                <td>Background (active)</td>
+                <td>~50-80MB</td>
+                <td>Apps doing background work</td>
+            </tr>
+            <tr>
+                <td>App Extensions</td>
+                <td>~40-120MB</td>
+                <td>Depends on extension type</td>
+            </tr>
+            <tr>
+                <td>Widget Extensions</td>
+                <td>~30MB</td>
+                <td>Very constrained</td>
+            </tr>
+            <tr>
+                <td>Notification Service</td>
+                <td>~24MB</td>
+                <td>Must process quickly</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Handling background transition — reduce memory immediately</span>
+<span class="keyword">func</span> <span class="func">applicationDidEnterBackground</span>(_ application: <span class="type">UIApplication</span>) {
+    <span class="comment">// You have seconds to get under ~50MB or risk Jetsam</span>
+    <span class="type">ImageCache</span>.shared.<span class="func">removeAll</span>()
+    <span class="type">URLCache</span>.shared.<span class="func">removeAllCachedResponses</span>()
+    <span class="func">releaseDecodedImages</span>()
+    <span class="func">compactDataStructures</span>()
+
+    <span class="keyword">let</span> available = <span class="func">os_proc_available_memory</span>()
+    <span class="func">print</span>(<span class="string">"Background available: \(available / 1024 / 1024) MB"</span>)
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Pitfall: Background Memory Spikes</div>
+        <p>A common pattern that causes Jetsam kills: the app is backgrounded, a background fetch or push notification triggers processing, and the processing temporarily spikes memory above the background limit. The app is killed even though the spike is temporary. Solution: check <code>os_proc_available_memory()</code> before starting background work, and process data in small batches.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="metrickit">MetricKit Memory Reports</h2>
+
+    <p>MetricKit provides production memory metrics that are aggregated and delivered daily. This is the only way to understand real-world memory behavior across your user base.</p>
+
+    <pre><code><span class="keyword">import</span> <span class="type">MetricKit</span>
+
+<span class="keyword">class</span> <span class="type">MemoryMetricsSubscriber</span>: <span class="type">NSObject</span>, <span class="type">MXMetricManagerSubscriber</span> {
+
+    <span class="keyword">func</span> <span class="func">didReceive</span>(_ payloads: [<span class="type">MXMetricPayload</span>]) {
+        <span class="keyword">for</span> payload <span class="keyword">in</span> payloads {
+            <span class="keyword">if let</span> memoryMetrics = payload.memoryMetrics {
+                <span class="keyword">let</span> peakMemory = memoryMetrics.peakMemoryUsage
+                <span class="func">print</span>(<span class="string">"Peak memory: \(peakMemory)"</span>)
+
+                <span class="keyword">let</span> averageSuspended = memoryMetrics.averageSuspendedMemory
+                <span class="func">print</span>(<span class="string">"Avg suspended: \(averageSuspended)"</span>)
+            }
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">didReceive</span>(_ payloads: [<span class="type">MXDiagnosticPayload</span>]) {
+        <span class="keyword">for</span> payload <span class="keyword">in</span> payloads {
+            <span class="keyword">if let</span> crashDiagnostics = payload.crashDiagnostics {
+                <span class="keyword">for</span> diagnostic <span class="keyword">in</span> crashDiagnostics {
+                    <span class="keyword">if</span> diagnostic.terminationReason?.contains(<span class="string">"jetsam"</span>) == <span class="keyword">true</span> {
+                        <span class="func">print</span>(<span class="string">"Jetsam kill detected!"</span>)
+                        <span class="func">reportJetsamEvent</span>(diagnostic)
+                    }
+                }
+            }
+        }
+    }
+}
+
+<span class="comment">// Register in AppDelegate or App init</span>
+<span class="keyword">let</span> subscriber = <span class="type">MemoryMetricsSubscriber</span>()
+<span class="type">MXMetricManager</span>.shared.<span class="func">add</span>(subscriber)</code></pre>
+
+    <h3>Key MetricKit Memory Metrics</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Metric</th>
+                <th>What It Measures</th>
+                <th>Action Threshold</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>peakMemoryUsage</code></td>
+                <td>Highest memory footprint during the reporting period</td>
+                <td>&gt; 500MB on 4GB device</td>
+            </tr>
+            <tr>
+                <td><code>averageSuspendedMemory</code></td>
+                <td>Average footprint while suspended</td>
+                <td>&gt; 50MB</td>
+            </tr>
+            <tr>
+                <td>Jetsam diagnostics</td>
+                <td>OOM termination events</td>
+                <td>Any occurrence</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="dispatch-source">Memory Pressure Dispatch Source</h2>
+
+    <p>For more granular memory pressure notifications than <code>didReceiveMemoryWarning</code>, use a <code>DispatchSource</code> for memory pressure events:</p>
+
+    <pre><code><span class="keyword">class</span> <span class="type">MemoryPressureMonitor</span> {
+    <span class="keyword">private var</span> source: <span class="type">DispatchSourceMemoryPressure</span>?
+
+    <span class="keyword">func</span> <span class="func">startMonitoring</span>() {
+        source = <span class="type">DispatchSource</span>.<span class="func">makeMemoryPressureSource</span>(
+            eventMask: [.warning, .critical],
+            queue: .main
+        )
+
+        source?.<span class="func">setEventHandler</span> { [<span class="keyword">weak self</span>] <span class="keyword">in</span>
+            <span class="keyword">guard let</span> source = self?.source <span class="keyword">else</span> { <span class="keyword">return</span> }
+            <span class="keyword">let</span> event = source.data
+
+            <span class="keyword">if</span> event.contains(.critical) {
+                <span class="func">print</span>(<span class="string">"🔴 CRITICAL memory pressure"</span>)
+                self?.<span class="func">handleCriticalPressure</span>()
+            } <span class="keyword">else if</span> event.contains(.warning) {
+                <span class="func">print</span>(<span class="string">"🟡 WARNING memory pressure"</span>)
+                self?.<span class="func">handleWarningPressure</span>()
+            }
+        }
+
+        source?.<span class="func">resume</span>()
+    }
+
+    <span class="keyword">private func</span> <span class="func">handleWarningPressure</span>() {
+        <span class="type">URLCache</span>.shared.memoryCapacity = <span class="number">0</span>
+        <span class="type">ImageCache</span>.shared.<span class="func">trimToSize</span>(<span class="number">50_000_000</span>)
+    }
+
+    <span class="keyword">private func</span> <span class="func">handleCriticalPressure</span>() {
+        <span class="type">ImageCache</span>.shared.<span class="func">removeAll</span>()
+        <span class="type">URLCache</span>.shared.<span class="func">removeAllCachedResponses</span>()
+        <span class="type">NSCache</span>&lt;<span class="type">AnyObject</span>, <span class="type">AnyObject</span>&gt;().<span class="func">removeAllObjects</span>()
+    }
+
+    <span class="keyword">deinit</span> {
+        source?.<span class="func">cancel</span>()
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="memory-budget">Building a Memory Budget System</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know: Memory Budget System for Large Apps</div>
+        <p>At the Staff level, you should be able to design a memory budget system that prevents Jetsam kills proactively. Here's a complete architecture:</p>
+    </div>
+
+    <h3>Architecture Overview</h3>
+
+    <div class="diagram">
+Memory Budget System Architecture:
+┌─────────────────────────────────────────────────────────┐
+│                  MemoryBudgetManager                     │
+│                                                          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │ Budget Tiers │  │ Polling Loop │  │ Subscribers  │  │
+│  │              │  │              │  │              │  │
+│  │ Green: &gt;50%  │  │ Timer-based  │  │ ImageCache   │  │
+│  │ Yellow: 25%  │  │ os_proc_     │  │ URLCache     │  │
+│  │ Orange: 10%  │  │ available_   │  │ DataManager  │  │
+│  │ Red: &lt;5%     │  │ memory()     │  │ FeatureFlags │  │
+│  └──────────────┘  └──────────────┘  └──────────────┘  │
+│                                                          │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │ Per-Subsystem Budgets                             │   │
+│  │ Images: 200MB | Network: 50MB | Data: 100MB      │   │
+│  │ Each subsystem reports usage, receives limits     │   │
+│  └──────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+    </div>
+
+    <pre><code><span class="keyword">import</span> <span class="type">os</span>
+
+<span class="keyword">enum</span> <span class="type">MemoryPressureLevel</span> {
+    <span class="keyword">case</span> normal      <span class="comment">// &gt; 50% available</span>
+    <span class="keyword">case</span> warning     <span class="comment">// 25-50% available</span>
+    <span class="keyword">case</span> critical    <span class="comment">// 10-25% available</span>
+    <span class="keyword">case</span> terminal    <span class="comment">// &lt; 10% available</span>
+}
+
+<span class="keyword">protocol</span> <span class="type">MemoryBudgetSubscriber</span>: <span class="type">AnyObject</span> {
+    <span class="keyword">var</span> currentMemoryUsage: <span class="type">Int</span> { <span class="keyword">get</span> }
+    <span class="keyword">func</span> <span class="func">reduceMemory</span>(to level: <span class="type">MemoryPressureLevel</span>)
+}
+
+<span class="keyword">class</span> <span class="type">MemoryBudgetManager</span> {
+    <span class="keyword">static let</span> shared = <span class="type">MemoryBudgetManager</span>()
+    <span class="keyword">private var</span> subscribers: [<span class="type">WeakSubscriber</span>] = []
+    <span class="keyword">private var</span> timer: <span class="type">Timer</span>?
+    <span class="keyword">private let</span> logger = <span class="type">Logger</span>(subsystem: <span class="string">"com.app"</span>, category: <span class="string">"memory"</span>)
+
+    <span class="keyword">var</span> currentLevel: <span class="type">MemoryPressureLevel</span> = .normal {
+        <span class="keyword">didSet</span> {
+            <span class="keyword">if</span> currentLevel != oldValue {
+                <span class="func">notifySubscribers</span>()
+            }
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">startMonitoring</span>(interval: <span class="type">TimeInterval</span> = <span class="number">5.0</span>) {
+        timer = <span class="type">Timer</span>.<span class="func">scheduledTimer</span>(withTimeInterval: interval, repeats: <span class="keyword">true</span>) {
+            [<span class="keyword">weak self</span>] _ <span class="keyword">in</span>
+            self?.<span class="func">checkMemory</span>()
+        }
+    }
+
+    <span class="keyword">func</span> <span class="func">register</span>(_ subscriber: <span class="type">MemoryBudgetSubscriber</span>) {
+        subscribers.<span class="func">append</span>(<span class="type">WeakSubscriber</span>(subscriber))
+    }
+
+    <span class="keyword">private func</span> <span class="func">checkMemory</span>() {
+        <span class="keyword">let</span> available = <span class="func">os_proc_available_memory</span>()
+        <span class="keyword">let</span> totalEstimate = available + <span class="func">currentFootprint</span>()
+        <span class="keyword">let</span> ratio = <span class="type">Double</span>(available) / <span class="type">Double</span>(totalEstimate)
+
+        <span class="keyword">let</span> newLevel: <span class="type">MemoryPressureLevel</span>
+        <span class="keyword">switch</span> ratio {
+        <span class="keyword">case</span> <span class="number">0.5</span>...:  newLevel = .normal
+        <span class="keyword">case</span> <span class="number">0.25</span>...: newLevel = .warning
+        <span class="keyword">case</span> <span class="number">0.10</span>...: newLevel = .critical
+        <span class="keyword">default</span>:      newLevel = .terminal
+        }
+
+        logger.<span class="func">info</span>(<span class="string">"Memory: \(available/1024/1024)MB available, level: \(String(describing: newLevel))"</span>)
+        currentLevel = newLevel
+    }
+
+    <span class="keyword">private func</span> <span class="func">currentFootprint</span>() -> <span class="type">Int</span> {
+        <span class="keyword">var</span> info = <span class="type">task_vm_info_data_t</span>()
+        <span class="keyword">var</span> count = <span class="type">mach_msg_type_number_t</span>(
+            <span class="type">MemoryLayout</span>&lt;<span class="type">task_vm_info_data_t</span>&gt;.size / <span class="type">MemoryLayout</span>&lt;<span class="type">natural_t</span>&gt;.size
+        )
+        <span class="keyword">let</span> result = <span class="func">withUnsafeMutablePointer</span>(to: &amp;info) {
+            $0.<span class="func">withMemoryRebound</span>(to: <span class="type">integer_t</span>.<span class="keyword">self</span>, capacity: <span class="type">Int</span>(count)) {
+                <span class="func">task_info</span>(<span class="func">mach_task_self_</span>, <span class="type">task_flavor_t</span>(<span class="type">TASK_VM_INFO</span>), $0, &amp;count)
+            }
+        }
+        <span class="keyword">guard</span> result == <span class="type">KERN_SUCCESS</span> <span class="keyword">else</span> { <span class="keyword">return</span> <span class="number">0</span> }
+        <span class="keyword">return</span> <span class="type">Int</span>(info.phys_footprint)
+    }
+
+    <span class="keyword">private func</span> <span class="func">notifySubscribers</span>() {
+        subscribers.<span class="func">removeAll</span> { $0.subscriber == <span class="keyword">nil</span> }
+        <span class="keyword">for</span> weak <span class="keyword">in</span> subscribers {
+            weak.subscriber?.<span class="func">reduceMemory</span>(to: currentLevel)
+        }
+    }
+}
+
+<span class="keyword">private class</span> <span class="type">WeakSubscriber</span> {
+    <span class="keyword">weak var</span> subscriber: <span class="type">MemoryBudgetSubscriber</span>?
+    <span class="keyword">init</span>(_ subscriber: <span class="type">MemoryBudgetSubscriber</span>) {
+        <span class="keyword">self</span>.subscriber = subscriber
+    }
+}</code></pre>
+
+    <h3>Example Subscriber: Image Cache</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">ImageCacheManager</span>: <span class="type">MemoryBudgetSubscriber</span> {
+    <span class="keyword">private let</span> cache = <span class="type">NSCache</span>&lt;<span class="type">NSString</span>, <span class="type">UIImage</span>&gt;()
+
+    <span class="keyword">var</span> currentMemoryUsage: <span class="type">Int</span> {
+        <span class="comment">// Track total decoded image bytes</span>
+        <span class="keyword">return</span> trackedBytes
+    }
+
+    <span class="keyword">func</span> <span class="func">reduceMemory</span>(to level: <span class="type">MemoryPressureLevel</span>) {
+        <span class="keyword">switch</span> level {
+        <span class="keyword">case</span> .normal:
+            cache.totalCostLimit = <span class="number">200_000_000</span>  <span class="comment">// 200MB</span>
+        <span class="keyword">case</span> .warning:
+            cache.totalCostLimit = <span class="number">100_000_000</span>  <span class="comment">// 100MB</span>
+        <span class="keyword">case</span> .critical:
+            cache.totalCostLimit = <span class="number">30_000_000</span>   <span class="comment">// 30MB</span>
+        <span class="keyword">case</span> .terminal:
+            cache.<span class="func">removeAllObjects</span>()            <span class="comment">// Everything</span>
+        }
+    }
+}</code></pre>
+
+    <div class="nav-footer">
+        <a href="03-memory-regions.html">← Previous: Memory Regions</a>
+        <a href="05-app-startup.html">Next: App Startup →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interview Q&amp;A — Memory &amp; Performance — iOS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Memory &amp; Performance</a><span class="sep">›</span>
+        Interview Q&amp;A
+    </nav>
+
+    <h1>Interview Questions &amp; Answers</h1>
+    <p class="subtitle">60+ L6-level questions covering ARC internals, retain cycles, memory regions, Jetsam, app startup, profiling, and energy management.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#arc">ARC &amp; Reference Counting (Q1–Q12)</a></li>
+            <li><a href="#retain">Retain Cycles &amp; Leaks (Q13–Q24)</a></li>
+            <li><a href="#memory">Memory Regions &amp; Allocation (Q25–Q34)</a></li>
+            <li><a href="#jetsam">Jetsam &amp; Memory Pressure (Q35–Q44)</a></li>
+            <li><a href="#startup">App Startup &amp; Launch Time (Q45–Q52)</a></li>
+            <li><a href="#profiling">Instruments &amp; Profiling (Q53–Q58)</a></li>
+            <li><a href="#energy">Energy &amp; Thermal (Q59–Q65)</a></li>
+        </ul>
+    </div>
+
+    <p>Click any question to reveal the answer. Questions are tagged by difficulty level.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="arc">ARC &amp; Reference Counting</h2>
+
+    <div class="qa-section">
+
+        <!-- Q1 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q1: Explain the fundamental difference between ARC and tracing garbage collection. Why did Apple choose ARC for iOS?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>ARC</strong> inserts retain/release calls at compile time. Objects are deallocated deterministically when their strong reference count reaches zero. <strong>Tracing GC</strong> periodically scans the heap to find unreachable objects and collects them in batches.</p>
+                <p>Apple chose ARC because: (1) <strong>No GC pauses</strong> — critical for 60fps UI rendering; (2) <strong>Deterministic deallocation</strong> — <code>deinit</code> runs at predictable points, essential for releasing file handles, GPU buffers, and network connections; (3) <strong>Lower memory overhead</strong> — objects are freed immediately, reducing peak memory (critical on memory-constrained mobile devices); (4) <strong>No runtime overhead</strong> of mark/sweep cycles. Apple actually shipped a tracing GC for ObjC on macOS (libauto, 10.5-10.8) and deprecated it because GC pauses were unacceptable for UI responsiveness.</p>
+                <p>The tradeoff: ARC cannot detect retain cycles. Programmers must break cycles manually using <code>weak</code> or <code>unowned</code> references.</p>
+            </div>
+        </div>
+
+        <!-- Q2 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q2: Describe the three types of reference counts in a Swift object. When is each decremented to zero, and what happens?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Swift objects maintain three reference counts:</p>
+                <p><strong>Strong count:</strong> Incremented by strong references (<code>let x = obj</code>). When it reaches zero, the object's <code>deinit</code> runs and stored properties are released. The object is logically dead but memory may not be freed yet.</p>
+                <p><strong>Unowned count:</strong> Incremented by <code>unowned</code> references. When it reaches zero (after strong count is already zero), the object's memory is freed (returned to the heap allocator). This means <code>unowned</code> references keep the object's memory alive in a "zombie" state after deinitialization.</p>
+                <p><strong>Weak count:</strong> Tracked in the side table (not inline). When it reaches zero, the side table entry itself is freed. Weak references don't keep the object memory alive — they point to the side table, which is a separate allocation.</p>
+                <p>The lifecycle: strong→0 triggers deinit, unowned→0 frees object memory, weak→0 frees side table.</p>
+            </div>
+        </div>
+
+        <!-- Q3 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q3: What is a side table in Swift's ARC implementation? When is one created, and why?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>A side table is a separate heap-allocated structure that stores reference counts when an object has <code>weak</code> references. It's created when the first <code>weak</code> reference to an object is made.</p>
+                <p><strong>Why it exists:</strong> Without side tables, weak references would either (a) keep the object memory alive until all weak refs are gone (wasteful), or (b) require maintaining a list of all weak reference locations in the object (expensive to update). The side table solves this by being a small, separate allocation that weak references point to. When the object is deallocated (strong count → 0), the object memory can be freed immediately. Weak references still point to the side table, and when they're loaded, the runtime checks the side table to see if the object is still alive — if not, it returns <code>nil</code>.</p>
+                <p><strong>Creation:</strong> When the first weak reference is created, the runtime allocates a side table, copies the strong/unowned counts from the inline refcount word to the side table, replaces the inline refcount with a pointer to the side table, and sets the <code>UseSlowRC</code> bit. All subsequent retain/release operations go through the side table (the "slow path").</p>
+            </div>
+        </div>
+
+        <!-- Q4 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q4: How does the Swift compiler optimize ARC operations? What are the key SIL optimization passes?</span>
+                <span class="level"><span class="tag tag-architect">Architect</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>The Swift compiler operates on SIL (Swift Intermediate Language) and applies several ARC optimization passes:</p>
+                <p><strong>1. Retain/release pairing:</strong> Removes a retain immediately followed by a release of the same value (they cancel out).</p>
+                <p><strong>2. Copy forwarding:</strong> Eliminates copies when the source value is not used after the copy point.</p>
+                <p><strong>3. Owned-to-guaranteed conversion:</strong> Changes function parameters from "owned" (caller retains, callee releases) to "guaranteed" (caller guarantees lifetime, no retain/release at call site). This is the default Swift calling convention and eliminates most parameter retain/release pairs.</p>
+                <p><strong>4. Dead object elimination:</strong> Removes allocations whose results are never used or whose only use is deallocation.</p>
+                <p><strong>5. Semantic ARC optimization:</strong> Uses ownership SSA form to prove larger regions where retain/release can be eliminated by analyzing the ownership flow through the program.</p>
+                <p><strong>6. Stack promotion:</strong> If escape analysis proves an object never escapes the current function, the allocation is moved from the heap to the stack, eliminating all reference counting.</p>
+                <p>These optimizations typically eliminate 50-80% of the retain/release calls that SILGen initially inserts. You can verify by comparing <code>swiftc -emit-sil</code> (unoptimized) vs <code>swiftc -emit-sil -O</code> (optimized).</p>
+            </div>
+        </div>
+
+        <!-- Q5 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q5: What is the difference between weak, unowned, and unowned(unsafe)? When would you use each?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>weak:</strong> Optional type. When the referenced object is deallocated, the weak reference is automatically set to <code>nil</code> (via the side table mechanism). Safe but has overhead: side table allocation, spin lock on load, and the reference is always Optional. Use when the referenced object's lifetime is uncertain (delegates, callbacks, closures).</p>
+                <p><strong>unowned:</strong> Non-optional type. If accessed after the referenced object is deallocated, it traps with a fatal error (deterministic crash). The object's memory stays allocated until all unowned references are gone. Use when you can guarantee the referenced object outlives the reference (parent-child relationships, lazy properties).</p>
+                <p><strong>unowned(unsafe):</strong> Non-optional type. If accessed after deallocation, it's undefined behavior (may crash, may return garbage, may seem to work). No runtime check. The object's memory is freed immediately on deallocation. Use only in extreme performance-critical code where you have absolute lifetime guarantees and have measured that the unowned check is a bottleneck.</p>
+            </div>
+        </div>
+
+        <!-- Q6 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q6: Explain copy-on-write (CoW) for Swift value types. How would you implement it for a custom type?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>CoW is an optimization where value types share a heap-allocated buffer until one of them mutates. The standard library uses it for Array, Dictionary, Set, and String.</p>
+                <p><strong>How it works:</strong> The value type (struct) holds a reference to a heap-allocated storage class. When the struct is copied, only the reference is copied (cheap). Before any mutation, the struct checks if the storage's reference count is 1 (uniquely referenced). If yes, mutate in place. If no, copy the storage first, then mutate the copy.</p>
+                <p><strong>Custom implementation:</strong> Use <code>isKnownUniquelyReferenced(&amp;storage)</code> before mutations. The storage must be a Swift-native class (not @objc) — <code>isKnownUniquelyReferenced</code> always returns <code>false</code> for ObjC objects. The check is a single atomic load of the reference count — O(1) and very fast.</p>
+                <p><strong>Pitfall:</strong> If you accidentally create a second reference to the storage (e.g., by passing it to a function), <code>isKnownUniquelyReferenced</code> returns <code>false</code> and you get an unnecessary copy. Keep the storage reference private and only access it through the struct's mutating methods.</p>
+            </div>
+        </div>
+
+        <!-- Q7 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q7: What are tagged pointers? Which ObjC types use them, and why do they matter for performance?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Tagged pointers store small objects directly in the pointer value instead of on the heap. On ARM64, the top bit indicates a tagged pointer, and the next 3 bits encode the class (NSNumber, NSString, NSDate, NSData, NSManagedObjectID, NSIndexPath, plus an extended tag for 256 more classes).</p>
+                <p><strong>Performance impact:</strong> Tagged pointers avoid heap allocation entirely — no <code>malloc</code>, no reference counting, no deallocation. <code>retain</code> and <code>release</code> on tagged pointers are no-ops. This is significant because NSNumber and short NSString instances are extremely common in ObjC code and bridging.</p>
+                <p><strong>Examples:</strong> <code>NSNumber(value: 42)</code> fits in 60 bits → tagged. <code>"Hi" as NSString</code> (2 ASCII chars) → tagged. <code>NSDate()</code> (timestamp) → tagged. Long strings and large numbers don't fit → heap allocated.</p>
+                <p><strong>Swift note:</strong> Swift's String has its own small string optimization (15 bytes inline in the 16-byte String struct) that's separate from NSString tagged pointers.</p>
+            </div>
+        </div>
+
+        <!-- Q8 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q8: Describe the memory layout of a Swift heap object. What are the metadata pointer and inline refcount word?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Every Swift heap object starts with a 16-byte header: 8 bytes for the metadata pointer and 8 bytes for the inline refcount word, followed by stored properties.</p>
+                <p><strong>Metadata pointer (8 bytes):</strong> Points to the type metadata structure containing the value witness table (size, alignment, copy/destroy functions), virtual method table (vtable for class dispatch), superclass pointer, and type descriptor (name, generic parameters). For @objc classes, this serves as the ISA pointer.</p>
+                <p><strong>Inline refcount word (8 bytes):</strong> Packs multiple fields: bit 63 = UseSlowRC (side table in use), bits 62-33 = strong count (30 bits, max ~1 billion), bit 32 = isDeinitializing, bits 31-1 = unowned count (31 bits), bit 0 = immortal flag. When UseSlowRC is set, this word instead contains a pointer to the side table.</p>
+                <p>Minimum object size is 16 bytes (header only, no properties). Alignment is 16 bytes on ARM64.</p>
+            </div>
+        </div>
+
+        <!-- Q9 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q9: What is withExtendedLifetime and when must you use it?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><code>withExtendedLifetime(_:_:)</code> prevents the compiler from releasing an object before the closure completes. It's necessary when working with unsafe pointers or C APIs that hold raw pointers to Swift objects.</p>
+                <p><strong>Why it's needed:</strong> The Swift optimizer can release objects as soon as they're no longer used, even before the end of their lexical scope (lifetime shortening). If you take an unsafe pointer to an object's data and then the optimizer releases the object, the pointer becomes dangling.</p>
+                <p><strong>Example:</strong> <code>let ptr = (data as NSData).bytes</code> — the compiler may release <code>data</code> after this line since it's "not used again." But <code>ptr</code> points into <code>data</code>'s buffer. Wrapping in <code>withExtendedLifetime(data) { ... }</code> guarantees <code>data</code> stays alive.</p>
+                <p><strong>Alternatives:</strong> <code>withUnsafeBufferPointer</code> and similar closure-based APIs inherently extend the lifetime of the source. Prefer these over manual pointer extraction + <code>withExtendedLifetime</code>.</p>
+            </div>
+        </div>
+
+        <!-- Q10 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q10: What is the non-pointer ISA optimization on ARM64? What information is packed into the ISA?</span>
+                <span class="level"><span class="tag tag-architect">Architect</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>On ARM64, Apple packs additional information into the ISA pointer's unused bits. The key fields: <code>nonpointer</code> (1 bit: is this an optimized ISA?), <code>has_assoc</code> (1 bit: has associated objects?), <code>has_cxx_dtor</code> (1 bit: has C++ destructor?), <code>shiftcls</code> (33 bits: class pointer, shifted), <code>magic</code> (6 bits: identifies initialized objects), <code>weakly_referenced</code> (1 bit), <code>deallocating</code> (1 bit), <code>has_sidetable_rc</code> (1 bit: refcount overflowed?), <code>extra_rc</code> (19 bits: inline reference count, 0-524,287).</p>
+                <p><strong>Key optimization:</strong> The reference count is stored inline in the ISA for ObjC objects (up to 524,287). This avoids a separate side table lookup for the vast majority of objects. Only when the count overflows 19 bits does it spill to the ObjC side table. This is different from Swift's side table mechanism — ObjC uses a global hash table keyed by object address.</p>
+            </div>
+        </div>
+
+        <!-- Q11 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q11: How does the Swift calling convention's "guaranteed" parameter passing reduce ARC overhead?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>In the "guaranteed" (borrowed) calling convention, the caller guarantees the argument stays alive for the duration of the call. The callee doesn't need to retain the parameter on entry or release it on exit.</p>
+                <p>Without this optimization (the "owned" convention), every function call would require: caller retains argument → call function → callee uses argument → callee releases argument. With guaranteed parameters, none of these retain/release operations are needed.</p>
+                <p>This is the default for most Swift function parameters and is one of the biggest ARC optimizations. It's particularly impactful for methods called in tight loops, where the retain/release overhead per call would be significant. The <code>__owned</code> and <code>borrowing</code>/<code>consuming</code> keywords let you explicitly control this convention when needed.</p>
+            </div>
+        </div>
+
+        <!-- Q12 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q12: How does the compiler's escape analysis enable stack promotion of class instances?</span>
+                <span class="level"><span class="tag tag-architect">Architect</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Escape analysis determines whether a reference can "escape" the current function — i.e., be stored in a global, returned, or captured by an escaping closure. If the compiler can prove a class instance never escapes, it can allocate it on the stack instead of the heap.</p>
+                <p><strong>Benefits:</strong> Stack allocation is a single instruction (move stack pointer) vs. heap allocation (~100+ instructions for malloc). No reference counting is needed. Deallocation is automatic (function return). No heap fragmentation.</p>
+                <p><strong>Requirements:</strong> The class must be <code>final</code> (or the compiler must prove no subclasses exist), the instance must not escape the function, and Whole Module Optimization should be enabled for cross-function analysis. <code>private</code> and <code>internal</code> access help because the compiler can see all uses.</p>
+                <p><strong>Limitations:</strong> Escape analysis is conservative — if the compiler can't prove non-escape, it falls back to heap allocation. Passing an object to a non-inlined function usually defeats escape analysis.</p>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="retain">Retain Cycles &amp; Leaks</h2>
+
+    <div class="qa-section">
+
+        <!-- Q13 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q13: A closure stored as a property on self captures self. Draw the retain cycle and explain two ways to break it.</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>The cycle:</strong> self → property (strong) → closure (strong) → captured self (strong) → back to self. Neither can reach refcount 0.</p>
+                <p><strong>Fix 1: [weak self]</strong> — The closure captures self weakly. self → property → closure → self (weak, doesn't increment refcount). self can be deallocated, which releases the property, which releases the closure. Inside the closure, use <code>guard let self else { return }</code> to safely unwrap.</p>
+                <p><strong>Fix 2: [unowned self]</strong> — The closure captures self with unowned reference. Same cycle-breaking effect, but the reference is non-optional. If the closure executes after self is deallocated, it crashes. Only use when you can guarantee self outlives the closure.</p>
+                <p><strong>Fix 3: Break the cycle externally</strong> — Set the property to nil when you're done with it (e.g., in <code>viewDidDisappear</code>). This breaks the cycle by removing the strong reference from self to the closure.</p>
+            </div>
+        </div>
+
+        <!-- Q14 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q14: Why must delegate properties be declared weak? What happens if you forget?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>In the typical delegate pattern, object A owns object B, and B has a delegate reference back to A. If B's delegate property is strong: A → B (strong) and B → A (strong via delegate) = retain cycle. Neither is ever deallocated.</p>
+                <p>Making the delegate <code>weak</code> breaks the cycle: B → A is weak, so A's refcount isn't incremented by the delegate reference. When A is released by its owner, its refcount reaches 0, it's deallocated, which releases B, which is also deallocated.</p>
+                <p>The protocol must be constrained to <code>AnyObject</code> (or <code>class</code>) to allow <code>weak</code> declaration. This also documents that the delegate must be a reference type.</p>
+                <p><strong>If you forget:</strong> The delegate and its owner form a retain cycle. They're leaked for the lifetime of the process. In a navigation app, every pushed/popped view controller leaks, accumulating memory until Jetsam kills the app.</p>
+            </div>
+        </div>
+
+        <!-- Q15 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q15: Explain the Timer retain cycle. Why doesn't invalidating the timer in deinit work?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>The cycle:</strong> RunLoop → Timer (strong, RunLoop retains scheduled timers) → target/self (strong, Timer retains its target). Even if you store the timer on self, the cycle is RunLoop → Timer → self. self's deinit never runs because the RunLoop keeps the Timer alive, which keeps self alive.</p>
+                <p><strong>Why deinit doesn't help:</strong> <code>timer.invalidate()</code> in <code>deinit</code> is dead code — <code>deinit</code> never executes because the retain cycle prevents deallocation. It's a chicken-and-egg problem.</p>
+                <p><strong>Solutions:</strong> (1) Use the block-based Timer API with <code>[weak self]</code> and invalidate in <code>viewDidDisappear</code>. (2) Use a proxy object pattern where the timer's target is a lightweight proxy that holds a weak reference to the real target. (3) Use <code>Task.sleep</code> with structured concurrency instead of Timer.</p>
+            </div>
+        </div>
+
+        <!-- Q16 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q16: What's the difference between .assign(to:on:) and .assign(to:) in Combine regarding retain cycles?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><code>.assign(to:on:)</code> captures the object <strong>strongly</strong> and returns an <code>AnyCancellable</code>. If the object is <code>self</code> and you store the cancellable on <code>self</code>, you get: self → cancellables → AnyCancellable → subscription → self (strong capture). Retain cycle.</p>
+                <p><code>.assign(to: &amp;$property)</code> (iOS 14+) uses an <strong>unowned</strong> reference internally and doesn't return an <code>AnyCancellable</code>. It connects the publisher directly to the @Published property's internal publisher. No cancellable to store, no strong capture, no cycle.</p>
+                <p>Always prefer <code>.assign(to: &amp;$property)</code> when assigning to a @Published property on self. Use <code>.sink { [weak self] }</code> for other cases.</p>
+            </div>
+        </div>
+
+        <!-- Q17 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q17: Does a Task { } closure create a retain cycle? When should you use [weak self] with Task?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>A <code>Task { }</code> does NOT create a retain cycle because the Task is not stored on self — it's a detached piece of work managed by the concurrency runtime. However, it does capture self strongly, which <strong>extends self's lifetime</strong> until the task completes.</p>
+                <p><strong>When this matters:</strong> If the task takes 30 seconds (e.g., a slow network request) and the user navigates away, the view controller stays in memory for those 30 seconds even though it's no longer visible. This isn't a leak (it will eventually be freed), but it wastes memory.</p>
+                <p><strong>Use [weak self] when:</strong> The task may take a long time, the result is only needed if self is still alive (e.g., UI updates), or you want to allow early deallocation. <strong>Don't bother with [weak self] when:</strong> The task is very short (< 1 second), or the task's side effects are needed regardless of self's lifetime (e.g., saving data).</p>
+            </div>
+        </div>
+
+        <!-- Q18 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q18: How do NotificationCenter observer leaks differ between pre-iOS 9 and post-iOS 9?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Pre-iOS 9:</strong> NotificationCenter held a <strong>raw (unsafe) pointer</strong> to the observer. If the observer was deallocated without removing itself, the next notification would send a message to a dangling pointer → crash (EXC_BAD_ACCESS). You HAD to call <code>removeObserver</code> in <code>deinit</code>.</p>
+                <p><strong>Post-iOS 9:</strong> For selector-based observers (<code>addObserver(_:selector:name:object:)</code>), NotificationCenter uses <strong>weak references</strong>. The observer is automatically removed on deallocation. No crash, no manual removal needed.</p>
+                <p><strong>Block-based observers</strong> (<code>addObserver(forName:object:queue:using:)</code>) still require manual management in all iOS versions. The returned token must be stored, and the observer must be removed in <code>deinit</code>. The closure should use <code>[weak self]</code> to avoid extending the observer's lifetime.</p>
+            </div>
+        </div>
+
+        <!-- Q19 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q19: How would you build automated leak detection into a CI pipeline?</span>
+                <span class="level"><span class="tag tag-architect">Architect</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>A comprehensive CI leak detection pipeline has multiple layers:</p>
+                <p><strong>1. Unit test deallocation assertions:</strong> For every view controller and view model, write a test that creates the object, exercises it, then verifies it's deallocated using the <code>weak var</code> + <code>autoreleasepool</code> pattern. The test creates the object inside an autoreleasepool, stores a weak reference, and asserts the weak reference is nil after the pool drains.</p>
+                <p><strong>2. UI test memory snapshots:</strong> Run UI tests that navigate through every major flow, then use <code>XCTMemoryMetric</code> to track peak memory. Set budgets and fail on regression.</p>
+                <p><strong>3. xctrace automation:</strong> Use <code>xctrace record --template Leaks --launch MyApp.app</code> in CI to run the Leaks instrument automatically and parse the output for leak counts.</p>
+                <p><strong>4. Memory graph export:</strong> Use the <code>leaks</code> command-line tool on the Simulator process to detect cycles programmatically.</p>
+                <p><strong>5. Production monitoring:</strong> Use MetricKit's <code>MXMemoryMetric</code> to track peak memory and Jetsam events. Alert on regressions compared to the previous release.</p>
+            </div>
+        </div>
+
+        <!-- Q20 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q20: Is [weak self] needed in UIView.animate closures? What about the completion handler?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Animation closure:</strong> No, <code>[weak self]</code> is not needed. The animation closure is executed by the animation system and released when the animation completes. It doesn't create a retain cycle because it's not stored on self — it's stored temporarily by UIKit's animation infrastructure.</p>
+                <p><strong>Completion handler:</strong> Generally not needed either, for the same reason — it's temporary. However, if the animation has a very long duration (e.g., 10+ seconds), using <code>[weak self]</code> allows the view controller to be deallocated during the animation instead of being kept alive until completion. For typical 0.3s animations, it doesn't matter.</p>
+                <p><strong>Rule of thumb:</strong> If the closure is temporary (not stored as a property) and short-lived, <code>[weak self]</code> is unnecessary. If it's stored on self or long-lived, use <code>[weak self]</code>.</p>
+            </div>
+        </div>
+
+        <!-- Q21 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q21: What's the guard let self pattern in Swift 5.7+? What are its implications for object lifetime?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Swift 5.7 introduced <code>guard let self else { return }</code> (previously required <code>guard let self = self</code>). After the guard, <code>self</code> is a strong reference for the remainder of the closure scope.</p>
+                <p><strong>Lifetime implication:</strong> The strong reference created by <code>guard let self</code> keeps the object alive until the end of the closure, even if it would otherwise be deallocated. For short closures (network callbacks, UI updates), this is fine. For long-running closures, this means the object stays in memory for the entire duration.</p>
+                <p><strong>Alternative for long closures:</strong> Check <code>self</code> at multiple points: <code>self?.doFirstThing()</code>, then later <code>self?.doSecondThing()</code>. Each optional chaining independently checks if self is still alive, allowing deallocation between operations.</p>
+            </div>
+        </div>
+
+        <!-- Q22 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q22: Explain how @MainActor closures interact with capture semantics in Swift concurrency.</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><code>@MainActor</code> closures are <code>@Sendable</code>, which means they capture variables by value for Sendable types and by strong reference for reference types. The <code>@MainActor</code> annotation ensures the closure runs on the main thread but doesn't change capture semantics.</p>
+                <p><code>Task { @MainActor in self.updateUI() }</code> captures self strongly. The task keeps self alive until it completes. Using <code>Task { [weak self] @MainActor in self?.updateUI() }</code> allows self to be deallocated while the task is pending.</p>
+                <p>Note: the capture list <code>[weak self]</code> must come before <code>@MainActor</code> in the closure syntax.</p>
+            </div>
+        </div>
+
+        <!-- Q23 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q23: Does a lazy property's initialization closure create a retain cycle?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>It depends on the form:</p>
+                <p><strong><code>lazy var label: UILabel = { ... self.tintColor ... }()</code></strong> — NO retain cycle. The closure executes immediately on first access and is then discarded. It's not stored. The <code>()</code> at the end means it's an immediately-invoked closure expression.</p>
+                <p><strong><code>lazy var formatter: () -> String = { self.name.uppercased() }</code></strong> — YES retain cycle. This stores the closure as the property value. self → formatter (strong) → closure → self (strong capture). The closure is stored and persists.</p>
+                <p>The key distinction: if the lazy property's type is the closure's return type (invoked with <code>()</code>), the closure runs once and is released. If the property's type IS a closure, the closure is stored and can create a cycle.</p>
+            </div>
+        </div>
+
+        <!-- Q24 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q24: How do retain cycles manifest differently in SwiftUI vs UIKit apps?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>UIKit:</strong> Retain cycles are common because UIViewController and UIView are classes (reference types). Stored closures, delegates, timers, and notification observers on view controllers are all potential cycle sources. The navigation stack holds strong references to VCs, so a leaked VC stays in memory indefinitely.</p>
+                <p><strong>SwiftUI:</strong> Views are structs (value types), so they can't participate in retain cycles directly. However, <code>ObservableObject</code> classes (used with <code>@StateObject</code>, <code>@ObservedObject</code>) are reference types and can have cycles. Combine subscriptions stored in <code>cancellables</code> on an ObservableObject are the most common SwiftUI leak pattern.</p>
+                <p>SwiftUI's <code>.task</code> modifier automatically cancels the task when the view disappears, which helps prevent lifetime issues. But <code>@StateObject</code> view models persist across view updates and can accumulate leaked subscriptions if not managed carefully.</p>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="memory">Memory Regions &amp; Allocation</h2>
+
+    <div class="qa-section">
+
+        <!-- Q25 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q25: When does a Swift value type get allocated on the heap instead of the stack?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Value types are heap-allocated in several situations: (1) <strong>Existential containers</strong> — when a value type larger than 24 bytes is stored in a protocol-typed variable, the value is heap-allocated (the existential container's inline buffer is only 3 words). (2) <strong>Closure captures</strong> — when a value type is captured by an escaping closure, it's promoted to the heap so it outlives the stack frame. (3) <strong>Inout parameters that escape</strong> — if the compiler can't prove the inout reference doesn't escape. (4) <strong>Generic contexts without specialization</strong> — unspecialized generic code may use heap-allocated buffers for arbitrary-sized T. (5) <strong>Class-containing structs</strong> — the struct itself may be on the stack, but its reference-type fields point to heap objects.</p>
+            </div>
+        </div>
+
+        <!-- Q26 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q26: What is an existential container? How does its layout affect performance?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>An existential container is the runtime representation of a protocol-typed value. It's 40 bytes (5 words): 24 bytes for the value buffer, 8 bytes for the value witness table pointer, and 8 bytes for the protocol witness table pointer.</p>
+                <p><strong>Small values (≤ 24 bytes):</strong> Stored inline in the value buffer. No heap allocation. Examples: a single Int, a CGPoint, a small struct.</p>
+                <p><strong>Large values (> 24 bytes):</strong> The value buffer stores a pointer to a heap-allocated copy. This means creating, copying, and destroying the existential involves heap allocation/deallocation.</p>
+                <p><strong>Performance impact:</strong> Using <code>let shapes: [Shape]</code> (protocol array) instead of <code>let shapes: [Circle]</code> (concrete array) means each element is 40 bytes instead of 8, with potential heap allocations. For data-heavy code, use generics with concrete types (<code>func process<T: Shape>(_ shapes: [T])</code>) to avoid existential overhead.</p>
+            </div>
+        </div>
+
+        <!-- Q27 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q27: When should you use ContiguousArray instead of Array?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Use <code>ContiguousArray</code> when: (1) The element type is a class (reference type), AND (2) the code is performance-critical. <code>Array</code> with class elements may be backed by an NSArray (when bridged from ObjC), requiring an indirection check on every element access. <code>ContiguousArray</code> is always backed by a contiguous Swift buffer, eliminating this check.</p>
+                <p>For value-type elements (Int, structs, etc.), <code>Array</code> and <code>ContiguousArray</code> are identical in performance because value-type arrays can't be bridged to NSArray.</p>
+                <p>In practice, the performance difference is small (a branch prediction hit per access) and only matters in tight loops processing thousands of elements. Profile before switching.</p>
+            </div>
+        </div>
+
+        <!-- Q28 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q28: When do you need @autoreleasepool in Swift? Give three concrete scenarios.</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>1. Tight loops calling ObjC APIs:</strong> Processing 10,000 images with <code>UIImage(named:)</code> in a loop. Each call may return autoreleased ObjC objects that accumulate until the RunLoop drains. Wrapping each iteration in <code>autoreleasepool { }</code> bounds memory.</p>
+                <p><strong>2. Background threads without a RunLoop:</strong> GCD background queues don't have a RunLoop to drain the default autorelease pool. Autoreleased objects accumulate until the thread exits. Use <code>autoreleasepool</code> in background processing blocks.</p>
+                <p><strong>3. Unit tests:</strong> To ensure deterministic deallocation in tests that verify object lifecycle. Wrapping test code in <code>autoreleasepool</code> ensures autoreleased objects are freed before assertions.</p>
+                <p><strong>Note:</strong> Pure Swift code (no ObjC bridging) doesn't use autorelease, so <code>autoreleasepool</code> has no effect. It only matters when calling APIs that return autoreleased ObjC objects.</p>
+            </div>
+        </div>
+
+        <!-- Q29 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q29: What are the ObjC bridging costs for String ↔ NSString? When does this matter?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Swift String uses UTF-8 encoding internally. NSString uses UTF-16. Bridging may require encoding conversion:</p>
+                <p><strong>O(1) cases:</strong> Small ASCII strings (tagged pointer NSString), strings that are already backed by an NSString (bridged from ObjC), and strings where Swift can share the buffer.</p>
+                <p><strong>O(n) cases:</strong> Strings containing non-ASCII characters that require UTF-8 → UTF-16 conversion. The entire string must be transcoded.</p>
+                <p><strong>When it matters:</strong> In tight loops that repeatedly bridge strings (e.g., calling NSString methods on Swift strings in a loop). Each bridge may allocate a new NSString. Solution: bridge once outside the loop, or use Swift-native string APIs instead of Foundation string methods.</p>
+            </div>
+        </div>
+
+        <!-- Q30 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q30: Explain the difference between MemoryLayout.size, .stride, and .alignment for a struct.</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>size:</strong> The actual number of bytes the type occupies, excluding trailing padding. For <code>struct { Bool; Double; Bool }</code>, size might be 17 bytes (1 + 7 padding + 8 + 1).</p>
+                <p><strong>stride:</strong> The number of bytes between consecutive elements in a contiguous array. Includes trailing padding for alignment. Always ≥ size. For the same struct, stride is 24 (rounded up to alignment of 8).</p>
+                <p><strong>alignment:</strong> The required memory alignment (must be a power of 2). The struct's alignment is the maximum alignment of its fields. If the largest field is Double (8-byte aligned), alignment is 8.</p>
+                <p><strong>Optimization:</strong> Reorder fields by decreasing alignment to minimize internal padding. <code>struct { Double; Bool; Bool }</code> has size 10, stride 16 — much better than the 24-stride version.</p>
+                <p><strong>Note:</strong> Swift may reorder struct fields for optimal layout (unlike C), so source order doesn't necessarily match memory order.</p>
+            </div>
+        </div>
+
+        <!-- Q31-34 -->
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q31: What is ManagedBuffer and when would you use it?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><code>ManagedBuffer</code> allocates a single heap block containing both a header and a contiguous array of elements. It's used for custom data structures that need to minimize allocations and maximize cache locality.</p>
+                <p><strong>Use cases:</strong> Custom ring buffers, deques, B-trees, or any data structure where you want header metadata and element storage in one allocation. The standard library uses it internally for Array's buffer.</p>
+                <p><strong>Advantage over separate allocations:</strong> One malloc instead of two (header + elements), better cache locality (header and elements are adjacent in memory), and the element count can be determined at runtime (unlike a fixed-size struct).</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q32: How does a struct containing 5 reference-type properties compare to a class with the same properties in terms of copy cost?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Copying the struct requires 5 retain operations (one per reference-type field) plus a memcpy of the struct's inline storage. Destroying the struct requires 5 release operations. Copying a reference to the class requires 1 retain. Destroying the reference requires 1 release.</p>
+                <p>For N reference-type fields, the struct's copy cost is O(N) retains while the class's copy cost is O(1). At some threshold (typically 3-4 reference fields), the class becomes cheaper to copy. Profile to find the crossover point for your specific types.</p>
+                <p>This is why Apple recommends using structs for types with few or no reference-type fields, and classes for types that are frequently copied and contain many references.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q33: What is the UnsafeBufferPointer family? When is it safe to use?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>The UnsafeBufferPointer family provides typed and untyped access to contiguous memory regions. <code>UnsafeBufferPointer&lt;T&gt;</code> (read-only), <code>UnsafeMutableBufferPointer&lt;T&gt;</code> (read-write), <code>UnsafeRawBufferPointer</code> (untyped read-only), <code>UnsafeMutableRawBufferPointer</code> (untyped read-write).</p>
+                <p><strong>Safe usage:</strong> Within <code>withUnsafeBufferPointer</code> closures (pointer is valid for the closure's duration), for C API interop where the API expects a pointer, and for performance-critical code that needs direct memory access (e.g., vDSP, Accelerate framework).</p>
+                <p><strong>Unsafe usage:</strong> Storing pointers obtained from <code>withUnsafe*</code> closures for later use (dangling pointer), accessing memory after deallocation, and violating type aliasing rules with raw pointers.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q34: How would you optimize memory layout for a data-heavy app processing millions of records?</span>
+                <span class="level"><span class="tag tag-architect">Architect</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>1. Struct-of-Arrays (SoA):</strong> Instead of <code>[Record]</code> where Record has 10 fields, use 10 separate arrays — one per field. When processing one field at a time (e.g., summing all prices), SoA gives much better cache locality because the CPU loads contiguous price values instead of skipping over other fields.</p>
+                <p><strong>2. Minimize padding:</strong> Order struct fields by decreasing alignment. Use <code>MemoryLayout</code> to verify. A poorly-ordered struct can waste 30-50% of its size on padding.</p>
+                <p><strong>3. Avoid existential containers:</strong> Use generics with concrete types. <code>[any Shape]</code> is 40 bytes per element with potential heap allocation. <code>[Circle]</code> is 8 bytes per element, contiguous.</p>
+                <p><strong>4. Pool allocations:</strong> Reuse buffers instead of allocating/deallocating per frame. Use <code>ManagedBuffer</code> or pre-allocated <code>UnsafeMutableBufferPointer</code>.</p>
+                <p><strong>5. Use ContiguousArray:</strong> For class-element collections in hot paths to avoid NSArray bridge checks.</p>
+                <p><strong>6. Memory-map large files:</strong> Use <code>mmap</code> (via Data(contentsOf:options:.mappedIfSafe)) for read-only access to large datasets. The data is clean memory (not counted by Jetsam) and loaded on demand by the kernel.</p>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="jetsam">Jetsam &amp; Memory Pressure</h2>
+
+    <div class="qa-section">
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q35: What is Jetsam and how does it decide which process to kill?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Jetsam is the iOS kernel's OOM killer. When physical memory runs low (iOS has no swap), Jetsam terminates processes to free memory. It kills with SIGKILL — uncatchable, no handler, no negotiation.</p>
+                <p><strong>Decision algorithm:</strong> Processes are organized into priority bands (idle → background → foreground → system). Jetsam starts killing from the lowest band. Within each band, it kills the process with the highest <strong>dirty memory footprint</strong> first. It continues killing until enough memory is freed.</p>
+                <p><strong>Key insight:</strong> Jetsam uses dirty memory (not total allocation, not virtual memory) as the metric. Clean memory (memory-mapped files, framework code) doesn't count. Compressed memory counts at its compressed size.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q36: What's the difference between dirty, clean, and compressed memory? Which does Jetsam care about?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Dirty memory:</strong> Pages written to by the app that can't be evicted (heap objects, decoded images, malloc'd buffers, stack). This is the primary Jetsam metric.</p>
+                <p><strong>Clean memory:</strong> Pages that can be evicted and reloaded from disk (memory-mapped files, framework __TEXT segments, read-only data). Does NOT count toward Jetsam footprint.</p>
+                <p><strong>Compressed memory:</strong> Dirty pages that the kernel's compressor has compressed to save space. These are inactive dirty pages. They count toward Jetsam footprint at their compressed size (not original size).</p>
+                <p><strong>Jetsam footprint = dirty + compressed.</strong> To reduce Jetsam risk: reduce dirty memory (smaller caches, downsampled images, release unused buffers) and let inactive memory be compressed (don't touch old allocations unnecessarily, which would decompress them).</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q37: Why is didReceiveMemoryWarning unreliable? What should you use instead?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><code>didReceiveMemoryWarning</code> is unreliable because: (1) It may fire too late — Jetsam can kill before the warning is delivered. (2) It's not guaranteed — rapid memory spikes can trigger Jetsam without any warning. (3) It's main-thread-only — if the main thread is blocked, the warning is delayed. (4) It provides no information about how much memory to free. (5) Background apps may be killed without any warning.</p>
+                <p><strong>Better alternatives:</strong> (1) <code>os_proc_available_memory()</code> — returns bytes available before Jetsam kills you. Poll periodically (every 5s) and respond proactively. (2) <code>DispatchSource.makeMemoryPressureSource</code> — provides warning and critical pressure levels. (3) MetricKit — tracks peak memory and Jetsam events in production for trend analysis.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q38: What are Jetsam priority bands? Where does your app sit?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Jetsam priority bands (low to high): Band 0 (Idle/suspended apps), Band 1 (Background apps), Band 3 (Background with active modes like audio/location), Band 5 (System daemons), Band 10 (Foreground app), Band 17 (Critical foreground like Phone during call), Band 18 (Kernel — never killed, system panics instead).</p>
+                <p>Your app moves between bands based on state: foreground → Band 10, background → Band 1, suspended → Band 0. Background modes (audio, location, VoIP) elevate to Band 3. The foreground app is the last user-facing process to be killed.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q39: What's the approximate background memory limit? How should you handle the foreground-to-background transition?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Background memory limits are approximately 50-80MB for most apps (varies by device and system state). App extensions have even lower limits: 40-120MB depending on type, with widget extensions at ~30MB and notification service extensions at ~24MB.</p>
+                <p><strong>Transition handling:</strong> In <code>applicationDidEnterBackground</code> or <code>sceneDidEnterBackground</code>, immediately: (1) Purge image caches, (2) Clear URL caches, (3) Release decoded image bitmaps, (4) Compact data structures, (5) Check <code>os_proc_available_memory()</code> to verify you're under budget. The goal is to get under 50MB as quickly as possible.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q40: How would you design a memory budget system for a large app?</span>
+                <span class="level"><span class="tag tag-architect">Architect</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>A memory budget system has: (1) <strong>A central MemoryBudgetManager</strong> that polls <code>os_proc_available_memory()</code> every 5 seconds and computes the current pressure level (normal/warning/critical/terminal). (2) <strong>Per-subsystem budgets</strong> — image cache gets 200MB, network cache gets 50MB, data layer gets 100MB. Each subsystem reports current usage and receives its limit. (3) <strong>Tiered response</strong> — at warning: stop prefetching, reduce cache limits; at critical: purge non-essential caches; at terminal: drop everything. (4) <strong>Subscriber pattern</strong> — subsystems register as subscribers and receive pressure change notifications. (5) <strong>Production telemetry</strong> — log pressure levels and subsystem usage to analytics for trend analysis.</p>
+                <p>The key insight: don't wait for the system to tell you about memory pressure. Proactively monitor and respond before Jetsam acts.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q41: What is the single biggest source of dirty memory in most iOS apps? How do you address it?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Decoded image bitmaps.</strong> A 12MP photo (4032×3024) decoded to RGBA consumes 48MB of dirty memory. Common mistakes: loading full-resolution images for small thumbnails, keeping decoded images in memory after scrolling off-screen, and not using ImageIO for downsampled loading.</p>
+                <p><strong>Solutions:</strong> (1) Use <code>CGImageSourceCreateThumbnailAtIndex</code> to load images at exactly the display size. (2) Use <code>UIGraphicsImageRenderer</code> to render at the target size. (3) Implement an image cache with a memory budget (NSCache with totalCostLimit). (4) Release decoded images when views scroll off-screen (prefetching delegate). (5) Use <code>preparingForDisplay()</code> (iOS 15+) to decode on a background thread.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q42: How do you use task_vm_info to get the current memory footprint programmatically?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Use the <code>task_info</code> Mach API with <code>TASK_VM_INFO</code> flavor to get <code>task_vm_info_data_t</code>, which contains <code>phys_footprint</code> — the current physical memory footprint (dirty + compressed). This is the same metric Jetsam uses.</p>
+                <p>The code: create a <code>task_vm_info_data_t</code>, call <code>task_info(mach_task_self_, TASK_VM_INFO, ...)</code>, and read <code>info.phys_footprint</code>. This gives bytes, divide by 1024*1024 for MB.</p>
+                <p>Use this alongside <code>os_proc_available_memory()</code> for a complete picture: footprint tells you how much you're using, available tells you how much headroom you have.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q43: How does NSCache differ from a Dictionary for caching, and why does it matter for memory pressure?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><code>NSCache</code> automatically evicts objects under memory pressure (it responds to <code>didReceiveMemoryWarning</code> internally). <code>Dictionary</code> never evicts anything — it holds strong references until you explicitly remove them.</p>
+                <p>Additional NSCache advantages: thread-safe (no external locking needed), <code>totalCostLimit</code> for size-based eviction, <code>countLimit</code> for count-based eviction, and objects can adopt <code>NSDiscardableContent</code> for fine-grained purging.</p>
+                <p>For memory-sensitive caching (images, data), always use NSCache or a custom cache with memory budget integration. Never use a plain Dictionary as a cache — it's a memory leak waiting to happen.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q44: How do you use MetricKit to detect Jetsam events in production?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Implement <code>MXMetricManagerSubscriber</code> and check <code>MXDiagnosticPayload.crashDiagnostics</code> for entries where <code>terminationReason</code> contains "jetsam". Also monitor <code>MXMetricPayload.memoryMetrics</code> for <code>peakMemoryUsage</code> and <code>averageSuspendedMemory</code> to identify trends before they become Jetsam events.</p>
+                <p>Set up alerting: if Jetsam kill rate exceeds 0.1% of sessions, or if p95 peak memory exceeds your budget, trigger an investigation. Track these metrics per app version to catch regressions.</p>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="startup">App Startup &amp; Launch Time</h2>
+
+    <div class="qa-section">
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q45: Describe the complete app launch sequence from user tap to first frame. What happens pre-main vs post-main?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Pre-main:</strong> (1) Kernel creates process and loads executable. (2) dyld4 maps the executable and all dependent dylibs into memory. (3) dyld4 applies fixups: rebasing (adjust pointers for ASLR) and binding (resolve external symbol references). (4) ObjC runtime registers all classes and categories. (5) +load methods execute. (6) C++ static initializers run. (7) Swift type metadata accessors run. (8) main() is called.</p>
+                <p><strong>Post-main:</strong> (9) UIApplicationMain creates UIApplication and AppDelegate. (10) willFinishLaunchingWithOptions. (11) didFinishLaunchingWithOptions. (12) UIScene connection (scene-based apps). (13) First view controller loaded. (14) First layout pass (Auto Layout solve). (15) First Core Animation commit. (16) First frame rendered — launch complete.</p>
+                <p>Apple's target: < 400ms total for cold launch.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q46: What is the dyld shared cache? How does it affect launch time?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>The dyld shared cache is a single file containing all system frameworks (UIKit, Foundation, CoreGraphics, Metal, etc.) pre-linked together. It's created by Apple and stored on the device. All processes share this cache via memory mapping.</p>
+                <p><strong>Impact:</strong> Loading system frameworks is essentially free — they're already mapped into every process's address space. Inter-framework references are pre-resolved. ObjC selectors are pre-uniqued. This means the number of system frameworks you use has minimal impact on launch time.</p>
+                <p><strong>Your frameworks are NOT in the shared cache.</strong> Each custom dynamic framework you add requires separate loading, rebasing, and binding. This is why reducing the number of custom dylibs is a key launch time optimization.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q47: What's the difference between +load and +initialize? Which affects launch time?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>+load:</strong> Runs during pre-main (dyld initializer phase). Called for every class and category that implements it, in a defined order (superclass before subclass, class before category). Runs on the main thread, blocking launch. Directly impacts launch time.</p>
+                <p><strong>+initialize:</strong> Runs lazily, before the first message is sent to the class. Thread-safe (runtime holds a lock). Only runs if the class is actually used. Does NOT affect launch time unless the class is used during launch.</p>
+                <p>Migration strategy: replace +load with +initialize where possible, or use Swift's lazy static properties (<code>static let shared = ...</code>) which are initialized on first access with dispatch_once semantics.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q48: What are dyld4 closures and how do they improve launch time?</span>
+                <span class="level"><span class="tag tag-architect">Architect</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>dyld4 closures are pre-computed launch plans that cache the results of the linking process. On first launch, dyld4 computes which dylibs to load, in what order, all fixup locations, and initializer order. It saves this as a "closure" in a cache file.</p>
+                <p>On subsequent launches, dyld4 replays the closure instead of re-computing everything, significantly reducing pre-main time. The closure is invalidated when the app is updated, the OS is updated, a dylib changes, or sometimes on reboot.</p>
+                <p>This is why the first launch after install/update is slower than subsequent launches — the closure hasn't been built yet.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q49: You're tasked with reducing a 3-second cold launch to under 400ms. Walk through your strategy.</span>
+                <span class="level"><span class="tag tag-architect">Architect</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Step 1: Measure.</strong> Use Instruments App Launch template to get per-phase breakdown. Identify whether the bottleneck is pre-main or post-main.</p>
+                <p><strong>Pre-main optimizations (if > 200ms):</strong> Reduce dylib count by merging frameworks or using mergeable libraries (Xcode 15+). Audit and remove +load methods. Reduce ObjC class count (prefer Swift structs). Remove unused code (dead stripping). Audit third-party SDKs for hidden +load methods.</p>
+                <p><strong>Post-main optimizations (usually the bigger win):</strong> Defer SDK initialization — only crash reporting before first frame. Implement a priority-based launch task system (critical/high/medium/low). Show a lightweight placeholder UI immediately, load real content after first frame. Move all disk/network I/O off the main thread. Simplify the initial view hierarchy (fewer views = faster layout). Pre-warm data on a background thread.</p>
+                <p><strong>Step 2: Prevent regression.</strong> Add XCTApplicationLaunchMetric tests to CI with a 400ms budget. Monitor production launch times via MetricKit.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q50: How do you use os_signpost to measure custom launch phases?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Create an <code>OSLog</code> with the <code>.pointsOfInterest</code> category, then use <code>os_signpost(.begin, ...)</code> and <code>os_signpost(.end, ...)</code> to bracket each phase. These appear in Instruments as named intervals on the Points of Interest track.</p>
+                <p>Wrap each initialization step: crash reporting, Core Data stack, analytics, push registration, etc. This gives you a precise breakdown of where post-main time is spent, complementing the Instruments App Launch template's system-level phases.</p>
+                <p>Use a <code>StaticString</code> for the name parameter (required by os_signpost) and include metadata in the format string for context.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q51: What is the difference between cold, warm, and hot launch? How do you measure each?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Cold launch:</strong> App not in memory, no cached data. Full dyld load, all initializers run. Measured by rebooting the device, waiting 2 minutes, then launching. Typical: 1-5 seconds.</p>
+                <p><strong>Warm launch:</strong> App not running but dylibs are in the system's file cache. Faster dyld loading. Measured by force-quitting the app and immediately relaunching. Typical: 0.5-2 seconds.</p>
+                <p><strong>Hot launch (resume):</strong> App suspended in background, just unsuspended. No initialization needed. Measured by backgrounding and foregrounding. Typical: < 100ms.</p>
+                <p>Apple measures cold launch in production via MetricKit's <code>histogrammedTimeToFirstDraw</code>. For CI, use <code>XCTApplicationLaunchMetric</code> which measures warm launch by default.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q52: What are mergeable libraries in Xcode 15 and how do they help launch time?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Mergeable libraries are a new Xcode 15 feature that gives you the best of both static and dynamic linking. In debug builds, they behave as dynamic frameworks (fast incremental builds). In release builds, they're merged into the main executable (like static libraries), eliminating the dylib loading overhead at launch.</p>
+                <p>This solves the classic tradeoff: dynamic frameworks are great for build time but hurt launch time (each dylib adds 5-10ms of loading). Static libraries are great for launch time but hurt build time (full relink on any change). Mergeable libraries automatically switch between the two based on build configuration.</p>
+                <p>To adopt: set "Mergeable Library" to YES in the framework's build settings. Xcode handles the rest.</p>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="profiling">Instruments &amp; Profiling</h2>
+
+    <div class="qa-section">
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q53: Walk through how you'd use the Time Profiler to find a scrolling performance bottleneck.</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>1. Record:</strong> Attach Time Profiler to the app on a physical device. Scroll the problematic list for 10-15 seconds. Stop recording.</p>
+                <p><strong>2. Filter:</strong> Select the scrolling time range on the timeline. Filter to the main thread only (scroll performance is main-thread-bound). Check "Hide System Libraries" to focus on your code.</p>
+                <p><strong>3. Analyze:</strong> Use "Invert Call Tree" to see which functions consume the most CPU time. Look for: image decoding on main thread, complex Auto Layout solving, synchronous disk/network I/O, excessive view creation, and string formatting.</p>
+                <p><strong>4. Drill down:</strong> Click the heaviest function to see its call stack. Look at "Self" time (time in the function itself) vs "Total" time (including callees). High Self time = optimize the function. High Total with low Self = optimize what it calls.</p>
+                <p><strong>5. Fix and verify:</strong> Move heavy work off main thread, simplify cell layout, cache computed values. Re-profile to verify improvement.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q54: What is Generation Analysis (heap shot) in the Allocations instrument? How do you use it to find leaks?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>Generation Analysis marks points in time and shows which allocations from each generation are still alive. The workflow: (1) Navigate to a screen, click "Mark Generation." (2) Navigate away. (3) Click "Mark Generation" again. (4) Repeat the navigation cycle 3-5 times.</p>
+                <p>If each generation shows growing "Still Living" counts for the same types (e.g., UIViewController, closures), you have a leak. The leaked objects from each visit accumulate because they're never deallocated.</p>
+                <p>This catches leaks that the Leaks instrument misses — specifically, objects that are still reachable (not technically "leaked" by the Leaks instrument's definition) but should have been released (e.g., a view controller retained by a closure cycle).</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q55: What does the VM Tracker instrument show that the Allocations instrument doesn't?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>VM Tracker shows the complete virtual memory picture: all memory regions (not just heap allocations), their types (MALLOC, CG raster data, IOKit, __TEXT, __DATA, Stack, mapped files), and their dirty/clean/compressed breakdown.</p>
+                <p>Allocations only shows heap allocations (malloc'd memory). VM Tracker additionally shows: decoded image bitmaps (CG raster data — often the biggest dirty memory consumer), GPU buffers (IOKit), memory-mapped files, thread stacks, and framework code segments.</p>
+                <p>VM Tracker gives the most accurate picture of what Jetsam sees (dirty + compressed footprint), while Allocations is better for tracking individual object lifecycles.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q56: How would you build a performance monitoring pipeline from development to production?</span>
+                <span class="level"><span class="tag tag-architect">Architect</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>Development:</strong> Instruments profiling (ad-hoc), Memory Graph Debugger for retain cycles, os_signpost annotations in code for custom intervals.</p>
+                <p><strong>CI/CD:</strong> XCTest performance tests with XCTMetric (launch time, memory, CPU budgets). xctrace automation for Leaks and Allocations. Deallocation assertion tests for all VCs and view models. Binary size tracking.</p>
+                <p><strong>Production:</strong> MetricKit subscriber forwarding MXMetricPayload and MXDiagnosticPayload to analytics backend. Custom telemetry: os_proc_available_memory() sampling, frame rate monitoring via CADisplayLink, network performance via URLSessionTaskMetrics.</p>
+                <p><strong>Alerting:</strong> Launch time p95 regression > 10%, Jetsam kill rate > 0.1%, hang rate > 1%, memory footprint p95 > budget. All tracked per app version for regression detection.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q57: Why should you always profile on a physical device instead of the Simulator?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>The Simulator runs x86/ARM translation on your Mac's CPU, which has completely different performance characteristics than the A-series chip in an iPhone. CPU-bound code may be 2-10x faster on the Simulator. Memory behavior differs — the Simulator has access to your Mac's full RAM (no Jetsam). GPU rendering uses your Mac's GPU (different architecture). Thermal throttling doesn't occur. Network conditions are your Mac's network (not cellular).</p>
+                <p>Profiling on the Simulator gives misleading results that don't reflect real-world performance. Always use a physical device, ideally the lowest-spec device you support (e.g., iPhone SE) to catch performance issues that wouldn't appear on high-end devices.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q58: How do you use the Xcode Memory Graph Debugger to find a retain cycle?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>(1) Run the app, navigate to the state you want to inspect (e.g., push then pop a view controller). (2) Click the Memory Graph button in the debug bar. (3) In the left panel, filter by your class names. (4) Look for objects that shouldn't be alive (e.g., a dismissed VC). (5) Click the object to see its reference graph in the center panel. (6) Follow the strong reference arrows to find the cycle. Purple exclamation marks indicate potential leaks.</p>
+                <p>You can also export the memory graph (<code>File → Export Memory Graph</code>) as a .memgraph file for later analysis or sharing with the team. The <code>leaks</code> command-line tool can analyze .memgraph files.</p>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="energy">Energy &amp; Thermal</h2>
+
+    <div class="qa-section">
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q59: What are the four ProcessInfo.ThermalState values? How should your app respond to each?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>.nominal:</strong> Normal temperature, full performance. No action needed.</p>
+                <p><strong>.fair:</strong> Slightly elevated. Reduce non-essential background work, stop prefetching.</p>
+                <p><strong>.serious:</strong> Significant throttling (50-70% CPU). Reduce render quality, pause non-essential downloads, drop frame rate to 30fps, simplify animations.</p>
+                <p><strong>.critical:</strong> Severe throttling (30-50% CPU), near thermal shutdown. Minimum viable operation: drop to 20fps, stop all background work, reduce to essential UI only, disable camera/GPU-intensive features.</p>
+                <p>Subscribe to <code>ProcessInfo.thermalStateDidChangeNotification</code> and adapt immediately. The key insight: code that runs in 16ms at .nominal may take 40ms at .serious, causing frame drops even without code changes.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q60: Explain the "tail energy" problem with network requests. How do you mitigate it?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>After each network request, the cellular radio stays powered for 10-30 seconds (the "tail") even though no data is being transferred. This is because powering up the radio is expensive, so the modem keeps it active in case more data arrives.</p>
+                <p>If you make individual requests every 15 seconds, the radio is essentially always on (each request's tail overlaps with the next request). But if you batch all requests into a single burst, you only pay the tail energy once.</p>
+                <p><strong>Mitigation:</strong> (1) Coalesce requests — batch multiple API calls together. (2) Use HTTP/2 multiplexing — multiple requests on one connection. (3) Prefetch data in batches rather than on-demand. (4) Use push notifications instead of polling. (5) Set <code>URLSessionConfiguration.isDiscretionary = true</code> for non-urgent transfers — the system will batch them with other apps' transfers.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q61: Why is push notification delivery more energy-efficient than polling?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p>APNs maintains a single persistent connection from the device to Apple's servers, shared across ALL apps. The connection uses a keep-alive mechanism that's optimized for the cellular radio's power states. When a push arrives, the system wakes the radio once, delivers notifications for all apps, then lets the radio sleep.</p>
+                <p>Polling requires each app to independently wake the radio, make a request, wait for a response, and keep the radio in the tail state. With 50 apps polling every 30 seconds, the radio would never sleep. With push, the radio only wakes when there's actually data to deliver.</p>
+                <p>The energy difference is 10-100x depending on polling frequency and number of apps.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q62: How does location accuracy affect energy consumption? What's the most efficient approach for background location?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><code>kCLLocationAccuracyBest</code> uses GPS + WiFi + Cell + Barometer — very high energy. <code>kCLLocationAccuracyKilometer</code> uses only cell towers — minimal energy. The GPS receiver is the single biggest energy consumer on the device after the display.</p>
+                <p><strong>Most efficient background approach:</strong> Use <code>startMonitoringSignificantLocationChanges()</code>. It only fires when the user moves ~500 meters, uses cell tower changes (no GPS), and has very low energy impact. For apps that need more precision in background, use <code>allowsBackgroundLocationUpdates = true</code> with <code>pausesLocationUpdatesAutomatically = true</code> and the highest acceptable <code>distanceFilter</code>.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q63: What MetricKit metrics help you understand your app's energy impact?</span>
+                <span class="level"><span class="tag tag-l6">L6</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>CPU metrics:</strong> <code>cumulativeCPUTime</code> and <code>cumulativeCPUInstructions</code> — high values indicate CPU-intensive code that drains battery.</p>
+                <p><strong>GPU metrics:</strong> <code>cumulativeGPUTime</code> — high values indicate GPU-heavy rendering.</p>
+                <p><strong>Location metrics:</strong> <code>cumulativeBestAccuracyTime</code>, <code>cumulativeBestAccuracyForNavigationTime</code> — time spent using high-accuracy location.</p>
+                <p><strong>Network metrics:</strong> <code>cumulativeCellularUpload/Download</code>, <code>cumulativeWifiUpload/Download</code> — cellular transfers are more energy-expensive than WiFi.</p>
+                <p><strong>Display metrics:</strong> <code>averagePixelLuminance</code> — brighter screens use more energy (especially on OLED where dark pixels are essentially free).</p>
+                <p>Track all of these per version and alert on regressions.</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q64: How would you design an app for sustained heavy workloads (e.g., video processing, AR) that handles thermal throttling gracefully?</span>
+                <span class="level"><span class="tag tag-architect">Architect</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><strong>1. Adaptive quality system:</strong> Monitor both thermal state and frame time. Blend these signals to compute a quality level (0.0-1.0). Apply the quality level to render resolution, effect complexity, physics fidelity, and AI model complexity. Smooth transitions to avoid jarring quality changes.</p>
+                <p><strong>2. Proactive throttling:</strong> Don't wait for .serious — start reducing quality at .fair. The goal is to prevent reaching .serious/.critical by reducing heat generation early.</p>
+                <p><strong>3. Work scheduling:</strong> Use efficiency cores (QoS .utility or .background) for non-latency-sensitive work. The system automatically migrates to E-cores under thermal pressure, but explicitly using lower QoS helps.</p>
+                <p><strong>4. Frame rate adaptation:</strong> Drop from 120fps to 60fps to 30fps based on thermal state. Use CADisplayLink's preferredFrameRateRange to communicate this to the system.</p>
+                <p><strong>5. User communication:</strong> If quality is significantly degraded, show a subtle indicator. Users prefer knowing "the device is hot" over wondering "why does it look bad?"</p>
+            </div>
+        </div>
+
+        <div class="qa-item">
+            <div class="qa-question">
+                <span>Q65: What is the role of Timer.tolerance in energy optimization?</span>
+                <span class="level"><span class="tag tag-senior">Senior</span></span>
+            </div>
+            <div class="qa-answer">
+                <p><code>Timer.tolerance</code> tells the system that the timer can fire within a window (interval to interval + tolerance) instead of at the exact interval. This allows the system to coalesce multiple timers from different apps/subsystems to fire at the same time, reducing CPU wake-ups.</p>
+                <p>Without tolerance, a 60-second timer fires at exactly t=60, t=120, t=180. With 10-second tolerance, it can fire anywhere in [60-70], [120-130], [180-190]. If another timer fires at t=65, the system can coalesce both to fire at t=65, saving one CPU wake-up.</p>
+                <p>Apple recommends setting tolerance to at least 10% of the interval. For background timers, set it even higher. This is one of the simplest energy optimizations with significant impact.</p>
+            </div>
+        </div>
+
+    </div>
+
+    <div class="nav-footer">
+        <a href="07-energy-thermal.html">← Previous: Energy &amp; Thermal</a>
+        <a href="index.html">Back to Series Overview →</a>
+    </div>
+</div>
+
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+    q.addEventListener('click', () => {
+        q.nextElementSibling.classList.toggle('open');
+    });
+});
+</script>
+</body>
+</html>
