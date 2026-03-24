@@ -1,59 +1,110 @@
-# Android Interview Preparation Documentation
+# Android & iOS Interview Preparation
 
-A comprehensive collection of Android development documentation covering deep technical topics for senior-level (L5/L6) interview preparation.
+A comprehensive collection of deep-dive documentation covering Android and iOS internals for senior-level (L5/L6) interview preparation.
 
-## Topics Covered
+---
 
-### Core Android Topics
-
-| Topic | Description |
-|-------|-------------|
-| **Background Work** | Services, WorkManager, JobScheduler, and power management |
-| **Coroutines & Threading** | Threading fundamentals, coroutines, structured concurrency, Flows |
-| **Compose Internals** | Compose runtime, recomposition, snapshot system, slot table |
-| **Rendering Pipeline** | VSYNC, Choreographer, RenderThread, SurfaceFlinger, Skia |
-| **Security** | Permissions, Keystore, R8, app sandbox, secure networking |
-| **IPC & Binder** | Binder architecture, AIDL, Zygote, system services |
-| **Memory & Performance** | Memory model, GC internals, leaks, ANR, OOM, Baseline Profiles |
-| **Lifecycle & Navigation** | Activity/Fragment lifecycle, back stack, Navigation Component |
-| **Testing & DI** | Unit testing, Dagger/Hilt, Koin, testing strategies |
-| **System Services** | System server boot, AMS, WMS, PMS, platform internals |
-| **View System** | View hierarchy, measure/layout/draw, touch system, RecyclerView |
-| **Modularization & Build** | Gradle internals, module architecture, build performance |
-
-## Project Structure
+## Repository Structure
 
 ```
 android_document/
-├── docs/
-│   ├── android_document/     # Android topic documentation (HTML)
-│   └── iOS_document/         # iOS topic documentation
-├── questions/                # Calibration questions & answers
-└── android_project/          # Sample Android projects
-    ├── workmanager-samples/
-    ├── compose-custom-views/
-    └── android-client-server-samples/
+├── android/                      # Android deep-dive documentation
+│   ├── 01-background-work/
+│   ├── 02-coroutines-and-threading/
+│   ├── 03-compose-internals/
+│   ├── 04-rendering-pipeline/
+│   ├── 05-security/
+│   ├── 06-ipc-binder/
+│   ├── 07-memory-performance/
+│   ├── 08-lifecycle-navigation/
+│   ├── 09-testing-di/
+│   ├── 10-system-services/
+│   ├── 11-view-system/
+│   └── 12-modularization-build/
+│
+├── ios/                          # iOS deep-dive documentation
+│   ├── 01-app-lifecycle/
+│   ├── 02-uikit-view-system/
+│   ├── 03-swiftui-internals/
+│   ├── 04-concurrency-threading/
+│   ├── 05-memory-performance/
+│   ├── 06-networking-data/
+│   ├── 07-rendering-graphics/
+│   ├── 08-system-frameworks/
+│   ├── 09-security-privacy/
+│   ├── 10-testing-di/
+│   ├── 11-architecture-patterns/
+│   ├── 12-build-toolchain/
+│   └── 13-api-evolution-history/
+│
+├── code-samples/                 # Runnable sample projects
+│   ├── ipc-binder/
+│   │   └── android-client-server-samples/
+│   ├── compose/
+│   │   └── compose-custom-views/
+│   └── background-work/
+│       └── workmanager-samples/
+│
+└── interview-prep/               # Calibration questions & study guides
+    ├── onboarding.md
+    ├── services.md
+    └── ios-utility-libraries.md
 ```
 
-## Content Format
+---
 
-- Documentation is in **HTML format** for rich formatting and embedded diagrams
-- Each topic includes comprehensive **interview Q&A sections**
-- All code examples are in **Kotlin**
-- Covers AOSP internals, trade-offs, and production-grade considerations
+## Android Topics
 
-## How to Use
+| # | Topic | Focus Areas |
+|---|-------|-------------|
+| 01 | Background Work | WorkManager, Services, JobScheduler, Foreground Services |
+| 02 | Coroutines & Threading | Coroutine internals, Flow, Dispatchers, Structured Concurrency |
+| 03 | Compose Internals | Recomposition, Slot Table, LayoutNode, State management |
+| 04 | Rendering Pipeline | Choreographer, VSync, GPU/CPU pipeline, Jank prevention |
+| 05 | Security | Keystore, Biometrics, Certificate pinning, ProGuard |
+| 06 | IPC & Binder | Binder protocol, AIDL, Messenger, ContentProvider internals |
+| 07 | Memory & Performance | GC, Memory leaks, Profiling, ANR debugging |
+| 08 | Lifecycle & Navigation | Activity/Fragment lifecycle, Navigation Component, back stack |
+| 09 | Testing & DI | Unit/Integration/UI testing, Hilt, Dagger internals |
+| 10 | System Services | AMS, WMS, PMS, Context internals |
+| 11 | View System | Measure/Layout/Draw pass, RecyclerView internals, custom views |
+| 12 | Modularization & Build | Gradle internals, dynamic features, modularization strategies |
 
-1. Open the HTML files in a browser to view the documentation
-2. Each topic folder contains an `index.html` as the entry point
-3. Topics are organized progressively from fundamentals to advanced internals
+---
 
-## Tech Stack
+## iOS Topics
 
-- HTML/CSS for documentation
-- Kotlin for code examples
-- Mermaid/SVG for diagrams
+| # | Topic | Focus Areas |
+|---|-------|-------------|
+| 01 | App Lifecycle | UIApplicationDelegate, Scene lifecycle, state transitions |
+| 02 | UIKit View System | Responder chain, Auto Layout, CALayer |
+| 03 | SwiftUI Internals | View diffing, `@State`/`@Binding`/`@ObservableObject` |
+| 04 | Concurrency & Threading | GCD, OperationQueue, async/await, actors |
+| 05 | Memory & Performance | ARC, retain cycles, Instruments, memory pressure |
+| 06 | Networking & Data | URLSession, Codable, CoreData, CloudKit |
+| 07 | Rendering & Graphics | Core Animation, Metal, offscreen rendering |
+| 08 | System Frameworks | Notifications, background modes, extensions |
+| 09 | Security & Privacy | Keychain, App Transport Security, privacy manifests |
+| 10 | Testing & DI | XCTest, UI testing, dependency injection patterns |
+| 11 | Architecture Patterns | MVC, MVVM, TCA, Coordinator |
+| 12 | Build Toolchain | Xcode build system, Swift Package Manager, Instruments |
+| 13 | API Evolution & History | Swift evolution, deprecation strategies, backward compatibility |
 
-## License
+---
 
-MIT License
+## Code Samples
+
+| Folder | Topic | Description |
+|--------|-------|-------------|
+| `code-samples/ipc-binder/` | IPC & Binder | Android client/server communication examples |
+| `code-samples/compose/` | Compose | Custom composables and layout examples |
+| `code-samples/background-work/` | Background Work | WorkManager and scheduling examples |
+
+---
+
+## How to Use This Repo
+
+1. **Topic review** — Navigate to the numbered folder for the topic you want to study.
+2. **Run samples** — Open any folder under `code-samples/` in Android Studio.
+3. **Interview prep** — Check `interview-prep/` for curated calibration questions.
+4. **Navigation** — The numbered folders follow a logical learning order but can be studied independently.
