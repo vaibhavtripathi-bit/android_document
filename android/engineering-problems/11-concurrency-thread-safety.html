@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Problem 11: Concurrency Control and Thread Safety in Event-Driven Systems</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+            background: #ffffff;
+            color: #1a1a2e;
+            line-height: 1.8;
+            padding: 40px 20px;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        .back { display: inline-block; margin-bottom: 32px; color: #3b82f6; text-decoration: none; font-size: 0.9em; font-weight: 500; }
+        .back:hover { text-decoration: underline; }
+        .label { font-size: 0.8em; font-weight: 600; color: #3b82f6; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+        h1 { font-size: 2em; font-weight: 700; margin-bottom: 16px; color: #1a1a2e; }
+        .summary { font-size: 1.05em; color: #6b7280; margin-bottom: 40px; padding-bottom: 24px; border-bottom: 2px solid #e5e7eb; }
+        h2 { font-size: 1.4em; font-weight: 600; margin: 36px 0 16px; color: #1a1a2e; }
+        h3 { font-size: 1.1em; font-weight: 600; margin: 24px 0 12px; color: #374151; }
+        p { margin-bottom: 16px; color: #374151; }
+        ul, ol { margin: 12px 0 20px 24px; color: #374151; }
+        li { margin-bottom: 8px; }
+        .highlight {
+            background: #f8fafc;
+            border-left: 4px solid #3b82f6;
+            padding: 20px 24px;
+            margin: 24px 0;
+            border-radius: 0 8px 8px 0;
+        }
+        .highlight p { margin-bottom: 0; }
+        .approach-box {
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 24px;
+            margin: 20px 0;
+        }
+        .approach-box h3 { margin-top: 0; }
+        footer { margin-top: 60px; padding-top: 24px; border-top: 1px solid #e5e7eb; text-align: center; color: #9ca3af; font-size: 0.85em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <a class="back" href="index.html">&larr; Back to all problems</a>
+        <div class="label">Problem 11</div>
+        <h1>Concurrency Control and Thread Safety in Event-Driven Systems</h1>
+        <p class="summary">An event-driven SDK processes system broadcasts, coroutine callbacks, WorkManager jobs, and Flow emissions — all potentially on different threads simultaneously. Without careful concurrency control, counters overflow, state corrupts, and race conditions cause subtle bugs. This document describes the concurrency patterns used to maintain correctness.</p>
+
+        <h2>The Problem</h2>
+        <p>Consider these real concurrency scenarios:</p>
+        <ul>
+            <li>Two screen-on broadcasts arrive simultaneously on different threads. Both check the rate limit counter, both see it's under the limit, both increment it — the limit is exceeded by one.</li>
+            <li>A periodic reset coroutine resets the hourly counter to zero at the exact moment another coroutine is reading and incrementing it — the increment is lost.</li>
+            <li>Multiple SIM subscription change callbacks fire in rapid succession, each spawning a coroutine that reads SIM info — the results interleave and corrupt state.</li>
+            <li>A module's <code>start()</code> and <code>stop()</code> are called from different EventBus subscribers — the module ends up in an inconsistent half-started state.</li>
+        </ul>
+
+        <h2>Approaches Used</h2>
+
+        <div class="approach-box">
+            <h3>1. Kotlin Mutex for Coroutine-Safe Critical Sections</h3>
+            <p>For rate-limit counters and other shared state accessed from coroutines, Kotlin's <code>Mutex</code> provides non-blocking mutual exclusion:</p>
+            <ul>
+                <li>A <code>Mutex</code> instance is shared between the event handler and the periodic reset coroutine.</li>
+                <li>The event handler acquires the mutex, reads the counter, checks the limit, increments, and releases.</li>
+                <li>The reset coroutine acquires the same mutex before zeroing the counter.</li>
+                <li>A utility function <code>launchWithMutexLock</code> wraps the acquire-execute-release pattern to prevent forgetting to release.</li>
+            </ul>
+            <div class="highlight">
+                <p><strong>Key Insight:</strong> Kotlin <code>Mutex</code> is a <strong>suspending</strong> lock, not a blocking one. When a coroutine can't acquire the mutex, it suspends (freeing the thread) rather than blocking. This is critical in coroutine-heavy code — a blocking lock on the IO dispatcher could exhaust the thread pool.</p>
+            </div>
+        </div>
+
+        <div class="approach-box">
+            <h3>2. Dedicated Thread Pool with Queued Execution</h3>
+            <p>For operations that must execute strictly sequentially (not just mutually exclusively), a custom thread pool with a queue is used:</p>
+            <ul>
+                <li>A <code>DedicatedThreadPool</code> wraps a fixed-size executor with a mutex-protected FIFO queue of lambdas.</li>
+                <li>Callers submit work via <code>runQueued()</code>, which adds the lambda to the queue.</li>
+                <li>A processing loop dequeues and executes one lambda at a time.</li>
+                <li>This ensures strict ordering — work items execute in the order they were submitted, even if submitted from different threads.</li>
+            </ul>
+            <p>This is used for operations where not just mutual exclusion but <strong>ordering</strong> matters — e.g., processing events in the order they occurred.</p>
+        </div>
+
+        <div class="approach-box">
+            <h3>3. ConcurrentLinkedQueue for Event Ordering</h3>
+            <p>For event triggers that arrive from system broadcasts (which can come on any thread), a <code>ConcurrentLinkedQueue</code> provides thread-safe ordering:</p>
+            <ul>
+                <li>Incoming events are added to the queue from any thread (broadcast receivers, callbacks).</li>
+                <li>A single processing coroutine dequeues and handles events one at a time.</li>
+                <li>This converts a multi-threaded event stream into a single-threaded processing pipeline.</li>
+            </ul>
+        </div>
+
+        <div class="approach-box">
+            <h3>4. Debounce for Rapid Event Coalescing</h3>
+            <p>When events come in bursts and only the final state matters, debouncing eliminates redundant processing:</p>
+            <ul>
+                <li><strong>Flow debounce:</strong> Kotlin Flow's <code>debounce()</code> operator waits for a quiet period before emitting. Used for consent changes (60s window) and lifecycle events (30s window).</li>
+                <li><strong>Job cancellation pattern:</strong> For non-Flow contexts, the pattern is: cancel the previous job, launch a new one with a delay. If another event arrives before the delay, the job is cancelled and a new one starts. Only the last event's job completes. Used for SIM subscription changes (5s delay).</li>
+            </ul>
+        </div>
+
+        <div class="approach-box">
+            <h3>5. @Synchronized for Simple Mutual Exclusion</h3>
+            <p>For simpler cases where coroutine suspension isn't needed, Kotlin's <code>@Synchronized</code> annotation provides JVM-level locking:</p>
+            <ul>
+                <li>Used on scheduler methods that should not be called concurrently (e.g., scheduling a WorkManager job while another call is already scheduling).</li>
+                <li>Used on the <code>ModuleInitializer.runInitialize()</code> base method to ensure each initializer runs exactly once.</li>
+                <li>Simpler than Mutex but <strong>blocks</strong> the thread — appropriate only for short critical sections.</li>
+            </ul>
+        </div>
+
+        <div class="approach-box">
+            <h3>6. SharedFlow Buffer and Overflow Strategy</h3>
+            <p>The module event emitter uses a <code>SharedFlow</code> with specific buffer and overflow settings:</p>
+            <ul>
+                <li><strong>Buffer size: 64</strong> — events are buffered so slow subscribers don't miss events.</li>
+                <li><strong>Overflow: SUSPEND</strong> — if the buffer is full, the emitter suspends rather than dropping events.</li>
+                <li>This ensures no system events are lost, even if a subscriber is temporarily slow (e.g., doing database work).</li>
+                <li>The trade-off: a very slow subscriber can cause backpressure on the emitter. The buffer size (64) provides enough headroom for typical bursts.</li>
+            </ul>
+        </div>
+
+        <div class="approach-box">
+            <h3>7. SupervisorJob for Failure Isolation</h3>
+            <p>When multiple coroutines run under a shared scope, a failure in one can cancel all others. <code>SupervisorJob</code> prevents this:</p>
+            <ul>
+                <li>Scopes created with <code>SupervisorJob()</code> allow child coroutines to fail independently.</li>
+                <li>If the voice module's coroutine throws, the coverage module's coroutine keeps running.</li>
+                <li>This is used in the scoped IO scope utility that creates isolated scopes for module work.</li>
+            </ul>
+        </div>
+
+        <h2>Choosing the Right Tool</h2>
+        <table style="width:100%; border-collapse: collapse; margin: 20px 0;">
+            <thead>
+                <tr style="border-bottom: 2px solid #e5e7eb;">
+                    <th style="text-align:left; padding: 12px 8px; color: #6b7280; font-size: 0.85em;">SCENARIO</th>
+                    <th style="text-align:left; padding: 12px 8px; color: #6b7280; font-size: 0.85em;">TOOL</th>
+                    <th style="text-align:left; padding: 12px 8px; color: #6b7280; font-size: 0.85em;">WHY</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr style="border-bottom: 1px solid #f3f4f6;"><td style="padding: 12px 8px;">Coroutine-accessed counter</td><td style="padding: 12px 8px;">Mutex</td><td style="padding: 12px 8px;">Suspends, doesn't block threads</td></tr>
+                <tr style="border-bottom: 1px solid #f3f4f6;"><td style="padding: 12px 8px;">Strictly ordered processing</td><td style="padding: 12px 8px;">Queued thread pool</td><td style="padding: 12px 8px;">FIFO guarantee</td></tr>
+                <tr style="border-bottom: 1px solid #f3f4f6;"><td style="padding: 12px 8px;">Multi-thread event collection</td><td style="padding: 12px 8px;">ConcurrentLinkedQueue</td><td style="padding: 12px 8px;">Lock-free thread safety</td></tr>
+                <tr style="border-bottom: 1px solid #f3f4f6;"><td style="padding: 12px 8px;">Bursty events, only last matters</td><td style="padding: 12px 8px;">Debounce / job cancel</td><td style="padding: 12px 8px;">Eliminates redundant work</td></tr>
+                <tr style="border-bottom: 1px solid #f3f4f6;"><td style="padding: 12px 8px;">Short critical section, no coroutines</td><td style="padding: 12px 8px;">@Synchronized</td><td style="padding: 12px 8px;">Simple, JVM-native</td></tr>
+                <tr><td style="padding: 12px 8px;">Independent child coroutines</td><td style="padding: 12px 8px;">SupervisorJob</td><td style="padding: 12px 8px;">Failure isolation</td></tr>
+            </tbody>
+        </table>
+
+        <h2>Key Takeaways</h2>
+        <ul>
+            <li><strong>Prefer Mutex over synchronized in coroutine code.</strong> Blocking a coroutine thread starves the dispatcher; suspending frees it.</li>
+            <li><strong>Ordering and exclusion are different problems.</strong> Mutex gives exclusion; a queue gives ordering. Know which you need.</li>
+            <li><strong>Debounce is a concurrency tool.</strong> It's not just for UI — it prevents redundant processing of rapid system events.</li>
+            <li><strong>Buffer your SharedFlows.</strong> Without a buffer, slow subscribers cause the emitter to suspend, creating unexpected backpressure.</li>
+            <li><strong>Use SupervisorJob for independent work.</strong> One module's failure shouldn't take down the entire coroutine tree.</li>
+        </ul>
+
+        <footer>
+            <a href="index.html" style="color: #3b82f6; text-decoration: none;">&larr; Back to all problems</a>
+        </footer>
+    </div>
+</body>
+</html>

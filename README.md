@@ -20,7 +20,8 @@ android_document/
 │   ├── 09-testing-di/
 │   ├── 10-system-services/
 │   ├── 11-view-system/
-│   └── 12-modularization-build/
+│   ├── 12-modularization-build/
+│   └── engineering-problems/
 │
 ├── ios/                          # iOS deep-dive documentation
 │   ├── 01-app-lifecycle/
@@ -69,6 +70,28 @@ android_document/
 | 10 | System Services | AMS, WMS, PMS, Context internals |
 | 11 | View System | Measure/Layout/Draw pass, RecyclerView internals, custom views |
 | 12 | Modularization & Build | Gradle internals, dynamic features, modularization strategies |
+| — | **Engineering Problems** | Rate limiting, module communication, crash resilience, caching, remote config, network-aware uploads, PII protection, multi-process safety, concurrency, product flavors |
+
+---
+
+## Engineering Problems (Android)
+
+Real-world production problems with deep-dive solutions — designed for L5/L6 system design rounds.
+
+| # | Problem | Key Concepts |
+|---|---------|--------------|
+| 01 | Rate Limiting & Server Protection | Token bucket, leaky bucket, client-side throttling |
+| 02 | Module Communication via Dagger Maps | Dagger multibindings, decoupled module events |
+| 03 | Report Caching & Threshold Sending | Batching strategies, local persistence, flush triggers |
+| 04 | Ordered Module Initialization | Dependency graphs, startup sequencing, AppStartup |
+| 05 | Crash Resilience & ANR Prevention | Watchdog, uncaught exception handlers, StrictMode |
+| 06 | Cross-Module Event Communication | EventBus, SharedFlow, decoupled pub/sub |
+| 07 | Remote Configuration Management | Feature flags, A/B testing, Firebase Remote Config |
+| 08 | Network-Aware & Roaming-Safe Uploads | ConnectivityManager, WorkManager constraints |
+| 09 | Data Anonymization & PII Protection | Hashing, encryption, data masking strategies |
+| 10 | Multi-Process Safety & Background Work | Locking, IPC, WorkManager in multi-process apps |
+| 11 | Concurrency & Thread Safety | Mutex, atomic ops, coroutine synchronization |
+| 12 | Product Flavor & Modular Builds | Build variants, flavor dimensions, conditional modules |
 
 ---
 

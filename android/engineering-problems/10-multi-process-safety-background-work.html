@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Problem 10: Multi-Process Safety and Reliable Background Work</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+            background: #ffffff;
+            color: #1a1a2e;
+            line-height: 1.8;
+            padding: 40px 20px;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        .back { display: inline-block; margin-bottom: 32px; color: #3b82f6; text-decoration: none; font-size: 0.9em; font-weight: 500; }
+        .back:hover { text-decoration: underline; }
+        .label { font-size: 0.8em; font-weight: 600; color: #3b82f6; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+        h1 { font-size: 2em; font-weight: 700; margin-bottom: 16px; color: #1a1a2e; }
+        .summary { font-size: 1.05em; color: #6b7280; margin-bottom: 40px; padding-bottom: 24px; border-bottom: 2px solid #e5e7eb; }
+        h2 { font-size: 1.4em; font-weight: 600; margin: 36px 0 16px; color: #1a1a2e; }
+        h3 { font-size: 1.1em; font-weight: 600; margin: 24px 0 12px; color: #374151; }
+        p { margin-bottom: 16px; color: #374151; }
+        ul, ol { margin: 12px 0 20px 24px; color: #374151; }
+        li { margin-bottom: 8px; }
+        .highlight {
+            background: #f8fafc;
+            border-left: 4px solid #3b82f6;
+            padding: 20px 24px;
+            margin: 24px 0;
+            border-radius: 0 8px 8px 0;
+        }
+        .highlight p { margin-bottom: 0; }
+        .approach-box {
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 24px;
+            margin: 20px 0;
+        }
+        .approach-box h3 { margin-top: 0; }
+        footer { margin-top: 60px; padding-top: 24px; border-top: 1px solid #e5e7eb; text-align: center; color: #9ca3af; font-size: 0.85em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <a class="back" href="index.html">&larr; Back to all problems</a>
+        <div class="label">Problem 10</div>
+        <h1>Multi-Process Safety and Reliable Background Work</h1>
+        <p class="summary">Android apps can run in multiple processes (e.g., for services, content providers, or FCM). Each process gets its own Application.onCreate() call, its own memory space, and its own DI graph. This document describes how to handle initialization safely across processes and keep background work alive.</p>
+
+        <h2>The Problem</h2>
+        <p>When an Android app declares components in separate processes (e.g., <code>android:process=":fcm"</code>), the system creates separate OS processes. Each process:</p>
+        <ul>
+            <li><strong>Runs Application.onCreate() independently:</strong> Your full initialization code runs in every process, not just the main one.</li>
+            <li><strong>Has its own memory:</strong> Singletons in one process don't exist in another.</li>
+            <li><strong>Has its own DI graph:</strong> Hilt creates a separate component in each process.</li>
+            <li><strong>Can start unexpectedly:</strong> A push notification can start the FCM process without the main process running.</li>
+        </ul>
+        <p>If the SDK's full initialization (database setup, module startup, WorkManager scheduling) runs in every process, you get duplicated work, database contention, and wasted resources.</p>
+
+        <h2>Approaches Used</h2>
+
+        <div class="approach-box">
+            <h3>1. Process Name Gating</h3>
+            <p>The Application class checks the current process name before running initialization:</p>
+            <ul>
+                <li>On <code>onCreate()</code>, the app calls <code>getProcessName()</code> and compares it to the default package name.</li>
+                <li>If the process name matches the package name, it's the <strong>main process</strong> — full initialization runs.</li>
+                <li>If the process name is different (e.g., <code>:fcm</code>, <code>:service</code>), only minimal setup runs.</li>
+                <li>This prevents modules from initializing, databases from being set up, and WorkManager jobs from being scheduled in non-main processes.</li>
+            </ul>
+            <div class="highlight">
+                <p><strong>Key Insight:</strong> Without this check, every push notification that wakes the FCM process would trigger full SDK initialization — registering receivers, scheduling workers, and starting modules. This wastes resources and can cause race conditions with the main process.</p>
+            </div>
+        </div>
+
+        <div class="approach-box">
+            <h3>2. Keep-Alive Service for Process Persistence</h3>
+            <p>Android aggressively kills background processes to reclaim memory. For a telemetry SDK that needs to run continuously, this is a problem:</p>
+            <ul>
+                <li>A <strong>sticky foreground service</strong> keeps the process alive with higher priority.</li>
+                <li>The service is managed by a <code>KeepAliveManager</code> that can be started/stopped based on config.</li>
+                <li>The "sticky" flag (<code>START_STICKY</code>) tells Android to restart the service if it's killed.</li>
+                <li>This is a deliberate trade-off: the service consumes a notification slot and some resources, but ensures data collection isn't interrupted.</li>
+            </ul>
+        </div>
+
+        <div class="approach-box">
+            <h3>3. WorkManager as the Primary Background Scheduler</h3>
+            <p>Instead of relying on services or alarms for periodic work, the SDK uses WorkManager extensively:</p>
+            <ul>
+                <li><strong>Survives process death:</strong> WorkManager persists work requests in a database. If the process dies, the work runs when the process restarts.</li>
+                <li><strong>Handles constraints:</strong> Network connectivity, battery level, and other constraints are checked before running.</li>
+                <li><strong>Deduplication:</strong> <code>enqueueUniquePeriodicWork</code> with policies like <code>KEEP</code> (don't replace existing) or <code>REPLACE</code> (cancel and reschedule) prevents duplicate workers.</li>
+                <li><strong>Backoff:</strong> Failed workers retry with exponential backoff (typically 5-10 minutes initial delay).</li>
+            </ul>
+        </div>
+
+        <div class="approach-box">
+            <h3>4. Initialization Race Prevention</h3>
+            <p>Even within the main process, initialization order matters. Some specific races are handled:</p>
+            <ul>
+                <li>Certain initialization steps (Firebase, Play Services) run on background threads via <code>GlobalScope.launch(Dispatchers.IO)</code>.</li>
+                <li>Comments in the codebase document specific race conditions discovered in production — e.g., a periodic report worker starting before SharedPreferences are initialized.</li>
+                <li>The initialization framework (with dependency resolution) ensures that modules don't start before their dependencies are ready.</li>
+                <li>The report upload worker skips the first ~15 minutes after scheduling to allow initial data accumulation and module startup to complete.</li>
+            </ul>
+        </div>
+
+        <div class="approach-box">
+            <h3>5. WorkManager Unique Work Policies</h3>
+            <p>Different features use different policies for handling existing work:</p>
+            <ul>
+                <li><strong><code>KEEP</code>:</strong> If a worker with the same name already exists, keep it. Used for heartbeat network workers — don't restart a running heartbeat.</li>
+                <li><strong><code>REPLACE</code>:</strong> Cancel the existing worker and schedule a new one. Used when config changes the interval — the old schedule is outdated.</li>
+                <li><strong><code>CANCEL_AND_REENQUEUE</code>:</strong> Similar to REPLACE but with different semantics for in-progress work.</li>
+                <li><strong><code>UPDATE</code>:</strong> Update the existing worker's parameters without cancelling it.</li>
+            </ul>
+            <p>Choosing the right policy prevents both duplicate workers (wasting resources) and lost workers (missing scheduled work).</p>
+        </div>
+
+        <h2>Key Takeaways</h2>
+        <ul>
+            <li><strong>Always check the process name.</strong> In a multi-process app, <code>Application.onCreate()</code> runs in every process. Gate your initialization.</li>
+            <li><strong>Use WorkManager for periodic background work.</strong> It survives process death, handles constraints, and prevents duplicates.</li>
+            <li><strong>Keep-alive services are a trade-off.</strong> They keep the process alive but consume resources. Use them only when continuous operation is truly required.</li>
+            <li><strong>Document race conditions.</strong> When you discover and fix a race, leave a comment explaining it. The next developer will thank you.</li>
+            <li><strong>Choose WorkManager policies carefully.</strong> KEEP vs. REPLACE vs. UPDATE have very different behaviors for in-progress and pending work.</li>
+        </ul>
+
+        <footer>
+            <a href="index.html" style="color: #3b82f6; text-decoration: none;">&larr; Back to all problems</a>
+        </footer>
+    </div>
+</body>
+</html>

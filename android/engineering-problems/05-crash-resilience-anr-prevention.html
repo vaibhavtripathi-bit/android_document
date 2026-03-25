@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Problem 05: Crash Resilience and ANR Prevention in a Background-Heavy App</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+            background: #ffffff;
+            color: #1a1a2e;
+            line-height: 1.8;
+            padding: 40px 20px;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        .back { display: inline-block; margin-bottom: 32px; color: #3b82f6; text-decoration: none; font-size: 0.9em; font-weight: 500; }
+        .back:hover { text-decoration: underline; }
+        .label { font-size: 0.8em; font-weight: 600; color: #3b82f6; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+        h1 { font-size: 2em; font-weight: 700; margin-bottom: 16px; color: #1a1a2e; }
+        .summary { font-size: 1.05em; color: #6b7280; margin-bottom: 40px; padding-bottom: 24px; border-bottom: 2px solid #e5e7eb; }
+        h2 { font-size: 1.4em; font-weight: 600; margin: 36px 0 16px; color: #1a1a2e; }
+        h3 { font-size: 1.1em; font-weight: 600; margin: 24px 0 12px; color: #374151; }
+        p { margin-bottom: 16px; color: #374151; }
+        ul, ol { margin: 12px 0 20px 24px; color: #374151; }
+        li { margin-bottom: 8px; }
+        .highlight {
+            background: #f8fafc;
+            border-left: 4px solid #3b82f6;
+            padding: 20px 24px;
+            margin: 24px 0;
+            border-radius: 0 8px 8px 0;
+        }
+        .highlight p { margin-bottom: 0; }
+        .approach-box {
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 24px;
+            margin: 20px 0;
+        }
+        .approach-box h3 { margin-top: 0; }
+        footer { margin-top: 60px; padding-top: 24px; border-top: 1px solid #e5e7eb; text-align: center; color: #9ca3af; font-size: 0.85em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <a class="back" href="index.html">&larr; Back to all problems</a>
+        <div class="label">Problem 05</div>
+        <h1>Crash Resilience and ANR Prevention in a Background-Heavy App</h1>
+        <p class="summary">A data-collection SDK runs mostly in the background, reacting to system broadcasts, processing database operations, and managing long-running coroutines. Any unhandled exception kills the host app. Any work on the main thread risks an ANR. This document describes the defensive patterns used to keep the SDK stable.</p>
+
+        <h2>The Problem</h2>
+        <p>Background SDKs face unique stability challenges:</p>
+        <ul>
+            <li><strong>BroadcastReceiver 10-second limit:</strong> Android kills the process if <code>onReceive()</code> doesn't return within ~10 seconds. Heavy processing in a receiver causes ANRs.</li>
+            <li><strong>Coroutine failures propagate:</strong> An unhandled exception in a coroutine can cancel its parent scope, taking down unrelated work.</li>
+            <li><strong>Bad data causes crash loops:</strong> A corrupted database row that causes OOM on read will crash the app every time the reporting worker runs — creating an infinite crash loop.</li>
+            <li><strong>OEM API instability:</strong> Querying device-specific ContentProviders or telephony APIs can throw unexpected exceptions on certain devices/OS versions.</li>
+            <li><strong>Module failures shouldn't cascade:</strong> If the voice module crashes during startup, the coverage module should still work.</li>
+        </ul>
+
+        <h2>Approaches Used</h2>
+
+        <div class="approach-box">
+            <h3>1. Background BroadcastReceiver Pattern</h3>
+            <p>Instead of doing work directly in <code>onReceive()</code>, an abstract base class immediately moves all processing off the main thread:</p>
+            <ul>
+                <li>The base <code>BroadcastReceiver</code> overrides <code>onReceive()</code> as <code>final</code>.</li>
+                <li>Inside, it launches a coroutine on the IO dispatcher using a safe-launch wrapper.</li>
+                <li>Subclasses implement <code>onBackgroundReceive()</code> instead, which runs on a background thread.</li>
+                <li>The main thread returns immediately, avoiding the 10-second ANR window.</li>
+            </ul>
+            <div class="highlight">
+                <p><strong>Key Insight:</strong> By making <code>onReceive()</code> final, the base class guarantees that no subclass accidentally does heavy work on the main thread. The pattern is enforced by the type system, not by code review.</p>
+            </div>
+        </div>
+
+        <div class="approach-box">
+            <h3>2. Safe Coroutine Launch with Error Absorption</h3>
+            <p>A utility function wraps coroutine launches with error handling:</p>
+            <ul>
+                <li>The coroutine runs in its own <code>CoroutineScope</code> (not a shared scope), so failures don't propagate.</li>
+                <li><code>invokeOnCompletion</code> catches any <code>Throwable</code> (except <code>CancellationException</code>) and logs it instead of crashing.</li>
+                <li>An optional error callback allows callers to add custom error handling.</li>
+                <li><code>CancellationException</code> is explicitly excluded — cancellation is a normal control flow, not an error.</li>
+            </ul>
+            <p>For structured concurrency where parent-child relationships matter, a separate utility creates scopes with <code>SupervisorJob</code> — child failures don't cancel siblings.</p>
+        </div>
+
+        <div class="approach-box">
+            <h3>3. safeTry Wrappers for Module Orchestration</h3>
+            <p>The lifecycle manager wraps every module start/stop call in a try-catch:</p>
+            <ul>
+                <li>If <code>VoiceProvider.moduleStart()</code> throws, the exception is logged and the loop continues to <code>CoverageProvider.moduleStart()</code>.</li>
+                <li>The same pattern is used in the module state observer — if one listener's callback throws, others still receive the event.</li>
+                <li>This creates a "best effort" model: as many modules as possible will work, even if some are broken.</li>
+            </ul>
+        </div>
+
+        <div class="approach-box">
+            <h3>4. Defensive Database Record Handling</h3>
+            <p>The reporting pipeline includes multiple safeguards against bad data:</p>
+            <ul>
+                <li><strong>Oversized row deletion:</strong> On startup, any event row whose payload exceeds the configured size limit is deleted. This prevents OOM when the reporting worker tries to load and serialize all pending events.</li>
+                <li><strong>Stuck status reset:</strong> Report entries left in "SENDING" status (from a crash during upload) are reset to "NOT_SENT" so they can be retried.</li>
+                <li><strong>Debug vs. Release behavior:</strong> In debug builds, JSON serialization failures throw exceptions to surface bugs. In release builds, the bad record is silently deleted to prevent crash loops.</li>
+            </ul>
+            <div class="highlight">
+                <p><strong>Key Insight:</strong> The debug/release split is crucial. During development, you want to know about bad data immediately (crash = fix the bug). In production, you want the app to survive (delete the bad record, keep running).</p>
+            </div>
+        </div>
+
+        <div class="approach-box">
+            <h3>5. Process Exit Reason Tracking</h3>
+            <p>On Android 11+, the SDK uses <code>ActivityManager.getHistoricalProcessExitReasons()</code> to understand why the app previously died:</p>
+            <ul>
+                <li>It categorizes exits by reason: crash, ANR, excessive resource usage, low memory, user request, etc.</li>
+                <li>This data is collected as analytics events, giving visibility into stability issues across the device fleet.</li>
+                <li>The counts help prioritize which crash/ANR categories to fix first.</li>
+            </ul>
+        </div>
+
+        <div class="approach-box">
+            <h3>6. SecurityException Blanket Handling</h3>
+            <p>Telephony and OEM ContentProvider queries are wrapped in try-catch blocks that specifically handle <code>SecurityException</code>:</p>
+            <ul>
+                <li>Some devices revoke permissions unexpectedly or have broken permission models.</li>
+                <li>OEM-specific ContentProviders may not exist on all devices, throwing when queried.</li>
+                <li>Rather than crashing, the SDK logs the failure and returns default/empty data.</li>
+            </ul>
+        </div>
+
+        <div class="approach-box">
+            <h3>7. Crash Recovery via Persisted State</h3>
+            <p>Modules that track ongoing sessions (e.g., battery monitoring, satellite sessions) persist their state to SharedPreferences:</p>
+            <ul>
+                <li>If the process dies mid-session, the module can recover its state on restart.</li>
+                <li>Session duration calculators store start timestamps so elapsed time can be computed even after a restart.</li>
+                <li>State machines (FSMs) persist their current state, allowing them to resume from the correct point.</li>
+            </ul>
+        </div>
+
+        <h2>Key Takeaways</h2>
+        <ul>
+            <li><strong>Never do work on the main thread in receivers.</strong> Use a base class that enforces background execution via the type system.</li>
+            <li><strong>Isolate coroutine failures.</strong> Use separate scopes or SupervisorJob to prevent one failure from cascading.</li>
+            <li><strong>Module failures must be independent.</strong> The orchestrator must survive any individual module's crash.</li>
+            <li><strong>Bad data is inevitable.</strong> The database will eventually contain corrupt or oversized records. Handle them proactively.</li>
+            <li><strong>Debug and release need different error policies.</strong> Crash early in debug; survive gracefully in release.</li>
+            <li><strong>Persist state for crash recovery.</strong> Any long-running operation should be resumable after process death.</li>
+        </ul>
+
+        <footer>
+            <a href="index.html" style="color: #3b82f6; text-decoration: none;">&larr; Back to all problems</a>
+        </footer>
+    </div>
+</body>
+</html>
