@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JavaScript Runtime — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Architecture &amp; Bridge</a><span class="sep">›</span>
+        JavaScript Runtime
+    </nav>
+
+    <h1>JavaScript Runtime</h1>
+    <p class="subtitle">React Native runs JavaScript on embedded engines — JavaScriptCore, Hermes, or V8. Understanding engine internals, bytecode compilation, and the JSI abstraction layer is critical for Staff-level performance optimization and architecture decisions.</p>
+
+    <nav class="nav">
+        <a href="01-bridge-architecture.html">Bridge Architecture</a>
+        <a href="02-javascript-runtime.html" class="active">JS Runtime</a>
+        <a href="03-native-module-system.html">Native Modules</a>
+        <a href="04-shadow-tree-yoga.html">Shadow Tree &amp; Yoga</a>
+        <a href="05-rendering-pipeline.html">Rendering Pipeline</a>
+        <a href="06-threading-model.html">Threading Model</a>
+        <a href="07-metro-bundler.html">Metro Bundler</a>
+        <a href="08-interview-qa.html">Interview Q&amp;A</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#engine-landscape">1. Engine Landscape</a></li>
+            <li><a href="#javascriptcore">2. JavaScriptCore (JSC)</a></li>
+            <li><a href="#hermes">3. Hermes Engine</a></li>
+            <li><a href="#v8-integration">4. V8 Integration</a></li>
+            <li><a href="#engine-comparison">5. Engine Comparison</a></li>
+            <li><a href="#bytecode">6. Bytecode Precompilation</a></li>
+            <li><a href="#engine-init">7. Engine Initialization</a></li>
+            <li><a href="#global-object">8. Global Object Setup</a></li>
+            <li><a href="#jsi-foundation">9. JSI: The Foundation for New Architecture</a></li>
+            <li><a href="#polyfills">10. Polyfills and Environment Differences</a></li>
+            <li><a href="#architect">11. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="engine-landscape">1. Engine Landscape</h2>
+
+    <p>Unlike web browsers where the JS engine is fixed (V8 in Chrome, SpiderMonkey in Firefox), React Native can use different engines. The engine choice significantly impacts startup time, runtime performance, memory usage, and debugging capabilities.</p>
+
+    <div class="diagram">
+Engine Evolution in React Native
+═════════════════════════════════
+
+2015-2019: JavaScriptCore (JSC) — default on both platforms
+           iOS: System JSC framework (no JIT on iOS)
+           Android: Bundled JSC (with JIT)
+
+2019:      Hermes introduced (RN 0.60)
+           Android-first, optional
+
+2021:      Hermes becomes Android default (RN 0.70)
+
+2022:      Hermes available on iOS (RN 0.70)
+
+2023+:     Hermes default on both platforms
+           JSI-based, optimized for React Native
+
+Alternative: V8 via react-native-v8 (community)
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>The engine choice is not just a performance decision — it affects your entire toolchain. Hermes uses a custom bytecode format that requires ahead-of-time compilation, changing your build pipeline. JSC on iOS uses the system framework (no JIT due to iOS restrictions), while Android JSC bundles the full engine. V8 brings Chrome DevTools protocol but adds ~7MB to APK size. Each choice has cascading implications for debugging, profiling, and CI/CD.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="javascriptcore">2. JavaScriptCore (JSC)</h2>
+
+    <p>JavaScriptCore is the WebKit project's JavaScript engine. React Native originally used JSC on both platforms.</p>
+
+    <h3>2.1 iOS: System JSC</h3>
+    <p>On iOS, React Native uses the system-provided <code>JavaScriptCore.framework</code>. This has a critical implication: <strong>no JIT compilation</strong>. Apple's security model prevents third-party apps from generating executable code at runtime, so JSC runs in interpreter-only mode on iOS.</p>
+
+    <pre><code><span class="comment">// iOS JSC execution pipeline (no JIT)</span>
+<span class="comment">// Source Code → Parser → AST → Bytecode → LLInt (interpreter)</span>
+<span class="comment">//                                          ↑ stops here on iOS</span>
+<span class="comment">//</span>
+<span class="comment">// Full JSC pipeline (macOS/Android with JIT):</span>
+<span class="comment">// Source → Parser → AST → Bytecode → LLInt → Baseline JIT → DFG → FTL</span>
+<span class="comment">//                                     ↑         ↑           ↑     ↑</span>
+<span class="comment">//                                  interpret  tier 1      tier 2  tier 3</span>
+
+<span class="comment">// Performance impact:</span>
+<span class="comment">// Without JIT, hot loops are 5-10x slower than JIT-compiled code</span>
+<span class="comment">// This is why Hermes (with AOT bytecode) is faster on iOS</span></code></pre>
+
+    <h3>2.2 Android: Bundled JSC</h3>
+    <p>On Android, React Native bundles a custom build of JSC. This includes JIT compilation tiers but adds significant APK size (~3-4MB per ABI).</p>
+
+    <pre><code><span class="comment">// Android JSC characteristics:</span>
+<span class="comment">// - Full JIT pipeline available</span>
+<span class="comment">// - APK size: ~3.5MB per ABI (arm64-v8a, armeabi-v7a, x86, x86_64)</span>
+<span class="comment">// - Startup: must parse + compile JS source at runtime</span>
+<span class="comment">// - Memory: JIT code cache adds to memory footprint</span>
+<span class="comment">// - Debugging: WebKit Inspector protocol (Safari DevTools)</span>
+
+<span class="comment">// Startup timeline with JSC:</span>
+<span class="comment">// 1. Load JSC library (~50ms)</span>
+<span class="comment">// 2. Create JSC context (~10ms)</span>
+<span class="comment">// 3. Load JS bundle from disk (~30-100ms)</span>
+<span class="comment">// 4. Parse JS source (~100-500ms for large bundles)</span>
+<span class="comment">// 5. Execute top-level code (~50-200ms)</span>
+<span class="comment">// Total: ~240-860ms before first render</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="hermes">3. Hermes Engine</h2>
+
+    <p>Hermes is a JavaScript engine built by Meta specifically for React Native. Its key innovation is <strong>ahead-of-time (AOT) bytecode compilation</strong> — JavaScript is compiled to Hermes bytecode during the build step, not at runtime.</p>
+
+    <h3>3.1 Architecture</h3>
+
+    <div class="diagram">
+Hermes Compilation Pipeline
+════════════════════════════
+
+Build Time (on developer machine / CI):
+┌──────────┐    ┌──────────┐    ┌───────────┐    ┌──────────────┐
+│ JS Source │───→│  Parser  │───→│ IR (Herm  │───→│ Hermes       │
+│ (.js)     │    │          │    │  bytecode)│    │ Bytecode     │
+│           │    │          │    │           │    │ (.hbc file)  │
+└──────────┘    └──────────┘    └───────────┘    └──────────────┘
+                                                        │
+                                                        │ shipped in APK/IPA
+                                                        ▼
+Runtime (on device):
+┌──────────────┐    ┌───────────────────────────┐
+│ Hermes       │───→│ Hermes VM                 │
+│ Bytecode     │    │ - Memory-mapped execution  │
+│ (.hbc file)  │    │ - No parse step needed     │
+│              │    │ - Interpreter only (no JIT) │
+└──────────────┘    └───────────────────────────┘
+    </div>
+
+    <h3>3.2 Key Features</h3>
+
+    <pre><code><span class="comment">// Hermes-specific features and optimizations:</span>
+
+<span class="comment">// 1. Bytecode precompilation — no runtime parsing</span>
+<span class="comment">//    Build: hermes -emit-binary -out bundle.hbc bundle.js</span>
+<span class="comment">//    Result: binary bytecode ready for direct execution</span>
+
+<span class="comment">// 2. Memory-mapped bytecode loading</span>
+<span class="comment">//    Instead of reading entire file into memory:</span>
+<span class="comment">//    mmap() maps the .hbc file into virtual memory</span>
+<span class="comment">//    Pages loaded on-demand by OS virtual memory system</span>
+<span class="comment">//    Reduces RSS (Resident Set Size) significantly</span>
+
+<span class="comment">// 3. Optimized garbage collector</span>
+<span class="comment">//    GenGC: generational, moving garbage collector</span>
+<span class="comment">//    Young generation: bump-pointer allocation (fast)</span>
+<span class="comment">//    Old generation: mark-compact (reduces fragmentation)</span>
+<span class="comment">//    Incremental collection to avoid long pauses</span>
+
+<span class="comment">// 4. Lazy compilation</span>
+<span class="comment">//    Functions compiled to bytecode but not fully optimized</span>
+<span class="comment">//    until first call — reduces startup work</span>
+
+<span class="comment">// 5. ES6+ support (subset)</span>
+<span class="comment">//    Proxy: supported (required for NativeModules)</span>
+<span class="comment">//    WeakRef: supported</span>
+<span class="comment">//    Intl: partial (via hermes-engine with Intl)</span>
+<span class="comment">//    eval(): disabled by default (security + no runtime compiler)</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Critical Limitation</div>
+        <p>Hermes does not support <code>eval()</code> or <code>new Function()</code> by default because it has no runtime compiler. This breaks libraries that rely on dynamic code generation (some template engines, certain ORMs). The <code>-allow-eval</code> flag enables a basic interpreter for eval'd code, but at significant performance cost.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="v8-integration">4. V8 Integration</h2>
+
+    <p>V8 (Chrome's engine) can be used via the community <code>react-native-v8</code> package. It provides the most complete ES specification support and the Chrome DevTools Protocol for debugging.</p>
+
+    <pre><code><span class="comment">// V8 integration characteristics:</span>
+<span class="comment">// - Full JIT compilation (TurboFan optimizing compiler)</span>
+<span class="comment">// - Chrome DevTools Protocol (native Chrome debugging)</span>
+<span class="comment">// - Complete ES2023+ support</span>
+<span class="comment">// - APK size: ~7-8MB per ABI</span>
+<span class="comment">// - Higher memory usage due to JIT code cache</span>
+<span class="comment">// - Faster peak performance for compute-heavy workloads</span>
+
+<span class="comment">// V8 execution tiers:</span>
+<span class="comment">// 1. Ignition (interpreter) — fast startup</span>
+<span class="comment">// 2. Sparkplug (baseline compiler) — quick compilation</span>
+<span class="comment">// 3. Maglev (mid-tier compiler) — balanced optimization</span>
+<span class="comment">// 4. TurboFan (optimizing compiler) — peak performance</span>
+
+<span class="comment">// Trade-off: V8's JIT gives better peak perf but</span>
+<span class="comment">// worse startup time and higher memory than Hermes</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="engine-comparison">5. Engine Comparison</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Characteristic</th>
+                <th>JSC (iOS)</th>
+                <th>JSC (Android)</th>
+                <th>Hermes</th>
+                <th>V8</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>JIT Compilation</strong></td>
+                <td>No (iOS restriction)</td>
+                <td>Yes (multi-tier)</td>
+                <td>No (AOT bytecode)</td>
+                <td>Yes (TurboFan)</td>
+            </tr>
+            <tr>
+                <td><strong>Startup Time</strong></td>
+                <td>Slow (parse at runtime)</td>
+                <td>Slow (parse at runtime)</td>
+                <td>Fast (precompiled)</td>
+                <td>Medium (parse + compile)</td>
+            </tr>
+            <tr>
+                <td><strong>Peak Performance</strong></td>
+                <td>Low (interpreter only)</td>
+                <td>High (JIT)</td>
+                <td>Medium (interpreter)</td>
+                <td>Highest (TurboFan)</td>
+            </tr>
+            <tr>
+                <td><strong>Memory Usage</strong></td>
+                <td>Medium</td>
+                <td>High (JIT cache)</td>
+                <td>Low (mmap'd bytecode)</td>
+                <td>Highest (JIT cache)</td>
+            </tr>
+            <tr>
+                <td><strong>APK/IPA Size</strong></td>
+                <td>0 (system framework)</td>
+                <td>~3.5MB/ABI</td>
+                <td>~1.5MB/ABI</td>
+                <td>~7MB/ABI</td>
+            </tr>
+            <tr>
+                <td><strong>Debugging</strong></td>
+                <td>Safari DevTools</td>
+                <td>Safari DevTools</td>
+                <td>Chrome DevTools (Hermes)</td>
+                <td>Chrome DevTools (native)</td>
+            </tr>
+            <tr>
+                <td><strong>eval() Support</strong></td>
+                <td>Yes</td>
+                <td>Yes</td>
+                <td>No (default)</td>
+                <td>Yes</td>
+            </tr>
+            <tr>
+                <td><strong>Bytecode Cache</strong></td>
+                <td>No</td>
+                <td>No</td>
+                <td>Yes (AOT .hbc)</td>
+                <td>Yes (code cache)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="diagram">
+Startup Time Comparison (typical medium-sized app)
+══════════════════════════════════════════════════
+
+JSC (iOS):     ████████████████████████████████████  ~800ms
+JSC (Android): ██████████████████████████████████    ~750ms
+V8:            ████████████████████████              ~550ms
+Hermes:        ████████████████                      ~350ms
+
+Memory Usage (RSS after startup)
+════════════════════════════════
+
+JSC (iOS):     ████████████████████████  ~45MB
+JSC (Android): ██████████████████████████████  ~55MB
+V8:            ████████████████████████████████████  ~65MB
+Hermes:        ████████████████████  ~35MB
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="bytecode">6. Bytecode Precompilation</h2>
+
+    <p>Hermes's bytecode precompilation is its most important optimization. The compilation happens during the build step, eliminating runtime parsing entirely.</p>
+
+    <pre><code><span class="comment">// Hermes bytecode compilation pipeline</span>
+
+<span class="comment">// Step 1: Metro bundles JS into a single file</span>
+<span class="comment">// metro bundle → index.android.bundle (plain JS)</span>
+
+<span class="comment">// Step 2: Hermes compiler converts to bytecode</span>
+<span class="comment">// hermesc -emit-binary -out index.android.bundle.hbc index.android.bundle</span>
+
+<span class="comment">// Step 3: Bytecode file structure (.hbc format)</span>
+<span class="comment">// ┌─────────────────────────────────────┐</span>
+<span class="comment">// │ Magic Number (0x1F 0x1F)            │</span>
+<span class="comment">// │ Bytecode Version                     │</span>
+<span class="comment">// │ Source Hash (SHA1)                   │</span>
+<span class="comment">// │ Global Code Flag                     │</span>
+<span class="comment">// ├─────────────────────────────────────┤</span>
+<span class="comment">// │ Function Header Table               │</span>
+<span class="comment">// │   - offset, paramCount, frameSize   │</span>
+<span class="comment">// │   - environmentSize, nameID         │</span>
+<span class="comment">// ├─────────────────────────────────────┤</span>
+<span class="comment">// │ String Table (deduplicated)         │</span>
+<span class="comment">// ├─────────────────────────────────────┤</span>
+<span class="comment">// │ RegExp Table                        │</span>
+<span class="comment">// ├─────────────────────────────────────┤</span>
+<span class="comment">// │ Bytecode Instructions               │</span>
+<span class="comment">// │   (compact binary opcodes)          │</span>
+<span class="comment">// └─────────────────────────────────────┘</span>
+
+<span class="comment">// Runtime loading:</span>
+<span class="comment">// 1. mmap() the .hbc file (no copy into heap)</span>
+<span class="comment">// 2. Validate header (fast checksum)</span>
+<span class="comment">// 3. Begin executing global bytecode immediately</span>
+<span class="comment">// 4. Function bytecodes loaded on-demand via page faults</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="engine-init">7. Engine Initialization</h2>
+
+    <pre><code><span class="comment">// Engine initialization sequence (simplified C++ pseudocode)</span>
+
+<span class="comment">// 1. Create runtime</span>
+<span class="keyword">auto</span> runtime = facebook::hermes::makeHermesRuntime(
+  hermes::vm::RuntimeConfig::Builder()
+    .withGCConfig(GCConfig::Builder()
+      .withInitHeapSize(32 &lt;&lt; 20)   <span class="comment">// 32MB initial heap</span>
+      .withMaxHeapSize(512 &lt;&lt; 20)    <span class="comment">// 512MB max heap</span>
+      .build())
+    .withEnableSampleProfiling(<span class="keyword">true</span>)
+    .build()
+);
+
+<span class="comment">// 2. Install native bindings (global functions)</span>
+runtime->global().setProperty(
+  *runtime,
+  <span class="string">"nativeFlushQueueImmediate"</span>,
+  Function::createFromHostFunction(*runtime, ...)
+);
+
+<span class="comment">// 3. Install console, performance, timers</span>
+installGlobals(*runtime);
+
+<span class="comment">// 4. Load and execute bundle</span>
+<span class="keyword">auto</span> buffer = readBundleFile(<span class="string">"index.bundle"</span>);
+runtime->evaluateJavaScript(std::move(buffer), <span class="string">"index.bundle"</span>);</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="global-object">8. Global Object Setup</h2>
+
+    <p>React Native sets up a custom global object that differs significantly from both browser <code>window</code> and Node.js <code>global</code>.</p>
+
+    <pre><code><span class="comment">// React Native global object (accessible as `global` or `globalThis`)</span>
+<span class="comment">// Key properties injected by the runtime:</span>
+
+global.__DEV__                    <span class="comment">// boolean: development mode flag</span>
+global.__BUNDLE_START_TIME__      <span class="comment">// timestamp: when bundle started loading</span>
+global.nativeFlushQueueImmediate  <span class="comment">// function: flush bridge queue</span>
+global.nativeCallSyncHook         <span class="comment">// function: synchronous native calls (debug)</span>
+global.nativeRequire              <span class="comment">// function: load RAM bundle segments</span>
+global.performance                <span class="comment">// object: Performance API subset</span>
+global.ErrorUtils                 <span class="comment">// object: global error handler</span>
+
+<span class="comment">// NOT available (unlike browser):</span>
+<span class="comment">// window, document, navigator (partially polyfilled)</span>
+<span class="comment">// localStorage, sessionStorage</span>
+<span class="comment">// XMLHttpRequest (polyfilled by RN)</span>
+<span class="comment">// fetch (polyfilled by RN)</span>
+<span class="comment">// WebSocket (polyfilled by RN)</span>
+
+<span class="comment">// Hermes-specific globals:</span>
+global.HermesInternal             <span class="comment">// Hermes runtime info</span>
+HermesInternal.hasPromise()       <span class="comment">// true — native Promise</span>
+HermesInternal.enablePromiseRejectionTracker(...)
+
+<span class="comment">// Detecting the engine at runtime:</span>
+<span class="keyword">const</span> isHermes = () => !!global.HermesInternal;
+<span class="keyword">const</span> isV8 = () => !!global._v8runtime;
+<span class="keyword">const</span> isJSC = () => !isHermes() &amp;&amp; !isV8();</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="jsi-foundation">9. JSI: The Foundation for New Architecture</h2>
+
+    <p>The JavaScript Interface (JSI) is a C++ API that provides a thin, engine-agnostic abstraction over JavaScript runtimes. It's the foundation that enables the new architecture (Fabric, TurboModules) by allowing direct, synchronous communication between JS and native code.</p>
+
+    <pre><code><span class="comment">// JSI provides a common interface across engines:</span>
+<span class="comment">// jsi::Runtime is the abstract base class</span>
+
+<span class="keyword">class</span> <span class="type">Runtime</span> {
+  <span class="comment">// Evaluate JavaScript code</span>
+  <span class="keyword">virtual</span> Value evaluateJavaScript(
+    <span class="keyword">const</span> shared_ptr&lt;Buffer&gt;&amp; buffer,
+    <span class="keyword">const</span> string&amp; sourceURL) = 0;
+
+  <span class="comment">// Access global object</span>
+  <span class="keyword">virtual</span> Object global() = 0;
+
+  <span class="comment">// Create JS values from C++</span>
+  <span class="comment">// String, Object, Array, Function — all created via Runtime</span>
+};
+
+<span class="comment">// HostObject: expose C++ objects directly to JS</span>
+<span class="keyword">class</span> <span class="type">MyHostObject</span> : <span class="keyword">public</span> jsi::HostObject {
+  Value get(Runtime&amp; rt, <span class="keyword">const</span> PropNameID&amp; name) <span class="keyword">override</span> {
+    <span class="keyword">if</span> (name.utf8(rt) == <span class="string">"getValue"</span>) {
+      <span class="keyword">return</span> Function::createFromHostFunction(rt,
+        PropNameID::forAscii(rt, <span class="string">"getValue"</span>), 0,
+        [](Runtime&amp; rt, <span class="keyword">const</span> Value&amp; thisVal,
+           <span class="keyword">const</span> Value* args, size_t count) -> Value {
+          <span class="keyword">return</span> Value(42);  <span class="comment">// Direct return, no serialization!</span>
+        });
+    }
+    <span class="keyword">return</span> Value::undefined();
+  }
+};
+
+<span class="comment">// Install on JS global:</span>
+runtime.global().setProperty(runtime, <span class="string">"myObject"</span>,
+  Object::createFromHostObject(runtime,
+    make_shared&lt;MyHostObject&gt;()));</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>JSI is the single most important architectural change in React Native's history. By providing a C++ abstraction over the JS runtime, it enables: (1) synchronous JS↔native calls without serialization, (2) shared memory between JS and C++ via HostObjects, (3) engine-agnostic native modules (TurboModules), and (4) C++ rendering (Fabric). The bridge becomes optional — JSI replaces it with direct function calls.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="polyfills">10. Polyfills and Environment Differences</h2>
+
+    <p>React Native polyfills several Web APIs to provide a familiar development experience, but the implementations differ from browser versions in important ways.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>API</th>
+                <th>Browser</th>
+                <th>React Native</th>
+                <th>Key Difference</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>fetch</code></td>
+                <td>Native browser API</td>
+                <td>Polyfill over native HTTP</td>
+                <td>Goes through native networking stack; no CORS</td>
+            </tr>
+            <tr>
+                <td><code>XMLHttpRequest</code></td>
+                <td>Native browser API</td>
+                <td>Polyfill over native HTTP</td>
+                <td>Bridge-based; progress events cross bridge</td>
+            </tr>
+            <tr>
+                <td><code>WebSocket</code></td>
+                <td>Native browser API</td>
+                <td>Polyfill over native WS</td>
+                <td>Native socket; messages cross bridge</td>
+            </tr>
+            <tr>
+                <td><code>setTimeout</code></td>
+                <td>Browser timer</td>
+                <td>Native timer module</td>
+                <td>Timer fires on native, callback on JS thread</td>
+            </tr>
+            <tr>
+                <td><code>console.log</code></td>
+                <td>Browser console</td>
+                <td>Bridges to native logger</td>
+                <td>Serializes args across bridge; expensive for objects</td>
+            </tr>
+            <tr>
+                <td><code>requestAnimationFrame</code></td>
+                <td>Tied to display refresh</td>
+                <td>Tied to Choreographer/CADisplayLink</td>
+                <td>Callback runs on JS thread, not UI thread</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Common gotchas with RN polyfills:</span>
+
+<span class="comment">// 1. console.log is expensive — serializes across bridge</span>
+console.log(largeObject);  <span class="comment">// Serializes entire object to JSON for native logger</span>
+<span class="comment">// In production: strip console.* calls via babel plugin</span>
+
+<span class="comment">// 2. setTimeout minimum resolution differs</span>
+setTimeout(fn, 0);  <span class="comment">// Browser: ~4ms, RN: depends on bridge flush cycle (~5ms)</span>
+
+<span class="comment">// 3. fetch has no CORS (no browser security sandbox)</span>
+fetch(<span class="string">'https://api.example.com/data'</span>);  <span class="comment">// No preflight needed</span>
+
+<span class="comment">// 4. No DOM APIs at all</span>
+document.getElementById(<span class="string">'foo'</span>);  <span class="comment">// ❌ ReferenceError</span>
+window.addEventListener(<span class="string">'resize'</span>, fn);  <span class="comment">// ❌ ReferenceError</span>
+
+<span class="comment">// 5. TextEncoder/TextDecoder may not be available</span>
+<span class="keyword">new</span> TextEncoder().encode(<span class="string">'hello'</span>);  <span class="comment">// ❌ on older Hermes versions</span>
+
+<span class="comment">// 6. Intl support varies by engine</span>
+<span class="keyword">new</span> Intl.NumberFormat(<span class="string">'en-US'</span>).format(1234);  <span class="comment">// May need hermes + intl build</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">11. Architect Considerations</h2>
+
+    <h3>11.1 Engine Selection Decision Matrix</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Priority</th>
+                <th>Best Engine</th>
+                <th>Rationale</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Fastest startup</td>
+                <td>Hermes</td>
+                <td>AOT bytecode eliminates parse time</td>
+            </tr>
+            <tr>
+                <td>Lowest memory</td>
+                <td>Hermes</td>
+                <td>mmap'd bytecode, no JIT cache</td>
+            </tr>
+            <tr>
+                <td>Peak compute perf</td>
+                <td>V8</td>
+                <td>TurboFan JIT produces fastest code</td>
+            </tr>
+            <tr>
+                <td>Smallest binary</td>
+                <td>JSC (iOS) / Hermes</td>
+                <td>System JSC is free; Hermes is ~1.5MB</td>
+            </tr>
+            <tr>
+                <td>Best debugging</td>
+                <td>V8 / Hermes</td>
+                <td>Chrome DevTools protocol</td>
+            </tr>
+            <tr>
+                <td>Full ES spec</td>
+                <td>V8</td>
+                <td>Most complete and up-to-date</td>
+            </tr>
+            <tr>
+                <td>New architecture</td>
+                <td>Hermes</td>
+                <td>Best JSI integration, co-developed with RN</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>The JS engine is the foundation of your React Native app's performance profile. Hermes is the right default for most apps because it optimizes for what matters most on mobile: startup time and memory. But understanding <em>why</em> is what separates L6 from L5. Hermes trades peak throughput (no JIT) for predictable, fast startup (AOT bytecode + mmap). This is the correct trade-off for mobile because: (1) users perceive startup latency directly, (2) mobile memory is constrained, and (3) most RN apps are I/O-bound (network, storage), not compute-bound. If your app does heavy computation (ML inference, complex calculations), V8's JIT may be worth the startup and memory cost.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="01-bridge-architecture.html">← Bridge Architecture</a>
+        <a href="03-native-module-system.html">Next: Native Module System →</a>
+    </div>
+</div>
+</body>
+</html>

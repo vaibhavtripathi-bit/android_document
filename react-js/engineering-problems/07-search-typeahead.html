@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Search Typeahead — Engineering Problems</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Engineering Problems</a>
+  <span class="sep">›</span>
+  Search Typeahead
+</nav>
+
+<h1>Building Search Typeahead at Scale</h1>
+<p class="subtitle">Debouncing, cancellation, caching, keyboard UX, accessibility, highlighting, recents, trending, and rate limits—end to end.</p>
+
+<div class="callout-architect">
+  <div class="callout-title">Staff takeaway</div>
+  <p>Typeahead is a distributed systems problem in miniature: stale responses, thundering herds, and accessibility state machines all collide in one input. The production solution is explicit about <em>ordering</em>, <em>cancellation</em>, and <em>announcements</em>.</p>
+</div>
+
+<h2>Debouncing vs throttling</h2>
+<p><strong>Debounce</strong> waits for a pause in input; ideal when each keystroke would otherwise trigger an expensive query. <strong>Throttle</strong> enforces a maximum rate regardless of burstiness; better for scroll or resize, rarely primary for search unless you cap server QPS.</p>
+
+<div class="diagram">DEBOUNCE (wait 300ms after last key)
+Keys:  r ─ e ─ a ─ c ─ t
+       │   │   │   │   └─── fire ──► request("react")
+       └───┴───┴───┴──────── (earlier chars never fire)
+
+THROTTLE (max 1 call / 300ms wall clock)
+Keys:  r ─ e ─ a ─ c ─ t
+       ▼       ▼       ▼
+     req("r") skip   skip   req("react")  ← may skip intermediate states</div>
+
+<table>
+  <thead>
+    <tr>
+      <th>Technique</th>
+      <th>Server load</th>
+      <th>Perceived latency</th>
+      <th>Stale risk</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Debounce 200–400ms</td>
+      <td>Low</td>
+      <td>Slight delay after typing stops</td>
+      <td>Lower (fewer in-flight)</td>
+    </tr>
+    <tr>
+      <td>Throttle</td>
+      <td>Bounded</td>
+      <td>More intermediate results</td>
+      <td>Higher cancellation need</td>
+    </tr>
+    <tr>
+      <td>Leading debounce</td>
+      <td>Medium</td>
+      <td>Snappier first char</td>
+      <td>Needs merge with trailing</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout-info">
+  <div class="callout-title">Hybrid pattern</div>
+  <p>Use a short leading request for the first character (instant feedback) and debounce subsequent edits, or debounce + prefetch on focus for empty-query defaults.</p>
+</div>
+
+<h2>Request cancellation with AbortController</h2>
+<p>Network latency is non-deterministic: response for <code>"rea"</code> may arrive after <code>"react"</code>. Abort previous fetches when the query changes; ignore payloads that match an aborted signal.</p>
+
+<h2>LRU cache for queries</h2>
+<p>Cache normalized query strings to keys; cap entries (e.g., 100) and evict LRU. Store both results and <em>negative</em> cache entries for empty results to avoid hammering the backend.</p>
+
+<div class="callout-warning">
+  <div class="callout-title">PII in localStorage</div>
+  <p>Recent searches may contain health, financial, or personal strings. Offer clear-user-data, encrypt at rest if required, or keep recents server-side with consent.</p>
+</div>
+
+<h2>Accessibility: ARIA combobox</h2>
+<p>Follow the WAI-ARIA combobox pattern: input has <code>role="combobox"</code>, <code>aria-expanded</code>, <code>aria-controls</code> pointing to listbox, <code>aria-activedescendant</code> for virtual focus. Announce result counts with a polite live region.</p>
+
+<h2>Production typeahead component (TypeScript + React)</h2>
+<pre><code>// Typeahead.tsx — single-file production-shaped example
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ChangeEvent,
+} from 'react';
+
+type Suggestion = { id: string; label: string };
+
+const RECENTS_KEY = 'typeahead:recents:v1';
+const MAX_RECENTS = 8;
+const CACHE_CAP = 128;
+
+class LruCache&lt;K, V&gt; {
+  private map = new Map&lt;K, V&gt;();
+  constructor(private cap: number) {}
+  get(k: K) {
+    if (!this.map.has(k)) return undefined;
+    const v = this.map.get(k)!;
+    this.map.delete(k);
+    this.map.set(k, v);
+    return v;
+  }
+  set(k: K, v: V) {
+    if (this.map.has(k)) this.map.delete(k);
+    this.map.set(k, v);
+    if (this.map.size &gt; this.cap) {
+      const first = this.map.keys().next().value;
+      this.map.delete(first);
+    }
+  }
+}
+
+function normalize(q: string) {
+  return q.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function loadRecents(): string[] {
+  try {
+    const raw = localStorage.getItem(RECENTS_KEY);
+    return raw ? (JSON.parse(raw) as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveRecents(items: string[]) {
+  localStorage.setItem(RECENTS_KEY, JSON.stringify(items.slice(0, MAX_RECENTS)));
+}
+
+function highlight(label: string, q: string) {
+  const n = normalize(q);
+  if (!n) return label;
+  const idx = label.toLowerCase().indexOf(n);
+  if (idx &lt; 0) return label;
+  const before = label.slice(0, idx);
+  const match = label.slice(idx, idx + n.length);
+  const after = label.slice(idx + n.length);
+  return (
+    &lt;&gt;
+      {before}
+      &lt;strong&gt;{match}&lt;/strong&gt;
+      {after}
+    &lt;/&gt;
+  );
+}
+
+async function fetchSuggestions(query: string, signal: AbortSignal): Promise&lt;Suggestion[]&gt; {
+  const url = `/api/search/suggest?q=${encodeURIComponent(query)}`;
+  const res = await fetch(url, { signal, headers: { Accept: 'application/json' } });
+  if (!res.ok) throw new Error(String(res.status));
+  return res.json();
+}
+
+export function Typeahead({
+  trending,
+}: {
+  trending: Suggestion[];
+}) {
+  const listId = useId();
+  const statusId = useId();
+  const [value, setValue] = useState('');
+  const [open, setOpen] = useState(false);
+  const [activeIdx, setActiveIdx] = useState(-1);
+  const [loading, setLoading] = useState(false);
+  const [items, setItems] = useState&lt;Suggestion[]&gt;([]);
+  const [announce, setAnnounce] = useState('');
+
+  const cache = useMemo(() =&gt; new LruCache&lt;string, Suggestion[]&gt;(CACHE_CAP), []);
+  const abortRef = useRef&lt;AbortController | null&gt;(null);
+  const debounceRef = useRef&lt;number | null&gt;(null);
+  const seqRef = useRef(0);
+
+  const runQuery = useCallback(
+    async (q: string) =&gt; {
+      const key = normalize(q);
+      if (!key) {
+        setItems(trending);
+        setAnnounce(`${trending.length} trending suggestions`);
+        return;
+      }
+      const hit = cache.get(key);
+      if (hit) {
+        setItems(hit);
+        setAnnounce(`${hit.length} results for ${q}`);
+        return;
+      }
+      abortRef.current?.abort();
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
+      const mySeq = ++seqRef.current;
+      setLoading(true);
+      try {
+        const data = await fetchSuggestions(key, ctrl.signal);
+        if (mySeq !== seqRef.current) return;
+        cache.set(key, data);
+        setItems(data);
+        setAnnounce(`${data.length} results for ${q}`);
+      } catch (e) {
+        if ((e as Error).name === 'AbortError') return;
+        setItems([]);
+        setAnnounce('Search failed');
+      } finally {
+        if (mySeq === seqRef.current) setLoading(false);
+      }
+    },
+    [cache, trending],
+  );
+
+  const schedule = useCallback(
+    (q: string) =&gt; {
+      if (debounceRef.current) window.clearTimeout(debounceRef.current);
+      debounceRef.current = window.setTimeout(() =&gt; runQuery(q), 280);
+    },
+    [runQuery],
+  );
+
+  useEffect(() =&gt; () =&gt; {
+    if (debounceRef.current) window.clearTimeout(debounceRef.current);
+    abortRef.current?.abort();
+  }, []);
+
+  function onChange(e: ChangeEvent&lt;HTMLInputElement&gt;) {
+    const q = e.target.value;
+    setValue(q);
+    setOpen(true);
+    setActiveIdx(-1);
+    schedule(q);
+  }
+
+  function commitSelection(label: string) {
+    setValue(label);
+    setOpen(false);
+    const rec = [label, ...loadRecents().filter((x) =&gt; x !== label)];
+    saveRecents(rec);
+    setAnnounce(`Selected ${label}`);
+  }
+
+  function onKeyDown(e: KeyboardEvent&lt;HTMLInputElement&gt;) {
+    if (!open) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setActiveIdx((i) =&gt; Math.min(items.length - 1, i + 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setActiveIdx((i) =&gt; Math.max(0, i - 1));
+    } else if (e.key === 'Enter' &amp;&amp; activeIdx &gt;= 0) {
+      e.preventDefault();
+      commitSelection(items[activeIdx].label);
+    } else if (e.key === 'Escape') {
+      setOpen(false);
+    }
+  }
+
+  return (
+    &lt;div className="typeahead"&gt;
+      &lt;label htmlFor="typeahead-input"&gt;Search&lt;/label&gt;
+      &lt;input
+        id="typeahead-input"
+        role="combobox"
+        aria-expanded={open}
+        aria-controls={listId}
+        aria-activedescendant={activeIdx &gt;= 0 ? `${listId}-opt-${items[activeIdx].id}` : undefined}
+        aria-autocomplete="list"
+        value={value}
+        onChange={onChange}
+        onKeyDown={onKeyDown}
+        onFocus={() =&gt; {
+          setOpen(true);
+          if (!value) runQuery('');
+        }}
+        onBlur={() =&gt; setTimeout(() =&gt; setOpen(false), 120)}
+      /&gt;
+      &lt;div id={statusId} role="status" aria-live="polite" className="sr-only"&gt;
+        {announce}
+        {loading ? ' Loading.' : ''}
+      &lt;/div&gt;
+      {open &amp;&amp; (
+        &lt;ul id={listId} role="listbox" className="typeahead-list"&gt;
+          {items.map((s, idx) =&gt; (
+            &lt;li
+              key={s.id}
+              id={`${listId}-opt-${s.id}`}
+              role="option"
+              aria-selected={idx === activeIdx}
+              onMouseDown={(ev) =&gt; ev.preventDefault()}
+              onClick={() =&gt; commitSelection(s.label)}
+            &gt;
+              {highlight(s.label, value)}
+            &lt;/li&gt;
+          ))}
+        &lt;/ul&gt;
+      )}
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<h2>Keyboard navigation summary</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Key</th>
+      <th>Behavior</th>
+      <th>Implementation note</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>↓ / ↑</td>
+      <td>Move active option</td>
+      <td>Clamp index; skip hidden/disabled</td>
+    </tr>
+    <tr>
+      <td>Enter</td>
+      <td>Commit active or best match</td>
+      <td>Prevent form submit if dropdown open</td>
+    </tr>
+    <tr>
+      <td>Esc</td>
+      <td>Close list</td>
+      <td>Restore focus to input</td>
+    </tr>
+    <tr>
+      <td>Tab</td>
+      <td>Leave field</td>
+      <td>Close on blur with small delay for click</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Recent searches and trending</h2>
+<p>Recents are client-persisted strings shown when the query is empty. Trending should be fetched once (or edge-cached) as a static JSON blob to avoid coupling hot paths to OLTP.</p>
+
+<h2>Rate limiting</h2>
+<ul>
+  <li><strong>Client-side</strong> — debounce + max concurrent requests (1) + exponential backoff on 429; jitter to prevent synchronized retries.</li>
+  <li><strong>Server-side</strong> — token bucket per IP + per API key; separate budgets for authenticated users; optionally edge rate limits on CDN.</li>
+</ul>
+
+<pre><code>// client backoff sketch
+async function fetchWithBackoff(url: string, init: RequestInit, attempt = 0): Promise&lt;Response&gt; {
+  const res = await fetch(url, init);
+  if (res.status === 429 &amp;&amp; attempt &lt; 4) {
+    const ra = Number(res.headers.get('Retry-After')) || 2 ** attempt;
+    await new Promise((r) =&gt; setTimeout(r, ra * 1000 + Math.random() * 250));
+    return fetchWithBackoff(url, init, attempt + 1);
+  }
+  return res;
+}</code></pre>
+
+<div class="callout-architect">
+  <div class="callout-title">Observability</div>
+  <p>Log client-side <code>suggest_latency_ms</code>, <code>cache_hit</code>, <code>aborted</code>, and server-side <code>qps</code> per tenant. Alert on p95 latency inflation and rising 429 rates—often the first sign of a bad deploy or bot traffic.</p>
+</div>
+
+<h2>Comparison: client strategies</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Strategy</th>
+      <th>Pros</th>
+      <th>Cons</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Debounced fetch</td>
+      <td>Simple, low QPS</td>
+      <td>Feels sluggish if delay too high</td>
+    </tr>
+    <tr>
+      <td>Prefetch + cache</td>
+      <td>Instant for repeats</td>
+      <td>Memory + stale data policy</td>
+    </tr>
+    <tr>
+      <td>Web Worker ranking</td>
+      <td>Off main thread</td>
+      <td>Complexity for marginal win</td>
+    </tr>
+    <tr>
+      <td>Edge suggest (CDN)</td>
+      <td>Global low latency</td>
+      <td>Invalidation harder</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 class="qa-section">Deep-dive Q&amp;A</h2>
+
+<div class="qa-item">
+  <div class="qa-question">Why blur + setTimeout for closing the list? <span class="level tag tag-senior">Senior</span></div>
+  <div class="qa-answer">
+    <p>Clicking an option fires blur on the input before click handlers run. A short timeout lets mousedown preventDefault on the option preserve selection; alternatively use focusin/focusout with relatedTarget checks.</p>
+  </div>
+</div>
+
+<div class="qa-item">
+  <div class="qa-question">How do you handle multilingual tokenization? <span class="level tag tag-l6">L6</span></div>
+  <div class="qa-answer">
+    <p>Highlighting on raw substring breaks for composed scripts and diacritics. Prefer server-returned match ranges or ICU-based normalization on both ends; never rely on naive <code>toLowerCase()</code> for Turkish “I” issues in global products.</p>
+  </div>
+</div>
+
+<div class="qa-item">
+  <div class="qa-question">Should suggestions be virtualized? <span class="level tag tag-architect">Arch</span></div>
+  <div class="qa-answer">
+    <p>For &lt;200 items, DOM lists are fine. For huge catalogs, virtualize and ensure aria-activedescendant still points to stable IDs; test with screen readers.</p>
+  </div>
+</div>
+
+<nav class="nav-footer">
+  <a href="06-micro-frontend-migration.html">← Prev: Micro-Frontend Migration</a>
+  <a href="08-image-gallery-optimization.html">Next: Image Gallery Optimization →</a>
+</nav>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

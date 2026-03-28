@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secure Storage — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Security &amp; Storage</a><span class="sep">›</span>
+        Secure Storage
+    </nav>
+
+    <h1>Secure Storage</h1>
+    <p class="subtitle">Platform-native secure storage primitives — Keychain, Keystore, Secure Enclave, StrongBox — and how React Native bridges to them. Understanding hardware-backed security guarantees is essential for Staff-level mobile architecture.</p>
+
+    <nav class="nav">
+        <span class="label">Series 11:</span>
+        <span class="current">01 Secure Storage</span>
+        <a href="02-network-security.html">02 Network Security</a>
+        <a href="03-code-protection.html">03 Code Protection</a>
+        <a href="04-authentication.html">04 Authentication</a>
+        <a href="05-data-protection.html">05 Data Protection</a>
+        <a href="06-dependency-security.html">06 Dependency Security</a>
+        <a href="07-app-store-security.html">07 App Store Security</a>
+        <a href="08-interview-qa.html">08 Interview Q&amp;A</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#storage-landscape">1. Storage Landscape in React Native</a></li>
+            <li><a href="#keychain-ios">2. iOS Keychain Services</a></li>
+            <li><a href="#keystore-android">3. Android Keystore System</a></li>
+            <li><a href="#react-native-keychain">4. react-native-keychain Bridge</a></li>
+            <li><a href="#encrypted-async-storage">5. Encrypted AsyncStorage</a></li>
+            <li><a href="#mmkv-encryption">6. MMKV with Encryption</a></li>
+            <li><a href="#biometric-storage">7. Biometric-Protected Storage</a></li>
+            <li><a href="#secure-enclave">8. Secure Enclave &amp; StrongBox</a></li>
+            <li><a href="#data-protection-classes">9. iOS Data Protection Classes</a></li>
+            <li><a href="#encrypted-databases">10. Encrypted Databases (SQLCipher)</a></li>
+            <li><a href="#comparison">11. Storage Security Comparison</a></li>
+            <li><a href="#architect">12. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="storage-landscape">1. Storage Landscape in React Native</h2>
+
+    <p>React Native applications have access to multiple storage mechanisms, each with different security guarantees. The critical distinction is between <strong>general-purpose storage</strong> (AsyncStorage, MMKV, SQLite) and <strong>credential storage</strong> (Keychain, Keystore). A Staff engineer must understand that these are fundamentally different systems with different threat models.</p>
+
+    <div class="diagram">
+Storage Security Hierarchy in React Native
+═══════════════════════════════════════════
+
+  HIGHEST SECURITY
+  ┌─────────────────────────────────────────────┐
+  │  Secure Enclave / StrongBox                 │
+  │  Hardware-isolated key storage              │
+  │  Keys never leave secure processor          │
+  ├─────────────────────────────────────────────┤
+  │  Keychain (iOS) / Keystore (Android)        │
+  │  OS-managed credential storage              │
+  │  Hardware-backed on modern devices          │
+  ├─────────────────────────────────────────────┤
+  │  Encrypted MMKV / Encrypted AsyncStorage    │
+  │  App-level encryption with key in Keychain  │
+  ├─────────────────────────────────────────────┤
+  │  SQLCipher (Encrypted SQLite)               │
+  │  Database-level AES-256 encryption          │
+  ├─────────────────────────────────────────────┤
+  │  Plain AsyncStorage / MMKV / SQLite         │
+  │  No encryption — plaintext on disk          │
+  └─────────────────────────────────────────────┘
+  LOWEST SECURITY
+    </div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Critical Misconception</div>
+        <p>AsyncStorage stores data as <strong>plaintext</strong> in SQLite (Android) or plist files (iOS). On a rooted/jailbroken device, or via a device backup, this data is trivially readable. Never store tokens, passwords, or PII in plain AsyncStorage.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="keychain-ios">2. iOS Keychain Services</h2>
+
+    <p>The iOS Keychain is a system-level encrypted database managed by the <code>securityd</code> daemon. It uses AES-256-GCM encryption with keys derived from the device's hardware UID and the user's passcode. Keychain items are stored in a SQLite database at <code>/var/Keychains/keychain-2.db</code>, encrypted with a class key hierarchy.</p>
+
+    <h3>2.1 Keychain Architecture</h3>
+
+    <div class="diagram">
+iOS Keychain Key Hierarchy
+══════════════════════════
+
+  Device Hardware UID (burned into Secure Enclave)
+         │
+         ▼
+  ┌──────────────┐     ┌──────────────┐
+  │  Device Key   │     │ Passcode Key │
+  └──────┬───────┘     └──────┬───────┘
+         │                     │
+         ▼                     ▼
+  ┌──────────────────────────────────┐
+  │       Class Key (per access      │
+  │       control level)             │
+  └──────────────┬───────────────────┘
+                 │
+                 ▼
+  ┌──────────────────────────────────┐
+  │       Per-Item Key               │
+  │  (wraps individual keychain item)│
+  └──────────────────────────────────┘
+    </div>
+
+    <h3>2.2 Keychain Access Groups</h3>
+
+    <p>Keychain items are scoped by <strong>access groups</strong>, which control sharing between apps. The default access group is the app's bundle identifier. Apps in the same team can share keychain items via a shared access group defined in entitlements.</p>
+
+    <pre><code><span class="comment">// Keychain access group configuration (Xcode entitlements)</span>
+<span class="comment">// com.apple.security.application-groups</span>
+<span class="comment">// $(AppIdentifierPrefix)com.company.shared</span>
+
+<span class="comment">// In React Native via react-native-keychain:</span>
+<span class="keyword">import</span> * <span class="keyword">as</span> Keychain <span class="keyword">from</span> <span class="string">'react-native-keychain'</span>;
+
+<span class="keyword">await</span> Keychain.<span class="func">setGenericPassword</span>(<span class="string">'user'</span>, <span class="string">'token_value'</span>, {
+  accessGroup: <span class="string">'$(AppIdentifierPrefix)com.company.shared'</span>,
+  service: <span class="string">'com.company.auth'</span>,
+});</code></pre>
+
+    <h3>2.3 Keychain Accessibility Levels</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Accessibility Constant</th>
+                <th>Available When</th>
+                <th>Persists Backup</th>
+                <th>Use Case</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>kSecAttrAccessibleWhenUnlocked</code></td>
+                <td>Device unlocked</td>
+                <td>Yes</td>
+                <td>Default — auth tokens</td>
+            </tr>
+            <tr>
+                <td><code>kSecAttrAccessibleAfterFirstUnlock</code></td>
+                <td>After first unlock</td>
+                <td>Yes</td>
+                <td>Background refresh tokens</td>
+            </tr>
+            <tr>
+                <td><code>kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly</code></td>
+                <td>Passcode set, unlocked</td>
+                <td>No</td>
+                <td>High-security credentials</td>
+            </tr>
+            <tr>
+                <td><code>kSecAttrAccessibleAlways</code></td>
+                <td>Always (deprecated)</td>
+                <td>Yes</td>
+                <td>Avoid — insecure</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>The <code>ThisDeviceOnly</code> variants prevent keychain items from being included in device backups (iCloud or iTunes). For tokens that should not survive device migration, always use <code>ThisDeviceOnly</code>. This is a common L6 interview question — "What happens to keychain items when a user restores a backup to a new device?"</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="keystore-android">3. Android Keystore System</h2>
+
+    <p>The Android Keystore system provides a container for cryptographic keys that are bound to the device's hardware security module (TEE or StrongBox). Unlike iOS Keychain, Android Keystore stores <strong>keys</strong> rather than arbitrary credentials — you generate or import keys, then use them to encrypt/decrypt data stored elsewhere.</p>
+
+    <h3>3.1 Keystore Architecture</h3>
+
+    <div class="diagram">
+Android Keystore Architecture
+═════════════════════════════
+
+  ┌─────────────────────────────────────────┐
+  │            Application Layer            │
+  │  KeyStore API / Cipher / KeyGenerator   │
+  └──────────────────┬──────────────────────┘
+                     │
+  ┌──────────────────▼──────────────────────┐
+  │          Keystore Daemon                │
+  │  (keystore2 service — Android 12+)      │
+  └──────────────────┬──────────────────────┘
+                     │
+  ┌──────────────────▼──────────────────────┐
+  │     Hardware Abstraction Layer (HAL)    │
+  │     KeyMint (Android 12+) / Keymaster  │
+  └──────────────────┬──────────────────────┘
+                     │
+  ┌──────────────────▼──────────────────────┐
+  │  Trusted Execution Environment (TEE)   │
+  │  or StrongBox Secure Element           │
+  │  Keys never leave this boundary        │
+  └─────────────────────────────────────────┘
+    </div>
+
+    <h3>3.2 Key Properties</h3>
+
+    <pre><code><span class="comment">// Android Keystore key generation (Java/Kotlin — underlying native code)</span>
+<span class="keyword">val</span> keyGenerator = KeyGenerator.<span class="func">getInstance</span>(
+    KeyProperties.KEY_ALGORITHM_AES, <span class="string">"AndroidKeyStore"</span>
+)
+
+keyGenerator.<span class="func">init</span>(
+    KeyGenParameterSpec.<span class="func">Builder</span>(
+        <span class="string">"my_key_alias"</span>,
+        KeyProperties.PURPOSE_ENCRYPT <span class="keyword">or</span> KeyProperties.PURPOSE_DECRYPT
+    )
+    .<span class="func">setBlockModes</span>(KeyProperties.BLOCK_MODE_GCM)
+    .<span class="func">setEncryptionPaddings</span>(KeyProperties.ENCRYPTION_PADDING_NONE)
+    .<span class="func">setKeySize</span>(<span class="number">256</span>)
+    .<span class="func">setUserAuthenticationRequired</span>(<span class="keyword">true</span>)
+    .<span class="func">setUserAuthenticationValidityDurationSeconds</span>(<span class="number">30</span>)
+    .<span class="func">setIsStrongBoxBacked</span>(<span class="keyword">true</span>) <span class="comment">// Requires StrongBox hardware</span>
+    .<span class="func">build</span>()
+)
+
+<span class="keyword">val</span> secretKey = keyGenerator.<span class="func">generateKey</span>()</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="react-native-keychain">4. react-native-keychain Bridge</h2>
+
+    <p><code>react-native-keychain</code> is the standard library for bridging to platform-native credential storage. It abstracts Keychain (iOS) and Keystore-backed EncryptedSharedPreferences (Android) behind a unified API.</p>
+
+    <h3>4.1 Core API</h3>
+
+    <pre><code><span class="keyword">import</span> * <span class="keyword">as</span> Keychain <span class="keyword">from</span> <span class="string">'react-native-keychain'</span>;
+
+<span class="comment">// Store credentials</span>
+<span class="keyword">await</span> Keychain.<span class="func">setGenericPassword</span>(<span class="string">'username'</span>, <span class="string">'access_token_here'</span>, {
+  accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+  accessControl: Keychain.ACCESS_CONTROL.BIOMETRY_CURRENT_SET,
+  securityLevel: Keychain.SECURITY_LEVEL.SECURE_HARDWARE,
+  storage: Keychain.STORAGE_TYPE.AES,
+  service: <span class="string">'com.myapp.auth'</span>,
+});
+
+<span class="comment">// Retrieve credentials</span>
+<span class="keyword">const</span> credentials = <span class="keyword">await</span> Keychain.<span class="func">getGenericPassword</span>({
+  service: <span class="string">'com.myapp.auth'</span>,
+  authenticationPrompt: {
+    title: <span class="string">'Authenticate to access credentials'</span>,
+    cancel: <span class="string">'Cancel'</span>,
+  },
+});
+
+<span class="keyword">if</span> (credentials) {
+  console.<span class="func">log</span>(<span class="string">'Token:'</span>, credentials.password);
+}
+
+<span class="comment">// Check supported biometry type</span>
+<span class="keyword">const</span> biometryType = <span class="keyword">await</span> Keychain.<span class="func">getSupportedBiometryType</span>();
+<span class="comment">// Returns: 'FaceID' | 'TouchID' | 'Fingerprint' | 'Face' | 'Iris' | null</span>
+
+<span class="comment">// Reset credentials</span>
+<span class="keyword">await</span> Keychain.<span class="func">resetGenericPassword</span>({ service: <span class="string">'com.myapp.auth'</span> });</code></pre>
+
+    <h3>4.2 Android Storage Types</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Storage Type</th>
+                <th>Mechanism</th>
+                <th>Min API</th>
+                <th>Security Level</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>AES</code></td>
+                <td>AES encryption with Keystore-managed key</td>
+                <td>API 23+</td>
+                <td>Hardware-backed</td>
+            </tr>
+            <tr>
+                <td><code>RSA</code></td>
+                <td>RSA encryption (legacy, for API &lt; 23)</td>
+                <td>API 18+</td>
+                <td>Software/TEE</td>
+            </tr>
+            <tr>
+                <td><code>FB</code></td>
+                <td>Facebook Conceal (deprecated)</td>
+                <td>API 16+</td>
+                <td>Software only</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="encrypted-async-storage">5. Encrypted AsyncStorage</h2>
+
+    <p>For bulk data that needs encryption but doesn't fit the credential model, encrypted wrappers around AsyncStorage provide a middle ground. The pattern is: store the encryption key in Keychain/Keystore, encrypt data before writing to AsyncStorage.</p>
+
+    <pre><code><span class="keyword">import</span> AsyncStorage <span class="keyword">from</span> <span class="string">'@react-native-async-storage/async-storage'</span>;
+<span class="keyword">import</span> * <span class="keyword">as</span> Keychain <span class="keyword">from</span> <span class="string">'react-native-keychain'</span>;
+<span class="keyword">import</span> CryptoJS <span class="keyword">from</span> <span class="string">'crypto-js'</span>;
+
+<span class="keyword">class</span> <span class="type">EncryptedStorage</span> {
+  <span class="keyword">private</span> encryptionKey: <span class="type">string</span> | <span class="keyword">null</span> = <span class="keyword">null</span>;
+
+  <span class="keyword">async</span> <span class="func">initialize</span>(): <span class="type">Promise</span>&lt;<span class="keyword">void</span>&gt; {
+    <span class="keyword">const</span> creds = <span class="keyword">await</span> Keychain.<span class="func">getGenericPassword</span>({
+      service: <span class="string">'com.myapp.storage-key'</span>,
+    });
+
+    <span class="keyword">if</span> (creds) {
+      <span class="keyword">this</span>.encryptionKey = creds.password;
+    } <span class="keyword">else</span> {
+      <span class="keyword">this</span>.encryptionKey = CryptoJS.lib.WordArray.<span class="func">random</span>(<span class="number">256</span> / <span class="number">8</span>).<span class="func">toString</span>();
+      <span class="keyword">await</span> Keychain.<span class="func">setGenericPassword</span>(<span class="string">'storage'</span>, <span class="keyword">this</span>.encryptionKey, {
+        service: <span class="string">'com.myapp.storage-key'</span>,
+        accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+      });
+    }
+  }
+
+  <span class="keyword">async</span> <span class="func">setItem</span>(key: <span class="type">string</span>, value: <span class="type">string</span>): <span class="type">Promise</span>&lt;<span class="keyword">void</span>&gt; {
+    <span class="keyword">const</span> encrypted = CryptoJS.AES.<span class="func">encrypt</span>(value, <span class="keyword">this</span>.encryptionKey!).<span class="func">toString</span>();
+    <span class="keyword">await</span> AsyncStorage.<span class="func">setItem</span>(key, encrypted);
+  }
+
+  <span class="keyword">async</span> <span class="func">getItem</span>(key: <span class="type">string</span>): <span class="type">Promise</span>&lt;<span class="type">string</span> | <span class="keyword">null</span>&gt; {
+    <span class="keyword">const</span> encrypted = <span class="keyword">await</span> AsyncStorage.<span class="func">getItem</span>(key);
+    <span class="keyword">if</span> (!encrypted) <span class="keyword">return</span> <span class="keyword">null</span>;
+    <span class="keyword">return</span> CryptoJS.AES.<span class="func">decrypt</span>(encrypted, <span class="keyword">this</span>.encryptionKey!)
+      .<span class="func">toString</span>(CryptoJS.enc.Utf8);
+  }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Warning: CryptoJS Limitations</div>
+        <p>CryptoJS is a pure-JS implementation — it's slow and not audited for mobile use. For production, prefer <code>react-native-quick-crypto</code> (OpenSSL bindings via JSI) or platform-native encryption through a native module. CryptoJS also lacks streaming support, making it unsuitable for large payloads.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="mmkv-encryption">6. MMKV with Encryption</h2>
+
+    <p>MMKV (from WeChat/Tencent) supports AES-128 CFB encryption natively. When used via <code>react-native-mmkv</code>, encryption is handled in C++ with no JS-side crypto overhead. The encryption key should still be stored in Keychain/Keystore.</p>
+
+    <pre><code><span class="keyword">import</span> { MMKV } <span class="keyword">from</span> <span class="string">'react-native-mmkv'</span>;
+
+<span class="comment">// Create encrypted MMKV instance</span>
+<span class="keyword">const</span> secureStorage = <span class="keyword">new</span> <span class="type">MMKV</span>({
+  id: <span class="string">'secure-storage'</span>,
+  encryptionKey: <span class="string">'key-from-keychain'</span>, <span class="comment">// Retrieved from Keychain at startup</span>
+});
+
+secureStorage.<span class="func">set</span>(<span class="string">'user.token'</span>, <span class="string">'eyJhbGciOiJSUzI1NiIs...'</span>);
+secureStorage.<span class="func">set</span>(<span class="string">'user.refreshToken'</span>, <span class="string">'dGhpcyBpcyBhIHJlZnJl...'</span>);
+
+<span class="keyword">const</span> token = secureStorage.<span class="func">getString</span>(<span class="string">'user.token'</span>);
+
+<span class="comment">// Re-key: change encryption key (e.g., after password change)</span>
+secureStorage.<span class="func">recrypt</span>(<span class="string">'new-key-from-keychain'</span>);
+
+<span class="comment">// Remove encryption entirely</span>
+secureStorage.<span class="func">recrypt</span>(<span class="keyword">undefined</span>);</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">MMKV vs Keychain/Keystore</div>
+        <p>MMKV encryption protects data at rest on disk but the encryption key must be loaded into memory. Keychain/Keystore items are decrypted by the OS only when accessed, and hardware-backed keys never leave the TEE. For high-value credentials (auth tokens, API keys), always prefer Keychain/Keystore. Use encrypted MMKV for bulk sensitive data like cached user profiles.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="biometric-storage">7. Biometric-Protected Storage</h2>
+
+    <p>Both platforms support gating credential access on biometric authentication. The key insight is that biometric protection happens at the <strong>OS level</strong> — the Keychain/Keystore item is encrypted with a key that requires biometric authentication to unwrap.</p>
+
+    <pre><code><span class="keyword">import</span> * <span class="keyword">as</span> Keychain <span class="keyword">from</span> <span class="string">'react-native-keychain'</span>;
+
+<span class="comment">// Store with biometric protection</span>
+<span class="keyword">await</span> Keychain.<span class="func">setGenericPassword</span>(<span class="string">'user'</span>, <span class="string">'sensitive_token'</span>, {
+  accessControl: Keychain.ACCESS_CONTROL.BIOMETRY_CURRENT_SET_OR_DEVICE_PASSCODE,
+  accessible: Keychain.ACCESSIBLE.WHEN_PASSCODE_SET_THIS_DEVICE_ONLY,
+  securityLevel: Keychain.SECURITY_LEVEL.SECURE_HARDWARE,
+  service: <span class="string">'com.myapp.biometric-auth'</span>,
+});
+
+<span class="comment">// Retrieve — OS will prompt for biometric automatically</span>
+<span class="keyword">try</span> {
+  <span class="keyword">const</span> credentials = <span class="keyword">await</span> Keychain.<span class="func">getGenericPassword</span>({
+    service: <span class="string">'com.myapp.biometric-auth'</span>,
+    authenticationPrompt: {
+      title: <span class="string">'Verify your identity'</span>,
+      subtitle: <span class="string">'Access your secure credentials'</span>,
+      description: <span class="string">'Use Face ID or your passcode'</span>,
+      cancel: <span class="string">'Cancel'</span>,
+    },
+  });
+} <span class="keyword">catch</span> (error) {
+  <span class="keyword">if</span> (error.message === <span class="string">'User canceled the operation'</span>) {
+    <span class="comment">// Handle cancellation</span>
+  } <span class="keyword">else</span> <span class="keyword">if</span> (error.message.<span class="func">includes</span>(<span class="string">'Biometry is locked out'</span>)) {
+    <span class="comment">// Too many failed attempts — fall back to passcode</span>
+  }
+}</code></pre>
+
+    <h3>7.1 Access Control Options</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Access Control</th>
+                <th>Behavior</th>
+                <th>Fallback</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>BIOMETRY_ANY</code></td>
+                <td>Any enrolled biometric</td>
+                <td>None</td>
+            </tr>
+            <tr>
+                <td><code>BIOMETRY_CURRENT_SET</code></td>
+                <td>Current biometric enrollment</td>
+                <td>None — invalidated if biometrics change</td>
+            </tr>
+            <tr>
+                <td><code>BIOMETRY_ANY_OR_DEVICE_PASSCODE</code></td>
+                <td>Biometric or passcode</td>
+                <td>Device passcode</td>
+            </tr>
+            <tr>
+                <td><code>BIOMETRY_CURRENT_SET_OR_DEVICE_PASSCODE</code></td>
+                <td>Current biometric or passcode</td>
+                <td>Device passcode, invalidated on biometric change</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="secure-enclave">8. Secure Enclave &amp; StrongBox</h2>
+
+    <p>The <strong>Secure Enclave</strong> (iOS) and <strong>StrongBox</strong> (Android) are dedicated security processors physically isolated from the main CPU. Keys generated in these processors <em>never leave the hardware boundary</em> — all cryptographic operations happen inside the secure processor.</p>
+
+    <div class="diagram">
+Secure Enclave / StrongBox Architecture
+════════════════════════════════════════
+
+  ┌──────────────────────────────────────────┐
+  │              Main Processor              │
+  │  ┌────────────┐  ┌───────────────────┐  │
+  │  │ App Process │  │  OS Kernel        │  │
+  │  │ (RN JS +   │  │  Keychain/        │  │
+  │  │  Native)   │──│  Keystore daemon  │  │
+  │  └────────────┘  └────────┬──────────┘  │
+  └───────────────────────────┼─────────────┘
+                              │ Mailbox protocol
+  ┌───────────────────────────▼─────────────┐
+  │        Secure Enclave / StrongBox       │
+  │  ┌─────────────────────────────────┐    │
+  │  │  Dedicated AES Engine           │    │
+  │  │  True Random Number Generator   │    │
+  │  │  Secure Boot ROM                │    │
+  │  │  Encrypted Memory               │    │
+  │  │  Anti-replay Counter            │    │
+  │  └─────────────────────────────────┘    │
+  │  Keys are generated and used HERE       │
+  │  Only results (ciphertext) leave        │
+  └─────────────────────────────────────────┘
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>Secure Enclave keys support only elliptic curve operations (P-256). You cannot store arbitrary data in the Secure Enclave — you generate an EC key pair, then use it to encrypt/sign data. For "storing" a secret in the Secure Enclave, the pattern is: generate an SE key, encrypt your secret with the SE public key, store the ciphertext in Keychain, decrypt on demand using the SE private key (which never leaves the enclave).</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="data-protection-classes">9. iOS Data Protection Classes</h2>
+
+    <p>iOS Data Protection encrypts files on disk using keys derived from the device passcode and hardware UID. Each file is assigned a <strong>protection class</strong> that determines when its class key is available in memory.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Protection Class</th>
+                <th>Key Available</th>
+                <th>After Reboot</th>
+                <th>Use Case</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Complete Protection</td>
+                <td>Only when unlocked</td>
+                <td>After first unlock</td>
+                <td>Health data, financial records</td>
+            </tr>
+            <tr>
+                <td>Protected Unless Open</td>
+                <td>Until file is closed</td>
+                <td>After first unlock</td>
+                <td>Background downloads</td>
+            </tr>
+            <tr>
+                <td>Protected Until First User Auth</td>
+                <td>After first unlock</td>
+                <td>After first unlock</td>
+                <td>Default — most app data</td>
+            </tr>
+            <tr>
+                <td>No Protection</td>
+                <td>Always</td>
+                <td>Always</td>
+                <td>Non-sensitive system data</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Setting file protection in React Native (native module)</span>
+<span class="comment">// iOS: NSFileProtectionComplete on the app's Documents directory</span>
+
+<span class="comment">// In Info.plist or via native module:</span>
+<span class="comment">// NSFileProtectionKey = NSFileProtectionComplete</span>
+
+<span class="comment">// React Native side — check if data protection is available</span>
+<span class="keyword">import</span> { NativeModules } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="keyword">const</span> isProtected = <span class="keyword">await</span> NativeModules.DataProtection.<span class="func">isFileProtectionActive</span>();
+<span class="keyword">const</span> protectionLevel = <span class="keyword">await</span> NativeModules.DataProtection.<span class="func">getProtectionLevel</span>();</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="encrypted-databases">10. Encrypted Databases (SQLCipher)</h2>
+
+    <p>SQLCipher is a fork of SQLite that provides transparent AES-256 encryption of the entire database file. In React Native, it's available through <code>react-native-sqlcipher-storage</code> or <code>op-sqlite</code> with encryption support.</p>
+
+    <pre><code><span class="keyword">import</span> SQLite <span class="keyword">from</span> <span class="string">'react-native-sqlcipher-storage'</span>;
+
+<span class="comment">// Open encrypted database</span>
+<span class="keyword">const</span> db = <span class="keyword">await</span> SQLite.<span class="func">openDatabase</span>({
+  name: <span class="string">'secure.db'</span>,
+  key: <span class="string">'encryption-key-from-keychain'</span>, <span class="comment">// Retrieved from Keychain</span>
+  location: <span class="string">'default'</span>,
+});
+
+<span class="comment">// Re-key database (change encryption key)</span>
+<span class="keyword">await</span> db.<span class="func">executeSql</span>(<span class="string">"PRAGMA rekey = 'new-key-from-keychain'"</span>);
+
+<span class="comment">// Verify encryption is active</span>
+<span class="keyword">const</span> [result] = <span class="keyword">await</span> db.<span class="func">executeSql</span>(<span class="string">'PRAGMA cipher_version'</span>);
+console.<span class="func">log</span>(<span class="string">'SQLCipher version:'</span>, result.rows.<span class="func">item</span>(<span class="number">0</span>).cipher_version);
+
+<span class="comment">// Performance: SQLCipher adds ~5-15% overhead for read/write operations</span>
+<span class="comment">// Use PRAGMA cipher_memory_security = OFF for better performance</span>
+<span class="comment">// (disables memory wiping — acceptable for most mobile apps)</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="comparison">11. Storage Security Comparison</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Solution</th>
+                <th>Encryption</th>
+                <th>Hardware-Backed</th>
+                <th>Biometric Gate</th>
+                <th>Capacity</th>
+                <th>Speed</th>
+                <th>Best For</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Keychain / Keystore</td>
+                <td>AES-256-GCM</td>
+                <td>Yes (SE/TEE)</td>
+                <td>Yes</td>
+                <td>Small (KB)</td>
+                <td>Moderate</td>
+                <td>Tokens, passwords, keys</td>
+            </tr>
+            <tr>
+                <td>Encrypted MMKV</td>
+                <td>AES-128-CFB</td>
+                <td>Key only</td>
+                <td>No</td>
+                <td>Medium (MB)</td>
+                <td>Very Fast</td>
+                <td>Cached sensitive data</td>
+            </tr>
+            <tr>
+                <td>Encrypted AsyncStorage</td>
+                <td>App-level AES</td>
+                <td>Key only</td>
+                <td>No</td>
+                <td>Medium (MB)</td>
+                <td>Slow</td>
+                <td>Legacy migration</td>
+            </tr>
+            <tr>
+                <td>SQLCipher</td>
+                <td>AES-256-CBC</td>
+                <td>Key only</td>
+                <td>No</td>
+                <td>Large (GB)</td>
+                <td>Fast</td>
+                <td>Structured sensitive data</td>
+            </tr>
+            <tr>
+                <td>react-native-encrypted-storage</td>
+                <td>Platform native</td>
+                <td>Yes</td>
+                <td>No</td>
+                <td>Small (KB)</td>
+                <td>Moderate</td>
+                <td>Simple key-value secrets</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">12. Architect Considerations</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Storage Strategy Decision Framework</div>
+        <p><strong>Rule of thumb:</strong> Credentials (tokens, passwords, API keys) → Keychain/Keystore. Bulk sensitive data (user profiles, messages) → Encrypted MMKV or SQLCipher. Non-sensitive preferences → Plain MMKV or AsyncStorage. The encryption key for any app-level encryption must always be stored in Keychain/Keystore — never hardcoded or derived from predictable inputs.</p>
+    </div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common L6 Interview Pitfall</div>
+        <p>Candidates often conflate "encrypted storage" with "secure storage." Encryption protects data at rest, but if the encryption key is stored alongside the data (or hardcoded in the JS bundle), the encryption is theater. True secure storage requires the key to be managed by a hardware-backed system (Keychain/Keystore/TEE) that enforces access control independently of the application.</p>
+    </div>
+
+    <h3>Key Architectural Decisions</h3>
+
+    <ul>
+        <li><strong>Key rotation strategy:</strong> How do you rotate encryption keys without data loss? MMKV supports <code>recrypt()</code>; SQLCipher supports <code>PRAGMA rekey</code>; Keychain items must be re-stored.</li>
+        <li><strong>Backup behavior:</strong> <code>ThisDeviceOnly</code> items don't survive backup/restore. Design your auth flow to handle credential loss gracefully.</li>
+        <li><strong>Multi-user support:</strong> Use separate Keychain services or MMKV instances per user to prevent credential leakage between accounts.</li>
+        <li><strong>Wipe on jailbreak:</strong> Consider clearing sensitive storage if jailbreak/root is detected — but balance security with user experience.</li>
+        <li><strong>Migration path:</strong> When upgrading storage (e.g., AsyncStorage → encrypted MMKV), migrate data atomically and verify before deleting the old store.</li>
+    </ul>
+
+    <div class="nav-footer">
+        <a href="index.html">← Series Index</a>
+        <a href="02-network-security.html">Next: Network Security →</a>
+    </div>
+</div>
+</body>
+</html>

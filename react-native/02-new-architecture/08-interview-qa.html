@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interview Q&amp;A — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">New Architecture</a><span class="sep">›</span>
+        Interview Q&amp;A
+    </nav>
+
+    <h1>Interview Q&amp;A</h1>
+    <p class="subtitle">66 Staff-level interview questions covering JSI, Fabric, TurboModules, Codegen, bridgeless mode, concurrent rendering, and migration strategies. Each answer targets the depth and architectural reasoning expected at Google L6 / Staff level.</p>
+
+    <nav class="nav">
+        <a href="01-jsi-foundation.html">JSI Foundation</a>
+        <a href="02-fabric-renderer.html">Fabric Renderer</a>
+        <a href="03-turbo-modules.html">TurboModules</a>
+        <a href="04-codegen.html">Codegen</a>
+        <a href="05-bridgeless-mode.html">Bridgeless Mode</a>
+        <a href="06-concurrent-rendering.html">Concurrent Rendering</a>
+        <a href="07-migration-guide.html">Migration Guide</a>
+        <a href="08-interview-qa.html" class="active">Interview Q&amp;A</a>
+    </nav>
+
+    <!-- ============================================================ -->
+    <h2>JSI Foundation</h2>
+
+    <div class="qa-item">
+        <h3>Q1: What is JSI and why was it created?</h3>
+        <p>JSI (JavaScript Interface) is a C++ abstraction layer over JavaScript engines that provides direct, synchronous communication between JS and native code. It was created to eliminate the bridge's fundamental bottleneck: JSON serialization. The bridge required every cross-boundary call to serialize arguments to JSON, send them asynchronously through a message queue, and deserialize on the other side. JSI replaces this with direct C++ function calls — native code can create, read, and manipulate JS objects without any serialization. JSI also decouples React Native from any specific JS engine by providing the <code>jsi::Runtime</code> abstract interface, enabling the switch from JSC to Hermes.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q2: Explain the jsi::Runtime abstraction. Why is engine independence important?</h3>
+        <p><code>jsi::Runtime</code> is an abstract C++ class that defines the complete API for interacting with a JavaScript execution context: evaluating code, creating objects/arrays/functions, accessing the global object, and managing memory. Each JS engine (Hermes, JSC, V8) provides a concrete implementation. Engine independence matters because it allows React Native to switch engines without changing any native module code — the same TurboModule works identically on Hermes and JSC. It also enables engine-specific optimizations (like Hermes's ahead-of-time bytecode compilation) without affecting the rest of the architecture.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q3: What is a HostObject and how does it differ from a regular JS object?</h3>
+        <p>A HostObject is a C++ object exposed to JavaScript through JSI. Unlike regular JS objects (which live entirely in the JS heap), a HostObject's data lives in C++ memory and its property access is intercepted by C++ <code>get()</code> and <code>set()</code> methods. When JS code accesses <code>hostObj.someProperty</code>, it triggers a C++ virtual function call — enabling lazy computation, dynamic property resolution, and direct access to native data structures without copying. Libraries like MMKV and WatermelonDB use HostObjects to provide synchronous, zero-serialization access to native storage.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q4: How does JSI handle memory management across the JS/C++ boundary?</h3>
+        <p>JSI uses a dual ownership model. C++ objects exposed to JS (via HostObject) are wrapped in <code>std::shared_ptr</code> — the shared_ptr prevents C++ destruction while JS holds a reference, and the destructor runs when both JS GC and C++ release their references. JS objects referenced from C++ are held via <code>jsi::Value</code> which internally uses the engine's GC rooting mechanism. The critical rule: <code>jsi::Value</code> and <code>jsi::Object</code> are only valid on the JS thread and during the scope of the <code>jsi::Runtime&amp;</code> reference. To hold JS references across async boundaries, you must use <code>jsi::Value::asObject(rt).getProperty()</code> to extract data, or use a shared_ptr wrapper.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q5: When should you use synchronous JSI calls vs async? What are the threading implications?</h3>
+        <p>Use synchronous JSI calls for fast operations (&lt;1ms): reading cached values, accessing device state, performing small computations. Use async for anything slow: disk I/O, network requests, heavy computation. The threading implication is critical: synchronous JSI calls execute on the JS thread. If the native operation blocks for 50ms, the JS thread is blocked for 50ms — no animations, no event handling, no rendering. The rule of thumb: if it would block the browser's main thread, it should be async in JSI. For async operations, dispatch to a background thread and use RuntimeExecutor to return results to the JS thread.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q6: How does JSI enable shared memory between JS and native? Give a concrete example.</h3>
+        <p>JSI enables shared memory through HostObjects and ArrayBuffers. A HostObject's <code>get()</code>/<code>set()</code> methods can read/write directly to native memory — there's no copy. For binary data, JSI supports <code>jsi::ArrayBuffer</code> which maps to a native memory region. Example: a camera module can write frame data directly into an ArrayBuffer that JS can read without copying. In the bridge era, this required Base64 encoding (33% size overhead plus encode/decode time). With JSI, the same memory address is accessible from both JS and C++, enabling zero-copy data sharing for images, audio buffers, and large datasets.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q7: What happens if a C++ exception is thrown during a JSI call from JavaScript?</h3>
+        <p>JSI converts C++ exceptions to JavaScript errors. If a HostFunction or HostObject method throws a <code>std::exception</code>, JSI catches it and re-throws it as a <code>jsi::JSError</code> in the JavaScript context. The JS code sees a regular JavaScript error with the C++ exception message. Conversely, if JS code throws during a JSI call from C++, it propagates as a <code>jsi::JSError</code> C++ exception. This bidirectional exception propagation is a major improvement over the bridge, which lost error context during async message passing. However, you must be careful: uncaught C++ exceptions that aren't <code>std::exception</code> subclasses will crash the process.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q8: Compare JSI call overhead to bridge call overhead with specific numbers.</h3>
+        <p>Bridge call: ~5-10ms total. Breakdown: JSON.stringify on JS side (~0.5-2ms depending on payload), enqueue to message queue (~0.1ms), wait for batch flush (~0-5ms, batched every 5ms), transfer across bridge (~0.1ms), JSON.parse on native side (~0.5-2ms), execute native method, reverse the process for the response. JSI call: ~0.005-0.05ms. It's a direct C++ virtual function call — no serialization, no queueing, no batching. The 100-1000× improvement is most impactful for high-frequency operations: gesture callbacks (called every 16ms), animation drivers, and real-time data processing.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Fabric Renderer</h2>
+
+    <div class="qa-item">
+        <h3>Q9: What is Fabric and how does it differ from the old renderer?</h3>
+        <p>Fabric is React Native's new rendering system built in C++. The old renderer used a JS-side shadow tree with async bridge communication to the native UI layer. Fabric moves the shadow tree to C++ (ShadowNodes), enabling synchronous layout computation, direct JSI-based communication with React, and support for concurrent rendering. Key differences: Fabric performs Yoga layout in C++ (not via async bridge calls), supports multiple tree revisions for concurrent rendering, implements view flattening to reduce native view hierarchy depth, and enables synchronous event handling for gestures.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q10: Explain the Fabric rendering pipeline from React reconciliation to screen pixels.</h3>
+        <p>The pipeline has three phases: (1) <strong>Render</strong> — React reconciles the component tree and produces a new ShadowNode tree in C++. This happens on the JS thread via JSI. (2) <strong>Commit</strong> — The new ShadowNode tree is diffed against the current tree. Yoga layout runs synchronously in C++ to compute positions/sizes. The diff produces a set of mutations (create, update, delete, insert). (3) <strong>Mount</strong> — Mutations are dispatched to the main/UI thread where they're applied to actual native views (UIView on iOS, Android.View on Android). The mounting coordinator batches mutations for atomic UI updates. With concurrent rendering, phases 1-2 can be interrupted and restarted without affecting the mounted UI.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q11: What is view flattening in Fabric and why does it matter?</h3>
+        <p>View flattening is Fabric's optimization that eliminates unnecessary native views from the hierarchy. In React, developers often nest <code>&lt;View&gt;</code> components for styling (padding, margin, flex layout). The old renderer created a native view for every React <code>&lt;View&gt;</code>. Fabric analyzes the ShadowNode tree and merges layout-only views (those with no visual properties like background color, border, opacity, or event handlers) into their parent. This reduces the native view count by 30-50% in typical apps, which improves rendering performance, reduces memory usage, and speeds up hit testing for touch events.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q12: How does Fabric enable synchronous event handling? Why does this matter for gestures?</h3>
+        <p>In the old architecture, touch events were sent from the native UI thread to JS via the async bridge — introducing at least one frame of latency (16ms). Fabric enables synchronous event dispatch: when a touch occurs on the UI thread, Fabric can synchronously read the ShadowNode tree (which is in C++ shared memory) to determine the target, and dispatch the event to JS via JSI. For gestures, this eliminates the "gesture lag" that plagued the old architecture. Combined with Reanimated's worklets (which run on the UI thread via JSI), gesture-driven animations can now run at native frame rates without any JS thread involvement.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q13: Explain how Fabric's C++ ShadowNode tree supports concurrent rendering.</h3>
+        <p>Fabric's ShadowNode tree is immutable — each update creates a new tree revision rather than mutating the existing one. This is essential for concurrent rendering because React may be preparing multiple tree versions simultaneously (one for a high-priority update, one for a transition). The current (mounted) tree remains stable while new revisions are being prepared. When a revision is ready to commit, Fabric atomically swaps it in. If a higher-priority update arrives, the in-progress revision is simply discarded — no rollback needed because the mounted tree was never modified. This immutable tree model is what makes interruptible rendering possible.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>TurboModules</h2>
+
+    <div class="qa-item">
+        <h3>Q14: What are TurboModules and how do they improve on the old NativeModules system?</h3>
+        <p>TurboModules are the JSI-based replacement for the bridge-based NativeModules system. Three key improvements: (1) <strong>Lazy initialization</strong> — modules are created on first access instead of all at startup, reducing TTI by 200-400ms in typical apps. (2) <strong>Direct JSI calls</strong> — method invocations go through JSI instead of the bridge, eliminating serialization overhead. (3) <strong>Type safety</strong> — module interfaces are defined in TypeScript/Flow specs and Codegen generates native type-safe bindings, catching type mismatches at build time instead of runtime.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q15: Walk through what happens when JS calls a TurboModule method.</h3>
+        <p>When JS calls <code>TurboModuleRegistry.get('Storage').getItem('key')</code>: (1) <code>TurboModuleRegistry.get()</code> is a JSI HostFunction that looks up the module in a C++ cache. On first access, it creates the module via the platform-specific provider. (2) The returned object is a JSI HostObject whose <code>get()</code> method returns JSI HostFunctions for each method. (3) Calling <code>getItem('key')</code> invokes the HostFunction directly — the string argument is passed as a <code>jsi::String</code> (no serialization). (4) For sync methods, the native code executes immediately and returns a <code>jsi::Value</code>. For async methods, the native code dispatches to a background thread via CallInvoker and returns a JSI Promise. The Promise is resolved via <code>jsCallInvoker-&gt;invokeAsync()</code> when the background work completes.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q16: How does lazy initialization in TurboModules improve startup time?</h3>
+        <p>In the old architecture, the bridge eagerly initialized every registered native module at startup — typically 60-100 modules, each taking 2-5ms. That's 200-400ms of startup time for modules the user may never use. TurboModules defer initialization to first access: the module's constructor and setup code only run when JS first calls <code>TurboModuleRegistry.get('ModuleName')</code>. In a typical app, only 10-20 modules are needed during the initial render. The remaining 40-80 modules initialize on-demand throughout the app's lifecycle, spreading the cost and reducing TTI by 30-40%.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q17: What is the role of CallInvoker in TurboModules?</h3>
+        <p><code>CallInvoker</code> is the thread dispatch abstraction used by TurboModules for async operations. When a TurboModule method needs to do background work and return a result to JS, it uses <code>jsCallInvoker-&gt;invokeAsync()</code> to schedule the callback on the JS thread. This replaces the bridge's internal thread dispatch mechanism. There are two invokers: <code>jsCallInvoker</code> (dispatches to JS thread) and <code>nativeCallInvoker</code> (dispatches to native modules thread). The key difference from RuntimeExecutor: CallInvoker provides a plain <code>void()</code> callback (for when you've already captured JS references), while RuntimeExecutor provides a <code>jsi::Runtime&amp;</code> reference (for when you need to create new JS values).</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Codegen</h2>
+
+    <div class="qa-item">
+        <h3>Q18: What is Codegen and what problem does it solve?</h3>
+        <p>Codegen is a build-time tool that generates native C++, Objective-C++, and Java/Kotlin code from TypeScript or Flow interface specifications. It solves the type safety gap between JS and native: in the old architecture, the bridge passed untyped JSON, so type mismatches (passing a string where a number was expected) caused runtime crashes. Codegen generates type-safe native interfaces that validate types at the C++ level, catching mismatches at build time. It also generates boilerplate code for TurboModule and Fabric component registration, reducing manual native code by 60-80%.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q19: Describe the Codegen pipeline from spec file to native code.</h3>
+        <p>The pipeline: (1) Developer writes a TypeScript/Flow spec file (e.g., <code>NativeStorage.ts</code>) with a <code>TurboModuleRegistrySpec</code> interface. (2) Codegen's parser extracts the interface into a platform-independent schema (JSON IR). (3) Platform-specific generators consume the schema: the C++ generator produces header files with abstract method declarations, the ObjC++ generator produces protocol definitions and method stubs, the Java generator produces abstract class definitions. (4) The generated code is compiled into the app binary. (5) At runtime, the developer's native implementation extends the generated abstract class, and the type-safe interface is enforced by the C++ compiler.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q20: How does Codegen handle type mapping between TypeScript and native types?</h3>
+        <p>Codegen maps TypeScript types to native types: <code>string</code> → <code>jsi::String</code> / <code>NSString</code> / <code>String</code>, <code>number</code> → <code>double</code>, <code>boolean</code> → <code>bool</code>, <code>Array&lt;T&gt;</code> → <code>jsi::Array</code> / <code>NSArray</code> / <code>ReadableArray</code>, <code>Object</code> → <code>jsi::Object</code> / <code>NSDictionary</code> / <code>ReadableMap</code>. Nullable types (<code>?string</code>) generate <code>std::optional&lt;std::string&gt;</code> in C++. Enums generate C++ enums with validation. The generated code includes runtime type checks that throw descriptive errors if JS passes the wrong type, making debugging much easier than the old "bridge error" messages.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q21: What happens if a Codegen spec doesn't match the native implementation?</h3>
+        <p>It's a build-time error. Codegen generates abstract classes/protocols that the native implementation must conform to. If the spec declares <code>getItem(key: string): Promise&lt;string&gt;</code> but the native implementation has a different signature, the C++ compiler (or ObjC/Java compiler) will fail with a clear error about the missing or mismatched method. This is a fundamental improvement: the old architecture only caught these mismatches at runtime (when the bridge tried to invoke a non-existent method), often in production. Codegen shifts this entire class of errors to build time.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Bridgeless Mode</h2>
+
+    <div class="qa-item">
+        <h3>Q22: What is bridgeless mode and how does it differ from just using TurboModules?</h3>
+        <p>Bridgeless mode is the complete removal of the bridge infrastructure (<code>CxxBridge</code>/<code>CatalystInstance</code>). You can use TurboModules while the bridge is still present — TurboModules use JSI for their own calls, but the bridge remains for legacy modules and system services. Bridgeless mode removes the bridge entirely: all communication goes through JSI, RuntimeExecutor, and CallInvoker. The bridge's message queue, batching mechanism, and module registry are gone. This eliminates the bridge's memory overhead, removes the batching delay (5ms), and simplifies the threading model. It also enables proper event loop integration with Hermes microtasks.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q23: Explain RuntimeExecutor. When would you use it vs CallInvoker?</h3>
+        <p><code>RuntimeExecutor</code> is a function that schedules a callback on the JS thread with a valid <code>jsi::Runtime&amp;</code> reference. Use it when you need to create or manipulate JS values from native code (e.g., emitting events, creating JS objects). <code>CallInvoker</code> schedules a plain <code>void()</code> callback on a specific thread. Use it when you've already captured the necessary JS references (e.g., resolving a Promise where the resolve function is already captured as a <code>shared_ptr&lt;jsi::Function&gt;</code>). In practice: RuntimeExecutor for event emission and global state updates; CallInvoker for Promise resolution and thread dispatch in TurboModules.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q24: What is the interop layer and what are its performance trade-offs?</h3>
+        <p>The interop layer wraps legacy bridge-based modules and components so they work in the new architecture without code changes. For modules, it creates a TurboModule-compatible wrapper that receives JSI calls, serializes arguments to the legacy format (NSDictionary/WritableMap), calls the legacy method, and serializes the result back. For components, it wraps <code>requireNativeComponent</code> views in a Fabric-compatible shell. The trade-off: interop modules still pay serialization costs (negating JSI's performance benefit for those specific modules), and interop components don't benefit from view flattening. The interop layer is a migration tool, not a permanent solution.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q25: How does module initialization order change in bridgeless mode? What problems can this cause?</h3>
+        <p>In bridge mode, modules initialized in a deterministic order based on registration. Some modules implicitly depended on this ordering (e.g., module A's constructor assumed module B was already initialized). In bridgeless mode, modules initialize lazily on first access — the order depends on which module JS code accesses first. This can expose hidden dependencies: if module A accesses module B in its constructor, but module B hasn't been accessed yet, it triggers B's initialization recursively. Circular dependencies can cause deadlocks. The fix: explicit dependency injection or initialization hooks instead of relying on implicit ordering.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q26: How does error handling differ between bridge and bridgeless mode?</h3>
+        <p>The bridge swallowed error context during async message passing — native exceptions became generic "bridge error" strings by the time they reached JS. In bridgeless mode, JSI enables synchronous exception propagation: C++ exceptions become JS errors with full stack traces, and JS exceptions propagate to C++ as <code>jsi::JSError</code> with message and stack. This bidirectional propagation makes debugging dramatically easier. However, it also means unhandled native exceptions can crash the app immediately (the bridge's async nature provided accidental error isolation). Apps must implement proper error boundaries and global error handlers.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Concurrent Rendering</h2>
+
+    <div class="qa-item">
+        <h3>Q27: What is concurrent rendering and why does it require Fabric?</h3>
+        <p>Concurrent rendering is React's ability to prepare multiple UI versions simultaneously and interrupt low-priority work for high-priority updates. It requires Fabric because the old renderer committed UI changes synchronously and mutably — once a render started, it had to finish before the UI could update. Fabric's immutable C++ ShadowNode tree supports multiple revisions: React can prepare a new tree in the background while the current tree stays mounted. If a higher-priority update arrives, the in-progress tree is discarded (no rollback needed) and a new render starts with updated state. The old renderer's mutable tree model made this impossible.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q28: Explain the React lanes priority system. How does it apply to React Native?</h3>
+        <p>Lanes are bitmask-based priority levels for React updates. From highest to lowest: SyncLane (discrete input like taps), InputContinuousLane (continuous input like scroll), DefaultLane (network responses, timers), TransitionLane (startTransition updates), IdleLane (offscreen pre-rendering). In React Native, SyncLane handles touch events with zero delay, InputContinuousLane batches scroll events per frame, and TransitionLane enables smooth navigation transitions. The lane system uses bitwise operations for efficient priority comparison — a single 32-bit integer can represent all pending work priorities. React processes lanes in order, and lower-priority lanes yield to higher-priority ones via the <code>shouldYield()</code> check every ~5ms.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q29: How does useTransition improve navigation performance in React Native?</h3>
+        <p><code>useTransition</code> marks a state update as non-urgent (TransitionLane). For navigation: when the user taps a tab, the tab highlight updates immediately (SyncLane), while the new screen's render is deferred (TransitionLane). If the new screen is expensive to render (complex layout, data processing), the tab bar and current screen remain responsive. The <code>isPending</code> flag lets you show a loading indicator. Without useTransition, the entire render (tab update + new screen) runs synchronously — blocking all interaction until the new screen is fully rendered. This is especially impactful on lower-end devices where screen renders can take 100-300ms.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q30: What is interruptible rendering? How does the shouldYield mechanism work?</h3>
+        <p>Interruptible rendering means React can pause a low-priority render to handle high-priority work. React's concurrent work loop processes one fiber at a time, checking <code>shouldYield()</code> between each fiber. <code>shouldYield()</code> returns true if: (a) the current time slice has exceeded ~5ms, AND (b) there's pending higher-priority work (checked via <code>isInputPending()</code> or the scheduler's priority queue). When yielding, React exits the work loop with the in-progress render saved. After processing the high-priority update, React restarts the interrupted render from scratch (not resumed — restarted with the latest state, which now includes the high-priority update's changes).</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q31: What are the practical limitations of concurrent rendering in React Native today?</h3>
+        <p>Key limitations: (1) Requires Fabric — the old renderer cannot support it. (2) No automatic concurrency — existing setState calls remain synchronous; you must explicitly use useTransition/startTransition. (3) Suspense for data fetching is experimental — requires a Suspense-compatible data library. (4) Code splitting via React.lazy works but there's no native bundle splitting equivalent to web's dynamic import(). (5) Libraries using findNodeHandle, setNativeProps, or relying on synchronous layout measurements may break. (6) Render restarts mean components must be pure — side effects in render bodies become visible bugs. (7) The Offscreen/Activity API for pre-rendering hidden screens is still experimental.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q32: Does concurrent rendering make renders faster? Explain the actual performance model.</h3>
+        <p>No — concurrent rendering does not reduce total render time. A render that takes 200ms of CPU time still takes 200ms. What changes is <em>perceived</em> performance: the 200ms render is broken into ~5ms chunks with yield points between them. High-priority updates (user input) are processed in the gaps. The user sees immediate response to their actions while the expensive render completes in the background. In fact, total render time may slightly <em>increase</em> due to render restarts (if a high-priority update invalidates the in-progress render). The benefit is entirely about responsiveness and perceived smoothness, not raw throughput.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q33: How does Suspense work in React Native? What are the differences from web?</h3>
+        <p>Suspense works the same conceptually: a component throws a Promise during render, React catches it, shows the nearest Suspense boundary's fallback, and re-renders when the Promise resolves. In React Native, the differences are: (1) No native code splitting — React.lazy works but loads from the same bundle, not separate chunks. (2) Fallback components are React Native views (ActivityIndicator, skeleton screens), not HTML. (3) Suspense for data fetching requires a compatible library (no built-in fetch integration). (4) Nested Suspense boundaries enable granular loading states — e.g., profile header loads before posts list. Combined with useTransition, Suspense enables "render-as-you-fetch" patterns where navigation and data loading happen in parallel.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Architecture Decisions &amp; Trade-offs</h2>
+
+    <div class="qa-item">
+        <h3>Q34: Why did React Native choose C++ for the new architecture instead of keeping platform-specific implementations?</h3>
+        <p>C++ provides three critical benefits: (1) <strong>Shared implementation</strong> — Fabric's ShadowNode tree, Yoga layout, and JSI are written once in C++ and shared across iOS and Android, eliminating platform divergence bugs. (2) <strong>Performance</strong> — C++ eliminates JNI overhead on Android and ObjC message dispatch overhead on iOS for hot-path operations like layout computation and tree diffing. (3) <strong>JSI compatibility</strong> — since JS engines expose C++ APIs, having the rendering pipeline in C++ enables direct integration without language boundary crossings. The trade-off: C++ increases build complexity (CMake, NDK), debugging difficulty, and the learning curve for contributors.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q35: What are the trade-offs of lazy module initialization in TurboModules?</h3>
+        <p>Benefits: faster startup (only used modules initialize), lower memory baseline (unused modules never allocate), and better resource utilization. Trade-offs: (1) First-call latency — the first call to a module incurs initialization cost (2-5ms), which can cause a one-time jank if it happens during an animation. (2) Non-deterministic initialization order — modules initialize based on access patterns, exposing hidden dependencies. (3) Debugging complexity — module state depends on whether it's been accessed yet, making reproduction of issues harder. Mitigation: pre-warm critical modules during idle time after initial render, and use explicit dependency injection instead of implicit initialization ordering.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q36: Compare the old architecture's batching model with bridgeless mode's immediate dispatch. What are the implications?</h3>
+        <p>The bridge batched native calls every ~5ms, which had an accidental benefit: it naturally coalesced rapid-fire updates (e.g., multiple setState calls in a loop would batch into one bridge message). Bridgeless mode dispatches immediately — each call executes as it's made. Implications: (1) Lower latency for individual calls (no 5ms wait). (2) Potentially more native calls if code relied on batching for coalescing. (3) Different timing behavior — code that assumed "these two calls arrive together" may see them arrive separately. (4) Race conditions that were hidden by batching may surface. Apps should use React's built-in batching (automatic in React 18) rather than relying on bridge-level batching.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q37: How would you design a high-performance animation system using the new architecture?</h3>
+        <p>The optimal design uses three layers: (1) <strong>UI thread worklets</strong> (Reanimated) — animation logic runs as JSI-compiled functions directly on the UI thread, achieving native frame rates without JS thread involvement. (2) <strong>Shared values</strong> — animation state is stored in JSI shared values accessible from both UI and JS threads, replacing the old <code>setNativeProps</code> pattern. (3) <strong>Gesture-driven animations</strong> — react-native-gesture-handler provides Fabric-native gesture recognition that feeds directly into Reanimated worklets. The key insight: the JS thread is only involved for declaring the animation (what to animate), not executing it (frame-by-frame updates). This architecture achieves consistent 60fps even on low-end devices because the animation loop never touches the JS thread.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q38: What is the "strangler fig" pattern and how does React Native's interop layer implement it?</h3>
+        <p>The strangler fig pattern is a migration strategy where a new system gradually replaces an old one while both coexist. React Native's interop layer implements this by wrapping legacy modules/components in new-architecture-compatible shims. The old code continues to work (via the shim), while new code uses native TurboModules/Fabric components directly. Over time, each legacy module is individually migrated to a native implementation, and the shim is removed. The old system is "strangled" — it shrinks as more modules migrate, until eventually nothing uses the interop layer and it can be removed entirely. This avoids the risk of a big-bang migration while providing a clear path to full adoption.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Debugging &amp; Performance</h2>
+
+    <div class="qa-item">
+        <h3>Q39: How do you debug a crash in a TurboModule's C++ code?</h3>
+        <p>Approach: (1) Check the crash log for the C++ stack trace — Fabric/TurboModule crashes show C++ frames with demangled symbols. (2) Use Xcode's debugger (iOS) or Android Studio's native debugger (Android) with breakpoints in the C++ code. (3) Enable JSI error logging — uncaught <code>jsi::JSError</code> exceptions include both JS and native stack traces. (4) Use Flipper's crash reporter to correlate JS actions with native crashes. (5) For memory issues, use Address Sanitizer (ASan) — common in JSI code where shared_ptr misuse or use-after-free across thread boundaries causes crashes. (6) Add defensive null checks in HostObject <code>get()</code>/<code>set()</code> methods — JS can access any property name, and unexpected property access is a common crash source.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q40: How would you diagnose and fix a performance regression after migrating to the new architecture?</h3>
+        <p>Systematic approach: (1) <strong>Identify the regression</strong> — compare TTI, frame rate, and memory metrics between old and new arch builds using the same test scenarios. (2) <strong>Profile the JS thread</strong> — use Hermes sampling profiler to find hot functions. Check if lazy module initialization is causing first-call jank. (3) <strong>Profile the UI thread</strong> — use systrace (Android) or Instruments (iOS) to find native-side bottlenecks. Check if interop layer serialization is in the hot path. (4) <strong>Check interop overhead</strong> — identify which modules are using the interop layer and whether they're called frequently. Migrate hot-path modules to native TurboModules first. (5) <strong>Verify view flattening</strong> — use Flipper's layout inspector to check if Fabric is flattening views as expected. Interop components don't flatten.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q41: What tools are available for profiling React Native's new architecture?</h3>
+        <p>Key tools: (1) <strong>Hermes profiler</strong> — sampling profiler for JS execution, accessible via Flipper or <code>HermesInternal.enableSamplingProfiler()</code>. (2) <strong>Systrace</strong> (Android) — traces native thread activity including Fabric rendering, Yoga layout, and TurboModule calls. (3) <strong>Xcode Instruments</strong> (iOS) — Time Profiler for CPU, Allocations for memory, Core Animation for frame rate. (4) <strong>React DevTools Profiler</strong> — shows component render times, re-render reasons, and concurrent rendering lanes. (5) <strong>Flipper</strong> — layout inspector (shows Fabric view hierarchy), network inspector, and crash reporter. (6) <strong>Flashlight</strong> — automated performance testing that measures TTI, frame rate, and CPU usage across test scenarios.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q42: How do you identify if a performance issue is on the JS thread, UI thread, or in the bridge/JSI layer?</h3>
+        <p>Use systrace or Instruments to see per-thread activity: (1) <strong>JS thread bottleneck</strong> — the JS thread shows continuous activity while the UI thread is idle waiting for instructions. Symptoms: slow renders, delayed event handling. Fix: optimize React components, use useMemo/useCallback, reduce re-renders. (2) <strong>UI thread bottleneck</strong> — the UI thread shows long frames while the JS thread is idle. Symptoms: animation jank, slow native view creation. Fix: reduce view hierarchy depth, optimize native components. (3) <strong>JSI/bridge layer</strong> — frequent short blocks on the JS thread correlating with native calls. Symptoms: many small delays adding up. Fix: batch native calls, use synchronous JSI for small reads, cache results.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Migration &amp; Real-World Scenarios</h2>
+
+    <div class="qa-item">
+        <h3>Q43: You're leading the migration of a 200-screen app to the new architecture. What's your strategy?</h3>
+        <p>Phased approach over 3-4 sprints: <strong>Sprint 1:</strong> Audit — inventory all native modules and components, run compatibility checker, identify blockers. Enable new arch with interop on a feature branch. Fix build errors. Run full E2E suite to establish baseline. <strong>Sprint 2:</strong> Migrate critical path — update navigation, gesture handler, reanimated, and storage libraries. Replace setNativeProps usage. Re-run E2E suite, compare metrics. <strong>Sprint 3:</strong> Migrate remaining libraries — work through the inventory, migrating or finding alternatives for incompatible libraries. Enable bridgeless mode. <strong>Sprint 4:</strong> Validation — performance benchmarking, staged rollout (10% → 50% → 100%), monitor crash rates. Keep rollback capability for 2 release cycles.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q44: A third-party library doesn't support the new architecture. What are your options?</h3>
+        <p>Options in order of preference: (1) <strong>Use interop layer</strong> — the library works via interop with reduced performance. Acceptable if it's not in the hot path. (2) <strong>Update the library</strong> — check if a newer version supports new arch. Many popular libraries added support in 2023-2024. (3) <strong>Fork and migrate</strong> — if the library is critical and unmaintained, fork it and add TurboModule/Fabric specs. Contribute back upstream. (4) <strong>Find an alternative</strong> — switch to a library that natively supports new arch (e.g., MMKV instead of AsyncStorage for performance-critical storage). (5) <strong>Write a wrapper</strong> — create a thin TurboModule that wraps the legacy library's native code, bypassing its JS-side bridge code.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q45: How would you implement a feature flag to gradually roll out the new architecture?</h3>
+        <p>The new architecture is a build-time configuration (not runtime), so true feature flagging requires separate builds. Strategy: (1) Create two build variants — one with <code>newArchEnabled=true</code>, one with <code>false</code>. (2) Use your app distribution system (Firebase App Distribution, TestFlight) to route a percentage of users to the new-arch build. (3) Monitor crash rates, performance metrics, and user-reported issues per variant. (4) Gradually increase the new-arch percentage: 5% → 25% → 50% → 100%. (5) Keep the old-arch build pipeline active until new-arch has been at 100% for at least one release cycle. This is more complex than a runtime flag but necessary because the architecture choice affects native compilation.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q46: Your app's startup time increased after enabling the new architecture. How do you investigate?</h3>
+        <p>This is counterintuitive since new arch should improve startup. Investigation: (1) Profile with Hermes sampling profiler — check if C++ initialization (Fabric setup, TurboModule registry) is the bottleneck. First build after enabling new arch includes one-time Codegen costs. (2) Check if interop layer initialization is expensive — wrapping many legacy modules at startup adds overhead that didn't exist before. (3) Verify lazy initialization is working — if something eagerly accesses all TurboModules during startup (e.g., a module that iterates NativeModules), you lose the lazy benefit. (4) Check C++ compilation flags — debug builds with new arch are significantly slower due to unoptimized C++ code. Always benchmark with release builds. (5) Measure Yoga layout — Fabric's synchronous layout may be slower for the initial render if the view hierarchy is very deep.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q47: How do you handle setNativeProps removal when migrating animation-heavy screens?</h3>
+        <p>Three migration paths: (1) <strong>Reanimated shared values</strong> (preferred) — replace <code>setNativeProps({ style: { opacity: 0.5 } })</code> with a Reanimated shared value: <code>const opacity = useSharedValue(1)</code> and <code>useAnimatedStyle(() =&gt; ({ opacity: opacity.value }))</code>. This is actually better — animations run on the UI thread. (2) <strong>React state</strong> — for infrequent updates, use regular setState. Fabric's synchronous layout makes state-driven updates faster than they were with the old renderer. (3) <strong>Animated API</strong> — React Native's built-in Animated API works with Fabric and handles the native driver path. Replace <code>setNativeProps</code> with <code>Animated.timing()</code> for standard animations.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Advanced &amp; System Design</h2>
+
+    <div class="qa-item">
+        <h3>Q48: Design a real-time collaborative editing feature using the new architecture's capabilities.</h3>
+        <p>Architecture: (1) <strong>WebSocket TurboModule</strong> — JSI-based WebSocket for low-latency server communication. Synchronous message sending via JSI, async receive via RuntimeExecutor. (2) <strong>CRDT engine as HostObject</strong> — implement the conflict resolution algorithm in C++ and expose it as a JSI HostObject. JS accesses the document state synchronously without serialization. (3) <strong>Concurrent rendering for UI</strong> — use useTransition for applying remote changes so local typing is never blocked by incoming edits. (4) <strong>Shared ArrayBuffer</strong> — for large document state, use JSI ArrayBuffer to share memory between the CRDT engine and the JS rendering layer. (5) <strong>UI thread worklets</strong> — cursor position and selection highlighting run on the UI thread via Reanimated for 60fps responsiveness.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q49: How would you architect a React Native app that needs to process 30fps video frames in real-time?</h3>
+        <p>The key is minimizing data copying: (1) <strong>Camera TurboModule</strong> — captures frames and stores them in native memory (no JS involvement). (2) <strong>Processing pipeline in C++</strong> — image processing (filters, ML inference) runs in C++ on a background thread, accessing frame data directly. (3) <strong>JSI HostObject for results</strong> — processed results (bounding boxes, labels, filtered frames) are exposed to JS via HostObject. JS reads results synchronously without copying pixel data. (4) <strong>Fabric custom component</strong> — a native Fabric component renders the processed frames directly from native memory, bypassing React's reconciliation for the video surface. (5) <strong>React overlay</strong> — UI elements (labels, buttons) render via normal React/Fabric on top of the native video surface. Use concurrent rendering to keep the overlay responsive during heavy processing.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q50: Explain how you would implement a custom Fabric component from scratch.</h3>
+        <p>Steps: (1) Write the component spec in TypeScript: define props interface extending <code>ViewProps</code>, export using <code>codegenNativeComponent</code>. (2) Run Codegen to generate C++ ShadowNode, Props struct, and event emitter classes. (3) Implement the C++ ShadowNode subclass — override <code>layout()</code> if custom layout is needed, implement <code>updateProps()</code> for prop handling. (4) Implement the platform-specific ComponentView — on iOS, create a UIView subclass that maps ShadowNode props to UIKit properties; on Android, create a ViewManager that maps to Android Views. (5) Register the component descriptor in the ComponentsRegistry. (6) The generated JS code provides a typed React component that maps to your native implementation. Props are type-checked at build time via Codegen.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q51: How does the new architecture change your approach to state management in a large React Native app?</h3>
+        <p>Key changes: (1) <strong>Synchronous native access</strong> — state stored in native (MMKV, SQLite) can be read synchronously via JSI, enabling patterns like synchronous hydration from disk cache on startup. (2) <strong>Concurrent-safe selectors</strong> — state management libraries must handle concurrent rendering (selectors may be called multiple times during interrupted renders). Libraries like Zustand and Jotai are concurrent-safe; older Redux patterns with external subscriptions need <code>useSyncExternalStore</code>. (3) <strong>Transition-aware updates</strong> — split state into urgent (UI state) and deferrable (data state). Use startTransition for data state updates that trigger expensive re-renders. (4) <strong>Shared values for animation state</strong> — animation-related state should live in Reanimated shared values, not React state, to avoid JS thread involvement.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q52: What security considerations arise from JSI's direct memory sharing?</h3>
+        <p>JSI's shared memory model introduces risks: (1) <strong>Memory corruption</strong> — a bug in C++ HostObject code can corrupt the JS heap (the bridge's serialization boundary provided accidental isolation). (2) <strong>Use-after-free</strong> — if C++ frees memory that JS still references via a HostObject, accessing it causes undefined behavior. Mitigated by shared_ptr, but custom raw pointer usage is risky. (3) <strong>Thread safety</strong> — shared memory accessed from multiple threads without synchronization causes data races. JSI values must only be accessed on the JS thread. (4) <strong>Information leakage</strong> — HostObjects can expose native memory contents to JS. Ensure sensitive data (encryption keys, tokens) isn't accidentally exposed through HostObject property enumeration. (5) <strong>Native code injection</strong> — JSI HostFunctions execute native code from JS calls. Validate all inputs to prevent buffer overflows or command injection in native code.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q53: How would you benchmark and compare the old and new architectures for a specific app?</h3>
+        <p>Rigorous benchmarking protocol: (1) <strong>Same device, same conditions</strong> — test on the same physical device (not emulator), same OS version, airplane mode (no network variance), after a fresh reboot. (2) <strong>Automated test scenarios</strong> — use Maestro or Detox to run identical user flows on both architectures. Measure TTI, frame rate during navigation, scroll performance, and memory usage. (3) <strong>Statistical significance</strong> — run each scenario 20+ times and report median with p95. Single runs are meaningless due to variance. (4) <strong>Isolate variables</strong> — test with interop disabled (only native TurboModules) to see true new-arch performance, then with interop enabled to see the migration-phase performance. (5) <strong>Profile hot paths</strong> — use Hermes profiler + systrace to identify where time is spent differently between architectures.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q54: Explain the threading model of the new architecture. How many threads are involved and what does each do?</h3>
+        <p>Primary threads: (1) <strong>JS thread</strong> — runs the JavaScript engine (Hermes/JSC), React reconciliation, and JSI calls. All JS execution happens here. (2) <strong>UI/Main thread</strong> — handles native view mounting, user input events, and platform UI operations. Fabric's mount phase runs here. (3) <strong>Background thread</strong> — TurboModule async operations, network requests, and heavy computation. Dispatched via CallInvoker. (4) <strong>Yoga layout thread</strong> — in some configurations, Yoga layout computation can run on a dedicated thread (though it often runs on the JS thread). The key interaction: JS thread produces ShadowNode trees via JSI → Fabric commits and diffs on the JS thread → mounting coordinator dispatches mutations to the UI thread. RuntimeExecutor bridges native threads back to the JS thread. The bridge's "native modules thread" is replaced by CallInvoker's flexible dispatch.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q55: If you were designing React Native's architecture from scratch today, what would you do differently from the current new architecture?</h3>
+        <p>Potential improvements: (1) <strong>Rust instead of C++</strong> — memory safety guarantees would eliminate the use-after-free and data race bugs that are common in JSI/Fabric C++ code, while maintaining the same performance. (2) <strong>Built-in state management</strong> — integrate a concurrent-safe state management primitive at the framework level, rather than relying on third-party libraries to handle concurrent rendering correctly. (3) <strong>Native code splitting</strong> — implement true dynamic module loading (like web's dynamic import) at the native level, not just JS bundle splitting. (4) <strong>Declarative native modules</strong> — instead of Codegen from JS specs, use a shared IDL (like Protocol Buffers) that generates both JS and native code, ensuring perfect type alignment. (5) <strong>First-class animation primitives</strong> — build Reanimated-style UI thread worklets into the core framework rather than requiring a separate library.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q56: How does Fabric's mounting coordinator ensure atomic UI updates?</h3>
+        <p>The mounting coordinator collects all mutations (create, update, delete, insert, remove) produced by a ShadowTree commit and applies them as a single batch on the UI thread. This prevents partial updates where some views reflect the new state while others show the old state. The coordinator uses a mutex to ensure only one commit's mutations are applied at a time. If multiple commits arrive while the UI thread is busy, they're queued and applied in order. This is a significant improvement over the old renderer, where mutations could interleave if the bridge delivered them across multiple batches, causing visual glitches like views appearing at wrong positions for a single frame.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q57: What is the difference between a Fabric component spec and a TurboModule spec?</h3>
+        <p>A Fabric component spec defines a UI component: it extends <code>ViewProps</code>, declares custom props (with types), events (with event data types), and commands (imperative methods). It's processed by Codegen to generate C++ ShadowNode classes, Props structs, and EventEmitter classes. A TurboModule spec defines a native module: it extends <code>TurboModule</code>, declares methods with typed parameters and return types (including Promise for async). It generates C++ abstract classes that the native implementation must conform to. The key distinction: component specs describe declarative UI elements (props in, events out), while module specs describe imperative APIs (method calls with return values).</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q58: How would you handle a situation where a TurboModule needs to access UI-thread-only APIs?</h3>
+        <p>TurboModule methods typically execute on the JS thread (sync) or a background thread (async). For UI-thread-only APIs (e.g., UIKit operations on iOS, View operations on Android), you need explicit thread dispatch: (1) In the TurboModule method, dispatch to the main thread using platform APIs (<code>dispatch_async(dispatch_get_main_queue(), ...)</code> on iOS, <code>UiThreadUtil.runOnUiThread()</code> on Android). (2) Capture the result and use <code>jsCallInvoker-&gt;invokeAsync()</code> to return it to JS. (3) For synchronous UI reads (e.g., getting a view's frame), use <code>invokeSync</code> on the main thread — but be cautious of deadlocks if the UI thread is waiting on the JS thread. The safest pattern is always async dispatch with Promise resolution.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q59: Explain how useDeferredValue differs from useTransition in React Native.</h3>
+        <p><code>useTransition</code> wraps a state <em>update</em> — you control which setState call is deferred. <code>useDeferredValue</code> wraps a state <em>value</em> — React automatically provides a deferred version of any value. Use useTransition when you own the state update (e.g., in an event handler). Use useDeferredValue when you receive a value as a prop and want to defer your rendering of it (e.g., a child component receiving a search query prop). Under the hood, useDeferredValue triggers a transition-priority re-render when the value changes. In React Native, useDeferredValue is useful for expensive list filtering: <code>const deferredQuery = useDeferredValue(query)</code> lets the input update immediately while the list re-renders with the deferred value.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q60: What are the implications of React 18's automatic batching for React Native's new architecture?</h3>
+        <p>React 18 automatically batches all state updates regardless of where they originate — inside event handlers, Promises, setTimeout, or native callbacks. In the old architecture, only event handler updates were batched; updates in Promises or timeouts triggered separate re-renders. With automatic batching + new architecture: (1) Fewer re-renders overall — multiple setState calls in an async function produce one render instead of many. (2) The bridge's accidental batching (5ms window) is no longer needed — React's own batching is more predictable and correct. (3) If you need to force a synchronous re-render (rare), use <code>flushSync()</code>. (4) Combined with concurrent rendering, automatic batching means React can intelligently schedule when batched updates are processed based on priority.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q61: How do you ensure a smooth rollback if the new architecture causes issues in production?</h3>
+        <p>Rollback readiness requires: (1) <strong>Dual build pipeline</strong> — maintain CI/CD for both old and new arch builds throughout the migration period. (2) <strong>Feature parity</strong> — keep legacy NativeModule registrations and requireNativeComponent calls in the codebase (behind build flags or alongside new implementations). (3) <strong>Monitoring gates</strong> — define rollback triggers: crash rate increase &gt;0.5%, ANR rate increase &gt;1%, or P0 bug report. (4) <strong>Hot-fix path</strong> — pre-build an old-arch binary ready to ship. Switching <code>newArchEnabled=false</code> and rebuilding takes 30+ minutes; having a pre-built binary enables immediate rollback. (5) <strong>Data compatibility</strong> — ensure any data format changes (e.g., storage schema) are backward compatible so rolling back doesn't corrupt user data.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q62: How does Yoga layout work differently in Fabric compared to the old architecture?</h3>
+        <p>In the old architecture, Yoga layout was computed on the "shadow thread" — a dedicated background thread that received layout instructions via the bridge. The JS thread sent a batch of layout updates, the shadow thread computed Yoga layout asynchronously, and the results were sent to the UI thread via another bridge message. This introduced at least two async hops. In Fabric, Yoga runs synchronously in C++ during the commit phase — it's called directly on the ShadowNode tree without any serialization or thread hopping. The layout results are immediately available for the diff algorithm. This synchronous layout is why Fabric can provide accurate layout measurements to JS instantly (via <code>measure()</code>) and why layout-dependent animations are smoother.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q63: What is the role of the MountingCoordinator in Fabric and why is it important for concurrent rendering?</h3>
+        <p>The MountingCoordinator sits between the commit phase (JS thread) and the mount phase (UI thread). It receives committed ShadowTree revisions and coordinates their application to native views. For concurrent rendering, it's critical because multiple revisions may be committed in rapid succession (e.g., a transition commit followed by a sync commit that interrupts it). The coordinator ensures: (1) only the latest relevant revision is mounted (skipping stale intermediate revisions), (2) mutations are applied atomically (no partial updates visible to the user), and (3) the UI thread isn't overwhelmed with too many mount operations. It effectively acts as a buffer that absorbs the non-deterministic timing of concurrent commits.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q64: Compare React Native's new architecture approach to Flutter's architecture. What are the key differences?</h3>
+        <p>Key differences: (1) <strong>Rendering</strong> — Flutter uses its own Skia-based rendering engine (draws every pixel), while Fabric uses platform-native views (UIView/Android.View). Flutter has more control but loses platform-native behavior; Fabric preserves native look and feel. (2) <strong>Language bridge</strong> — Flutter uses Dart with direct compilation to native code (no JS engine), while React Native uses JSI to bridge JS and C++. Flutter avoids the bridge problem entirely but requires learning Dart. (3) <strong>Hot reload</strong> — both support it, but React Native's JSI-based approach allows synchronous state inspection during development. (4) <strong>Ecosystem</strong> — React Native leverages the JS/React ecosystem; Flutter has its own widget library. (5) <strong>Concurrent rendering</strong> — React Native gets this from React 18; Flutter doesn't have an equivalent concept since it controls the entire rendering pipeline.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q65: What is the significance of Hermes's microtask queue support for bridgeless mode?</h3>
+        <p>Hermes's microtask queue support enables proper Promise resolution ordering that matches web semantics. In bridge mode, Promise callbacks were resolved via the bridge's message queue, which meant they could be delayed by batching or interleaved with other bridge messages — violating the JS spec's microtask ordering guarantees. With Hermes microtasks in bridgeless mode, <code>Promise.then()</code> callbacks execute immediately after the current macrotask completes (before the next timer or event), exactly as they would in a browser. This fixes subtle bugs where code relied on Promise ordering (e.g., state updates in Promise chains) and enables <code>queueMicrotask()</code> as a scheduling primitive. It also means <code>async/await</code> behaves identically to web, reducing platform-specific behavior differences.</p>
+    </div>
+
+    <div class="qa-item">
+        <h3>Q66: How would you approach debugging a race condition that only appears with the new architecture?</h3>
+
+        <p>Race conditions surfacing after migration typically stem from two causes: (1) the removal of bridge batching (which accidentally serialized concurrent operations), or (2) lazy module initialization changing the timing of module setup.</p>
+        <p>Debugging approach: First, reproduce reliably — add logging timestamps to the suspected code paths. Second, check if the issue disappears with interop mode enabled (which reintroduces some serialization). Third, use systrace to visualize thread interleaving — look for cases where two operations that were previously sequential (due to bridge batching) now overlap. Fourth, if it's an initialization order issue, add explicit dependency declarations or use a startup sequencer that ensures modules initialize in the required order. Finally, consider whether the code was always racy and the bridge was masking it — the fix should address the root cause, not re-introduce artificial serialization.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="07-migration-guide.html">← Migration Guide</a>
+        <a href="index.html">Series Index →</a>
+    </div>
+</div>
+</body>
+</html>

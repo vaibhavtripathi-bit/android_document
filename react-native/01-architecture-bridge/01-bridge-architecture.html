@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bridge Architecture — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Architecture &amp; Bridge</a><span class="sep">›</span>
+        Bridge Architecture
+    </nav>
+
+    <h1>Bridge Architecture</h1>
+    <p class="subtitle">React Native's original architecture centers on a JSON-serialized asynchronous bridge connecting JavaScript and native realms. Understanding its design, bottlenecks, and communication patterns is essential for Staff-level mobile engineers.</p>
+
+    <nav class="nav">
+        <a href="01-bridge-architecture.html" class="active">Bridge Architecture</a>
+        <a href="02-javascript-runtime.html">JS Runtime</a>
+        <a href="03-native-module-system.html">Native Modules</a>
+        <a href="04-shadow-tree-yoga.html">Shadow Tree &amp; Yoga</a>
+        <a href="05-rendering-pipeline.html">Rendering Pipeline</a>
+        <a href="06-threading-model.html">Threading Model</a>
+        <a href="07-metro-bundler.html">Metro Bundler</a>
+        <a href="08-interview-qa.html">Interview Q&amp;A</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#high-level">1. High-Level Architecture Overview</a></li>
+            <li><a href="#three-realms">2. Three Realms: JS, Shadow, Native</a></li>
+            <li><a href="#bridge-internals">3. Bridge Internals: MessageQueue</a></li>
+            <li><a href="#batched-bridge">4. BatchedBridge and Call Batching</a></li>
+            <li><a href="#serialization">5. JSON Serialization Protocol</a></li>
+            <li><a href="#module-registration">6. Module Registration</a></li>
+            <li><a href="#native-modules-proxy">7. NativeModules Proxy</a></li>
+            <li><a href="#bottlenecks">8. Why the Bridge Is a Bottleneck</a></li>
+            <li><a href="#communication-patterns">9. Communication Patterns</a></li>
+            <li><a href="#architect">10. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="high-level">1. High-Level Architecture Overview</h2>
+
+    <p>React Native's original architecture (pre-0.68) is built around a <strong>bridge</strong> that connects two separate runtimes: a JavaScript VM (JavaScriptCore or Hermes) and the native platform (iOS UIKit / Android View system). These runtimes share no memory — all communication is serialized as JSON strings passed asynchronously across the bridge.</p>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│                    React Native Application                      │
+├──────────────────┬──────────────────┬───────────────────────────┤
+│   JS Thread      │   Shadow Thread  │   Main (UI) Thread        │
+│                  │                  │                           │
+│  React Component │  Yoga Layout     │  Native View Hierarchy    │
+│  Tree + Logic    │  Engine (C++)    │  (UIView / android.View)  │
+│                  │                  │                           │
+│  Hermes / JSC    │  Shadow Nodes    │  Platform Renderers       │
+│  JS Runtime      │  Layout Calc     │  Event Handlers           │
+├──────────────────┴──────────────────┴───────────────────────────┤
+│                                                                  │
+│              ┌──────────────────────────┐                        │
+│              │    THE BRIDGE            │                        │
+│              │  JSON Serialization      │                        │
+│              │  Async Message Queue     │                        │
+│              │  BatchedBridge           │                        │
+│              └──────────────────────────┘                        │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>The bridge architecture was a deliberate design choice: by keeping JS and native completely isolated, React Native achieved platform independence and crash isolation. A JS exception cannot crash the native app. However, this isolation comes at the cost of serialization overhead and the inability to make synchronous calls — the fundamental trade-off that drove the new architecture (JSI/Fabric/TurboModules).</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="three-realms">2. Three Realms: JS, Shadow, Native</h2>
+
+    <p>React Native operates across three distinct realms, each with its own thread and responsibilities:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Realm</th>
+                <th>Thread</th>
+                <th>Responsibilities</th>
+                <th>Runtime</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>JavaScript</strong></td>
+                <td>JS Thread</td>
+                <td>React reconciliation, business logic, state management, event handling callbacks</td>
+                <td>Hermes / JSC / V8</td>
+            </tr>
+            <tr>
+                <td><strong>Shadow</strong></td>
+                <td>Background Thread</td>
+                <td>Layout calculation (Yoga), shadow tree construction, diffing shadow nodes</td>
+                <td>C++ (Yoga engine)</td>
+            </tr>
+            <tr>
+                <td><strong>Native</strong></td>
+                <td>Main/UI Thread</td>
+                <td>View creation/mutation, touch handling, native animations, system events</td>
+                <td>ObjC/Swift (iOS), Java/Kotlin (Android)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="diagram">
+JS Realm                    Shadow Realm               Native Realm
+─────────                   ────────────               ────────────
+React.createElement()  ──→  ShadowNode creation   ──→  UIView creation
+setState()             ──→  Yoga layout calc       ──→  setFrame/layout
+onPress callback       ←──  (pass-through)         ←──  Touch event
+Animated.timing()      ──→  (bypass for native)    ──→  CADisplayLink
+
+        ◄──── All arrows cross the Bridge ────►
+        ◄──── JSON serialized, async only  ────►
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="bridge-internals">3. Bridge Internals: MessageQueue</h2>
+
+    <p>At its core, the bridge is implemented as a <code>MessageQueue</code> — a bidirectional message-passing system. The JavaScript side maintains a queue of calls destined for native, and native maintains a queue of calls destined for JavaScript.</p>
+
+    <pre><code><span class="comment">// Simplified MessageQueue structure (from React Native source)</span>
+<span class="keyword">class</span> <span class="type">MessageQueue</span> {
+  _lazyCallableModules: {[key: string]: () => Object};
+  _queue: [number[], number[], any[], number];  <span class="comment">// [moduleIDs, methodIDs, params, callID]</span>
+  _successCallbacks: Map&lt;number, Function&gt;;
+  _failureCallbacks: Map&lt;number, Function&gt;;
+  _callID: number;
+
+  <span class="comment">// Called by native to invoke JS methods</span>
+  callFunctionReturnFlushedQueue(module: string, method: string, args: any[]) {
+    <span class="keyword">this</span>.__guard(() => {
+      <span class="keyword">this</span>.__callFunction(module, method, args);
+    });
+    <span class="keyword">return</span> <span class="keyword">this</span>.flushedQueue();
+  }
+
+  <span class="comment">// Flush pending calls to native — returns batched queue</span>
+  flushedQueue(): ?[number[], number[], any[]] {
+    <span class="keyword">const</span> queue = <span class="keyword">this</span>._queue;
+    <span class="keyword">this</span>._queue = [[], [], [], <span class="keyword">this</span>._callID];
+    <span class="keyword">return</span> queue[0].length ? queue : <span class="keyword">null</span>;
+  }
+
+  <span class="comment">// Enqueue a call to a native module</span>
+  enqueueNativeCall(moduleID: number, methodID: number, params: any[],
+                    onFail: ?Function, onSucc: ?Function) {
+    <span class="keyword">this</span>._callID++;
+    <span class="keyword">this</span>._queue[0].push(moduleID);
+    <span class="keyword">this</span>._queue[1].push(methodID);
+    <span class="keyword">this</span>._queue[2].push(params);
+    <span class="comment">// Store callbacks indexed by callID</span>
+    <span class="keyword">if</span> (onFail || onSucc) {
+      <span class="keyword">this</span>._successCallbacks.set(<span class="keyword">this</span>._callID, onSucc);
+      <span class="keyword">this</span>._failureCallbacks.set(<span class="keyword">this</span>._callID, onFail);
+    }
+  }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Key Detail</div>
+        <p>The queue stores calls as parallel arrays of <code>[moduleIDs, methodIDs, params]</code> rather than an array of objects. This is a deliberate optimization — parallel arrays serialize to smaller JSON and are faster to iterate on the native side.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="batched-bridge">4. BatchedBridge and Call Batching</h2>
+
+    <p><code>BatchedBridge</code> is the singleton <code>MessageQueue</code> instance that all JS-to-native communication flows through. Rather than sending each native call individually, calls are <strong>batched</strong> and flushed together.</p>
+
+    <pre><code><span class="comment">// BatchedBridge is the global MessageQueue instance</span>
+<span class="keyword">const</span> BatchedBridge = <span class="keyword">new</span> <span class="type">MessageQueue</span>();
+
+<span class="comment">// Batching strategy:</span>
+<span class="comment">// 1. JS code enqueues multiple native calls</span>
+<span class="comment">// 2. At end of JS execution frame, queue is flushed</span>
+<span class="comment">// 3. Native receives batch: [[moduleIDs], [methodIDs], [params]]</span>
+
+<span class="comment">// Example: A single render cycle might batch these calls:</span>
+BatchedBridge.enqueueNativeCall(UIManager, createView, [tag, 'RCTView', rootTag, props]);
+BatchedBridge.enqueueNativeCall(UIManager, createView, [tag2, 'RCTText', rootTag, props2]);
+BatchedBridge.enqueueNativeCall(UIManager, setChildren, [rootTag, [tag, tag2]]);
+<span class="comment">// All three sent as a single JSON payload to native</span></code></pre>
+
+    <div class="diagram">
+Batching Timeline
+═════════════════
+
+JS Thread:
+  ┌─────────────────────────────────────────────┐
+  │ setState() → reconcile → enqueue calls      │
+  │ call1, call2, call3, call4, call5           │
+  └──────────────────────┬──────────────────────┘
+                         │ flush (end of frame)
+                         ▼
+Bridge:          ┌───────────────────┐
+                 │ JSON.stringify()  │
+                 │ [[1,1,1,1,1],    │
+                 │  [2,3,4,5,6],    │
+                 │  [p1,p2,p3,p4]]  │
+                 └───────┬───────────┘
+                         │
+Native Thread:           ▼
+  ┌─────────────────────────────────────────────┐
+  │ JSON.parse() → dispatch to modules          │
+  │ UIManager.createView(...)                   │
+  │ UIManager.createView(...)                   │
+  │ UIManager.setChildren(...)                  │
+  └─────────────────────────────────────────────┘
+    </div>
+
+    <h3>4.1 Flush Triggers</h3>
+
+    <p>The queue is flushed in several scenarios:</p>
+
+    <ul>
+        <li><strong>End of JS execution</strong> — after any native-to-JS call completes, the return value includes the flushed queue</li>
+        <li><strong>Timer expiration</strong> — native polls the JS queue at a minimum interval (typically 5ms)</li>
+        <li><strong>Explicit flush</strong> — certain high-priority operations trigger immediate flush</li>
+        <li><strong>Native callback</strong> — when native invokes a JS callback, the response includes queued calls</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2 id="serialization">5. JSON Serialization Protocol</h2>
+
+    <p>Every value crossing the bridge must be serializable to JSON. This imposes fundamental constraints:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Supported</th>
+                <th>Not Supported</th>
+                <th>Workaround</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Strings, numbers, booleans</td>
+                <td>Functions</td>
+                <td>Callback IDs (integers)</td>
+            </tr>
+            <tr>
+                <td>Arrays, plain objects</td>
+                <td>Dates</td>
+                <td>ISO string or timestamp</td>
+            </tr>
+            <tr>
+                <td>null</td>
+                <td>undefined</td>
+                <td>Converted to null</td>
+            </tr>
+            <tr>
+                <td>Nested structures</td>
+                <td>Circular references</td>
+                <td>Must be avoided</td>
+            </tr>
+            <tr>
+                <td>—</td>
+                <td>Binary data (ArrayBuffer)</td>
+                <td>Base64 encoding</td>
+            </tr>
+            <tr>
+                <td>—</td>
+                <td>BigInt, Symbol, Map, Set</td>
+                <td>Manual conversion</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// What actually crosses the bridge for a simple view update:</span>
+<span class="comment">// JS side enqueues:</span>
+UIManager.updateView(reactTag, 'RCTView', { backgroundColor: '#ff0000' });
+
+<span class="comment">// Serialized as JSON:</span>
+<span class="comment">// [[7], [3], [[42, "RCTView", {"backgroundColor": "#ff0000"}]]]</span>
+<span class="comment">//  ↑moduleID ↑methodID  ↑params array</span>
+
+<span class="comment">// For a scroll event going JS-ward:</span>
+<span class="comment">// {"type": "topScroll", "tag": 42, "data": {</span>
+<span class="comment">//   "contentOffset": {"x": 0, "y": 347.5},</span>
+<span class="comment">//   "contentSize": {"width": 375, "height": 2400},</span>
+<span class="comment">//   "layoutMeasurement": {"width": 375, "height": 667}</span>
+<span class="comment">// }}</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Performance Warning</div>
+        <p>A single scroll event serializes to ~200 bytes of JSON. At 60fps, that's 12KB/s of serialization overhead just for scroll events. When combined with other bridge traffic (layout, touch, animation), the bridge can become saturated — this is the primary cause of "bridge congestion" that manifests as dropped frames.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="module-registration">6. Module Registration</h2>
+
+    <p>Native modules must register themselves so the bridge can route calls. Registration happens at app startup and creates a mapping from module names to module IDs.</p>
+
+    <pre><code><span class="comment">// iOS: Module registration via macro</span>
+<span class="comment">// ObjC implementation</span>
+@implementation RCTMyModule
+
+RCT_EXPORT_MODULE()  <span class="comment">// Registers as "MyModule" (strips RCT prefix)</span>
+
+RCT_EXPORT_METHOD(doSomething:(NSString *)name
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+{
+  <span class="comment">// Runs on a dedicated GCD queue by default</span>
+  resolve(@{@"result": name});
+}
+
+@end
+
+<span class="comment">// Android: Module registration via ReactPackage</span>
+<span class="keyword">class</span> <span class="type">MyModule</span>(reactContext: ReactApplicationContext)
+  : ReactContextBaseJavaModule(reactContext) {
+
+  <span class="keyword">override fun</span> getName() = <span class="string">"MyModule"</span>
+
+  @ReactMethod
+  <span class="keyword">fun</span> doSomething(name: String, promise: Promise) {
+    promise.resolve(WritableNativeMap().apply {
+      putString(<span class="string">"result"</span>, name)
+    })
+  }
+}
+
+<span class="comment">// Package registration</span>
+<span class="keyword">class</span> <span class="type">MyPackage</span> : ReactPackage {
+  <span class="keyword">override fun</span> createNativeModules(ctx: ReactApplicationContext) =
+    listOf(MyModule(ctx))
+  <span class="keyword">override fun</span> createViewManagers(ctx: ReactApplicationContext) =
+    emptyList()
+}</code></pre>
+
+    <div class="diagram">
+Module Registration Flow
+════════════════════════
+
+App Startup
+    │
+    ▼
+┌──────────────────────────────────────┐
+│ Native: Collect all ReactPackages    │
+│   → Instantiate each NativeModule    │
+│   → Build module registry:           │
+│     { "MyModule": 0,                 │
+│       "UIManager": 1,                │
+│       "Networking": 2, ... }         │
+└──────────────────┬───────────────────┘
+                   │ Send registry to JS
+                   ▼
+┌──────────────────────────────────────┐
+│ JS: Receive module config            │
+│   → Create NativeModules proxy       │
+│   → NativeModules.MyModule.doSomething()│
+│     maps to enqueueNativeCall(0, 0, args)│
+└──────────────────────────────────────┘
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="native-modules-proxy">7. NativeModules Proxy</h2>
+
+    <p>On the JavaScript side, <code>NativeModules</code> is a <code>Proxy</code> object that lazily creates module accessors. When you access <code>NativeModules.MyModule</code>, it returns an object whose methods enqueue bridge calls.</p>
+
+    <pre><code><span class="comment">// Simplified NativeModules proxy implementation</span>
+<span class="keyword">const</span> NativeModules = {};
+
+<span class="comment">// Module config received from native at startup:</span>
+<span class="comment">// [moduleName, constants, methods, promiseMethods, syncMethods]</span>
+<span class="keyword">function</span> genModule(config, moduleID) {
+  <span class="keyword">const</span> [moduleName, constants, methods, promiseMethods, syncMethods] = config;
+  <span class="keyword">const</span> module = { ...constants };
+
+  methods.forEach((methodName, methodID) => {
+    <span class="keyword">const</span> isPromise = promiseMethods?.includes(methodName);
+
+    module[methodName] = (...args) => {
+      <span class="keyword">if</span> (isPromise) {
+        <span class="keyword">return new</span> <span class="type">Promise</span>((resolve, reject) => {
+          BatchedBridge.enqueueNativeCall(
+            moduleID, methodID, args, reject, resolve
+          );
+        });
+      }
+      BatchedBridge.enqueueNativeCall(moduleID, methodID, args);
+    };
+  });
+
+  NativeModules[moduleName] = module;
+}
+
+<span class="comment">// Usage in app code:</span>
+<span class="keyword">import</span> { NativeModules } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+<span class="keyword">const</span> result = <span class="keyword">await</span> NativeModules.MyModule.doSomething(<span class="string">'hello'</span>);
+<span class="comment">// Internally: enqueueNativeCall(moduleID=0, methodID=0, ['hello'], reject, resolve)</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Implementation Detail</div>
+        <p>Callbacks are stored in the MessageQueue indexed by <code>callID</code>. When native completes the call, it invokes <code>invokeCallbackAndReturnFlushedQueue(callID, args)</code>, which looks up and executes the stored callback. This is why callbacks can only be invoked once — the entry is deleted after invocation.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="bottlenecks">8. Why the Bridge Is a Bottleneck</h2>
+
+    <p>The bridge architecture has several fundamental limitations that become critical at scale:</p>
+
+    <h3>8.1 Serialization Cost</h3>
+    <p>Every value crossing the bridge must be JSON-serialized on one side and parsed on the other. For large data structures (e.g., long lists, complex state), this cost is non-trivial.</p>
+
+    <pre><code><span class="comment">// Benchmark: Bridge serialization overhead</span>
+<span class="comment">// Sending 1000 items across the bridge:</span>
+
+<span class="keyword">const</span> data = Array.from({ length: 1000 }, (_, i) => ({
+  id: i,
+  title: <span class="string">`Item ${i}`</span>,
+  description: <span class="string">`Description for item ${i} with some additional text`</span>,
+  timestamp: Date.now(),
+  metadata: { category: <span class="string">'test'</span>, priority: i % 5 }
+}));
+
+<span class="comment">// JSON.stringify(data) → ~120KB of JSON text</span>
+<span class="comment">// Serialization time: ~2-5ms on modern devices</span>
+<span class="comment">// Deserialization time: ~3-8ms on native side</span>
+<span class="comment">// Total bridge overhead: ~5-13ms per transfer</span>
+<span class="comment">// At 16ms frame budget (60fps), this alone can cause dropped frames</span></code></pre>
+
+    <h3>8.2 Async-Only Communication</h3>
+    <p>The bridge is strictly asynchronous. There is no way for JS to synchronously read a native value. This creates fundamental UX problems:</p>
+
+    <pre><code><span class="comment">// Problem: Cannot synchronously read layout</span>
+<span class="comment">// In web: element.getBoundingClientRect() is synchronous</span>
+<span class="comment">// In React Native (old arch): must use async callback</span>
+
+viewRef.current.measure((x, y, width, height, pageX, pageY) => {
+  <span class="comment">// By the time this callback fires, the layout may have changed</span>
+  <span class="comment">// This makes tooltip positioning, drag-and-drop, and</span>
+  <span class="comment">// gesture-based animations fundamentally harder</span>
+});
+
+<span class="comment">// Problem: Scroll event handling</span>
+<span class="comment">// Each scroll event: Native → serialize → bridge → JS → process</span>
+<span class="comment">//                    → bridge → serialize → Native → update</span>
+<span class="comment">// Minimum 2 bridge crossings per frame = guaranteed frame drops</span></code></pre>
+
+    <h3>8.3 No Direct Memory Access</h3>
+    <p>JS and native cannot share memory. Every piece of data must be copied through serialization. This is especially costly for:</p>
+
+    <ul>
+        <li><strong>Images</strong> — pixel data cannot be shared; must use native image references</li>
+        <li><strong>Large datasets</strong> — database query results must be fully serialized</li>
+        <li><strong>Binary data</strong> — must be base64 encoded (33% size increase)</li>
+        <li><strong>Frequent updates</strong> — animation values, sensor data, scroll positions</li>
+    </ul>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Analysis</div>
+        <p>The bridge bottleneck is not just about raw throughput — it's about <strong>latency</strong>. Even if serialization is fast, the async nature means a minimum of one frame delay for any JS↔native round-trip. For 60fps rendering, that's 16.67ms of inherent latency. For gesture-driven animations that need JS logic, this creates visible jank because the animation is always one frame behind the user's finger. This is the core motivation behind JSI (synchronous calls) and Fabric (C++ rendering).</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="communication-patterns">9. Communication Patterns</h2>
+
+    <h3>9.1 JS → Native (Commands)</h3>
+    <pre><code><span class="comment">// Pattern 1: Fire-and-forget</span>
+NativeModules.Analytics.track(<span class="string">'screen_view'</span>, { screen: <span class="string">'Home'</span> });
+
+<span class="comment">// Pattern 2: Callback</span>
+NativeModules.Camera.takePicture(
+  { quality: 0.8 },
+  (error) => console.error(error),
+  (uri) => setPhoto(uri)
+);
+
+<span class="comment">// Pattern 3: Promise</span>
+<span class="keyword">const</span> token = <span class="keyword">await</span> NativeModules.Auth.getToken();
+
+<span class="comment">// Pattern 4: UIManager commands (view operations)</span>
+UIManager.dispatchViewManagerCommand(
+  findNodeHandle(scrollViewRef),
+  UIManager.getViewManagerConfig(<span class="string">'RCTScrollView'</span>).Commands.scrollTo,
+  [0, 100, <span class="keyword">true</span>]  <span class="comment">// x, y, animated</span>
+);</code></pre>
+
+    <h3>9.2 Native → JS (Events)</h3>
+    <pre><code><span class="comment">// Native sends events via RCTDeviceEventEmitter</span>
+<span class="comment">// iOS (ObjC):</span>
+[<span class="keyword">self</span>.bridge.eventDispatcher sendAppEventWithName:@<span class="string">"onLocationUpdate"</span>
+                                             body:@{@<span class="string">"lat"</span>: @37.7749, @<span class="string">"lng"</span>: @-122.4194}];
+
+<span class="comment">// JS side subscribes:</span>
+<span class="keyword">import</span> { NativeEventEmitter, NativeModules } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="keyword">const</span> emitter = <span class="keyword">new</span> <span class="type">NativeEventEmitter</span>(NativeModules.LocationManager);
+<span class="keyword">const</span> subscription = emitter.addListener(<span class="string">'onLocationUpdate'</span>, (event) => {
+  console.log(event.lat, event.lng);
+});
+
+<span class="comment">// Cleanup</span>
+subscription.remove();</code></pre>
+
+    <h3>9.3 Communication Pattern Summary</h3>
+
+    <div class="diagram">
+JS → Native Patterns:
+═══════════════════════
+
+1. Fire-and-forget:     JS ──call──→ Native (no response)
+2. Callback:            JS ──call──→ Native ──callback──→ JS
+3. Promise:             JS ──call──→ Native ──resolve/reject──→ JS
+4. UIManager command:   JS ──command──→ UIManager ──→ Native View
+
+Native → JS Patterns:
+═══════════════════════
+
+1. Events:              Native ──event──→ EventEmitter ──→ JS listener
+2. Direct call:         Native ──callFunction──→ JS module method
+3. Touch events:        Native ──touch──→ JS responder system
+4. Timer callbacks:     Native ──timer──→ JS setTimeout/setInterval
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">10. Architect Considerations</h2>
+
+    <h3>10.1 Bridge Traffic Optimization</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Strategy</th>
+                <th>Technique</th>
+                <th>Impact</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Reduce crossing frequency</td>
+                <td>Debounce/throttle events, batch state updates</td>
+                <td>Fewer serialization cycles</td>
+            </tr>
+            <tr>
+                <td>Reduce payload size</td>
+                <td>Send only changed fields, use compact keys</td>
+                <td>Less JSON to serialize/parse</td>
+            </tr>
+            <tr>
+                <td>Move logic to native</td>
+                <td>Native animations, native gesture handlers</td>
+                <td>Bypass bridge entirely</td>
+            </tr>
+            <tr>
+                <td>Use native driver</td>
+                <td><code>useNativeDriver: true</code> for Animated</td>
+                <td>Animation runs on UI thread</td>
+            </tr>
+            <tr>
+                <td>Avoid bridge for layout</td>
+                <td>Use onLayout instead of measure()</td>
+                <td>Layout info comes with render cycle</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>10.2 When Bridge Congestion Manifests</h3>
+
+    <pre><code><span class="comment">// Scenario: Scroll-driven header animation (BAD — bridge-heavy)</span>
+&lt;<span class="type">ScrollView</span>
+  onScroll={(e) => {
+    <span class="comment">// Every scroll event crosses bridge: Native → JS</span>
+    <span class="keyword">const</span> y = e.nativeEvent.contentOffset.y;
+    <span class="comment">// Animation update crosses bridge: JS → Native</span>
+    headerHeight.setValue(Math.max(60, 200 - y));
+  }}
+  scrollEventThrottle={16}
+/&gt;
+
+<span class="comment">// Fix: Use Animated.event with native driver</span>
+<span class="keyword">const</span> scrollY = useRef(<span class="keyword">new</span> Animated.Value(0)).current;
+<span class="keyword">const</span> headerHeight = scrollY.interpolate({
+  inputRange: [0, 140],
+  outputRange: [200, 60],
+  extrapolate: <span class="string">'clamp'</span>,
+});
+
+&lt;<span class="type">Animated.ScrollView</span>
+  onScroll={Animated.event(
+    [{ nativeEvent: { contentOffset: { y: scrollY } } }],
+    { useNativeDriver: <span class="keyword">false</span> }  <span class="comment">// layout props can't use native driver</span>
+  )}
+  scrollEventThrottle={16}
+/&gt;</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>The bridge is React Native's original sin and greatest strength simultaneously. It enabled the "learn once, write anywhere" promise by providing a clean abstraction boundary. But it also created a performance ceiling that no amount of optimization can break through — you cannot make JSON serialization free, and you cannot make async communication synchronous. The new architecture (JSI + Fabric + TurboModules) doesn't just optimize the bridge — it <strong>eliminates</strong> it by allowing direct C++ function calls between JS and native.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="index.html">← Series Index</a>
+        <a href="02-javascript-runtime.html">Next: JavaScript Runtime →</a>
+    </div>
+</div>
+</body>
+</html>

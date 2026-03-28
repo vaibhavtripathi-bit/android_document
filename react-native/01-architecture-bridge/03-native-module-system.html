@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Native Module System — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Architecture &amp; Bridge</a><span class="sep">›</span>
+        Native Module System
+    </nav>
+
+    <h1>Native Module System</h1>
+    <p class="subtitle">NativeModules are the mechanism by which JavaScript code invokes platform-specific functionality. Understanding the registration, invocation, threading, and migration path to TurboModules is essential for Staff-level mobile architecture.</p>
+
+    <nav class="nav">
+        <a href="01-bridge-architecture.html">Bridge Architecture</a>
+        <a href="02-javascript-runtime.html">JS Runtime</a>
+        <a href="03-native-module-system.html" class="active">Native Modules</a>
+        <a href="04-shadow-tree-yoga.html">Shadow Tree &amp; Yoga</a>
+        <a href="05-rendering-pipeline.html">Rendering Pipeline</a>
+        <a href="06-threading-model.html">Threading Model</a>
+        <a href="07-metro-bundler.html">Metro Bundler</a>
+        <a href="08-interview-qa.html">Interview Q&amp;A</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#overview">1. NativeModules Overview</a></li>
+            <li><a href="#ios-registration">2. iOS Module Registration</a></li>
+            <li><a href="#android-registration">3. Android Module Registration</a></li>
+            <li><a href="#method-export">4. Method Export Patterns</a></li>
+            <li><a href="#callbacks-promises">5. Callbacks and Promises</a></li>
+            <li><a href="#threading">6. Threading Model</a></li>
+            <li><a href="#batch-calls">7. Batch Calls and Optimization</a></li>
+            <li><a href="#lazy-loading">8. Module Lazy Loading</a></li>
+            <li><a href="#turbo-modules">9. TurboModules: The Replacement</a></li>
+            <li><a href="#architect">10. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="overview">1. NativeModules Overview</h2>
+
+    <p>NativeModules provide the bridge between JavaScript business logic and platform-specific native APIs. Every time your React Native app accesses the camera, file system, Bluetooth, biometrics, or any other platform capability, it goes through a NativeModule.</p>
+
+    <div class="diagram">
+NativeModule Call Flow (Old Architecture)
+═════════════════════════════════════════
+
+JS Thread                    Bridge                    Native Thread
+─────────                    ──────                    ─────────────
+NativeModules.Camera         JSON.stringify()          CameraModule
+  .takePicture({             ──────────────→           .takePicture()
+    quality: 0.8             [moduleID,                  │
+  })                          methodID,                  │ capture photo
+  .then(uri => ...)           [params]]                  │
+       ↑                                                 ▼
+       │                     JSON.parse()              resolve(uri)
+       └─────────────────── ←──────────────            callback(uri)
+         Promise resolved
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>The NativeModule system was designed for extensibility over performance. Any native developer can expose platform APIs to JS with minimal boilerplate. This made React Native's ecosystem grow rapidly — but the cost is that every module call pays the bridge tax (serialization + async). TurboModules fix this by using JSI for direct C++ calls, but the registration and design patterns remain similar.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="ios-registration">2. iOS Module Registration</h2>
+
+    <p>On iOS, native modules are Objective-C or Swift classes that conform to the <code>RCTBridgeModule</code> protocol and register via macros.</p>
+
+    <pre><code><span class="comment">// iOS NativeModule — Objective-C implementation</span>
+
+<span class="comment">// Header: RCTDeviceInfo.h</span>
+#import &lt;React/RCTBridgeModule.h&gt;
+#import &lt;React/RCTEventEmitter.h&gt;
+
+@interface RCTDeviceInfo : RCTEventEmitter &lt;RCTBridgeModule&gt;
+@end
+
+<span class="comment">// Implementation: RCTDeviceInfo.m</span>
+@implementation RCTDeviceInfo
+
+<span class="comment">// RCT_EXPORT_MODULE() registers the module with the bridge</span>
+<span class="comment">// Internally: creates a +load method that adds the class to a registry</span>
+<span class="comment">// The module name defaults to the ObjC class name minus "RCT" prefix</span>
+RCT_EXPORT_MODULE()  <span class="comment">// Registers as "DeviceInfo"</span>
+
+<span class="comment">// Or with explicit name:</span>
+<span class="comment">// RCT_EXPORT_MODULE(CustomName)</span>
+
+<span class="comment">// Export a method — macro generates the method descriptor</span>
+RCT_EXPORT_METHOD(getDeviceId:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+{
+  NSString *deviceId = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
+  resolve(deviceId);
+}
+
+<span class="comment">// Export constants — evaluated once at module init</span>
+- (NSDictionary *)constantsToExport {
+  <span class="keyword">return</span> @{
+    @"platform": @"ios",
+    @"osVersion": [[UIDevice currentDevice] systemVersion],
+    @"model": [[UIDevice currentDevice] model]
+  };
+}
+
+<span class="comment">// Specify which thread methods run on</span>
+- (dispatch_queue_t)methodQueue {
+  <span class="comment">// Default: dedicated background queue per module</span>
+  <span class="comment">// Return dispatch_get_main_queue() for UI operations</span>
+  <span class="keyword">return</span> dispatch_get_main_queue();
+}
+
+<span class="comment">// For event emitters — declare supported events</span>
+- (NSArray&lt;NSString *&gt; *)supportedEvents {
+  <span class="keyword">return</span> @[@"onDeviceOrientationChange", @"onBatteryLevelChange"];
+}
+
+@end</code></pre>
+
+    <h3>2.1 RCT_EXPORT_MODULE Macro Internals</h3>
+
+    <pre><code><span class="comment">// What RCT_EXPORT_MODULE() expands to (simplified):</span>
+
+<span class="comment">// 1. Creates a +moduleName class method</span>
++ (NSString *)moduleName { <span class="keyword">return</span> @<span class="string">"DeviceInfo"</span>; }
+
+<span class="comment">// 2. Creates a +load method that registers the class</span>
++ (<span class="keyword">void</span>)load {
+  RCTRegisterModule(<span class="keyword">self</span>);
+  <span class="comment">// Adds to global array: RCTModuleClasses</span>
+}
+
+<span class="comment">// At bridge startup, RCTModuleClasses is iterated to:</span>
+<span class="comment">// 1. Instantiate each module class</span>
+<span class="comment">// 2. Extract method descriptors (from RCT_EXPORT_METHOD)</span>
+<span class="comment">// 3. Extract constants (from constantsToExport)</span>
+<span class="comment">// 4. Build module config: [name, constants, methods, promiseMethods]</span>
+<span class="comment">// 5. Send config to JS as __fbBatchedBridgeConfig</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="android-registration">3. Android Module Registration</h2>
+
+    <pre><code><span class="comment">// Android NativeModule — Kotlin implementation</span>
+
+<span class="keyword">class</span> <span class="type">DeviceInfoModule</span>(
+  <span class="keyword">private val</span> reactContext: ReactApplicationContext
+) : ReactContextBaseJavaModule(reactContext) {
+
+  <span class="comment">// Module name exposed to JS</span>
+  <span class="keyword">override fun</span> getName(): String = <span class="string">"DeviceInfo"</span>
+
+  <span class="comment">// Constants sent to JS at module init</span>
+  <span class="keyword">override fun</span> getConstants(): Map&lt;String, Any&gt; = mapOf(
+    <span class="string">"platform"</span> to <span class="string">"android"</span>,
+    <span class="string">"osVersion"</span> to Build.VERSION.RELEASE,
+    <span class="string">"model"</span> to Build.MODEL
+  )
+
+  <span class="comment">// @ReactMethod marks methods callable from JS</span>
+  <span class="comment">// isBlockingSynchronousMethod = false (default, async)</span>
+  @ReactMethod
+  <span class="keyword">fun</span> getDeviceId(promise: Promise) {
+    <span class="keyword">try</span> {
+      <span class="keyword">val</span> deviceId = Settings.Secure.getString(
+        reactContext.contentResolver,
+        Settings.Secure.ANDROID_ID
+      )
+      promise.resolve(deviceId)
+    } <span class="keyword">catch</span> (e: Exception) {
+      promise.reject(<span class="string">"DEVICE_ID_ERROR"</span>, e.message, e)
+    }
+  }
+
+  <span class="comment">// Synchronous method (blocks JS thread — use sparingly)</span>
+  @ReactMethod(isBlockingSynchronousMethod = <span class="keyword">true</span>)
+  <span class="keyword">fun</span> getDeviceIdSync(): String {
+    <span class="keyword">return</span> Settings.Secure.getString(
+      reactContext.contentResolver,
+      Settings.Secure.ANDROID_ID
+    )
+  }
+}
+
+<span class="comment">// Package registration — groups modules for the app</span>
+<span class="keyword">class</span> <span class="type">DeviceInfoPackage</span> : ReactPackage {
+  <span class="keyword">override fun</span> createNativeModules(
+    reactContext: ReactApplicationContext
+  ): List&lt;NativeModule&gt; = listOf(DeviceInfoModule(reactContext))
+
+  <span class="keyword">override fun</span> createViewManagers(
+    reactContext: ReactApplicationContext
+  ): List&lt;ViewManager&lt;*, *&gt;&gt; = emptyList()
+}
+
+<span class="comment">// In MainApplication.kt:</span>
+<span class="keyword">override fun</span> getPackages(): List&lt;ReactPackage&gt; = listOf(
+  MainReactPackage(),
+  DeviceInfoPackage()  <span class="comment">// Register custom package</span>
+)</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="method-export">4. Method Export Patterns</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Pattern</th>
+                <th>iOS Macro</th>
+                <th>Android Annotation</th>
+                <th>JS Signature</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Fire-and-forget</td>
+                <td><code>RCT_EXPORT_METHOD(doWork:(NSString *)input)</code></td>
+                <td><code>@ReactMethod fun doWork(input: String)</code></td>
+                <td><code>NativeModules.Mod.doWork("x")</code></td>
+            </tr>
+            <tr>
+                <td>Callback</td>
+                <td><code>RCT_EXPORT_METHOD(get:(RCTResponseSenderBlock)cb)</code></td>
+                <td><code>@ReactMethod fun get(cb: Callback)</code></td>
+                <td><code>NativeModules.Mod.get((err, val) => {})</code></td>
+            </tr>
+            <tr>
+                <td>Promise</td>
+                <td><code>RCT_EXPORT_METHOD(get:(RCTPromiseResolveBlock)res rejecter:(RCTPromiseRejectBlock)rej)</code></td>
+                <td><code>@ReactMethod fun get(promise: Promise)</code></td>
+                <td><code>await NativeModules.Mod.get()</code></td>
+            </tr>
+            <tr>
+                <td>Sync (Android)</td>
+                <td>Not supported</td>
+                <td><code>@ReactMethod(isBlockingSynchronousMethod = true)</code></td>
+                <td><code>NativeModules.Mod.getSync()</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="callbacks-promises">5. Callbacks and Promises</h2>
+
+    <pre><code><span class="comment">// Callback pattern — can only be invoked ONCE</span>
+<span class="comment">// Stored in MessageQueue._successCallbacks / _failureCallbacks</span>
+
+<span class="comment">// JS side:</span>
+NativeModules.FileSystem.readFile(<span class="string">'/path/to/file'</span>, (error, content) => {
+  <span class="keyword">if</span> (error) {
+    console.error(<span class="string">'Read failed:'</span>, error);
+    <span class="keyword">return</span>;
+  }
+  console.log(<span class="string">'Content:'</span>, content);
+});
+
+<span class="comment">// Promise pattern — preferred for modern code</span>
+<span class="keyword">async function</span> readFile() {
+  <span class="keyword">try</span> {
+    <span class="keyword">const</span> content = <span class="keyword">await</span> NativeModules.FileSystem.readFileAsync(<span class="string">'/path/to/file'</span>);
+    console.log(<span class="string">'Content:'</span>, content);
+  } <span class="keyword">catch</span> (error) {
+    console.error(<span class="string">'Read failed:'</span>, error.code, error.message);
+  }
+}
+
+<span class="comment">// Event pattern — for continuous data (location, sensors, etc.)</span>
+<span class="keyword">import</span> { NativeEventEmitter, NativeModules } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="keyword">const</span> locationEmitter = <span class="keyword">new</span> <span class="type">NativeEventEmitter</span>(NativeModules.LocationManager);
+
+<span class="keyword">useEffect</span>(() => {
+  <span class="keyword">const</span> sub = locationEmitter.addListener(<span class="string">'onLocationUpdate'</span>, (event) => {
+    setLocation({ lat: event.latitude, lng: event.longitude });
+  });
+  NativeModules.LocationManager.startUpdating();
+  <span class="keyword">return</span> () => {
+    sub.remove();
+    NativeModules.LocationManager.stopUpdating();
+  };
+}, []);</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall</div>
+        <p>Callbacks in the old bridge architecture can only be invoked <strong>once</strong>. After invocation, the callback reference is deleted from the MessageQueue. If native code tries to invoke the callback a second time, it silently fails. For repeated notifications, use the event emitter pattern instead.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="threading">6. Threading Model</h2>
+
+    <div class="diagram">
+NativeModule Threading
+══════════════════════
+
+iOS Default:
+  Each module gets its own serial GCD queue
+  ┌─────────────────────────────────────────────┐
+  │ Module A Queue ──→ methodA1 → methodA2 → ...│
+  │ Module B Queue ──→ methodB1 → methodB2 → ...│
+  │ Main Queue     ──→ UI operations            │
+  └─────────────────────────────────────────────┘
+
+  Override with: - (dispatch_queue_t)methodQueue
+
+Android Default:
+  All module methods run on a shared NativeModules thread
+  ┌─────────────────────────────────────────────┐
+  │ NativeModulesThread ──→ all module methods  │
+  │ (single background thread)                  │
+  └─────────────────────────────────────────────┘
+
+  Override with: @ReactMethod on specific thread
+    </div>
+
+    <pre><code><span class="comment">// iOS: Controlling method execution thread</span>
+
+<span class="comment">// Run all methods on main thread (for UI operations)</span>
+- (dispatch_queue_t)methodQueue {
+  <span class="keyword">return</span> dispatch_get_main_queue();
+}
+
+<span class="comment">// Run on a custom serial queue</span>
+- (dispatch_queue_t)methodQueue {
+  <span class="keyword">static</span> dispatch_queue_t queue;
+  <span class="keyword">static</span> dispatch_once_t onceToken;
+  dispatch_once(&amp;onceToken, ^{
+    queue = dispatch_queue_create(<span class="string">"com.app.MyModule"</span>, DISPATCH_QUEUE_SERIAL);
+  });
+  <span class="keyword">return</span> queue;
+}
+
+<span class="comment">// Per-method thread control</span>
+RCT_EXPORT_METHOD(heavyComputation:(NSDictionary *)params
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+{
+  <span class="comment">// Dispatch to background even if module queue is main</span>
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    id result = [<span class="keyword">self</span> performHeavyWork:params];
+    resolve(result);
+  });
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="batch-calls">7. Batch Calls and Optimization</h2>
+
+    <pre><code><span class="comment">// Multiple native calls in a single JS frame are batched</span>
+
+<span class="comment">// This JS code:</span>
+NativeModules.Analytics.track(<span class="string">'event1'</span>, { key: <span class="string">'val1'</span> });
+NativeModules.Analytics.track(<span class="string">'event2'</span>, { key: <span class="string">'val2'</span> });
+NativeModules.Analytics.track(<span class="string">'event3'</span>, { key: <span class="string">'val3'</span> });
+
+<span class="comment">// Produces a single bridge message:</span>
+<span class="comment">// [[moduleID, moduleID, moduleID],</span>
+<span class="comment">//  [methodID, methodID, methodID],</span>
+<span class="comment">//  [['event1',{key:'val1'}], ['event2',{key:'val2'}], ['event3',{key:'val3'}]]]</span>
+
+<span class="comment">// Optimization: batch on the native side too</span>
+<span class="comment">// Instead of 3 separate native method invocations,</span>
+<span class="comment">// design modules to accept arrays:</span>
+
+<span class="comment">// BAD: N bridge calls</span>
+items.forEach(item => NativeModules.DB.insert(item));
+
+<span class="comment">// GOOD: 1 bridge call</span>
+NativeModules.DB.insertBatch(items);</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="lazy-loading">8. Module Lazy Loading</h2>
+
+    <p>In the old architecture, all native modules are instantiated at app startup, even if never used. This contributes to slow startup times.</p>
+
+    <pre><code><span class="comment">// Problem: Eager initialization</span>
+<span class="comment">// At startup, React Native:</span>
+<span class="comment">// 1. Iterates all registered ReactPackages</span>
+<span class="comment">// 2. Calls createNativeModules() on each</span>
+<span class="comment">// 3. Instantiates EVERY module class</span>
+<span class="comment">// 4. Calls getConstants() on each (synchronous!)</span>
+<span class="comment">// 5. Serializes all module configs to JS</span>
+
+<span class="comment">// For an app with 50 native modules, this can add 100-300ms to startup</span>
+
+<span class="comment">// Partial mitigation: LazyReactPackage (Android)</span>
+<span class="keyword">class</span> <span class="type">MyLazyPackage</span> : LazyReactPackage() {
+  <span class="keyword">override fun</span> getNativeModules(ctx: ReactApplicationContext) = listOf(
+    ModuleSpec(DeviceInfoModule::<span class="keyword">class</span>.java, <span class="type">DeviceInfoModuleProvider</span>(ctx))
+  )
+  <span class="comment">// Module instantiated only when first accessed from JS</span>
+}
+
+<span class="comment">// TurboModules solve this completely:</span>
+<span class="comment">// - Modules initialized on first access (true lazy loading)</span>
+<span class="comment">// - No upfront getConstants() call</span>
+<span class="comment">// - No module config serialization at startup</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="turbo-modules">9. TurboModules: The Replacement</h2>
+
+    <p>TurboModules are the new architecture's replacement for NativeModules. They use JSI instead of the bridge, enabling synchronous calls, type-safe interfaces, and true lazy initialization.</p>
+
+    <div class="diagram">
+NativeModule vs TurboModule
+════════════════════════════
+
+NativeModule (Old):
+  JS ──JSON.stringify──→ Bridge ──JSON.parse──→ Native
+  JS ←──JSON.parse──── Bridge ←──JSON.stringify── Native
+  • Async only
+  • All modules initialized at startup
+  • No type safety across boundary
+  • ~5-10ms round-trip overhead
+
+TurboModule (New):
+  JS ──JSI (C++ call)──→ Native (direct function pointer)
+  JS ←──JSI (C++ return)── Native
+  • Sync or async
+  • Lazy initialization
+  • Type-safe (codegen from specs)
+  • ~0.01ms call overhead
+    </div>
+
+    <pre><code><span class="comment">// TurboModule spec file (TypeScript)</span>
+<span class="comment">// NativeDeviceInfo.ts</span>
+<span class="keyword">import</span> type { TurboModule } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+<span class="keyword">import</span> { TurboModuleRegistry } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="keyword">export interface</span> <span class="type">Spec</span> <span class="keyword">extends</span> TurboModule {
+  getConstants(): {
+    platform: string;
+    osVersion: string;
+    model: string;
+  };
+  getDeviceId(): Promise&lt;string&gt;;
+  getDeviceIdSync(): string;  <span class="comment">// Synchronous! Not possible with old bridge</span>
+}
+
+<span class="keyword">export default</span> TurboModuleRegistry.getEnforcing&lt;Spec&gt;(<span class="string">'DeviceInfo'</span>);
+
+<span class="comment">// Codegen generates:</span>
+<span class="comment">// - C++ JSI bindings (NativeDeviceInfoSpecJSI.h/cpp)</span>
+<span class="comment">// - ObjC++ protocol (NativeDeviceInfoSpec.h)</span>
+<span class="comment">// - Java interface (NativeDeviceInfoSpec.java)</span>
+
+<span class="comment">// Usage in app code (identical to NativeModules):</span>
+<span class="keyword">import</span> NativeDeviceInfo <span class="keyword">from</span> <span class="string">'./NativeDeviceInfo'</span>;
+<span class="keyword">const</span> id = NativeDeviceInfo.getDeviceIdSync();  <span class="comment">// Synchronous!</span>
+<span class="keyword">const</span> asyncId = <span class="keyword">await</span> NativeDeviceInfo.getDeviceId();</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">10. Architect Considerations</h2>
+
+    <h3>10.1 Module Design Principles</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Principle</th>
+                <th>Old Architecture</th>
+                <th>New Architecture</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Minimize bridge crossings</td>
+                <td>Batch operations, reduce call frequency</td>
+                <td>Less critical (JSI is fast), but still good practice</td>
+            </tr>
+            <tr>
+                <td>Thread safety</td>
+                <td>Module queue isolation, dispatch_async</td>
+                <td>JSI calls can be synchronous — must be thread-aware</td>
+            </tr>
+            <tr>
+                <td>Error handling</td>
+                <td>Promise reject with code + message</td>
+                <td>C++ exceptions mapped to JS errors via JSI</td>
+            </tr>
+            <tr>
+                <td>Type safety</td>
+                <td>Runtime type checking only</td>
+                <td>Compile-time via codegen from specs</td>
+            </tr>
+            <tr>
+                <td>Initialization</td>
+                <td>Eager (all at startup)</td>
+                <td>Lazy (on first access)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>NativeModules are the escape hatch from JavaScript's sandbox into platform capabilities. At L6, you should understand not just how to write them, but how to <strong>architect</strong> them: batch operations to minimize bridge crossings, choose the right threading model (don't block the main thread for I/O, don't use background threads for UI mutations), design for both old and new architecture compatibility, and plan the migration path to TurboModules. The key insight is that TurboModules don't change <em>what</em> you can do — they change the <em>cost</em> of doing it, making previously impractical patterns (synchronous native calls, fine-grained native access) viable.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="02-javascript-runtime.html">← JavaScript Runtime</a>
+        <a href="04-shadow-tree-yoga.html">Next: Shadow Tree &amp; Yoga →</a>
+    </div>
+</div>
+</body>
+</html>

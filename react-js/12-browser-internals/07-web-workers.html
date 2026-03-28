@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Web Workers — Browser Internals</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Browser Internals</a>
+  <span class="sep">›</span>
+  Web Workers
+</nav>
+
+<h1>Web Workers</h1>
+<p class="subtitle">Dedicated, shared, and service workers. postMessage, transferable objects, SharedArrayBuffer, Comlink, OffscreenCanvas, worklets, and thread pool patterns.</p>
+
+<nav class="nav">
+  <a href="01-rendering-engine.html">Rendering Engine</a>
+  <a href="02-javascript-engine.html">JavaScript Engine</a>
+  <a href="03-event-loop.html">Event Loop</a>
+  <a href="04-dom-apis.html">DOM APIs</a>
+  <a href="05-networking.html">Networking</a>
+  <a href="06-storage-apis.html">Storage APIs</a>
+  <a href="08-interview-qa.html">Interview Q&amp;A</a>
+</nav>
+
+<h2 id="types">Worker Types</h2>
+
+<div class="diagram">
+Web Worker Types
+═══════════════════════════════════════════════════════════
+
+DEDICATED WORKER              SHARED WORKER
+(one page ↔ one worker)       (multiple pages ↔ one worker)
+
+┌──────┐    ┌──────────┐     ┌──────┐
+│ Page │◀──▶│ Worker   │     │ Tab1 │◀──┐
+└──────┘    └──────────┘     └──────┘   │   ┌──────────┐
+                              ┌──────┐   ├──▶│ Shared   │
+                              │ Tab2 │◀──┤   │ Worker   │
+                              └──────┘   │   └──────────┘
+                              ┌──────┐   │
+                              │ Tab3 │◀──┘
+                              └──────┘
+
+SERVICE WORKER
+(proxy between pages and network)
+
+┌──────┐    ┌──────────────┐    ┌─────────┐
+│ Page │◀──▶│ Service      │◀──▶│ Network │
+└──────┘    │ Worker       │    └─────────┘
+            │ (intercepts  │    ┌─────────┐
+            │  fetch)      │◀──▶│ Cache   │
+            └──────────────┘    └─────────┘
+</div>
+
+<h2 id="dedicated">Dedicated Workers</h2>
+
+<pre><code>// Creating a dedicated worker
+const worker = new Worker('/workers/heavy-computation.js');
+
+// Or with module syntax:
+const worker = new Worker('/workers/heavy-computation.js', {
+  type: 'module',
+});
+
+// Main thread → Worker
+worker.postMessage({ type: 'PROCESS', data: largeDataset });
+
+// Worker → Main thread
+worker.onmessage = (event) => {
+  const { type, result } = event.data;
+  if (type === 'RESULT') {
+    updateUI(result);
+  }
+};
+
+worker.onerror = (error) => {
+  console.error('Worker error:', error.message);
+};
+
+// Terminate worker
+worker.terminate();
+
+// heavy-computation.js (worker file)
+self.onmessage = (event) => {
+  const { type, data } = event.data;
+
+  if (type === 'PROCESS') {
+    const result = expensiveComputation(data);
+    self.postMessage({ type: 'RESULT', result });
+  }
+};
+
+function expensiveComputation(data) {
+  // This runs on a separate thread — doesn't block UI
+  return data.map(item => {
+    // CPU-intensive work
+    return transform(item);
+  });
+}
+
+// React hook for workers
+function useWorker(workerFactory) {
+  const workerRef = useRef(null);
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    const worker = workerFactory();
+    workerRef.current = worker;
+
+    worker.onmessage = (e) => {
+      setResult(e.data);
+      setLoading(false);
+    };
+
+    return () => worker.terminate();
+  }, [workerFactory]);
+
+  const postMessage = useCallback((data) => {
+    setLoading(true);
+    workerRef.current?.postMessage(data);
+  }, []);
+
+  return { result, loading, postMessage };
+}
+
+// Usage
+const { result, loading, postMessage } = useWorker(
+  () => new Worker(new URL('./worker.js', import.meta.url))
+);</code></pre>
+
+<h2 id="transferable">Transferable Objects</h2>
+
+<pre><code>// postMessage copies data (structured clone) — slow for large data
+// Transferable objects MOVE ownership — zero-copy, instant
+
+// Without transfer (copies 100MB):
+const buffer = new ArrayBuffer(100 * 1024 * 1024);
+worker.postMessage({ buffer }); // ~50ms to copy
+console.log(buffer.byteLength); // 104857600 (still accessible)
+
+// With transfer (moves 100MB):
+const buffer = new ArrayBuffer(100 * 1024 * 1024);
+worker.postMessage({ buffer }, [buffer]); // ~0ms (zero-copy)
+console.log(buffer.byteLength); // 0 (transferred, no longer accessible!)
+
+// Transferable types:
+// - ArrayBuffer
+// - MessagePort
+// - ReadableStream
+// - WritableStream
+// - TransformStream
+// - OffscreenCanvas
+// - ImageBitmap
+// - VideoFrame
+
+// Pattern: process image in worker
+// Main thread:
+const canvas = document.getElementById('canvas');
+const offscreen = canvas.transferControlToOffscreen();
+worker.postMessage({ canvas: offscreen }, [offscreen]);
+
+// Worker:
+self.onmessage = (event) => {
+  const canvas = event.data.canvas;
+  const ctx = canvas.getContext('2d');
+  // Render directly to the canvas from the worker!
+  // No main thread involvement for drawing
+  function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // ... complex rendering
+    requestAnimationFrame(draw);
+  }
+  draw();
+};</code></pre>
+
+<h2 id="shared-array-buffer">SharedArrayBuffer</h2>
+
+<pre><code>// SharedArrayBuffer: shared memory between threads
+// Requires cross-origin isolation headers:
+// Cross-Origin-Opener-Policy: same-origin
+// Cross-Origin-Embedder-Policy: require-corp
+
+// Create shared memory
+const sab = new SharedArrayBuffer(1024);
+const sharedArray = new Int32Array(sab);
+
+// Share with worker (NOT transferred — both have access)
+worker.postMessage({ sharedArray });
+
+// Main thread writes:
+sharedArray[0] = 42;
+
+// Worker reads (same memory!):
+// self.onmessage = (e) => {
+//   const arr = e.data.sharedArray;
+//   console.log(arr[0]); // 42
+// };
+
+// Atomics for thread-safe operations
+Atomics.store(sharedArray, 0, 100);        // Atomic write
+const val = Atomics.load(sharedArray, 0);  // Atomic read
+Atomics.add(sharedArray, 0, 1);            // Atomic increment
+Atomics.compareExchange(sharedArray, 0, 100, 200); // CAS
+
+// Atomics.wait / Atomics.notify for synchronization
+// Worker (waits for value to change):
+Atomics.wait(sharedArray, 0, 0); // Blocks until sharedArray[0] !== 0
+
+// Main thread (signals worker):
+Atomics.store(sharedArray, 0, 1);
+Atomics.notify(sharedArray, 0, 1); // Wake one waiting thread</code></pre>
+
+<h2 id="comlink">Comlink: RPC-Style Worker Communication</h2>
+
+<pre><code>// Comlink by Google Chrome team
+// Makes workers feel like async function calls
+
+// worker.js
+import { expose } from 'comlink';
+
+const api = {
+  async processImage(imageData) {
+    // Heavy computation in worker
+    const result = applyFilters(imageData);
+    return result;
+  },
+
+  fibonacci(n) {
+    if (n <= 1) return n;
+    return api.fibonacci(n - 1) + api.fibonacci(n - 2);
+  },
+
+  async searchIndex(query) {
+    // Full-text search in worker (doesn't block UI)
+    return index.search(query);
+  },
+};
+
+expose(api);
+
+// main.js
+import { wrap } from 'comlink';
+
+const worker = new Worker(new URL('./worker.js', import.meta.url));
+const api = wrap(worker);
+
+// Use like regular async functions!
+const result = await api.processImage(imageData);
+const fib = await api.fibonacci(40);
+const results = await api.searchIndex('react hooks');
+
+// React hook with Comlink
+function useComlinkWorker(workerFactory) {
+  const apiRef = useRef(null);
+
+  useEffect(() => {
+    const worker = workerFactory();
+    apiRef.current = wrap(worker);
+    return () => worker.terminate();
+  }, [workerFactory]);
+
+  return apiRef.current;
+}
+
+// Usage
+function SearchComponent() {
+  const searchWorker = useComlinkWorker(
+    () => new Worker(new URL('./search-worker.js', import.meta.url))
+  );
+
+  const handleSearch = async (query) => {
+    if (!searchWorker) return;
+    const results = await searchWorker.search(query);
+    setResults(results);
+  };
+}</code></pre>
+
+<h2 id="offscreen-canvas">OffscreenCanvas</h2>
+
+<pre><code>// OffscreenCanvas: render canvas in a worker thread
+// Keeps main thread free for user interactions
+
+// Main thread: transfer canvas control to worker
+const canvas = document.getElementById('visualization');
+const offscreen = canvas.transferControlToOffscreen();
+
+const worker = new Worker('/workers/renderer.js');
+worker.postMessage({ canvas: offscreen }, [offscreen]);
+
+// renderer.js (worker)
+self.onmessage = (event) => {
+  const canvas = event.data.canvas;
+  const ctx = canvas.getContext('2d');
+
+  let frame = 0;
+  function render() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Complex visualization rendering
+    for (let i = 0; i < 10000; i++) {
+      const x = Math.sin(frame * 0.01 + i * 0.1) * 200 + canvas.width / 2;
+      const y = Math.cos(frame * 0.01 + i * 0.1) * 200 + canvas.height / 2;
+      ctx.fillRect(x, y, 2, 2);
+    }
+
+    frame++;
+    requestAnimationFrame(render);
+  }
+
+  render();
+};
+
+// WebGL in worker (for 3D rendering off main thread)
+// const gl = canvas.getContext('webgl2');
+// Full WebGL API available in worker!</code></pre>
+
+<h2 id="worklets">Worklets</h2>
+
+<pre><code>// Worklets: lightweight workers for specific rendering tasks
+// Run on the rendering thread, not the main thread
+
+// 1. Paint Worklet (CSS Houdini)
+// Allows custom CSS painting
+// paint-worklet.js
+class CheckerboardPainter {
+  static get inputProperties() {
+    return ['--checker-size', '--checker-color'];
+  }
+
+  paint(ctx, size, properties) {
+    const checkerSize = parseInt(properties.get('--checker-size')) || 20;
+    const color = properties.get('--checker-color')?.toString() || '#000';
+
+    for (let y = 0; y < size.height; y += checkerSize) {
+      for (let x = 0; x < size.width; x += checkerSize) {
+        if ((x / checkerSize + y / checkerSize) % 2 === 0) {
+          ctx.fillStyle = color;
+          ctx.fillRect(x, y, checkerSize, checkerSize);
+        }
+      }
+    }
+  }
+}
+
+registerPaint('checkerboard', CheckerboardPainter);
+
+// Register and use:
+CSS.paintWorklet.add('paint-worklet.js');
+// CSS: background-image: paint(checkerboard);
+
+// 2. Animation Worklet
+// Runs animations on the compositor thread
+class ScrollTimeline {
+  animate(currentTime, effect) {
+    effect.localTime = currentTime * 0.5;
+  }
+}
+
+// 3. Audio Worklet (replaces ScriptProcessorNode)
+class NoiseGenerator extends AudioWorkletProcessor {
+  process(inputs, outputs) {
+    const output = outputs[0];
+    for (const channel of output) {
+      for (let i = 0; i < channel.length; i++) {
+        channel[i] = Math.random() * 2 - 1;
+      }
+    }
+    return true;
+  }
+}
+
+registerProcessor('noise-generator', NoiseGenerator);</code></pre>
+
+<h2 id="thread-pool">Thread Pool Patterns</h2>
+
+<pre><code>// Worker pool: reuse workers for multiple tasks
+class WorkerPool {
+  constructor(workerUrl, poolSize = navigator.hardwareConcurrency || 4) {
+    this.workers = [];
+    this.queue = [];
+    this.activeJobs = new Map();
+
+    for (let i = 0; i < poolSize; i++) {
+      const worker = new Worker(workerUrl, { type: 'module' });
+      worker.onmessage = (e) => this.handleResult(worker, e.data);
+      this.workers.push({ worker, busy: false });
+    }
+  }
+
+  execute(task) {
+    return new Promise((resolve, reject) => {
+      const job = { task, resolve, reject, id: crypto.randomUUID() };
+
+      const available = this.workers.find(w => !w.busy);
+      if (available) {
+        this.dispatch(available, job);
+      } else {
+        this.queue.push(job);
+      }
+    });
+  }
+
+  dispatch(workerInfo, job) {
+    workerInfo.busy = true;
+    this.activeJobs.set(workerInfo.worker, job);
+    workerInfo.worker.postMessage({ id: job.id, ...job.task });
+  }
+
+  handleResult(worker, result) {
+    const job = this.activeJobs.get(worker);
+    if (job) {
+      job.resolve(result);
+      this.activeJobs.delete(worker);
+    }
+
+    const workerInfo = this.workers.find(w => w.worker === worker);
+    workerInfo.busy = false;
+
+    if (this.queue.length > 0) {
+      const nextJob = this.queue.shift();
+      this.dispatch(workerInfo, nextJob);
+    }
+  }
+
+  terminate() {
+    this.workers.forEach(({ worker }) => worker.terminate());
+  }
+}
+
+// Usage
+const pool = new WorkerPool('/workers/processor.js', 4);
+
+// Process items in parallel across workers
+const results = await Promise.all(
+  items.map(item => pool.execute({ type: 'PROCESS', data: item }))
+);</code></pre>
+
+<h2 id="limitations">Worker Limitations</h2>
+
+<table>
+<thead>
+<tr><th>Feature</th><th>Main Thread</th><th>Dedicated Worker</th><th>Shared Worker</th><th>Service Worker</th></tr>
+</thead>
+<tbody>
+<tr><td>DOM access</td><td>Yes</td><td>No</td><td>No</td><td>No</td></tr>
+<tr><td>window object</td><td>Yes</td><td>No (self)</td><td>No (self)</td><td>No (self)</td></tr>
+<tr><td>fetch</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>IndexedDB</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Cache API</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>WebSocket</td><td>Yes</td><td>Yes</td><td>Yes</td><td>No</td></tr>
+<tr><td>setTimeout</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>requestAnimationFrame</td><td>Yes</td><td>No</td><td>No</td><td>No</td></tr>
+<tr><td>OffscreenCanvas</td><td>Yes</td><td>Yes</td><td>No</td><td>No</td></tr>
+<tr><td>Lifecycle</td><td>Page</td><td>Page/manual</td><td>Last tab</td><td>Browser-managed</td></tr>
+</tbody>
+</table>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p>The key decision for workers is: what computation justifies the overhead of serialization (postMessage) and context switching? Good candidates: image processing, data parsing (CSV, JSON), search indexing, cryptography, complex calculations. Bad candidates: simple state updates, small data transformations, anything that needs DOM access. Use Comlink to reduce the boilerplate, and transferable objects to eliminate serialization cost for large binary data.</p>
+</div>
+
+<div class="callout callout-info">
+  <div class="callout-title">Interview Tip</div>
+  <p>When discussing workers, mention the three types and their use cases: dedicated workers for CPU-intensive computation, shared workers for cross-tab state, service workers for network interception and caching. Then discuss the communication patterns: postMessage (copy), transferable objects (move), SharedArrayBuffer (share). Finally, mention Comlink for ergonomic RPC-style communication and worker pools for parallel processing.</p>
+</div>
+
+<div class="nav-footer">
+  <a href="06-storage-apis.html">← Storage APIs</a>
+  <a href="08-interview-qa.html">Interview Q&amp;A →</a>
+</div>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

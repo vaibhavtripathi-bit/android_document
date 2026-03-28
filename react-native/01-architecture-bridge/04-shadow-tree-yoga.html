@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shadow Tree &amp; Yoga — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Architecture &amp; Bridge</a><span class="sep">›</span>
+        Shadow Tree &amp; Yoga
+    </nav>
+
+    <h1>Shadow Tree &amp; Yoga Layout Engine</h1>
+    <p class="subtitle">The shadow tree is the intermediate representation between React's virtual tree and native views. Yoga is the C++ Flexbox engine that computes layout. Understanding this pipeline is critical for debugging layout issues and optimizing rendering performance.</p>
+
+    <nav class="nav">
+        <a href="01-bridge-architecture.html">Bridge Architecture</a>
+        <a href="02-javascript-runtime.html">JS Runtime</a>
+        <a href="03-native-module-system.html">Native Modules</a>
+        <a href="04-shadow-tree-yoga.html" class="active">Shadow Tree &amp; Yoga</a>
+        <a href="05-rendering-pipeline.html">Rendering Pipeline</a>
+        <a href="06-threading-model.html">Threading Model</a>
+        <a href="07-metro-bundler.html">Metro Bundler</a>
+        <a href="08-interview-qa.html">Interview Q&amp;A</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#shadow-concept">1. Shadow Tree Concept</a></li>
+            <li><a href="#three-trees">2. Three Trees: React → Shadow → Native</a></li>
+            <li><a href="#yoga-overview">3. Yoga Layout Engine Overview</a></li>
+            <li><a href="#yoga-nodes">4. Yoga Node Tree</a></li>
+            <li><a href="#layout-process">5. Layout Calculation Process</a></li>
+            <li><a href="#style-resolution">6. Style Resolution</a></li>
+            <li><a href="#layout-passes">7. Layout Passes: Measure and Layout</a></li>
+            <li><a href="#performance">8. Performance Characteristics</a></li>
+            <li><a href="#yoga-vs-css">9. Yoga vs CSS Flexbox Differences</a></li>
+            <li><a href="#architect">10. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="shadow-concept">1. Shadow Tree Concept</h2>
+
+    <p>The shadow tree is a lightweight C++ representation of the view hierarchy that exists between React's JavaScript virtual tree and the platform's native view tree. It serves as the layout calculation substrate — Yoga operates on shadow nodes, not on native views or React elements.</p>
+
+    <div class="diagram">
+Why a Shadow Tree?
+══════════════════
+
+React Element Tree (JS)     Shadow Tree (C++)        Native View Tree
+────────────────────        ─────────────────        ────────────────
+Immutable descriptions      Mutable layout nodes     Platform views
+Created every render        Persisted, updated       Created/mutated
+No layout information       Yoga layout computed     Final pixel positions
+Platform-agnostic           Platform-agnostic        Platform-specific
+
+The shadow tree exists because:
+1. Layout must be computed off the main thread (shadow thread)
+2. Yoga is C++ — needs C++ node objects, not JS objects
+3. Diffing shadow trees produces minimal native mutations
+4. Cross-platform: same shadow tree → different native views
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>The shadow tree is React Native's equivalent of the browser's render tree (DOM + CSSOM → render tree → layout → paint). But unlike browsers where this is a monolithic pipeline, React Native separates each stage across threads: React reconciliation on JS thread, shadow tree + layout on shadow thread, native view mutations on UI thread. This separation enables concurrent work but introduces the async bridge bottleneck.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="three-trees">2. Three Trees: React → Shadow → Native</h2>
+
+    <pre><code><span class="comment">// The three-tree pipeline for a simple component:</span>
+
+<span class="comment">// 1. React Element Tree (JS) — created by React reconciliation</span>
+<span class="keyword">const</span> App = () => (
+  &lt;<span class="type">View</span> style={{ flex: 1, padding: 20 }}&gt;
+    &lt;<span class="type">Text</span> style={{ fontSize: 24 }}&gt;Hello&lt;/<span class="type">Text</span>&gt;
+    &lt;<span class="type">View</span> style={{ flexDirection: 'row', gap: 10 }}&gt;
+      &lt;<span class="type">Button</span> title="OK" /&gt;
+      &lt;<span class="type">Button</span> title="Cancel" /&gt;
+    &lt;/<span class="type">View</span>&gt;
+  &lt;/<span class="type">View</span>&gt;
+);
+
+<span class="comment">// 2. Shadow Tree (C++) — created via UIManager.createView bridge calls</span>
+<span class="comment">// ShadowNode(RCTView, {flex:1, padding:20})</span>
+<span class="comment">//   ├── ShadowNode(RCTText, {fontSize:24})</span>
+<span class="comment">//   │     └── RawText("Hello")</span>
+<span class="comment">//   └── ShadowNode(RCTView, {flexDirection:'row', gap:10})</span>
+<span class="comment">//         ├── ShadowNode(RCTView, button props)</span>
+<span class="comment">//         └── ShadowNode(RCTView, button props)</span>
+
+<span class="comment">// 3. Native View Tree — created after layout calculation</span>
+<span class="comment">// iOS:                          Android:</span>
+<span class="comment">// UIView (0,0,375,812)          FrameLayout (0,0,1080,2340)</span>
+<span class="comment">//   ├── RCTTextView              ├── ReactTextView</span>
+<span class="comment">//   └── UIView                  └── ViewGroup</span>
+<span class="comment">//         ├── UIView                   ├── ReactViewGroup</span>
+<span class="comment">//         └── UIView                   └── ReactViewGroup</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="yoga-overview">3. Yoga Layout Engine Overview</h2>
+
+    <p>Yoga is a cross-platform layout engine written in C++ that implements a subset of the CSS Flexbox specification. It was created by Meta specifically for React Native but is used in other projects (Litho for Android, ComponentKit for iOS).</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Feature</th>
+                <th>Details</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Language</strong></td>
+                <td>C++ with C API bindings</td>
+            </tr>
+            <tr>
+                <td><strong>Layout Model</strong></td>
+                <td>Flexbox (subset of CSS Flexbox)</td>
+            </tr>
+            <tr>
+                <td><strong>Default flexDirection</strong></td>
+                <td><code>column</code> (CSS default is <code>row</code>)</td>
+            </tr>
+            <tr>
+                <td><strong>Thread Safety</strong></td>
+                <td>Not thread-safe — must be used from a single thread</td>
+            </tr>
+            <tr>
+                <td><strong>Performance</strong></td>
+                <td>O(n) for most layouts, O(n²) worst case with measure functions</td>
+            </tr>
+            <tr>
+                <td><strong>Supported Properties</strong></td>
+                <td>flex, flexDirection, justifyContent, alignItems, margin, padding, position, width, height, minWidth, maxWidth, aspectRatio, gap, etc.</td>
+            </tr>
+            <tr>
+                <td><strong>Not Supported</strong></td>
+                <td>CSS Grid, float, z-index (layout), CSS transforms (layout), calc()</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="yoga-nodes">4. Yoga Node Tree</h2>
+
+    <pre><code><span class="comment">// Yoga node creation (C API, simplified)</span>
+
+<span class="comment">// Each shadow node owns a YGNode</span>
+YGNodeRef root = YGNodeNew();
+YGNodeStyleSetFlexDirection(root, YGFlexDirectionColumn);
+YGNodeStyleSetPadding(root, YGEdgeAll, 20);
+YGNodeStyleSetFlex(root, 1);
+
+YGNodeRef text = YGNodeNew();
+<span class="comment">// Text nodes have a measure function (see section 7)</span>
+YGNodeSetMeasureFunc(text, textMeasureFunc);
+
+YGNodeRef row = YGNodeNew();
+YGNodeStyleSetFlexDirection(row, YGFlexDirectionRow);
+YGNodeStyleSetGap(row, YGGutterColumn, 10);
+
+YGNodeRef btn1 = YGNodeNew();
+YGNodeRef btn2 = YGNodeNew();
+
+<span class="comment">// Build tree</span>
+YGNodeInsertChild(root, text, 0);
+YGNodeInsertChild(root, row, 1);
+YGNodeInsertChild(row, btn1, 0);
+YGNodeInsertChild(row, btn2, 1);
+
+<span class="comment">// Calculate layout for a 375x812 container (iPhone)</span>
+YGNodeCalculateLayout(root, 375, 812, YGDirectionLTR);
+
+<span class="comment">// Read computed layout</span>
+<span class="keyword">float</span> textTop = YGNodeLayoutGetTop(text);      <span class="comment">// 20 (padding)</span>
+<span class="keyword">float</span> textLeft = YGNodeLayoutGetLeft(text);     <span class="comment">// 20 (padding)</span>
+<span class="keyword">float</span> textWidth = YGNodeLayoutGetWidth(text);   <span class="comment">// 335 (375 - 40)</span>
+<span class="keyword">float</span> textHeight = YGNodeLayoutGetHeight(text); <span class="comment">// measured</span></code></pre>
+
+    <div class="diagram">
+Yoga Node Tree (for the example above)
+═══════════════════════════════════════
+
+YGNode(root)
+│ flexDirection: column
+│ padding: 20
+│ flex: 1
+│ computed: {0, 0, 375, 812}
+│
+├── YGNode(text)
+│   │ measureFunc: textMeasureFunc
+│   │ computed: {20, 20, 335, 29}
+│   │
+│   └── (text content measured by native)
+│
+└── YGNode(row)
+    │ flexDirection: row
+    │ gap: 10
+    │ computed: {20, 69, 335, 44}
+    │
+    ├── YGNode(btn1)
+    │   computed: {0, 0, 162.5, 44}
+    │
+    └── YGNode(btn2)
+        computed: {172.5, 0, 162.5, 44}
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="layout-process">5. Layout Calculation Process</h2>
+
+    <pre><code><span class="comment">// Complete layout calculation pipeline</span>
+
+<span class="comment">// Step 1: JS sends style props via bridge</span>
+<span class="comment">// UIManager.createView(tag, 'RCTView', rootTag, {flex: 1, padding: 20})</span>
+
+<span class="comment">// Step 2: Shadow thread creates/updates YGNodes</span>
+<span class="comment">// ShadowNodeRegistry maps reactTag → ShadowNode → YGNode</span>
+
+<span class="comment">// Step 3: Mark dirty nodes</span>
+<span class="comment">// When a style prop changes, the node and ancestors are marked dirty</span>
+YGNodeMarkDirty(node);
+<span class="comment">// Dirty flag propagates up: if child is dirty, parent must re-layout</span>
+
+<span class="comment">// Step 4: Calculate layout (on shadow thread)</span>
+YGNodeCalculateLayout(rootNode, screenWidth, screenHeight, direction);
+<span class="comment">// This is the expensive step — traverses entire dirty subtree</span>
+
+<span class="comment">// Step 5: Collect layout updates</span>
+<span class="comment">// Compare new layout with previous layout for each node</span>
+<span class="comment">// Only nodes whose layout actually changed produce updates</span>
+<span class="keyword">for</span> (node in dirtyNodes) {
+  <span class="keyword">if</span> (node.layout != node.previousLayout) {
+    layoutUpdates.push({
+      tag: node.reactTag,
+      layout: {
+        x: YGNodeLayoutGetLeft(node),
+        y: YGNodeLayoutGetTop(node),
+        width: YGNodeLayoutGetWidth(node),
+        height: YGNodeLayoutGetHeight(node)
+      }
+    });
+  }
+}
+
+<span class="comment">// Step 6: Send layout updates to UI thread</span>
+<span class="comment">// Dispatched as a batch to main thread for native view updates</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="style-resolution">6. Style Resolution</h2>
+
+    <p>React Native's style system differs from CSS in important ways. Styles are plain JavaScript objects, there's no cascade, and specificity is determined by object spread order.</p>
+
+    <pre><code><span class="comment">// Style resolution in React Native</span>
+
+<span class="comment">// 1. No cascade — styles are explicit per component</span>
+<span class="comment">// 2. No inheritance (except Text inherits from parent Text)</span>
+<span class="comment">// 3. Last-wins for array styles</span>
+
+<span class="keyword">const</span> styles = StyleSheet.create({
+  base: { padding: 10, backgroundColor: <span class="string">'white'</span> },
+  active: { backgroundColor: <span class="string">'blue'</span> },
+});
+
+<span class="comment">// Array style: later entries override earlier ones</span>
+&lt;<span class="type">View</span> style={[styles.base, styles.active]} /&gt;
+<span class="comment">// Result: { padding: 10, backgroundColor: 'blue' }</span>
+
+<span class="comment">// Style flattening (what happens internally):</span>
+<span class="comment">// StyleSheet.flatten([styles.base, styles.active])</span>
+<span class="comment">// → Object.assign({}, styles.base, styles.active)</span>
+<span class="comment">// → { padding: 10, backgroundColor: 'blue' }</span>
+
+<span class="comment">// StyleSheet.create optimization:</span>
+<span class="comment">// In production, StyleSheet.create registers styles and returns IDs</span>
+<span class="comment">// Style objects are sent to native once, then referenced by ID</span>
+<span class="comment">// This avoids re-serializing the same style object every render</span>
+
+<span class="comment">// Style → Yoga property mapping:</span>
+<span class="comment">// padding: 10        → YGNodeStyleSetPadding(node, YGEdgeAll, 10)</span>
+<span class="comment">// flexDirection:'row' → YGNodeStyleSetFlexDirection(node, YGFlexDirectionRow)</span>
+<span class="comment">// width: '50%'       → YGNodeStyleSetWidthPercent(node, 50)</span>
+<span class="comment">// position:'absolute' → YGNodeStyleSetPositionType(node, YGPositionTypeAbsolute)</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="layout-passes">7. Layout Passes: Measure and Layout</h2>
+
+    <p>Yoga performs two passes during layout calculation: a <strong>measure pass</strong> (bottom-up) and a <strong>layout pass</strong> (top-down).</p>
+
+    <div class="diagram">
+Yoga Two-Pass Layout Algorithm
+══════════════════════════════
+
+Pass 1: MEASURE (bottom-up)
+─────────────────────────────
+Start from leaf nodes, measure intrinsic sizes
+Text nodes call native text measurement
+Images use known dimensions or aspect ratio
+
+        root
+       /    \
+     row    text ← measure("Hello", maxWidth=335) → {335, 29}
+    /   \
+  btn1  btn2 ← measure each button's text content
+
+Pass 2: LAYOUT (top-down)
+─────────────────────────────
+Apply flex algorithm, compute final positions
+Parent distributes space among children
+
+  root {0, 0, 375, 812}
+       /              \
+  text {20,20,335,29}  row {20, 69, 335, 44}
+                      /                \
+              btn1 {0,0,162.5,44}  btn2 {172.5,0,162.5,44}
+    </div>
+
+    <pre><code><span class="comment">// Text measure function — the bridge between Yoga and native text rendering</span>
+
+<span class="comment">// Yoga calls this when it needs to know a text node's intrinsic size</span>
+YGSize textMeasureFunc(
+  YGNodeRef node,
+  <span class="keyword">float</span> width,
+  YGMeasureMode widthMode,
+  <span class="keyword">float</span> height,
+  YGMeasureMode heightMode
+) {
+  <span class="comment">// widthMode can be:</span>
+  <span class="comment">// YGMeasureModeUndefined — no constraint, measure natural size</span>
+  <span class="comment">// YGMeasureModeExactly   — width is fixed</span>
+  <span class="comment">// YGMeasureModeAtMost    — width is maximum</span>
+
+  <span class="comment">// Calls into platform-specific text measurement:</span>
+  <span class="comment">// iOS: [NSAttributedString boundingRectWithSize:...]</span>
+  <span class="comment">// Android: StaticLayout or BoringLayout</span>
+
+  TextMeasurement measurement = measureText(
+    textContent, fontSize, fontFamily, width, widthMode
+  );
+
+  <span class="keyword">return</span> { measurement.width, measurement.height };
+}
+
+<span class="comment">// This is expensive! Text measurement involves:</span>
+<span class="comment">// 1. Font loading and glyph lookup</span>
+<span class="comment">// 2. Line breaking algorithm</span>
+<span class="comment">// 3. Platform text layout engine</span>
+<span class="comment">// Yoga caches results to avoid redundant measurements</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Performance Warning</div>
+        <p>Text measurement is the most expensive part of layout calculation. Each text node requires a call to the platform's text rendering engine. For screens with hundreds of text nodes (e.g., long lists), this can take 10-50ms. This is why <code>FlatList</code> virtualizes — it limits the number of text nodes that need measurement at any given time.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="performance">8. Performance Characteristics</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Scenario</th>
+                <th>Complexity</th>
+                <th>Typical Time</th>
+                <th>Optimization</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Simple flat layout</td>
+                <td>O(n)</td>
+                <td>&lt;1ms</td>
+                <td>None needed</td>
+            </tr>
+            <tr>
+                <td>Nested flex containers</td>
+                <td>O(n)</td>
+                <td>1-5ms</td>
+                <td>Flatten hierarchy</td>
+            </tr>
+            <tr>
+                <td>Text-heavy screen</td>
+                <td>O(n × m)</td>
+                <td>5-50ms</td>
+                <td>Virtualize, cache text</td>
+            </tr>
+            <tr>
+                <td>Deeply nested (10+ levels)</td>
+                <td>O(n)</td>
+                <td>2-10ms</td>
+                <td>Reduce nesting depth</td>
+            </tr>
+            <tr>
+                <td>Percentage widths with wrap</td>
+                <td>O(n²)</td>
+                <td>5-20ms</td>
+                <td>Avoid flexWrap with %</td>
+            </tr>
+            <tr>
+                <td>Full screen re-layout</td>
+                <td>O(n)</td>
+                <td>5-30ms</td>
+                <td>Incremental updates</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Layout performance anti-patterns</span>
+
+<span class="comment">// BAD: Unnecessary nesting (each level adds layout computation)</span>
+&lt;<span class="type">View</span>&gt;
+  &lt;<span class="type">View</span>&gt;
+    &lt;<span class="type">View</span>&gt;
+      &lt;<span class="type">View</span>&gt;
+        &lt;<span class="type">Text</span>&gt;Deeply nested&lt;/<span class="type">Text</span>&gt;
+      &lt;/<span class="type">View</span>&gt;
+    &lt;/<span class="type">View</span>&gt;
+  &lt;/<span class="type">View</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+
+<span class="comment">// GOOD: Flat structure with style composition</span>
+&lt;<span class="type">View</span> style={styles.container}&gt;
+  &lt;<span class="type">Text</span>&gt;Flat layout&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+
+<span class="comment">// BAD: Dynamic styles that change on every render</span>
+&lt;<span class="type">View</span> style={{ width: Math.random() * 100 }} /&gt;
+<span class="comment">// Forces Yoga re-calculation every render</span>
+
+<span class="comment">// GOOD: Stable styles via StyleSheet.create</span>
+<span class="keyword">const</span> styles = StyleSheet.create({
+  box: { width: 100 }  <span class="comment">// Registered once, referenced by ID</span>
+});</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="yoga-vs-css">9. Yoga vs CSS Flexbox Differences</h2>
+
+    <p>Yoga implements a subset of CSS Flexbox with some intentional differences. These differences are a common source of bugs when porting web layouts to React Native.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Property</th>
+                <th>CSS Flexbox</th>
+                <th>Yoga (React Native)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>flexDirection</code></td>
+                <td>Default: <code>row</code></td>
+                <td>Default: <code>column</code></td>
+            </tr>
+            <tr>
+                <td><code>flex</code></td>
+                <td>Shorthand for grow/shrink/basis</td>
+                <td>Single number (maps to <code>flexGrow</code>; <code>flexShrink</code> and <code>flexBasis</code> set separately)</td>
+            </tr>
+            <tr>
+                <td><code>alignContent</code></td>
+                <td>Default: <code>stretch</code></td>
+                <td>Default: <code>flex-start</code></td>
+            </tr>
+            <tr>
+                <td><code>flexShrink</code></td>
+                <td>Default: <code>1</code></td>
+                <td>Default: <code>0</code></td>
+            </tr>
+            <tr>
+                <td>Units</td>
+                <td>px, em, rem, vw, vh, %, calc()</td>
+                <td>dp (unitless numbers), %</td>
+            </tr>
+            <tr>
+                <td><code>position</code></td>
+                <td>static, relative, absolute, fixed, sticky</td>
+                <td><code>relative</code> (default), <code>absolute</code>, <code>static</code></td>
+            </tr>
+            <tr>
+                <td><code>display</code></td>
+                <td>block, inline, flex, grid, none, etc.</td>
+                <td><code>flex</code> (default), <code>none</code></td>
+            </tr>
+            <tr>
+                <td><code>overflow</code></td>
+                <td>Affects layout and painting</td>
+                <td>Affects clipping only, not layout</td>
+            </tr>
+            <tr>
+                <td>CSS Grid</td>
+                <td>Fully supported</td>
+                <td>Not supported</td>
+            </tr>
+            <tr>
+                <td><code>gap</code></td>
+                <td>Supported</td>
+                <td>Supported (added in Yoga 2.0 / RN 0.71+)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Common gotcha: flex shorthand differs</span>
+
+<span class="comment">// CSS: flex: 1 means flex-grow:1, flex-shrink:1, flex-basis:0%</span>
+<span class="comment">// RN:  flex: 1 means flexGrow:1 (flexShrink:0, flexBasis:auto by default)</span>
+
+<span class="comment">// To get CSS-equivalent behavior in RN:</span>
+<span class="keyword">const</span> cssFlexOne = {
+  flexGrow: 1,
+  flexShrink: 1,
+  flexBasis: 0,  <span class="comment">// or '0%'</span>
+};
+
+<span class="comment">// Common gotcha: flexShrink default</span>
+<span class="comment">// CSS default: flexShrink: 1 (items shrink to fit)</span>
+<span class="comment">// RN default:  flexShrink: 0 (items overflow container)</span>
+
+<span class="comment">// This means text won't wrap by default in RN flex containers</span>
+<span class="comment">// unless you explicitly set flexShrink: 1 on the text container</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">10. Architect Considerations</h2>
+
+    <h3>10.1 Layout Optimization Strategies</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Strategy</th>
+                <th>Technique</th>
+                <th>Impact</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Minimize tree depth</td>
+                <td>Flatten view hierarchy, use style composition over nesting</td>
+                <td>Fewer Yoga nodes to traverse</td>
+            </tr>
+            <tr>
+                <td>Use view flattening</td>
+                <td><code>collapsable={true}</code> (default) removes layout-only views</td>
+                <td>Fewer native views and shadow nodes</td>
+            </tr>
+            <tr>
+                <td>Stable styles</td>
+                <td>StyleSheet.create, avoid inline style objects</td>
+                <td>Prevents unnecessary Yoga recalculation</td>
+            </tr>
+            <tr>
+                <td>Virtualize lists</td>
+                <td>FlatList/SectionList instead of ScrollView + map</td>
+                <td>Limits shadow tree size for long lists</td>
+            </tr>
+            <tr>
+                <td>Fixed dimensions</td>
+                <td>Use explicit width/height where possible</td>
+                <td>Avoids measure pass for those nodes</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>The shadow tree + Yoga system is React Native's layout engine, analogous to the browser's layout/reflow phase. At L6, you should understand: (1) layout is computed on a background thread, so it doesn't block the UI — but the results must be sent to the UI thread via the bridge, adding latency; (2) text measurement is the bottleneck because it requires platform text engines; (3) Yoga's O(n) complexity means layout itself is rarely the bottleneck — it's the bridge crossing and native view mutation that dominate; (4) in the new architecture (Fabric), the shadow tree moves to C++ shared between threads, eliminating the bridge for layout updates. The key architectural insight is that <strong>view flattening</strong> — removing shadow nodes that exist only for layout grouping — is the single most impactful optimization, as it reduces both layout computation and native view count.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="03-native-module-system.html">← Native Module System</a>
+        <a href="05-rendering-pipeline.html">Next: Rendering Pipeline →</a>
+    </div>
+</div>
+</body>
+</html>

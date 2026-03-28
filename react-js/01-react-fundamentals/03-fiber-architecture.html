@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fiber Architecture — React JS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">React Fundamentals</a><span class="sep">›</span>
+        Fiber Architecture
+    </nav>
+
+    <h1>Fiber Architecture</h1>
+    <p class="subtitle">The fiber node structure, double-buffered trees, linked-list traversal, the unit-of-work concept, and the priority lanes system that powers React's concurrent rendering engine.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#why-fiber">1. Why Fiber Exists</a></li>
+            <li><a href="#node-structure">2. Fiber Node Structure</a></li>
+            <li><a href="#double-buffer">3. Current vs WorkInProgress (Double Buffering)</a></li>
+            <li><a href="#linked-list">4. Why Linked List, Not Tree</a></li>
+            <li><a href="#unit-of-work">5. Unit of Work Concept</a></li>
+            <li><a href="#idle-callback">6. requestIdleCallback Origin Story</a></li>
+            <li><a href="#fiber-tags">7. Fiber Tags</a></li>
+            <li><a href="#lanes">8. Priority Lanes System Overview</a></li>
+            <li><a href="#traversal">9. Fiber Tree Traversal Algorithm</a></li>
+            <li><a href="#architect">10. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="why-fiber">1. Why Fiber Exists</h2>
+
+    <p>Before React 16, the reconciler (called the "Stack Reconciler") processed the entire component tree synchronously in a single, uninterruptible call stack. For large trees, this could block the main thread for hundreds of milliseconds, causing dropped frames and unresponsive UIs.</p>
+
+    <div class="diagram">
+Stack Reconciler (React ≤15):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+│ Reconcile entire tree (synchronous, uninterruptible)  │
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    200ms+ blocked
+                    ↓
+              Dropped frames, janky UI
+
+Fiber Reconciler (React 16+):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+│ Work │ Yield │ Work │ Yield │ Work │ Yield │ Commit  │
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5ms    browser  5ms   browser  5ms   browser  sync
+         event           paint          input
+    </div>
+
+    <p>Fiber was a complete rewrite of React's core algorithm, designed to make rendering <strong>interruptible</strong>. The key insight: by representing the component tree as a linked list of fiber nodes (rather than recursive function calls on the stack), React can pause work, do something more important, and resume later.</p>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>Fiber is essentially React's own virtual call stack implemented in the heap. A real call stack (function calls) can't be paused and resumed — once you start recursing, you must finish. By moving the "stack" to heap-allocated fiber objects with explicit pointers (child, sibling, return), React gains full control over scheduling.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="node-structure">2. Fiber Node Structure</h2>
+
+    <p>Each fiber is a JavaScript object with ~30 fields. Here are the critical ones:</p>
+
+    <pre><code><span class="comment">// Simplified Fiber node structure (React 18)</span>
+<span class="keyword">type</span> <span class="type">Fiber</span> = {
+  <span class="comment">// === Identity ===</span>
+  tag: <span class="type">WorkTag</span>,           <span class="comment">// FunctionComponent(0), ClassComponent(1), HostComponent(5)...</span>
+  key: <span class="keyword">null</span> | <span class="type">string</span>,     <span class="comment">// Reconciliation key from JSX</span>
+  elementType: <span class="keyword">any</span>,       <span class="comment">// The type from ReactElement (div, App, etc.)</span>
+  type: <span class="keyword">any</span>,              <span class="comment">// Resolved type (same as elementType for most)</span>
+
+  <span class="comment">// === Tree Structure (linked list) ===</span>
+  <span class="keyword">return</span>: <span class="type">Fiber</span> | <span class="keyword">null</span>,   <span class="comment">// Parent fiber</span>
+  child: <span class="type">Fiber</span> | <span class="keyword">null</span>,    <span class="comment">// First child fiber</span>
+  sibling: <span class="type">Fiber</span> | <span class="keyword">null</span>,  <span class="comment">// Next sibling fiber</span>
+  index: <span class="type">number</span>,          <span class="comment">// Position among siblings</span>
+
+  <span class="comment">// === State ===</span>
+  stateNode: <span class="keyword">any</span>,         <span class="comment">// DOM node | class instance | null (function)</span>
+  memoizedState: <span class="keyword">any</span>,     <span class="comment">// Hooks linked list (function) | state (class)</span>
+  memoizedProps: <span class="keyword">any</span>,     <span class="comment">// Props from last completed render</span>
+  pendingProps: <span class="keyword">any</span>,      <span class="comment">// Props for current render</span>
+
+  <span class="comment">// === Effects ===</span>
+  flags: <span class="type">Flags</span>,           <span class="comment">// Placement | Update | Deletion | ...</span>
+  subtreeFlags: <span class="type">Flags</span>,    <span class="comment">// Aggregated flags from children</span>
+  updateQueue: <span class="keyword">any</span>,       <span class="comment">// Queue of state updates</span>
+
+  <span class="comment">// === Double Buffering ===</span>
+  alternate: <span class="type">Fiber</span> | <span class="keyword">null</span>, <span class="comment">// Points to the other version of this fiber</span>
+
+  <span class="comment">// === Scheduling ===</span>
+  lanes: <span class="type">Lanes</span>,           <span class="comment">// Priority lanes for this fiber's pending work</span>
+  childLanes: <span class="type">Lanes</span>,      <span class="comment">// Aggregated lanes from subtree</span>
+};</code></pre>
+
+    <h3>2.1 Key Fields Explained</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Field</th>
+                <th>Purpose</th>
+                <th>Example Value</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>tag</code></td>
+                <td>Identifies the type of fiber for processing</td>
+                <td><code>0</code> (FunctionComponent)</td>
+            </tr>
+            <tr>
+                <td><code>stateNode</code></td>
+                <td>The "real" thing this fiber represents</td>
+                <td>DOM element, class instance, or null</td>
+            </tr>
+            <tr>
+                <td><code>memoizedState</code></td>
+                <td>For function components: head of hooks linked list</td>
+                <td><code>{ memoizedState: 0, queue: {...}, next: hook2 }</code></td>
+            </tr>
+            <tr>
+                <td><code>flags</code></td>
+                <td>Bitmask of side effects to perform in commit</td>
+                <td><code>Placement | Update</code> (binary OR)</td>
+            </tr>
+            <tr>
+                <td><code>alternate</code></td>
+                <td>Points to the corresponding fiber in the other tree</td>
+                <td>The workInProgress or current version</td>
+            </tr>
+            <tr>
+                <td><code>lanes</code></td>
+                <td>Bitmask of priority levels with pending work</td>
+                <td><code>SyncLane | DefaultLane</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="double-buffer">3. Current vs WorkInProgress (Double Buffering)</h2>
+
+    <p>React maintains two fiber trees simultaneously, connected via the <code>alternate</code> pointer. This is analogous to double buffering in graphics programming.</p>
+
+    <div class="diagram">
+                    current tree                workInProgress tree
+                   (on screen)                   (being built)
+                   ───────────                   ─────────────────
+                   ┌─────────┐    alternate     ┌─────────┐
+                   │  App    │ ◄──────────────► │  App    │
+                   └────┬────┘                  └────┬────┘
+                        │                            │
+                   ┌────┴────┐                  ┌────┴────┐
+                   │  div    │ ◄──────────────► │  div    │
+                   └──┬───┬──┘                  └──┬───┬──┘
+                      │   │                        │   │
+                ┌─────┘   └─────┐            ┌─────┘   └─────┐
+           ┌────┴──┐      ┌────┴──┐     ┌────┴──┐      ┌────┴──┐
+           │  h1   │      │  p    │     │  h1   │      │  p    │
+           └───────┘      └───────┘     └───────┘      └───────┘
+              ▲               ▲            ▲               ▲
+              │   alternate   │            │   alternate   │
+              └───────────────┘            └───────────────┘
+
+After commit: trees swap roles.
+workInProgress becomes current, old current becomes next workInProgress.
+    </div>
+
+    <h3>3.1 Why Double Buffering?</h3>
+
+    <pre><code><span class="comment">// Without double buffering:</span>
+<span class="comment">// Modifying the current tree in-place means partially updated UI</span>
+<span class="comment">// is visible if rendering is interrupted.</span>
+
+<span class="comment">// With double buffering:</span>
+<span class="comment">// 1. Build the entire new tree (workInProgress) off-screen</span>
+<span class="comment">// 2. Only when complete, swap it in atomically (commit phase)</span>
+<span class="comment">// 3. The user never sees a partially updated tree</span>
+
+<span class="comment">// The swap is a single pointer reassignment:</span>
+root.current = finishedWork; <span class="comment">// workInProgress becomes current</span>
+
+<span class="comment">// The old current tree is reused as the next workInProgress</span>
+<span class="comment">// (fiber nodes are recycled via alternate pointers)</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Memory Efficiency</div>
+        <p>Fiber nodes are not garbage collected between renders. The <code>alternate</code> pointer keeps both versions alive. When building workInProgress, React clones the current fiber and updates only the changed fields. This avoids allocating entirely new objects each render — a critical optimization for 60fps rendering.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="linked-list">4. Why Linked List, Not Tree</h2>
+
+    <p>Although we call it a "fiber tree," the data structure is actually a <strong>linked list</strong> with three pointer types: <code>child</code>, <code>sibling</code>, and <code>return</code> (parent).</p>
+
+    <h3>4.1 Tree vs Linked List Representation</h3>
+
+    <pre><code><span class="comment">// Traditional tree (like the DOM):</span>
+<span class="comment">// Each node has a children ARRAY</span>
+{
+  type: <span class="string">"div"</span>,
+  children: [
+    { type: <span class="string">"h1"</span>, children: [...] },
+    { type: <span class="string">"p"</span>, children: [...] },
+    { type: <span class="string">"span"</span>, children: [...] }
+  ]
+}
+
+<span class="comment">// Fiber linked list:</span>
+<span class="comment">// Each node has child (first child), sibling (next sibling), return (parent)</span>
+div.child    → h1
+h1.sibling   → p
+p.sibling    → span
+span.sibling → <span class="keyword">null</span>
+h1.<span class="keyword">return</span>    → div
+p.<span class="keyword">return</span>     → div
+span.<span class="keyword">return</span>  → div</code></pre>
+
+    <h3>4.2 Why This Matters for Interruptibility</h3>
+
+    <div class="diagram">
+Traversal order (depth-first):
+
+    App ─────────────────────────────────────────────────►
+     │                                                    │
+     ▼                                                    │
+    div ──────────────────────────────────►               │
+     │                                    │               │
+     ▼                                    │               │
+    h1 ──► "Hello" ──► (complete h1) ──► p ──► (done) ──►│
+                                          │               │
+                                          ▼               │
+                                        "World"           │
+                                          │               │
+                                     (complete p)         │
+                                          │               │
+                                     (complete div)       │
+                                          │               │
+                                     (complete App) ──────┘
+
+At ANY point in this traversal, React can:
+1. Save the current fiber pointer
+2. Yield to the browser
+3. Resume from the saved pointer
+    </div>
+
+    <p>With a recursive tree traversal, the "current position" is implicit in the call stack — you can't save and restore it. With a linked list, the current position is an explicit pointer to a fiber node, stored in a variable that persists across yields.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="unit-of-work">5. Unit of Work Concept</h2>
+
+    <p>Each fiber node represents one "unit of work." The work loop processes one fiber at a time, checking after each unit whether it should yield to the browser.</p>
+
+    <pre><code><span class="comment">// Simplified React work loop (conceptual)</span>
+<span class="keyword">let</span> workInProgress = <span class="keyword">null</span>; <span class="comment">// Current fiber being processed</span>
+
+<span class="keyword">function</span> <span class="func">workLoop</span>(deadline) {
+  <span class="keyword">while</span> (workInProgress !== <span class="keyword">null</span> && !<span class="func">shouldYield</span>()) {
+    workInProgress = <span class="func">performUnitOfWork</span>(workInProgress);
+  }
+
+  <span class="keyword">if</span> (workInProgress !== <span class="keyword">null</span>) {
+    <span class="comment">// More work to do — schedule continuation</span>
+    <span class="func">scheduleCallback</span>(workLoop);
+  } <span class="keyword">else</span> {
+    <span class="comment">// Render phase complete — enter commit phase</span>
+    <span class="func">commitRoot</span>();
+  }
+}
+
+<span class="keyword">function</span> <span class="func">performUnitOfWork</span>(fiber) {
+  <span class="comment">// Phase 1: beginWork — process this fiber, return first child</span>
+  <span class="keyword">const</span> next = <span class="func">beginWork</span>(fiber);
+
+  <span class="keyword">if</span> (next !== <span class="keyword">null</span>) {
+    <span class="keyword">return</span> next; <span class="comment">// Descend into child</span>
+  }
+
+  <span class="comment">// Phase 2: completeWork — no children, bubble up</span>
+  <span class="keyword">let</span> completedWork = fiber;
+  <span class="keyword">while</span> (completedWork !== <span class="keyword">null</span>) {
+    <span class="func">completeWork</span>(completedWork);
+
+    <span class="keyword">if</span> (completedWork.sibling !== <span class="keyword">null</span>) {
+      <span class="keyword">return</span> completedWork.sibling; <span class="comment">// Process next sibling</span>
+    }
+    completedWork = completedWork.<span class="keyword">return</span>; <span class="comment">// Bubble up to parent</span>
+  }
+  <span class="keyword">return</span> <span class="keyword">null</span>; <span class="comment">// Reached root — render complete</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="idle-callback">6. requestIdleCallback Origin Story</h2>
+
+    <p>The original Fiber proposal (2016) planned to use the browser's <code>requestIdleCallback</code> API for scheduling. React ultimately abandoned this approach.</p>
+
+    <h3>6.1 Why requestIdleCallback Seemed Perfect</h3>
+
+    <pre><code><span class="comment">// requestIdleCallback runs when the browser is idle</span>
+<span class="func">requestIdleCallback</span>((deadline) =&gt; {
+  <span class="keyword">while</span> (deadline.<span class="func">timeRemaining</span>() > <span class="number">0</span> && workRemaining) {
+    <span class="func">doWork</span>();
+  }
+});</code></pre>
+
+    <h3>6.2 Why React Stopped Using It</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Problem</th>
+                <th>Detail</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Low frequency</td>
+                <td>Only fires ~20 times/sec (50ms intervals), too slow for smooth UI updates</td>
+            </tr>
+            <tr>
+                <td>Inconsistent timing</td>
+                <td>Varies wildly across browsers and devices</td>
+            </tr>
+            <tr>
+                <td>Tab backgrounding</td>
+                <td>Throttled or stopped when tab is not visible</td>
+            </tr>
+            <tr>
+                <td>No priority support</td>
+                <td>All idle callbacks are equal — no way to express urgency</td>
+            </tr>
+            <tr>
+                <td>Safari support</td>
+                <td>Not implemented in Safari (as of 2024)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>6.3 What React Uses Instead: MessageChannel</h3>
+
+    <pre><code><span class="comment">// React's scheduler uses MessageChannel for ~5ms time slicing</span>
+<span class="keyword">const</span> channel = <span class="keyword">new</span> <span class="type">MessageChannel</span>();
+<span class="keyword">const</span> port = channel.port2;
+
+channel.port1.onmessage = () =&gt; {
+  <span class="comment">// This fires as a macrotask — after browser has had</span>
+  <span class="comment">// a chance to paint and handle input</span>
+  <span class="keyword">const</span> currentTime = <span class="func">getCurrentTime</span>();
+  <span class="keyword">const</span> deadline = currentTime + <span class="number">5</span>; <span class="comment">// 5ms time slice</span>
+
+  <span class="keyword">while</span> (<span class="func">getCurrentTime</span>() &lt; deadline && hasWork()) {
+    <span class="func">performWork</span>();
+  }
+
+  <span class="keyword">if</span> (hasWork()) {
+    port.<span class="func">postMessage</span>(<span class="keyword">null</span>); <span class="comment">// Schedule next slice</span>
+  }
+};
+
+<span class="comment">// Why MessageChannel over setTimeout?</span>
+<span class="comment">// setTimeout(fn, 0) has a minimum 4ms delay (HTML spec)</span>
+<span class="comment">// MessageChannel fires immediately in the next macrotask</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="fiber-tags">7. Fiber Tags</h2>
+
+    <p>Every fiber has a <code>tag</code> field (a number) that tells React how to process it. Here are the most important tags:</p>
+
+    <pre><code><span class="comment">// From ReactWorkTags.js in React source</span>
+<span class="keyword">const</span> FunctionComponent = <span class="number">0</span>;
+<span class="keyword">const</span> ClassComponent = <span class="number">1</span>;
+<span class="keyword">const</span> IndeterminateComponent = <span class="number">2</span>; <span class="comment">// Before first render (function or class?)</span>
+<span class="keyword">const</span> HostRoot = <span class="number">3</span>;              <span class="comment">// Root of the fiber tree (createRoot)</span>
+<span class="keyword">const</span> HostPortal = <span class="number">4</span>;            <span class="comment">// createPortal</span>
+<span class="keyword">const</span> HostComponent = <span class="number">5</span>;         <span class="comment">// DOM elements: div, span, input</span>
+<span class="keyword">const</span> HostText = <span class="number">6</span>;              <span class="comment">// Text nodes: "hello"</span>
+<span class="keyword">const</span> Fragment = <span class="number">7</span>;              <span class="comment">// React.Fragment</span>
+<span class="keyword">const</span> Mode = <span class="number">8</span>;                  <span class="comment">// StrictMode, ConcurrentMode</span>
+<span class="keyword">const</span> ContextConsumer = <span class="number">9</span>;      <span class="comment">// Context.Consumer</span>
+<span class="keyword">const</span> ContextProvider = <span class="number">10</span>;     <span class="comment">// Context.Provider</span>
+<span class="keyword">const</span> ForwardRef = <span class="number">11</span>;          <span class="comment">// React.forwardRef</span>
+<span class="keyword">const</span> Profiler = <span class="number">12</span>;            <span class="comment">// React.Profiler</span>
+<span class="keyword">const</span> SuspenseComponent = <span class="number">13</span>;  <span class="comment">// Suspense boundary</span>
+<span class="keyword">const</span> MemoComponent = <span class="number">14</span>;       <span class="comment">// React.memo</span>
+<span class="keyword">const</span> SimpleMemoComponent = <span class="number">15</span>; <span class="comment">// React.memo without custom compare</span>
+<span class="keyword">const</span> LazyComponent = <span class="number">16</span>;      <span class="comment">// React.lazy</span>
+<span class="keyword">const</span> OffscreenComponent = <span class="number">22</span>; <span class="comment">// Offscreen (Activity API)</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">IndeterminateComponent</div>
+        <p>When React first encounters a component, it doesn't know if it's a function or class. It assigns tag <code>2</code> (IndeterminateComponent). After calling it and checking the result, it reassigns to <code>0</code> (FunctionComponent) or <code>1</code> (ClassComponent). This only happens once per component type.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="lanes">8. Priority Lanes System Overview</h2>
+
+    <p>Lanes replaced the older "expiration time" priority system in React 18. Each lane is a bit in a 31-bit integer, allowing multiple priorities to be expressed and combined using bitwise operations.</p>
+
+    <pre><code><span class="comment">// Lane definitions (from ReactFiberLane.js)</span>
+<span class="keyword">const</span> NoLane       = <span class="number">0b0000000000000000000000000000000</span>;
+<span class="keyword">const</span> SyncLane     = <span class="number">0b0000000000000000000000000000010</span>; <span class="comment">// Highest priority</span>
+<span class="keyword">const</span> InputContinuousLane
+                   = <span class="number">0b0000000000000000000000000001000</span>; <span class="comment">// Drag, scroll</span>
+<span class="keyword">const</span> DefaultLane  = <span class="number">0b0000000000000000000000000100000</span>; <span class="comment">// Normal updates</span>
+<span class="keyword">const</span> TransitionLane1
+                   = <span class="number">0b0000000000000000000000001000000</span>; <span class="comment">// startTransition</span>
+<span class="comment">// ... TransitionLane2 through TransitionLane16 ...</span>
+<span class="keyword">const</span> IdleLane     = <span class="number">0b0100000000000000000000000000000</span>; <span class="comment">// Lowest priority</span>
+<span class="keyword">const</span> OffscreenLane= <span class="number">0b1000000000000000000000000000000</span>; <span class="comment">// Offscreen/hidden</span>
+
+<span class="comment">// Lanes are combined with bitwise OR:</span>
+<span class="keyword">const</span> pendingLanes = SyncLane | DefaultLane;
+
+<span class="comment">// Check if a lane is included:</span>
+<span class="keyword">const</span> hasSyncWork = (pendingLanes & SyncLane) !== NoLane;</code></pre>
+
+    <h3>8.1 Lane Assignment</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Update Source</th>
+                <th>Lane Assigned</th>
+                <th>Behavior</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>flushSync(() => setState())</code></td>
+                <td>SyncLane</td>
+                <td>Synchronous, blocks until committed</td>
+            </tr>
+            <tr>
+                <td>Click handler <code>setState()</code></td>
+                <td>SyncLane</td>
+                <td>Synchronous (discrete event)</td>
+            </tr>
+            <tr>
+                <td>Scroll/drag <code>setState()</code></td>
+                <td>InputContinuousLane</td>
+                <td>High priority, may batch</td>
+            </tr>
+            <tr>
+                <td>Normal <code>setState()</code></td>
+                <td>DefaultLane</td>
+                <td>Standard priority</td>
+            </tr>
+            <tr>
+                <td><code>startTransition(() => setState())</code></td>
+                <td>TransitionLane</td>
+                <td>Low priority, interruptible</td>
+            </tr>
+            <tr>
+                <td><code>useDeferredValue</code></td>
+                <td>TransitionLane</td>
+                <td>Deferred, shows stale value first</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="traversal">9. Fiber Tree Traversal Algorithm</h2>
+
+    <p>React traverses the fiber tree in a specific depth-first order, performing <code>beginWork</code> on the way down and <code>completeWork</code> on the way up.</p>
+
+    <pre><code><span class="comment">// Given this component tree:</span>
+<span class="comment">//   App</span>
+<span class="comment">//   ├── Header</span>
+<span class="comment">//   │   ├── Logo</span>
+<span class="comment">//   │   └── Nav</span>
+<span class="comment">//   └── Main</span>
+<span class="comment">//       └── Content</span>
+
+<span class="comment">// Traversal order:</span>
+<span class="comment">// beginWork(App)       → child: Header</span>
+<span class="comment">// beginWork(Header)    → child: Logo</span>
+<span class="comment">// beginWork(Logo)      → child: null</span>
+<span class="comment">// completeWork(Logo)   → sibling: Nav</span>
+<span class="comment">// beginWork(Nav)       → child: null</span>
+<span class="comment">// completeWork(Nav)    → sibling: null, return: Header</span>
+<span class="comment">// completeWork(Header) → sibling: Main</span>
+<span class="comment">// beginWork(Main)      → child: Content</span>
+<span class="comment">// beginWork(Content)   → child: null</span>
+<span class="comment">// completeWork(Content)→ sibling: null, return: Main</span>
+<span class="comment">// completeWork(Main)   → sibling: null, return: App</span>
+<span class="comment">// completeWork(App)    → DONE, enter commit phase</span></code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Insight — Bailout Optimization</div>
+        <p>During <code>beginWork</code>, React checks if a fiber's props and state have changed. If nothing changed and no pending lanes exist in the subtree (<code>childLanes === NoLanes</code>), React <strong>bails out</strong> — it skips the entire subtree without calling the component function. This is the fundamental mechanism behind React.memo, useMemo, and the upcoming React Compiler's automatic memoization. Understanding bailout conditions is essential for performance optimization at scale.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">10. Architect Considerations</h2>
+
+    <h3>10.1 Fiber Tree Depth and Performance</h3>
+
+    <pre><code><span class="comment">// Deep fiber trees mean more units of work to process.</span>
+<span class="comment">// Each wrapper component adds a fiber node:</span>
+
+<span class="comment">// Anti-pattern: excessive wrapper components</span>
+&lt;<span class="type">ThemeProvider</span>&gt;
+  &lt;<span class="type">AuthProvider</span>&gt;
+    &lt;<span class="type">RouterProvider</span>&gt;
+      &lt;<span class="type">QueryProvider</span>&gt;
+        &lt;<span class="type">I18nProvider</span>&gt;
+          &lt;<span class="type">Layout</span>&gt;
+            &lt;<span class="type">Sidebar</span>&gt;
+              &lt;<span class="type">Navigation</span>&gt;
+                &lt;<span class="type">NavItem</span>&gt;...&lt;/<span class="type">NavItem</span>&gt;  <span class="comment">// 9 levels deep!</span>
+
+<span class="comment">// Each provider adds a ContextProvider fiber</span>
+<span class="comment">// Total fibers: 9 wrappers + actual content fibers</span>
+<span class="comment">// Impact: more work per render, deeper traversal</span></code></pre>
+
+    <h3>10.2 Fiber Recycling and Memory</h3>
+
+    <pre><code><span class="comment">// React reuses fiber nodes via the alternate pointer.</span>
+<span class="comment">// When building workInProgress, React calls createWorkInProgress:</span>
+
+<span class="keyword">function</span> <span class="func">createWorkInProgress</span>(current, pendingProps) {
+  <span class="keyword">let</span> workInProgress = current.alternate;
+
+  <span class="keyword">if</span> (workInProgress === <span class="keyword">null</span>) {
+    <span class="comment">// First render: create new fiber</span>
+    workInProgress = <span class="func">createFiber</span>(current.tag, pendingProps, current.key);
+    workInProgress.alternate = current;
+    current.alternate = workInProgress;
+  } <span class="keyword">else</span> {
+    <span class="comment">// Subsequent renders: reuse existing fiber, update props</span>
+    workInProgress.pendingProps = pendingProps;
+    workInProgress.flags = NoFlags;
+    workInProgress.subtreeFlags = NoFlags;
+  }
+
+  <span class="comment">// Copy fields from current</span>
+  workInProgress.child = current.child;
+  workInProgress.memoizedState = current.memoizedState;
+  <span class="comment">// ...</span>
+  <span class="keyword">return</span> workInProgress;
+}</code></pre>
+
+    <div class="nav-footer">
+        <a href="02-component-model.html">← Prev: Component Model</a>
+        <a href="04-virtual-dom-diffing.html">Next: Virtual DOM &amp; Diffing →</a>
+    </div>
+</div>
+</body>
+</html>

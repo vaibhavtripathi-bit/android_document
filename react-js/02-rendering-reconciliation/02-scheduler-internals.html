@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scheduler Internals — React JS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Rendering &amp; Reconciliation</a><span class="sep">›</span>
+        Scheduler Internals
+    </nav>
+
+    <h1>Scheduler Internals</h1>
+    <p class="subtitle">The React Scheduler package: priority lanes, MessageChannel-based scheduling, 5ms time slicing, task expiration and starvation prevention, shouldYield() mechanism, and how the scheduler interacts with the browser's task queue.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#overview">1. Scheduler Package Overview</a></li>
+            <li><a href="#lanes">2. Priority Lanes System</a></li>
+            <li><a href="#message-channel">3. MessageChannel Scheduling</a></li>
+            <li><a href="#time-slicing">4. Time Slicing: 5ms Yield Intervals</a></li>
+            <li><a href="#expiration">5. Task Expiration and Starvation Prevention</a></li>
+            <li><a href="#should-yield">6. shouldYield() Mechanism</a></li>
+            <li><a href="#browser-queue">7. Scheduler vs Browser Task Queue</a></li>
+            <li><a href="#architect">8. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="overview">1. Scheduler Package Overview</h2>
+
+    <p>React's scheduler is a separate package (<code>scheduler</code>) that manages task prioritization and time-slicing. It's React's own cooperative scheduling system, independent of the browser's built-in scheduling APIs.</p>
+
+    <div class="diagram">
+User interaction (click, type, scroll)
+         │
+         ▼
+React: setState() → assign lane → schedule task
+         │
+         ▼
+┌────────────────────────────────────────────────┐
+│              REACT SCHEDULER                    │
+│                                                 │
+│  Task Queue (sorted by priority + expiration)   │
+│  ┌─────────┬──────────┬───────────┬──────────┐ │
+│  │ Sync    │ Input    │ Default   │ Idle     │ │
+│  │ (immed) │ (250ms)  │ (5000ms)  │ (never)  │ │
+│  └─────────┴──────────┴───────────┴──────────┘ │
+│                                                 │
+│  Work Loop:                                     │
+│  while (hasWork && !shouldYield()) {            │
+│    performWork();                               │
+│  }                                              │
+│  if (hasWork) scheduleNextSlice();              │
+└────────────────────────────────────────────────┘
+         │
+         ▼
+Browser: paint, handle input, layout, etc.
+    </div>
+
+    <pre><code><span class="comment">// The scheduler exposes these key functions:</span>
+<span class="keyword">import</span> {
+  scheduleCallback,       <span class="comment">// Schedule a task with priority</span>
+  cancelCallback,         <span class="comment">// Cancel a scheduled task</span>
+  shouldYield,            <span class="comment">// Check if time slice is exhausted</span>
+  getCurrentTime,         <span class="comment">// High-resolution timestamp</span>
+  ImmediatePriority,      <span class="comment">// Priority levels</span>
+  UserBlockingPriority,
+  NormalPriority,
+  LowPriority,
+  IdlePriority,
+} <span class="keyword">from</span> <span class="string">'scheduler'</span>;</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="lanes">2. Priority Lanes System</h2>
+
+    <p>Lanes are a 31-bit bitmask system that replaced the older "expiration time" priority model. Each lane represents a priority level, and lanes can be combined using bitwise operations.</p>
+
+    <pre><code><span class="comment">// Lane definitions (from ReactFiberLane.js)</span>
+<span class="keyword">const</span> TotalLanes = <span class="number">31</span>;
+
+<span class="comment">// Individual lanes (each is a single bit)</span>
+<span class="keyword">const</span> NoLane           = <span class="number">0b0000000000000000000000000000000</span>;
+<span class="keyword">const</span> SyncLane         = <span class="number">0b0000000000000000000000000000010</span>;
+<span class="keyword">const</span> InputContinuousLane = <span class="number">0b0000000000000000000000000001000</span>;
+<span class="keyword">const</span> DefaultLane      = <span class="number">0b0000000000000000000000000100000</span>;
+
+<span class="comment">// Transition lanes (16 lanes for concurrent transitions)</span>
+<span class="keyword">const</span> TransitionLane1  = <span class="number">0b0000000000000000000000001000000</span>;
+<span class="keyword">const</span> TransitionLane2  = <span class="number">0b0000000000000000000000010000000</span>;
+<span class="comment">// ... through TransitionLane16</span>
+
+<span class="keyword">const</span> IdleLane         = <span class="number">0b0100000000000000000000000000000</span>;
+<span class="keyword">const</span> OffscreenLane    = <span class="number">0b1000000000000000000000000000000</span>;</code></pre>
+
+    <h3>2.1 Why Lanes Replaced Expiration Times</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Expiration Times (old)</th>
+                <th>Lanes (current)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Representation</td>
+                <td>Single number (ms timestamp)</td>
+                <td>31-bit bitmask</td>
+            </tr>
+            <tr>
+                <td>Multiple priorities</td>
+                <td>Can't batch different priorities</td>
+                <td>Combine with bitwise OR</td>
+            </tr>
+            <tr>
+                <td>Priority check</td>
+                <td>Numeric comparison</td>
+                <td>Bitwise AND (faster)</td>
+            </tr>
+            <tr>
+                <td>Concurrent transitions</td>
+                <td>All transitions share one priority</td>
+                <td>16 separate transition lanes</td>
+            </tr>
+            <tr>
+                <td>Selective rendering</td>
+                <td>All-or-nothing</td>
+                <td>Process specific lanes independently</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>2.2 Lane Operations</h3>
+
+    <pre><code><span class="comment">// Combine lanes</span>
+<span class="keyword">const</span> pendingLanes = SyncLane | DefaultLane;
+
+<span class="comment">// Check if a lane is included</span>
+<span class="keyword">const</span> hasSyncWork = (pendingLanes & SyncLane) !== NoLane; <span class="comment">// true</span>
+
+<span class="comment">// Remove a lane</span>
+<span class="keyword">const</span> remaining = pendingLanes & ~SyncLane; <span class="comment">// only DefaultLane</span>
+
+<span class="comment">// Get highest priority lane</span>
+<span class="keyword">const</span> highest = pendingLanes & -pendingLanes; <span class="comment">// lowest set bit</span>
+
+<span class="comment">// Check if lanes overlap</span>
+<span class="keyword">const</span> overlap = (lanesA & lanesB) !== NoLane;</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="message-channel">3. MessageChannel Scheduling</h2>
+
+    <p>React uses <code>MessageChannel</code> to schedule work in the browser's macrotask queue. This was chosen over <code>setTimeout</code>, <code>requestAnimationFrame</code>, and <code>requestIdleCallback</code> for specific reasons.</p>
+
+    <pre><code><span class="comment">// React's scheduling mechanism (simplified from SchedulerHostConfig.js)</span>
+<span class="keyword">const</span> channel = <span class="keyword">new</span> <span class="type">MessageChannel</span>();
+<span class="keyword">const</span> port = channel.port2;
+
+<span class="keyword">let</span> scheduledHostCallback = <span class="keyword">null</span>;
+<span class="keyword">let</span> isMessageLoopRunning = <span class="keyword">false</span>;
+
+channel.port1.onmessage = <span class="keyword">function</span> <span class="func">performWorkUntilDeadline</span>() {
+  <span class="keyword">if</span> (scheduledHostCallback !== <span class="keyword">null</span>) {
+    <span class="keyword">const</span> currentTime = <span class="func">getCurrentTime</span>();
+    <span class="keyword">const</span> deadline = currentTime + yieldInterval; <span class="comment">// 5ms</span>
+
+    <span class="keyword">let</span> hasMoreWork = <span class="keyword">true</span>;
+    <span class="keyword">try</span> {
+      hasMoreWork = <span class="func">scheduledHostCallback</span>(currentTime);
+    } <span class="keyword">finally</span> {
+      <span class="keyword">if</span> (hasMoreWork) {
+        port.<span class="func">postMessage</span>(<span class="keyword">null</span>); <span class="comment">// Schedule next time slice</span>
+      } <span class="keyword">else</span> {
+        isMessageLoopRunning = <span class="keyword">false</span>;
+        scheduledHostCallback = <span class="keyword">null</span>;
+      }
+    }
+  }
+};
+
+<span class="keyword">function</span> <span class="func">requestHostCallback</span>(callback) {
+  scheduledHostCallback = callback;
+  <span class="keyword">if</span> (!isMessageLoopRunning) {
+    isMessageLoopRunning = <span class="keyword">true</span>;
+    port.<span class="func">postMessage</span>(<span class="keyword">null</span>); <span class="comment">// Trigger first time slice</span>
+  }
+}</code></pre>
+
+    <h3>3.1 Why Not Other APIs?</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>API</th>
+                <th>Problem for React</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>setTimeout(fn, 0)</code></td>
+                <td>HTML spec mandates 4ms minimum delay after 5 nested calls. Too slow for 5ms time slicing.</td>
+            </tr>
+            <tr>
+                <td><code>requestAnimationFrame</code></td>
+                <td>Fires once per frame (~16ms). Can't do multiple work slices per frame. Paused when tab is hidden.</td>
+            </tr>
+            <tr>
+                <td><code>requestIdleCallback</code></td>
+                <td>~50ms intervals, inconsistent timing, not in Safari, no priority support, throttled when backgrounded.</td>
+            </tr>
+            <tr>
+                <td><code>queueMicrotask</code></td>
+                <td>Microtasks run before browser can paint — would block rendering just like synchronous code.</td>
+            </tr>
+            <tr>
+                <td><code>MessageChannel</code></td>
+                <td>Fires as macrotask with near-zero delay. Browser can paint between messages. Works in all browsers.</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="time-slicing">4. Time Slicing: 5ms Yield Intervals</h2>
+
+    <pre><code><span class="comment">// React's default yield interval</span>
+<span class="keyword">let</span> yieldInterval = <span class="number">5</span>; <span class="comment">// milliseconds</span>
+
+<span class="comment">// Why 5ms?</span>
+<span class="comment">// At 60fps, each frame has ~16.6ms budget:</span>
+<span class="comment">//   - Browser input handling: ~2ms</span>
+<span class="comment">//   - React work: ~5ms</span>
+<span class="comment">//   - Layout + Paint: ~5ms</span>
+<span class="comment">//   - Compositing: ~2ms</span>
+<span class="comment">//   - Buffer: ~2ms</span>
+<span class="comment">//</span>
+<span class="comment">// 5ms gives React enough time to make progress</span>
+<span class="comment">// while leaving room for the browser to stay responsive.</span>
+
+<span class="comment">// The yield interval is adjustable:</span>
+<span class="keyword">function</span> <span class="func">forceFrameRate</span>(fps) {
+  <span class="keyword">if</span> (fps > <span class="number">0</span>) {
+    yieldInterval = Math.<span class="func">floor</span>(<span class="number">1000</span> / fps);
+  } <span class="keyword">else</span> {
+    yieldInterval = <span class="number">5</span>; <span class="comment">// Reset to default</span>
+  }
+}</code></pre>
+
+    <div class="diagram">
+One frame at 60fps (16.6ms):
+
+├─ Input ─┤─── React Work ───┤─── Layout + Paint ───┤─ Idle ─┤
+   2ms          5ms                  7ms               2.6ms
+
+React yields after 5ms:
+├─ React ─┤─ Browser ─┤─ React ─┤─ Browser ─┤─ React ─┤─ Commit ─┤
+   5ms        paint       5ms       paint       5ms       sync
+
+Without time slicing (synchronous):
+├──────────────── React (200ms) ────────────────┤─ Paint ─┤
+                 12 dropped frames!
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="expiration">5. Task Expiration and Starvation Prevention</h2>
+
+    <p>Each priority level has an expiration timeout. If a task isn't completed before its expiration, it's promoted to synchronous priority to prevent starvation.</p>
+
+    <pre><code><span class="comment">// Expiration timeouts by priority</span>
+<span class="keyword">const</span> IMMEDIATE_PRIORITY_TIMEOUT = <span class="number">-1</span>;     <span class="comment">// Already expired (sync)</span>
+<span class="keyword">const</span> USER_BLOCKING_PRIORITY_TIMEOUT = <span class="number">250</span>; <span class="comment">// 250ms</span>
+<span class="keyword">const</span> NORMAL_PRIORITY_TIMEOUT = <span class="number">5000</span>;      <span class="comment">// 5 seconds</span>
+<span class="keyword">const</span> LOW_PRIORITY_TIMEOUT = <span class="number">10000</span>;        <span class="comment">// 10 seconds</span>
+<span class="keyword">const</span> IDLE_PRIORITY_TIMEOUT = <span class="number">1073741823</span>;  <span class="comment">// ~12.4 days (never)</span>
+
+<span class="comment">// When scheduling a task:</span>
+<span class="keyword">const</span> expirationTime = startTime + timeout;
+
+<span class="comment">// In the work loop, expired tasks are processed synchronously:</span>
+<span class="keyword">function</span> <span class="func">workLoop</span>(currentTime) {
+  <span class="keyword">let</span> currentTask = <span class="func">peek</span>(taskQueue);
+
+  <span class="keyword">while</span> (currentTask !== <span class="keyword">null</span>) {
+    <span class="keyword">if</span> (currentTask.expirationTime > currentTime && <span class="func">shouldYield</span>()) {
+      <span class="comment">// Not expired AND time slice exhausted → yield</span>
+      <span class="keyword">break</span>;
+    }
+
+    <span class="comment">// Either expired OR still within time slice → process</span>
+    <span class="keyword">const</span> callback = currentTask.callback;
+    <span class="keyword">const</span> continuationCallback = <span class="func">callback</span>(currentTime);
+
+    <span class="keyword">if</span> (<span class="keyword">typeof</span> continuationCallback === <span class="string">'function'</span>) {
+      currentTask.callback = continuationCallback; <span class="comment">// More work</span>
+    } <span class="keyword">else</span> {
+      <span class="func">pop</span>(taskQueue); <span class="comment">// Task complete</span>
+    }
+    currentTask = <span class="func">peek</span>(taskQueue);
+  }
+
+  <span class="keyword">return</span> currentTask !== <span class="keyword">null</span>; <span class="comment">// hasMoreWork</span>
+}</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Starvation Prevention</div>
+        <p>Without expiration, a continuous stream of high-priority updates (e.g., rapid typing) could starve lower-priority work (e.g., a transition) indefinitely. The expiration mechanism ensures that even low-priority work eventually gets processed. After 5 seconds, a normal-priority task becomes synchronous — React processes it immediately regardless of other pending work. This is a critical fairness guarantee in the scheduling system.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="should-yield">6. shouldYield() Mechanism</h2>
+
+    <pre><code><span class="comment">// shouldYield checks if the current time slice is exhausted</span>
+<span class="keyword">function</span> <span class="func">shouldYieldToHost</span>() {
+  <span class="keyword">const</span> currentTime = <span class="func">getCurrentTime</span>();
+
+  <span class="comment">// Check if we've exceeded the 5ms deadline</span>
+  <span class="keyword">if</span> (currentTime >= deadline) {
+    <span class="comment">// Check if there's pending browser work</span>
+    <span class="keyword">if</span> (<span class="func">needsPaint</span>() || <span class="func">isInputPending</span>()) {
+      <span class="keyword">return</span> <span class="keyword">true</span>; <span class="comment">// Yield to browser</span>
+    }
+    <span class="comment">// No pending browser work — extend the deadline</span>
+    <span class="comment">// (up to 300ms max to prevent starvation)</span>
+    <span class="keyword">const</span> elapsed = currentTime - startTime;
+    <span class="keyword">if</span> (elapsed < <span class="number">300</span>) {
+      <span class="keyword">return</span> <span class="keyword">false</span>; <span class="comment">// Continue working</span>
+    }
+  }
+  <span class="keyword">return</span> <span class="keyword">false</span>;
+}
+
+<span class="comment">// isInputPending() is a browser API (navigator.scheduling.isInputPending)</span>
+<span class="comment">// that checks if there's pending user input (click, key, etc.)</span>
+<span class="comment">// React uses this to prioritize user responsiveness</span></code></pre>
+
+    <div class="diagram">
+shouldYield() decision flow:
+
+Time slice started (5ms budget)
+         │
+    ┌────▼────┐
+    │ 5ms     │  No → continue working
+    │ elapsed?│
+    └────┬────┘
+         │ Yes
+    ┌────▼──────────┐
+    │ Input pending? │  Yes → YIELD (user wants to interact)
+    │ Need paint?    │
+    └────┬──────────┘
+         │ No
+    ┌────▼────────┐
+    │ 300ms total  │  Yes → YIELD (starvation prevention)
+    │ elapsed?     │
+    └────┬────────┘
+         │ No
+    Continue working (browser is idle anyway)
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="browser-queue">7. Scheduler vs Browser Task Queue</h2>
+
+    <pre><code><span class="comment">// Browser event loop (simplified):</span>
+<span class="comment">// 1. Pick oldest macrotask from queue</span>
+<span class="comment">// 2. Execute it</span>
+<span class="comment">// 3. Run all microtasks</span>
+<span class="comment">// 4. If rendering opportunity: layout → paint → composite</span>
+<span class="comment">// 5. If idle: run requestIdleCallback</span>
+<span class="comment">// 6. Go to 1</span>
+
+<span class="comment">// React's MessageChannel posts macrotasks.</span>
+<span class="comment">// Each macrotask = one 5ms time slice of React work.</span>
+<span class="comment">// Between slices, the browser can:</span>
+<span class="comment">// - Handle input events (click, keypress)</span>
+<span class="comment">// - Run layout and paint</span>
+<span class="comment">// - Process other macrotasks</span>
+
+<span class="comment">// This interleaving is what makes React feel responsive</span>
+<span class="comment">// even during heavy rendering work.</span></code></pre>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Queue Type</th>
+                <th>Examples</th>
+                <th>React's Use</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Macrotask</td>
+                <td>setTimeout, MessageChannel, I/O</td>
+                <td>Time-sliced render work</td>
+            </tr>
+            <tr>
+                <td>Microtask</td>
+                <td>Promise.then, queueMicrotask, MutationObserver</td>
+                <td>State update batching, effect scheduling</td>
+            </tr>
+            <tr>
+                <td>Animation frame</td>
+                <td>requestAnimationFrame</td>
+                <td>Not used by scheduler (used by some effects)</td>
+            </tr>
+            <tr>
+                <td>Idle callback</td>
+                <td>requestIdleCallback</td>
+                <td>Not used (replaced by own scheduler)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">8. Architect Considerations</h2>
+
+    <h3>8.1 Scheduler Priority Mapping</h3>
+
+    <pre><code><span class="comment">// How React maps update sources to scheduler priorities:</span>
+
+<span class="comment">// Discrete events (click, keydown) → SyncLane → ImmediatePriority</span>
+<span class="comment">// These must be processed synchronously for responsiveness</span>
+
+<span class="comment">// Continuous events (mousemove, scroll) → InputContinuousLane</span>
+<span class="comment">// → UserBlockingPriority (250ms expiration)</span>
+
+<span class="comment">// Normal updates (setState in useEffect) → DefaultLane</span>
+<span class="comment">// → NormalPriority (5000ms expiration)</span>
+
+<span class="comment">// Transitions (startTransition) → TransitionLane</span>
+<span class="comment">// → NormalPriority but interruptible by higher lanes</span>
+
+<span class="comment">// Deferred (useDeferredValue) → TransitionLane</span>
+<span class="comment">// → Shows stale value while computing new one</span></code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Insight — Scheduler Independence</div>
+        <p>React's scheduler is a separate package that could theoretically be used by any JavaScript application needing cooperative scheduling. It implements a min-heap priority queue with expiration-based starvation prevention — a well-studied scheduling algorithm. Understanding this separation helps explain why React can target multiple platforms (DOM, Native, Canvas) — the scheduler is platform-agnostic, and only the host config (how to create/update/delete platform nodes) changes per renderer.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="01-render-phases.html">← Prev: Render Phases</a>
+        <a href="03-concurrent-features.html">Next: Concurrent Features →</a>
+    </div>
+</div>
+</body>
+</html>

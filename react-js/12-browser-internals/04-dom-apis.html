@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DOM APIs — Browser Internals</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Browser Internals</a>
+  <span class="sep">›</span>
+  DOM APIs
+</nav>
+
+<h1>DOM APIs and Performance</h1>
+<p class="subtitle">DOM manipulation performance, Observer APIs, Custom Elements, Shadow DOM, event model, passive listeners, and AbortController.</p>
+
+<nav class="nav">
+  <a href="01-rendering-engine.html">Rendering Engine</a>
+  <a href="02-javascript-engine.html">JavaScript Engine</a>
+  <a href="03-event-loop.html">Event Loop</a>
+  <a href="05-networking.html">Networking</a>
+  <a href="06-storage-apis.html">Storage APIs</a>
+  <a href="07-web-workers.html">Web Workers</a>
+  <a href="08-interview-qa.html">Interview Q&amp;A</a>
+</nav>
+
+<h2 id="batch-dom">Batch DOM Reads and Writes</h2>
+
+<pre><code>// DOM operations cross the JS↔C++ bridge, which has overhead
+// Layout thrashing: interleaving reads and writes forces synchronous layout
+
+// BAD: read-write-read-write (layout thrashing)
+elements.forEach(el => {
+  const width = el.offsetWidth;       // READ → forces layout
+  el.style.width = width + 10 + 'px'; // WRITE → invalidates layout
+});
+// Each iteration: layout → invalidate → layout → invalidate
+
+// GOOD: batch reads, then batch writes
+const widths = elements.map(el => el.offsetWidth); // All READs
+elements.forEach((el, i) => {
+  el.style.width = widths[i] + 10 + 'px';         // All WRITEs
+});
+// One layout at the start, one at the end
+
+// BEST: use requestAnimationFrame for writes
+function updateLayout() {
+  // Read phase
+  const measurements = elements.map(el => el.getBoundingClientRect());
+
+  // Write phase (deferred to next frame)
+  requestAnimationFrame(() => {
+    elements.forEach((el, i) => {
+      el.style.transform = `translateX(${measurements[i].width}px)`;
+    });
+  });
+}
+
+// DocumentFragment for batch insertions
+const fragment = document.createDocumentFragment();
+for (let i = 0; i < 1000; i++) {
+  const li = document.createElement('li');
+  li.textContent = `Item ${i}`;
+  fragment.appendChild(li); // No reflow per item
+}
+list.appendChild(fragment); // Single reflow for all 1000 items</code></pre>
+
+<h2 id="intersection-observer">IntersectionObserver</h2>
+
+<pre><code>// Efficiently detect when elements enter/exit the viewport
+// Replaces scroll event listeners for lazy loading, infinite scroll, etc.
+
+// Lazy loading images
+function useLazyImage(src) {
+  const imgRef = useRef(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          imgRef.current.src = src;
+          setLoaded(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '200px' } // Start loading 200px before visible
+    );
+
+    if (imgRef.current) observer.observe(imgRef.current);
+    return () => observer.disconnect();
+  }, [src]);
+
+  return { imgRef, loaded };
+}
+
+// Infinite scroll
+function useInfiniteScroll(loadMore) {
+  const sentinelRef = useRef(null);
+
+  useEffect(() => {
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) loadMore();
+      },
+      { threshold: 0.1 }
+    );
+
+    if (sentinelRef.current) observer.observe(sentinelRef.current);
+    return () => observer.disconnect();
+  }, [loadMore]);
+
+  return sentinelRef;
+}
+
+// Scroll-based animations (reveal on scroll)
+function useScrollReveal() {
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('revealed');
+          observer.unobserve(entry.target);
+        }
+      },
+      { threshold: 0.2 }
+    );
+
+    if (ref.current) observer.observe(ref.current);
+    return () => observer.disconnect();
+  }, []);
+
+  return ref;
+}</code></pre>
+
+<h2 id="resize-observer">ResizeObserver</h2>
+
+<pre><code>// Detect element size changes (not just window resize)
+// Essential for responsive components that don't depend on viewport
+
+function useElementSize(ref) {
+  const [size, setSize] = useState({ width: 0, height: 0 });
+
+  useEffect(() => {
+    if (!ref.current) return;
+
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      setSize({ width, height });
+    });
+
+    observer.observe(ref.current);
+    return () => observer.disconnect();
+  }, [ref]);
+
+  return size;
+}
+
+// Container queries via ResizeObserver (before CSS container queries)
+function useContainerQuery(ref, breakpoints) {
+  const [variant, setVariant] = useState('default');
+
+  useEffect(() => {
+    if (!ref.current) return;
+
+    const observer = new ResizeObserver(([entry]) => {
+      const width = entry.contentRect.width;
+      const match = Object.entries(breakpoints)
+        .reverse()
+        .find(([, minWidth]) => width >= minWidth);
+      setVariant(match ? match[0] : 'default');
+    });
+
+    observer.observe(ref.current);
+    return () => observer.disconnect();
+  }, [ref, breakpoints]);
+
+  return variant;
+}
+
+// Usage
+const variant = useContainerQuery(containerRef, {
+  compact: 0,
+  regular: 400,
+  wide: 800,
+});</code></pre>
+
+<h2 id="mutation-observer">MutationObserver</h2>
+
+<pre><code>// Observe DOM tree changes (attributes, children, subtree)
+// React rarely needs this, but useful for integrating with non-React code
+
+function useMutationObserver(ref, callback, options) {
+  useEffect(() => {
+    if (!ref.current) return;
+
+    const observer = new MutationObserver(callback);
+    observer.observe(ref.current, {
+      childList: true,      // Direct children added/removed
+      subtree: true,        // All descendants
+      attributes: true,     // Attribute changes
+      characterData: true,  // Text content changes
+      attributeOldValue: true,
+      ...options,
+    });
+
+    return () => observer.disconnect();
+  }, [ref, callback, options]);
+}
+
+// Use case: detect third-party script DOM modifications
+useMutationObserver(containerRef, (mutations) => {
+  for (const mutation of mutations) {
+    if (mutation.type === 'childList') {
+      mutation.addedNodes.forEach(node => {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          console.log('Element added:', node.tagName);
+        }
+      });
+    }
+  }
+});</code></pre>
+
+<h2 id="performance-observer">PerformanceObserver</h2>
+
+<pre><code>// Monitor performance metrics in real-time
+// Foundation for Real User Monitoring (RUM)
+
+// Observe all performance entry types
+const observer = new PerformanceObserver((list) => {
+  for (const entry of list.getEntries()) {
+    switch (entry.entryType) {
+      case 'largest-contentful-paint':
+        console.log('LCP:', entry.startTime);
+        break;
+      case 'first-input':
+        console.log('FID:', entry.processingStart - entry.startTime);
+        break;
+      case 'layout-shift':
+        if (!entry.hadRecentInput) {
+          console.log('CLS contribution:', entry.value);
+        }
+        break;
+      case 'longtask':
+        console.log('Long task:', entry.duration, 'ms');
+        break;
+    }
+  }
+});
+
+observer.observe({
+  type: 'largest-contentful-paint',
+  buffered: true,
+});
+observer.observe({ type: 'first-input', buffered: true });
+observer.observe({ type: 'layout-shift', buffered: true });
+observer.observe({ type: 'longtask', buffered: true });
+
+// Custom performance marks and measures
+performance.mark('fetch-start');
+const data = await fetch('/api/data');
+performance.mark('fetch-end');
+performance.measure('api-fetch', 'fetch-start', 'fetch-end');
+
+const [measure] = performance.getEntriesByName('api-fetch');
+console.log('Fetch took:', measure.duration, 'ms');</code></pre>
+
+<h2 id="event-model">DOM Event Model</h2>
+
+<div class="diagram">
+DOM Event Propagation
+═══════════════════════════════════════════════════════════
+
+Phase 1: CAPTURE (top → target)
+Phase 2: TARGET (at the element)
+Phase 3: BUBBLE (target → top)
+
+         window
+           │ ↑
+    ┌──────┼─┼──────┐
+    │ document       │
+    │      │ ↑       │
+    │  ┌───┼─┼───┐   │
+    │  │  body   │   │
+    │  │   │ ↑   │   │
+    │  │ ┌─┼─┼─┐ │   │
+    │  │ │ div │ │   │
+    │  │ │  │↑  │ │   │
+    │  │ │ [btn]│ │   │  ← event.target
+    │  │ │      │ │   │
+    │  │ └──────┘ │   │
+    │  └──────────┘   │
+    └─────────────────┘
+
+    ↓ Capture phase     ↑ Bubble phase
+    1. window           7. window
+    2. document         6. document
+    3. body             5. body
+    4. div              4. div
+    3. button (TARGET)  3. button (TARGET)
+</div>
+
+<pre><code>// Event delegation: handle events on parent, not each child
+// More efficient for lists with many items
+
+function TodoList({ items, onToggle, onDelete }) {
+  const handleClick = useCallback((e) => {
+    const target = e.target;
+    const li = target.closest('[data-id]');
+    if (!li) return;
+
+    const id = li.dataset.id;
+
+    if (target.matches('.toggle-btn')) {
+      onToggle(id);
+    } else if (target.matches('.delete-btn')) {
+      onDelete(id);
+    }
+  }, [onToggle, onDelete]);
+
+  return (
+    &lt;ul onClick={handleClick}&gt;
+      {items.map(item =&gt; (
+        &lt;li key={item.id} data-id={item.id}&gt;
+          {item.text}
+          &lt;button className="toggle-btn"&gt;Toggle&lt;/button&gt;
+          &lt;button className="delete-btn"&gt;Delete&lt;/button&gt;
+        &lt;/li&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+}
+
+// Passive event listeners (for scroll performance)
+// Passive listeners promise not to call preventDefault()
+// This lets the browser scroll without waiting for JS
+document.addEventListener('scroll', handleScroll, { passive: true });
+document.addEventListener('touchstart', handleTouch, { passive: true });
+
+// If you need preventDefault in a scroll handler:
+document.addEventListener('wheel', (e) => {
+  if (shouldPreventScroll) {
+    e.preventDefault(); // Only works with { passive: false }
+  }
+}, { passive: false });
+
+// AbortController for cleanup
+function useEventListener(target, event, handler) {
+  useEffect(() => {
+    const controller = new AbortController();
+
+    target.addEventListener(event, handler, {
+      signal: controller.signal,
+    });
+
+    return () => controller.abort(); // Removes listener
+  }, [target, event, handler]);
+}</code></pre>
+
+<h2 id="custom-elements">Custom Elements and Shadow DOM</h2>
+
+<pre><code>// Custom Elements: define new HTML elements
+class MyCounter extends HTMLElement {
+  static observedAttributes = ['initial'];
+
+  constructor() {
+    super();
+    this.count = 0;
+    this.attachShadow({ mode: 'open' });
+  }
+
+  connectedCallback() {
+    this.count = parseInt(this.getAttribute('initial') || '0');
+    this.render();
+  }
+
+  attributeChangedCallback(name, oldVal, newVal) {
+    if (name === 'initial') {
+      this.count = parseInt(newVal);
+      this.render();
+    }
+  }
+
+  render() {
+    this.shadowRoot.innerHTML = `
+      &lt;style&gt;
+        :host { display: inline-flex; gap: 8px; align-items: center; }
+        button { padding: 4px 12px; cursor: pointer; }
+        span { min-width: 2em; text-align: center; }
+      &lt;/style&gt;
+      &lt;button id="dec"&gt;-&lt;/button&gt;
+      &lt;span&gt;${this.count}&lt;/span&gt;
+      &lt;button id="inc"&gt;+&lt;/button&gt;
+    `;
+
+    this.shadowRoot.getElementById('dec').onclick = () => {
+      this.count--;
+      this.render();
+      this.dispatchEvent(new CustomEvent('change', {
+        detail: { count: this.count },
+        bubbles: true,
+        composed: true, // Crosses shadow DOM boundary
+      }));
+    };
+
+    this.shadowRoot.getElementById('inc').onclick = () => {
+      this.count++;
+      this.render();
+      this.dispatchEvent(new CustomEvent('change', {
+        detail: { count: this.count },
+        bubbles: true,
+        composed: true,
+      }));
+    };
+  }
+}
+
+customElements.define('my-counter', MyCounter);
+// Usage: &lt;my-counter initial="5"&gt;&lt;/my-counter&gt;
+
+// Shadow DOM provides CSS encapsulation:
+// - Styles inside shadow DOM don't leak out
+// - External styles don't leak in (except inherited properties)
+// - CSS custom properties DO cross the shadow boundary</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight — React and Web Components</div>
+  <p>React and Web Components solve different problems. React manages application state and rendering; Web Components provide encapsulated reusable elements. They can work together: wrap React components as Web Components for use in non-React apps (micro-frontends), or use Web Components inside React. The key limitation: React's event system doesn't naturally handle custom events from Web Components — you need manual <code>addEventListener</code> in a <code>useEffect</code>.</p>
+</div>
+
+<h2 id="abort-controller">AbortController for Cleanup</h2>
+
+<pre><code>// AbortController: universal cancellation mechanism
+// Works with fetch, event listeners, and custom async operations
+
+// Fetch cancellation
+function useFetch(url) {
+  const [data, setData] = useState(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    fetch(url, { signal: controller.signal })
+      .then(r => r.json())
+      .then(setData)
+      .catch(err => {
+        if (err.name !== 'AbortError') throw err;
+      });
+
+    return () => controller.abort();
+  }, [url]);
+
+  return data;
+}
+
+// Multiple listeners with single abort
+function useComplexListeners(element) {
+  useEffect(() => {
+    const controller = new AbortController();
+    const { signal } = controller;
+
+    element.addEventListener('click', handleClick, { signal });
+    element.addEventListener('keydown', handleKey, { signal });
+    element.addEventListener('focus', handleFocus, { signal });
+    window.addEventListener('resize', handleResize, { signal });
+
+    return () => controller.abort(); // Removes ALL listeners at once
+  }, [element]);
+}
+
+// Custom async operation with abort
+async function fetchWithTimeout(url, timeout = 5000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    return response;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (err.name === 'AbortError') {
+      throw new Error(`Request to ${url} timed out after ${timeout}ms`);
+    }
+    throw err;
+  }
+}</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">Interview Tip</div>
+  <p>When discussing DOM APIs, emphasize the shift from imperative to observer-based patterns: IntersectionObserver replaces scroll listeners for lazy loading, ResizeObserver replaces window resize for responsive components, MutationObserver replaces polling for DOM changes, and PerformanceObserver replaces manual timing for metrics. These observer APIs are more performant because the browser batches notifications and runs them at optimal times.</p>
+</div>
+
+<div class="nav-footer">
+  <a href="03-event-loop.html">← Event Loop</a>
+  <a href="05-networking.html">Networking →</a>
+</div>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

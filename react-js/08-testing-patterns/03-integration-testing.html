@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Integration Testing — Testing Patterns — React JS Deep Dive</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Testing Patterns</a>
+  <span class="sep">›</span>
+  Integration Testing
+</nav>
+
+<h1>Integration Testing</h1>
+<p class="subtitle">Testing component interactions with MSW, data fetching flows, routing, form submissions, error boundaries, Suspense boundaries, authentication flows, and test organization patterns.</p>
+
+<nav class="toc">
+  <h3>Table of Contents</h3>
+  <ul>
+    <li><a href="#component-interactions">Testing Component Interactions</a></li>
+    <li><a href="#msw">MSW (Mock Service Worker)</a></li>
+    <li><a href="#data-fetching">Testing Data Fetching Flows</a></li>
+    <li><a href="#routing">Testing Routing</a></li>
+    <li><a href="#forms">Testing Form Submissions</a></li>
+    <li><a href="#error-boundaries">Testing Error Boundaries</a></li>
+    <li><a href="#suspense">Testing Suspense Boundaries</a></li>
+    <li><a href="#auth">Testing Authentication Flows</a></li>
+    <li><a href="#organization">Test Organization Patterns</a></li>
+  </ul>
+</nav>
+
+<h2 id="component-interactions">Testing Component Interactions</h2>
+
+<p>Integration tests verify that multiple components work together correctly. The key principle: render the highest-level component that encompasses the interaction you're testing, and mock only at the network boundary.</p>
+
+<pre><code>// Testing a todo app — multiple components interacting
+test('complete todo workflow: add, toggle, delete', async () => {
+  const user = userEvent.setup();
+  render(&lt;TodoApp /&gt;);
+
+  // Add a todo
+  await user.type(screen.getByPlaceholderText('What needs to be done?'), 'Buy milk');
+  await user.keyboard('{Enter}');
+  expect(screen.getByText('Buy milk')).toBeInTheDocument();
+
+  // Add another
+  await user.type(screen.getByPlaceholderText('What needs to be done?'), 'Walk dog');
+  await user.keyboard('{Enter}');
+  expect(screen.getByText('Walk dog')).toBeInTheDocument();
+
+  // Toggle completion
+  await user.click(screen.getByRole('checkbox', { name: /buy milk/i }));
+  expect(screen.getByRole('checkbox', { name: /buy milk/i })).toBeChecked();
+
+  // Filter to active
+  await user.click(screen.getByRole('button', { name: /active/i }));
+  expect(screen.queryByText('Buy milk')).not.toBeInTheDocument();
+  expect(screen.getByText('Walk dog')).toBeInTheDocument();
+
+  // Delete
+  await user.hover(screen.getByText('Walk dog'));
+  await user.click(screen.getByRole('button', { name: /delete/i }));
+  expect(screen.queryByText('Walk dog')).not.toBeInTheDocument();
+  expect(screen.getByText('No active todos')).toBeInTheDocument();
+});</code></pre>
+
+<h2 id="msw">MSW (Mock Service Worker)</h2>
+
+<p>MSW intercepts network requests at the service worker level, providing realistic API mocking without modifying application code. It's the gold standard for integration test network mocking.</p>
+
+<pre><code>// mocks/handlers.ts — default API handlers
+import { http, HttpResponse } from 'msw';
+
+export const handlers = [
+  http.get('/api/users', () => {
+    return HttpResponse.json([
+      { id: '1', name: 'Alice', role: 'admin' },
+      { id: '2', name: 'Bob', role: 'user' },
+    ]);
+  }),
+
+  http.get('/api/users/:id', ({ params }) => {
+    const users = {
+      '1': { id: '1', name: 'Alice', role: 'admin' },
+      '2': { id: '2', name: 'Bob', role: 'user' },
+    };
+    const user = users[params.id];
+    if (!user) {
+      return new HttpResponse(null, { status: 404 });
+    }
+    return HttpResponse.json(user);
+  }),
+
+  http.post('/api/users', async ({ request }) => {
+    const body = await request.json();
+    return HttpResponse.json(
+      { id: '3', ...body },
+      { status: 201 }
+    );
+  }),
+
+  http.delete('/api/users/:id', () => {
+    return new HttpResponse(null, { status: 204 });
+  }),
+];
+
+// mocks/server.ts — test server setup
+import { setupServer } from 'msw/node';
+import { handlers } from './handlers';
+
+export const server = setupServer(...handlers);
+
+// jest.setup.ts or vitest.setup.ts
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());</code></pre>
+
+<pre><code>// Override handlers per test for specific scenarios
+test('shows error when API fails', async () => {
+  // Override the default handler for this test only
+  server.use(
+    http.get('/api/users', () => {
+      return new HttpResponse(null, { status: 500 });
+    })
+  );
+
+  render(&lt;UserList /&gt;);
+  expect(await screen.findByText(/failed to load users/i)).toBeInTheDocument();
+});
+
+test('shows empty state when no users', async () => {
+  server.use(
+    http.get('/api/users', () => {
+      return HttpResponse.json([]);
+    })
+  );
+
+  render(&lt;UserList /&gt;);
+  expect(await screen.findByText(/no users found/i)).toBeInTheDocument();
+});
+
+// Test network delay
+test('shows loading state during fetch', async () => {
+  server.use(
+    http.get('/api/users', async () => {
+      await delay(200); // Simulate slow network
+      return HttpResponse.json([{ id: '1', name: 'Alice' }]);
+    })
+  );
+
+  render(&lt;UserList /&gt;);
+
+  // Loading state visible immediately
+  expect(screen.getByText(/loading/i)).toBeInTheDocument();
+
+  // Data appears after fetch completes
+  expect(await screen.findByText('Alice')).toBeInTheDocument();
+  expect(screen.queryByText(/loading/i)).not.toBeInTheDocument();
+});</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">Why MSW Over jest.mock</div>
+  <p>MSW intercepts at the network level, so your application code (fetch, axios, react-query) runs exactly as in production. <code>jest.mock</code> replaces modules, which means you're not testing the actual data fetching code. MSW also works in the browser (Storybook, dev mode), providing a single mocking layer for all environments.</p>
+</div>
+
+<h2 id="data-fetching">Testing Data Fetching Flows</h2>
+
+<pre><code>// Testing React Query integration
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+
+function createTestQueryClient() {
+  return new QueryClient({
+    defaultOptions: {
+      queries: {
+        retry: false,
+        gcTime: 0, // Don't cache between tests
+      },
+    },
+  });
+}
+
+function renderWithQuery(ui) {
+  const queryClient = createTestQueryClient();
+  return render(
+    &lt;QueryClientProvider client={queryClient}&gt;
+      {ui}
+    &lt;/QueryClientProvider&gt;
+  );
+}
+
+test('fetches and displays product list', async () => {
+  server.use(
+    http.get('/api/products', () => {
+      return HttpResponse.json({
+        products: [
+          { id: '1', name: 'Widget', price: 9.99 },
+          { id: '2', name: 'Gadget', price: 19.99 },
+        ],
+        total: 2,
+      });
+    })
+  );
+
+  renderWithQuery(&lt;ProductList /&gt;);
+
+  // Wait for data to load
+  expect(await screen.findByText('Widget')).toBeInTheDocument();
+  expect(screen.getByText('$9.99')).toBeInTheDocument();
+  expect(screen.getByText('Gadget')).toBeInTheDocument();
+  expect(screen.getByText('Showing 2 products')).toBeInTheDocument();
+});
+
+// Testing pagination
+test('loads next page on scroll', async () => {
+  server.use(
+    http.get('/api/products', ({ request }) => {
+      const url = new URL(request.url);
+      const page = url.searchParams.get('page') ?? '1';
+
+      if (page === '1') {
+        return HttpResponse.json({
+          products: [{ id: '1', name: 'Widget' }],
+          hasMore: true,
+        });
+      }
+      return HttpResponse.json({
+        products: [{ id: '2', name: 'Gadget' }],
+        hasMore: false,
+      });
+    })
+  );
+
+  renderWithQuery(&lt;InfiniteProductList /&gt;);
+
+  expect(await screen.findByText('Widget')).toBeInTheDocument();
+
+  // Trigger load more
+  await userEvent.click(screen.getByRole('button', { name: /load more/i }));
+
+  expect(await screen.findByText('Gadget')).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: /load more/i }))
+    .not.toBeInTheDocument();
+});</code></pre>
+
+<h2 id="routing">Testing Routing</h2>
+
+<pre><code>import { MemoryRouter, Route, Routes } from 'react-router-dom';
+
+// MemoryRouter for testing — no real browser history
+function renderWithRouter(ui, { initialEntries = ['/'] } = {}) {
+  return render(
+    &lt;MemoryRouter initialEntries={initialEntries}&gt;
+      {ui}
+    &lt;/MemoryRouter&gt;
+  );
+}
+
+test('navigates between pages', async () => {
+  renderWithRouter(
+    &lt;Routes&gt;
+      &lt;Route path="/" element={&lt;HomePage /&gt;} /&gt;
+      &lt;Route path="/about" element={&lt;AboutPage /&gt;} /&gt;
+      &lt;Route path="/products/:id" element={&lt;ProductPage /&gt;} /&gt;
+    &lt;/Routes&gt;
+  );
+
+  // Start on home page
+  expect(screen.getByRole('heading', { name: /home/i })).toBeInTheDocument();
+
+  // Navigate to about
+  await userEvent.click(screen.getByRole('link', { name: /about/i }));
+  expect(screen.getByRole('heading', { name: /about/i })).toBeInTheDocument();
+});
+
+// Test with initial route
+test('renders product page for specific route', () => {
+  server.use(
+    http.get('/api/products/42', () => {
+      return HttpResponse.json({ id: '42', name: 'Widget' });
+    })
+  );
+
+  renderWithRouter(
+    &lt;Routes&gt;
+      &lt;Route path="/products/:id" element={&lt;ProductPage /&gt;} /&gt;
+    &lt;/Routes&gt;,
+    { initialEntries: ['/products/42'] }
+  );
+
+  expect(screen.findByText('Widget')).resolves.toBeInTheDocument();
+});
+
+// Test redirect
+test('redirects unauthenticated users to login', () => {
+  renderWithRouter(
+    &lt;AuthProvider user={null}&gt;
+      &lt;Routes&gt;
+        &lt;Route path="/login" element={&lt;LoginPage /&gt;} /&gt;
+        &lt;Route path="/dashboard" element={
+          &lt;ProtectedRoute&gt;&lt;Dashboard /&gt;&lt;/ProtectedRoute&gt;
+        } /&gt;
+      &lt;/Routes&gt;
+    &lt;/AuthProvider&gt;,
+    { initialEntries: ['/dashboard'] }
+  );
+
+  expect(screen.getByRole('heading', { name: /login/i })).toBeInTheDocument();
+});</code></pre>
+
+<h2 id="forms">Testing Form Submissions</h2>
+
+<pre><code>test('submits registration form and shows success', async () => {
+  const user = userEvent.setup();
+  let capturedBody;
+
+  server.use(
+    http.post('/api/register', async ({ request }) => {
+      capturedBody = await request.json();
+      return HttpResponse.json({ id: '1', ...capturedBody });
+    })
+  );
+
+  render(&lt;RegistrationForm /&gt;);
+
+  // Fill out form
+  await user.type(screen.getByLabelText(/name/i), 'Alice Smith');
+  await user.type(screen.getByLabelText(/email/i), 'alice@example.com');
+  await user.type(screen.getByLabelText(/password/i), 'SecureP@ss123');
+  await user.type(screen.getByLabelText(/confirm password/i), 'SecureP@ss123');
+  await user.click(screen.getByRole('checkbox', { name: /terms/i }));
+
+  // Submit
+  await user.click(screen.getByRole('button', { name: /register/i }));
+
+  // Verify success
+  expect(await screen.findByText(/registration successful/i)).toBeInTheDocument();
+
+  // Verify correct data was sent
+  expect(capturedBody).toEqual({
+    name: 'Alice Smith',
+    email: 'alice@example.com',
+    password: 'SecureP@ss123',
+  });
+});
+
+// Test form validation
+test('shows validation errors for invalid input', async () => {
+  const user = userEvent.setup();
+  render(&lt;RegistrationForm /&gt;);
+
+  // Submit empty form
+  await user.click(screen.getByRole('button', { name: /register/i }));
+
+  // Check validation messages
+  expect(screen.getByText(/name is required/i)).toBeInTheDocument();
+  expect(screen.getByText(/email is required/i)).toBeInTheDocument();
+
+  // Fix one error
+  await user.type(screen.getByLabelText(/name/i), 'Alice');
+  await user.click(screen.getByRole('button', { name: /register/i }));
+
+  // Name error gone, email error remains
+  expect(screen.queryByText(/name is required/i)).not.toBeInTheDocument();
+  expect(screen.getByText(/email is required/i)).toBeInTheDocument();
+});</code></pre>
+
+<h2 id="error-boundaries">Testing Error Boundaries</h2>
+
+<pre><code>// Testing error boundary behavior
+function BuggyComponent({ shouldThrow }) {
+  if (shouldThrow) throw new Error('Component crashed!');
+  return &lt;div&gt;Working fine&lt;/div&gt;;
+}
+
+test('error boundary catches rendering errors', () => {
+  // Suppress console.error for expected errors
+  const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+
+  render(
+    &lt;ErrorBoundary fallback={&lt;div&gt;Something went wrong&lt;/div&gt;}&gt;
+      &lt;BuggyComponent shouldThrow={true} /&gt;
+    &lt;/ErrorBoundary&gt;
+  );
+
+  expect(screen.getByText('Something went wrong')).toBeInTheDocument();
+  consoleSpy.mockRestore();
+});
+
+// Testing error boundary recovery
+test('error boundary recovers on retry', async () => {
+  const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+  let shouldThrow = true;
+
+  function UnstableComponent() {
+    if (shouldThrow) throw new Error('Temporary failure');
+    return &lt;div&gt;Recovered!&lt;/div&gt;;
+  }
+
+  render(
+    &lt;ErrorBoundary&gt;
+      &lt;UnstableComponent /&gt;
+    &lt;/ErrorBoundary&gt;
+  );
+
+  expect(screen.getByText(/something went wrong/i)).toBeInTheDocument();
+
+  // Fix the error condition
+  shouldThrow = false;
+
+  // Click retry
+  await userEvent.click(screen.getByRole('button', { name: /retry/i }));
+  expect(screen.getByText('Recovered!')).toBeInTheDocument();
+
+  consoleSpy.mockRestore();
+});</code></pre>
+
+<h2 id="suspense">Testing Suspense Boundaries</h2>
+
+<pre><code>// Testing Suspense loading states
+test('shows loading fallback then content', async () => {
+  server.use(
+    http.get('/api/data', async () => {
+      await delay(100);
+      return HttpResponse.json({ message: 'Hello' });
+    })
+  );
+
+  render(
+    &lt;Suspense fallback={&lt;div&gt;Loading...&lt;/div&gt;}&gt;
+      &lt;AsyncComponent /&gt;
+    &lt;/Suspense&gt;
+  );
+
+  // Fallback shown immediately
+  expect(screen.getByText('Loading...')).toBeInTheDocument();
+
+  // Content appears after data loads
+  expect(await screen.findByText('Hello')).toBeInTheDocument();
+  expect(screen.queryByText('Loading...')).not.toBeInTheDocument();
+});
+
+// Testing nested Suspense
+test('nested suspense boundaries load independently', async () => {
+  server.use(
+    http.get('/api/fast', () => {
+      return HttpResponse.json({ data: 'Fast data' });
+    }),
+    http.get('/api/slow', async () => {
+      await delay(500);
+      return HttpResponse.json({ data: 'Slow data' });
+    })
+  );
+
+  render(
+    &lt;div&gt;
+      &lt;Suspense fallback={&lt;div&gt;Loading fast...&lt;/div&gt;}&gt;
+        &lt;FastComponent /&gt;
+      &lt;/Suspense&gt;
+      &lt;Suspense fallback={&lt;div&gt;Loading slow...&lt;/div&gt;}&gt;
+        &lt;SlowComponent /&gt;
+      &lt;/Suspense&gt;
+    &lt;/div&gt;
+  );
+
+  // Fast component loads first
+  expect(await screen.findByText('Fast data')).toBeInTheDocument();
+  expect(screen.getByText('Loading slow...')).toBeInTheDocument();
+
+  // Slow component loads later
+  expect(await screen.findByText('Slow data')).toBeInTheDocument();
+});</code></pre>
+
+<h2 id="auth">Testing Authentication Flows</h2>
+
+<pre><code>test('complete login flow', async () => {
+  const user = userEvent.setup();
+
+  server.use(
+    http.post('/api/login', async ({ request }) => {
+      const { email, password } = await request.json();
+      if (email === 'alice@example.com' && password === 'password123') {
+        return HttpResponse.json({
+          user: { id: '1', name: 'Alice' },
+          token: 'mock-jwt-token',
+        });
+      }
+      return HttpResponse.json(
+        { error: 'Invalid credentials' },
+        { status: 401 }
+      );
+    }),
+    http.get('/api/dashboard', () => {
+      return HttpResponse.json({ stats: { users: 100 } });
+    })
+  );
+
+  render(&lt;App /&gt;);
+
+  // Should be on login page
+  expect(screen.getByRole('heading', { name: /login/i })).toBeInTheDocument();
+
+  // Enter credentials
+  await user.type(screen.getByLabelText(/email/i), 'alice@example.com');
+  await user.type(screen.getByLabelText(/password/i), 'password123');
+  await user.click(screen.getByRole('button', { name: /sign in/i }));
+
+  // Should redirect to dashboard
+  expect(await screen.findByRole('heading', { name: /dashboard/i }))
+    .toBeInTheDocument();
+  expect(screen.getByText('Welcome, Alice')).toBeInTheDocument();
+});</code></pre>
+
+<h2 id="organization">Test Organization Patterns</h2>
+
+<pre><code>// Arrange-Act-Assert pattern
+test('adds item to cart', async () => {
+  // ARRANGE: Set up the test environment
+  server.use(
+    http.get('/api/products/1', () =>
+      HttpResponse.json({ id: '1', name: 'Widget', price: 9.99 })
+    )
+  );
+  render(&lt;ProductPage productId="1" /&gt;);
+  await screen.findByText('Widget');
+
+  // ACT: Perform the user action
+  await userEvent.click(screen.getByRole('button', { name: /add to cart/i }));
+
+  // ASSERT: Verify the outcome
+  expect(screen.getByText('1 item in cart')).toBeInTheDocument();
+  expect(screen.getByText('$9.99')).toBeInTheDocument();
+});
+
+// Test file organization
+// src/
+// ├── components/
+// │   ├── ProductCard/
+// │   │   ├── ProductCard.tsx
+// │   │   ├── ProductCard.test.tsx    ← colocated test
+// │   │   └── ProductCard.stories.tsx
+// │   └── Cart/
+// │       ├── Cart.tsx
+// │       └── Cart.test.tsx
+// ├── features/
+// │   └── checkout/
+// │       ├── CheckoutFlow.tsx
+// │       └── __tests__/
+// │           ├── checkout-happy-path.test.tsx
+// │           ├── checkout-validation.test.tsx
+// │           └── checkout-error-handling.test.tsx
+// └── __tests__/                      ← cross-feature integration tests
+//     ├── add-to-cart-and-checkout.test.tsx
+//     └── user-registration-flow.test.tsx</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p>For large codebases, organize integration tests by user flow rather than by component. A test file named <code>checkout-flow.test.tsx</code> that tests the entire checkout process is more valuable than separate tests for CartButton, CartDrawer, CheckoutForm, and PaymentInput. Flow-based tests catch integration bugs that component-level tests miss.</p>
+</div>
+
+<nav class="nav-footer">
+  <a href="02-component-testing.html">← Component Testing</a>
+  <a href="04-e2e-testing.html">E2E Testing →</a>
+</nav>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

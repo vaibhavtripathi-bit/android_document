@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reanimated Internals — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Animations &amp; Gestures</a><span class="sep">›</span>
+        Reanimated Internals
+    </nav>
+
+    <h1>React Native Reanimated v3 Internals</h1>
+    <p class="subtitle">Reanimated runs JavaScript worklets on the UI thread via a dedicated JS VM, enabling 60fps gesture-driven animations with full JS expressiveness. Understanding the worklet runtime, shared values, JSI integration, and the threading model is essential Staff-level knowledge.</p>
+
+    <nav class="nav">
+        <a href="01-animated-api.html">Animated API</a>
+        <a href="03-gesture-handler.html">Gesture Handler</a>
+        <a href="04-layout-animations.html">Layout Animations</a>
+        <a href="05-shared-element-transitions.html">Shared Elements</a>
+        <a href="06-advanced-patterns.html">Advanced Patterns</a>
+        <a href="07-skia-graphics.html">Skia</a>
+        <a href="08-interview-qa.html">Interview Q&amp;A</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#architecture">1. Reanimated Architecture</a></li>
+            <li><a href="#worklets">2. Worklet Concept &amp; Threading</a></li>
+            <li><a href="#shared-values">3. Shared Values</a></li>
+            <li><a href="#animated-style">4. useAnimatedStyle</a></li>
+            <li><a href="#animated-props">5. useAnimatedProps &amp; Reactions</a></li>
+            <li><a href="#layout-animations">6. Layout Animations</a></li>
+            <li><a href="#comparison">7. Reanimated vs Animated API</a></li>
+            <li><a href="#architect">8. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architecture">1. Reanimated Architecture</h2>
+
+    <div class="diagram">
+Reanimated v3 Architecture
+════════════════════════════════════════════════════
+
+  ┌──────────────────────────────────────────────────┐
+  │                  JS Thread                        │
+  │  ┌────────────────────────────────────────────┐  │
+  │  │  React Components                          │  │
+  │  │  useSharedValue, useAnimatedStyle,         │  │
+  │  │  useAnimatedGestureHandler                 │  │
+  │  └──────────────────┬─────────────────────────┘  │
+  │                     │ JSI (synchronous)           │
+  └─────────────────────┼────────────────────────────┘
+                        │
+  ┌─────────────────────▼────────────────────────────┐
+  │              UI Thread                            │
+  │  ┌────────────────────────────────────────────┐  │
+  │  │  Worklet Runtime (separate JS VM)          │  │
+  │  │  ┌──────────────────────────────────────┐  │  │
+  │  │  │  Hermes/JSC instance (lightweight)   │  │  │
+  │  │  │  • Runs worklet functions            │  │  │
+  │  │  │  • Reads/writes shared values        │  │  │
+  │  │  │  • Computes animated styles          │  │  │
+  │  │  │  • Handles gesture callbacks         │  │  │
+  │  │  └──────────────────────────────────────┘  │  │
+  │  │                                            │  │
+  │  │  Updates native view properties directly   │  │
+  │  └────────────────────────────────────────────┘  │
+  │                                                  │
+  │  CADisplayLink (iOS) / Choreographer (Android)   │
+  │  ticks every ~16ms → runs pending worklets       │
+  └──────────────────────────────────────────────────┘
+
+  Key difference from Animated API:
+  Animated sends static config to native.
+  Reanimated runs actual JS code on the UI thread.
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>Reanimated's core innovation is running a <strong>second JavaScript VM on the UI thread</strong>. This VM executes worklet functions — small JS functions that have been serialized and transferred from the main JS thread. Because they run on the UI thread, worklets can read gesture state, compute styles, and update views at 60fps without any cross-thread communication. This is fundamentally different from the Animated API's approach of pre-computing animation frames on the JS thread and sending them to native.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="worklets">2. Worklet Concept &amp; Threading</h2>
+
+    <p>A worklet is a JavaScript function that can be executed on the UI thread. Reanimated's Babel plugin identifies worklet functions (marked with <code>'worklet'</code> directive or used in worklet contexts) and serializes them for the UI thread VM.</p>
+
+    <h3>2.1 Worklet Compilation</h3>
+
+    <pre><code><span class="comment">// Source code (what you write)</span>
+<span class="keyword">function</span> <span class="func">clamp</span>(value, min, max) {
+  <span class="string">'worklet'</span>;
+  <span class="keyword">return</span> Math.<span class="func">min</span>(Math.<span class="func">max</span>(value, min), max);
+}
+
+<span class="comment">// After Reanimated Babel plugin transforms it:</span>
+<span class="comment">// 1. The function body is serialized to a string</span>
+<span class="comment">// 2. Closure variables are captured</span>
+<span class="comment">// 3. A __workletHash is generated for caching</span>
+<span class="comment">// 4. The serialized worklet is sent to the UI thread VM via JSI</span>
+
+<span class="comment">// Conceptually, the plugin produces:</span>
+<span class="keyword">const</span> clamp = {
+  __closure: {},
+  __workletHash: <span class="number">12345</span>,
+  __initData: {
+    code: <span class="string">'function clamp(value,min,max){return Math.min(Math.max(value,min),max);}'</span>,
+  },
+  __stackDetails: { <span class="comment">/* source map info */</span> },
+};</code></pre>
+
+    <h3>2.2 runOnUI and runOnJS</h3>
+
+    <pre><code><span class="keyword">import</span> { runOnUI, runOnJS } <span class="keyword">from</span> <span class="string">'react-native-reanimated'</span>;
+
+<span class="comment">// Run a function on the UI thread from JS thread</span>
+<span class="keyword">const</span> updateNative = () =&gt; {
+  <span class="string">'worklet'</span>;
+  <span class="comment">// This runs on UI thread — can access shared values directly</span>
+  sharedValue.value = <span class="number">42</span>;
+};
+<span class="func">runOnUI</span>(updateNative)();
+
+<span class="comment">// Run a function on JS thread from UI thread (worklet)</span>
+<span class="keyword">const</span> showAlert = (message: <span class="type">string</span>) =&gt; {
+  Alert.<span class="func">alert</span>(<span class="string">'Animation Complete'</span>, message);
+};
+
+<span class="keyword">const</span> onAnimationEnd = () =&gt; {
+  <span class="string">'worklet'</span>;
+  <span class="comment">// Can't call Alert.alert directly in a worklet</span>
+  <span class="comment">// Must bounce back to JS thread</span>
+  <span class="func">runOnJS</span>(showAlert)(<span class="string">'Done!'</span>);
+};</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Warning</div>
+        <p>Worklets have a <strong>limited execution environment</strong>. They can't access React state, call React hooks, use most Node.js APIs, or access variables from the JS thread closure unless those variables are serializable or are shared values. The <code>runOnJS</code> bridge is asynchronous — there's no guarantee when the JS thread will execute the callback. Design worklets to be self-contained with all data passed through shared values.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="shared-values">3. Shared Values</h2>
+
+    <p>Shared values are the communication channel between the JS thread and the UI thread. They're accessible from both threads via JSI, with no serialization overhead.</p>
+
+    <pre><code><span class="keyword">import</span> { useSharedValue, withTiming, withSpring } <span class="keyword">from</span> <span class="string">'react-native-reanimated'</span>;
+
+<span class="keyword">function</span> <span class="func">AnimatedComponent</span>() {
+  <span class="keyword">const</span> offset = <span class="func">useSharedValue</span>(<span class="number">0</span>);
+  <span class="keyword">const</span> isActive = <span class="func">useSharedValue</span>(<span class="keyword">false</span>);
+  <span class="keyword">const</span> color = <span class="func">useSharedValue</span>(<span class="string">'#FF0000'</span>);
+
+  <span class="comment">// Read/write from JS thread</span>
+  <span class="keyword">const</span> handlePress = () =&gt; {
+    offset.value = <span class="func">withSpring</span>(<span class="number">100</span>);  <span class="comment">// Animate to 100</span>
+    isActive.value = <span class="keyword">true</span>;
+  };
+
+  <span class="comment">// Read/write from UI thread (worklet)</span>
+  <span class="keyword">const</span> animatedStyle = <span class="func">useAnimatedStyle</span>(() =&gt; {
+    <span class="comment">// This worklet runs on UI thread every frame</span>
+    <span class="keyword">return</span> {
+      transform: [{ translateX: offset.value }],
+      backgroundColor: isActive.value ? <span class="string">'blue'</span> : <span class="string">'gray'</span>,
+    };
+  });
+
+  <span class="keyword">return</span> (
+    &lt;<span class="type">Animated.View</span> style={[styles.box, animatedStyle]}&gt;
+      &lt;<span class="type">Pressable</span> onPress={handlePress}&gt;
+        &lt;<span class="type">Text</span>&gt;Tap me&lt;/<span class="type">Text</span>&gt;
+      &lt;/<span class="type">Pressable</span>&gt;
+    &lt;/<span class="type">Animated.View</span>&gt;
+  );
+}</code></pre>
+
+    <div class="diagram">
+Shared Value Internals
+════════════════════════════════════════════════════
+
+  useSharedValue(0)
+       │
+       ▼
+  ┌─────────────────────────────────────────┐
+  │           SharedValue&lt;number&gt;            │
+  │                                         │
+  │  JS Thread side:                        │
+  │  ├── .value getter/setter (JSI proxy)   │
+  │  └── Triggers animation when assigned   │
+  │      withTiming/withSpring              │
+  │                                         │
+  │  ┌─────────────────────────────────┐    │
+  │  │  Shared Memory (C++ backing)    │    │
+  │  │  Accessible from both threads   │    │
+  │  │  via JSI — no serialization     │    │
+  │  └─────────────────────────────────┘    │
+  │                                         │
+  │  UI Thread side:                        │
+  │  ├── .value getter (direct read)        │
+  │  ├── .value setter (direct write)       │
+  │  └── Triggers style recalculation       │
+  └─────────────────────────────────────────┘
+
+  Key: Setting .value with withTiming/withSpring
+  starts an animation that runs entirely on UI thread.
+  Setting .value directly (number) updates immediately.
+    </div>
+
+    <h3>3.1 Animation Modifiers</h3>
+
+    <pre><code><span class="keyword">import</span> {
+  withTiming, withSpring, withDecay,
+  withDelay, withSequence, withRepeat,
+  Easing,
+} <span class="keyword">from</span> <span class="string">'react-native-reanimated'</span>;
+
+<span class="comment">// Timing animation</span>
+offset.value = <span class="func">withTiming</span>(<span class="number">100</span>, {
+  duration: <span class="number">300</span>,
+  easing: Easing.<span class="func">bezier</span>(<span class="number">0.25</span>, <span class="number">0.1</span>, <span class="number">0.25</span>, <span class="number">1</span>),
+});
+
+<span class="comment">// Spring animation</span>
+offset.value = <span class="func">withSpring</span>(<span class="number">100</span>, {
+  damping: <span class="number">15</span>,
+  stiffness: <span class="number">150</span>,
+  mass: <span class="number">1</span>,
+});
+
+<span class="comment">// Sequence: one after another</span>
+offset.value = <span class="func">withSequence</span>(
+  <span class="func">withTiming</span>(<span class="number">50</span>, { duration: <span class="number">200</span> }),
+  <span class="func">withTiming</span>(<span class="number">100</span>, { duration: <span class="number">200</span> }),
+);
+
+<span class="comment">// Repeat with reverse (bounce effect)</span>
+scale.value = <span class="func">withRepeat</span>(
+  <span class="func">withTiming</span>(<span class="number">1.2</span>, { duration: <span class="number">500</span> }),
+  -<span class="number">1</span>,    <span class="comment">// infinite repetitions</span>
+  <span class="keyword">true</span>,  <span class="comment">// reverse on each iteration</span>
+);
+
+<span class="comment">// Delay</span>
+offset.value = <span class="func">withDelay</span>(<span class="number">500</span>, <span class="func">withSpring</span>(<span class="number">100</span>));
+
+<span class="comment">// Callback on completion</span>
+offset.value = <span class="func">withTiming</span>(<span class="number">100</span>, {}, (finished) =&gt; {
+  <span class="string">'worklet'</span>;
+  <span class="keyword">if</span> (finished) {
+    <span class="func">runOnJS</span>(onComplete)();
+  }
+});</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="animated-style">4. useAnimatedStyle</h2>
+
+    <pre><code><span class="keyword">import</span> { useAnimatedStyle, interpolate, interpolateColor } <span class="keyword">from</span> <span class="string">'react-native-reanimated'</span>;
+
+<span class="keyword">function</span> <span class="func">Card</span>({ index }: { index: <span class="type">number</span> }) {
+  <span class="keyword">const</span> progress = <span class="func">useSharedValue</span>(<span class="number">0</span>);
+
+  <span class="keyword">const</span> animatedStyle = <span class="func">useAnimatedStyle</span>(() =&gt; {
+    <span class="comment">// Full JS expressiveness — conditionals, math, interpolation</span>
+    <span class="keyword">const</span> scale = <span class="func">interpolate</span>(
+      progress.value,
+      [<span class="number">0</span>, <span class="number">0.5</span>, <span class="number">1</span>],
+      [<span class="number">1</span>, <span class="number">1.1</span>, <span class="number">1</span>]
+    );
+
+    <span class="keyword">const</span> backgroundColor = <span class="func">interpolateColor</span>(
+      progress.value,
+      [<span class="number">0</span>, <span class="number">1</span>],
+      [<span class="string">'#FFFFFF'</span>, <span class="string">'#4A90D9'</span>]
+    );
+
+    <span class="keyword">const</span> rotate = <span class="string">`</span>${progress.value * <span class="number">360</span>}<span class="string">deg`</span>;
+
+    <span class="keyword">return</span> {
+      transform: [
+        { scale },
+        { rotate },
+        { translateY: progress.value * -<span class="number">20</span> },
+      ],
+      backgroundColor,
+      opacity: progress.value &gt; <span class="number">0.5</span> ? <span class="number">1</span> : <span class="number">0.5</span> + progress.value,
+      shadowOpacity: <span class="func">interpolate</span>(progress.value, [<span class="number">0</span>, <span class="number">1</span>], [<span class="number">0</span>, <span class="number">0.3</span>]),
+    };
+  });
+
+  <span class="keyword">return</span> &lt;<span class="type">Animated.View</span> style={[styles.card, animatedStyle]} /&gt;;
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="animated-props">5. useAnimatedProps &amp; Reactions</h2>
+
+    <pre><code><span class="keyword">import</span> { useAnimatedProps, useDerivedValue, useAnimatedReaction } <span class="keyword">from</span> <span class="string">'react-native-reanimated'</span>;
+<span class="keyword">import</span> { Circle, Svg } <span class="keyword">from</span> <span class="string">'react-native-svg'</span>;
+
+<span class="keyword">const</span> AnimatedCircle = Animated.<span class="func">createAnimatedComponent</span>(Circle);
+
+<span class="keyword">function</span> <span class="func">ProgressRing</span>({ progress }: { progress: SharedValue&lt;<span class="type">number</span>&gt; }) {
+  <span class="keyword">const</span> animatedProps = <span class="func">useAnimatedProps</span>(() =&gt; ({
+    strokeDashoffset: (<span class="number">1</span> - progress.value) * <span class="number">2</span> * Math.PI * <span class="number">40</span>,
+  }));
+
+  <span class="keyword">return</span> (
+    &lt;<span class="type">Svg</span>&gt;
+      &lt;<span class="type">AnimatedCircle</span>
+        cx={<span class="number">50</span>} cy={<span class="number">50</span>} r={<span class="number">40</span>}
+        strokeDasharray={<span class="number">2</span> * Math.PI * <span class="number">40</span>}
+        animatedProps={animatedProps}
+      /&gt;
+    &lt;/<span class="type">Svg</span>&gt;
+  );
+}
+
+<span class="comment">// Derived values: computed from other shared values</span>
+<span class="keyword">const</span> x = <span class="func">useSharedValue</span>(<span class="number">0</span>);
+<span class="keyword">const</span> y = <span class="func">useSharedValue</span>(<span class="number">0</span>);
+<span class="keyword">const</span> distance = <span class="func">useDerivedValue</span>(() =&gt; {
+  <span class="keyword">return</span> Math.<span class="func">sqrt</span>(x.value ** <span class="number">2</span> + y.value ** <span class="number">2</span>);
+});
+
+<span class="comment">// Reactions: side effects when shared values change</span>
+<span class="func">useAnimatedReaction</span>(
+  () =&gt; progress.value,
+  (current, previous) =&gt; {
+    <span class="keyword">if</span> (current &gt;= <span class="number">1</span> &amp;&amp; (previous ?? <span class="number">0</span>) &lt; <span class="number">1</span>) {
+      <span class="func">runOnJS</span>(onComplete)();
+    }
+  }
+);</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="layout-animations">6. Layout Animations</h2>
+
+    <pre><code><span class="keyword">import</span> Animated, {
+  FadeIn, FadeOut, SlideInRight, SlideOutLeft,
+  Layout, LinearTransition,
+} <span class="keyword">from</span> <span class="string">'react-native-reanimated'</span>;
+
+<span class="comment">// Entering and exiting animations</span>
+&lt;<span class="type">Animated.View</span>
+  entering={FadeIn.<span class="func">duration</span>(<span class="number">300</span>).<span class="func">delay</span>(<span class="number">100</span>)}
+  exiting={FadeOut.<span class="func">duration</span>(<span class="number">200</span>)}
+&gt;
+  &lt;<span class="type">Text</span>&gt;I fade in and out&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">Animated.View</span>&gt;
+
+<span class="comment">// Layout transitions (when position/size changes)</span>
+&lt;<span class="type">Animated.View</span> layout={LinearTransition.<span class="func">springify</span>()}&gt;
+  &lt;<span class="type">Text</span>&gt;I animate when my layout changes&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">Animated.View</span>&gt;
+
+<span class="comment">// Custom entering animation</span>
+<span class="keyword">const</span> customEntering = (targetValues) =&gt; {
+  <span class="string">'worklet'</span>;
+  <span class="keyword">const</span> animations = {
+    opacity: <span class="func">withTiming</span>(<span class="number">1</span>, { duration: <span class="number">300</span> }),
+    transform: [
+      { translateY: <span class="func">withSpring</span>(targetValues.targetOriginY) },
+      { scale: <span class="func">withSpring</span>(<span class="number">1</span>) },
+    ],
+  };
+  <span class="keyword">const</span> initialValues = {
+    opacity: <span class="number">0</span>,
+    transform: [
+      { translateY: targetValues.targetOriginY + <span class="number">50</span> },
+      { scale: <span class="number">0.8</span> },
+    ],
+  };
+  <span class="keyword">return</span> { initialValues, animations };
+};</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="comparison">7. Reanimated vs Animated API</h2>
+
+    <table>
+        <thead>
+        <tr>
+            <th>Aspect</th>
+            <th>Animated API</th>
+            <th>Reanimated v3</th>
+        </tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td><strong>Execution model</strong></td>
+            <td>Static config sent to native</td>
+            <td>JS worklets on UI thread</td>
+        </tr>
+        <tr>
+            <td><strong>JS on UI thread</strong></td>
+            <td>No — only pre-computed frames</td>
+            <td>Yes — full JS in worklets</td>
+        </tr>
+        <tr>
+            <td><strong>Conditional logic</strong></td>
+            <td>Not possible during animation</td>
+            <td>Full if/else/switch in worklets</td>
+        </tr>
+        <tr>
+            <td><strong>Gesture integration</strong></td>
+            <td>Animated.event (limited)</td>
+            <td>Gesture Handler composable API</td>
+        </tr>
+        <tr>
+            <td><strong>Layout animations</strong></td>
+            <td>Not supported</td>
+            <td>Entering/exiting/layout transitions</td>
+        </tr>
+        <tr>
+            <td><strong>Dependencies</strong></td>
+            <td>Built-in (0 extra deps)</td>
+            <td>~200KB native + Babel plugin</td>
+        </tr>
+        <tr>
+            <td><strong>Debugging</strong></td>
+            <td>Standard JS debugging</td>
+            <td>Worklet debugging is harder</td>
+        </tr>
+        <tr>
+            <td><strong>Performance ceiling</strong></td>
+            <td>60fps for supported properties</td>
+            <td>60fps with full JS expressiveness</td>
+        </tr>
+        <tr>
+            <td><strong>Best for</strong></td>
+            <td>Simple transitions, scroll-driven</td>
+            <td>Complex gestures, interactive animations</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">8. Architect Considerations</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>Reanimated v3 is architecturally a <strong>second JavaScript runtime running on the UI thread</strong>. The Babel plugin extracts worklet functions at build time, serializes them, and the Reanimated runtime instantiates them in a lightweight Hermes/JSC VM on the UI thread. Shared values are C++ objects accessible via JSI from both threads — no serialization, no bridge, no async. This architecture enables the holy grail of mobile animation: <strong>full JavaScript expressiveness at native frame rates</strong>. The trade-off is complexity: worklets have a restricted execution environment, debugging is harder, and the Babel plugin adds build-time overhead. A Staff engineer uses Reanimated for gesture-driven interactions and complex animations, and falls back to the simpler Animated API for basic transitions.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="01-animated-api.html">← Animated API</a>
+        <a href="03-gesture-handler.html">Next: Gesture Handler →</a>
+    </div>
+</div>
+</body>
+</html>

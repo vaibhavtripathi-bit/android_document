@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Concurrent Rendering — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">New Architecture</a><span class="sep">›</span>
+        Concurrent Rendering
+    </nav>
+
+    <h1>Concurrent Rendering</h1>
+    <p class="subtitle">React 18's concurrent features — useTransition, Suspense, startTransition, and priority-based rendering — are now available in React Native through Fabric. This document covers how concurrent rendering works in a mobile context, the priority lane system, interruptible rendering, and the practical impact on app performance.</p>
+
+    <nav class="nav">
+        <a href="01-jsi-foundation.html">JSI Foundation</a>
+        <a href="02-fabric-renderer.html">Fabric Renderer</a>
+        <a href="03-turbo-modules.html">TurboModules</a>
+        <a href="04-codegen.html">Codegen</a>
+        <a href="05-bridgeless-mode.html">Bridgeless Mode</a>
+        <a href="06-concurrent-rendering.html" class="active">Concurrent Rendering</a>
+        <a href="07-migration-guide.html">Migration Guide</a>
+        <a href="08-interview-qa.html">Interview Q&amp;A</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#what-is-concurrent">1. What Is Concurrent Rendering?</a></li>
+            <li><a href="#why-mobile">2. Why Concurrent Rendering Matters on Mobile</a></li>
+            <li><a href="#fabric-integration">3. Concurrent Rendering with Fabric</a></li>
+            <li><a href="#priority-lanes">4. Priority-Based Updates (Lanes)</a></li>
+            <li><a href="#use-transition">5. useTransition for Navigation</a></li>
+            <li><a href="#suspense">6. Suspense in React Native</a></li>
+            <li><a href="#interruptible">7. Interruptible Rendering</a></li>
+            <li><a href="#state-transitions">8. State Transitions</a></li>
+            <li><a href="#sync-vs-concurrent">9. Synchronous vs Concurrent Rendering</a></li>
+            <li><a href="#limitations">10. Limitations and Current Status</a></li>
+            <li><a href="#architect">11. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="what-is-concurrent">1. What Is Concurrent Rendering?</h2>
+
+    <p>Concurrent rendering is React's ability to prepare multiple versions of the UI simultaneously and interrupt low-priority work to handle high-priority updates. Unlike synchronous rendering (where React must complete a render before responding to new input), concurrent rendering allows React to pause, abort, or restart renders based on priority. In React Native, this is enabled by Fabric's C++ rendering pipeline and the new architecture's direct JSI communication.</p>
+
+    <div class="diagram">
+Synchronous vs Concurrent Rendering
+════════════════════════════════════
+
+Synchronous (Old Architecture):
+  Time ──────────────────────────────────────────►
+  JS Thread:
+  ┌──────────────────────────────────┐ ┌────────┐
+  │  Render large list (blocks 200ms)│ │ Handle │
+  │  Cannot interrupt!               │ │ tap    │
+  └──────────────────────────────────┘ └────────┘
+  User taps button at T=50ms... waits 150ms for response
+
+Concurrent (New Architecture):
+  Time ──────────────────────────────────────────►
+  JS Thread:
+  ┌────────┐ ┌────────┐ ┌───┐ ┌────────────────┐
+  │Render  │ │ Handle │ │Ack│ │Resume render   │
+  │list    │ │ tap    │ │   │ │list (continue) │
+  │(pause) │ │(high   │ │   │ │                │
+  │        │ │ prio)  │ │   │ │                │
+  └────────┘ └────────┘ └───┘ └────────────────┘
+  User taps button at T=50ms... responds in &lt;16ms
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>Concurrent rendering is not about making renders faster — it's about making the UI <em>feel</em> faster by prioritizing what matters to the user. A list render that takes 200ms still takes 200ms of total CPU time. But with concurrent rendering, a button tap during that render gets processed immediately instead of waiting. This is the difference between actual performance (total CPU time) and perceived performance (responsiveness to user input). Staff engineers must understand this distinction — concurrent rendering is a scheduling optimization, not a computational one.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="why-mobile">2. Why Concurrent Rendering Matters on Mobile</h2>
+
+    <p>Mobile devices have unique constraints that make concurrent rendering especially valuable: limited CPU cores, thermal throttling, variable performance across device tiers, and user expectations of 60fps responsiveness. The old synchronous rendering model meant that any expensive render blocked all user interaction — a problem amplified on lower-end devices.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Mobile Constraint</th>
+                <th>Without Concurrent Rendering</th>
+                <th>With Concurrent Rendering</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Low-end devices</strong></td>
+                <td>Long renders block all interaction</td>
+                <td>High-priority updates interrupt long renders</td>
+            </tr>
+            <tr>
+                <td><strong>Navigation transitions</strong></td>
+                <td>New screen render blocks animation</td>
+                <td>useTransition keeps animation smooth</td>
+            </tr>
+            <tr>
+                <td><strong>Search/filter</strong></td>
+                <td>Each keystroke re-renders full list</td>
+                <td>Input stays responsive, list updates deferred</td>
+            </tr>
+            <tr>
+                <td><strong>Data loading</strong></td>
+                <td>Waterfall: fetch → render → fetch → render</td>
+                <td>Suspense enables parallel fetch + render</td>
+            </tr>
+            <tr>
+                <td><strong>Gesture handling</strong></td>
+                <td>Gestures jank during heavy renders</td>
+                <td>Gesture updates get highest priority</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="fabric-integration">3. Concurrent Rendering with Fabric</h2>
+
+    <p>Fabric enables concurrent rendering through its C++ ShadowTree architecture. Unlike the old renderer (which committed UI changes synchronously on the JS thread), Fabric can maintain multiple ShadowTree revisions simultaneously. React can prepare a new tree in the background while the current tree remains displayed — and switch atomically when the new tree is ready.</p>
+
+    <div class="diagram">
+Fabric Concurrent ShadowTree
+═════════════════════════════
+
+  Current (displayed):             Pending (background):
+  ┌──────────────────┐             ┌──────────────────┐
+  │   Root           │             │   Root'          │
+  │  ┌────┴────┐     │             │  ┌────┴────┐     │
+  │ View    Text     │             │ View    Text'    │
+  │ "Hello" "World"  │             │ "Hello" "Updated"│
+  └──────────────────┘             └──────────────────┘
+    │ Mounted on screen              │ Can be abandoned
+    ▼                                │ if interrupted
+  ┌──────────────┐                   │
+  │ Native Views │◄──────────────────┘ Atomic commit
+  └──────────────┘
+    </div>
+
+    <pre><code><span class="comment">// Fabric ShadowTree concurrent commit (simplified)</span>
+<span class="keyword">class</span> <span class="type">ShadowTree</span> {
+<span class="keyword">public</span>:
+  <span class="type">CommitStatus</span> tryCommit(<span class="keyword">const</span> <span class="type">ShadowTreeRevision</span>&amp; revision) {
+    std::lock_guard&lt;std::mutex&gt; lock(commitMutex_);
+    <span class="keyword">if</span> (revision.baseRevision != currentRevision_) {
+      <span class="keyword">return</span> <span class="type">CommitStatus</span>::Cancelled;  <span class="comment">// Stale — re-render needed</span>
+    }
+    currentRevision_ = revision;
+    mountingCoordinator_-&gt;push(revision);
+    <span class="keyword">return</span> <span class="type">CommitStatus</span>::Succeeded;
+  }
+};</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="priority-lanes">4. Priority-Based Updates (Lanes)</h2>
+
+    <p>React uses a "lanes" system to assign priorities to updates. Each update is tagged with a lane that determines when it should be processed. Higher-priority lanes (like user input) preempt lower-priority lanes (like data fetching results). In React Native with Fabric, these priorities map to the rendering pipeline's scheduling.</p>
+
+    <div class="diagram">
+React Priority Lanes
+════════════════════
+
+  Priority (highest → lowest):
+
+  ┌─────────────────────────────────────────────────┐
+  │  SyncLane (1)                                   │
+  │  • Discrete user input (tap, press)             │
+  │  • Focus/blur events                            │
+  │  • Processed immediately, cannot be interrupted  │
+  └─────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────┐
+  │  InputContinuousLane (4)                        │
+  │  • Continuous input (scroll, drag, hover)       │
+  │  • Can batch multiple events per frame          │
+  └─────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────┐
+  │  DefaultLane (32)                               │
+  │  • Network responses, setTimeout callbacks      │
+  │  • Normal priority — can be interrupted         │
+  └─────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────┐
+  │  TransitionLane (64-4194304)                    │
+  │  • startTransition / useTransition updates      │
+  │  • Explicitly low priority — interruptible      │
+  │  • Multiple transition lanes for parallelism    │
+  └─────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────┐
+  │  IdleLane (536870912)                           │
+  │  • Offscreen / hidden content pre-rendering     │
+  │  • Lowest priority — only when idle             │
+  └─────────────────────────────────────────────────┘
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Key Detail</div>
+        <p>Lanes are bitmasks, not simple integers. React uses bitwise operations to efficiently check, merge, and compare lane sets. A single fiber can have pending work in multiple lanes (e.g., a component with both a sync update and a transition update). React processes lanes in priority order, and work in a lower-priority lane can be interrupted when a higher-priority lane has pending work. There are 31 lanes total (fitting in a 32-bit integer), with multiple transition lanes to allow parallel transitions.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="use-transition">5. useTransition for Navigation</h2>
+
+    <p><code>useTransition</code> marks a state update as non-urgent, telling React it can be interrupted by higher-priority work. In React Native, the primary use case is screen navigation: the outgoing screen's exit animation stays smooth while the incoming screen renders in the background.</p>
+
+    <pre><code><span class="keyword">import</span> { useState, useTransition } <span class="keyword">from</span> <span class="string">'react'</span>;
+<span class="keyword">import</span> { View, Text, Pressable, ActivityIndicator } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="keyword">function</span> <span class="type">TabNavigator</span>() {
+  <span class="keyword">const</span> [activeTab, setActiveTab] = useState(<span class="string">'home'</span>);
+  <span class="keyword">const</span> [isPending, startTransition] = useTransition();
+
+  <span class="keyword">const</span> switchTab = (tab) =&gt; {
+    <span class="comment">// Mark the tab switch as a transition (low priority)</span>
+    <span class="comment">// The tab bar remains responsive while the new</span>
+    <span class="comment">// screen renders in the background</span>
+    startTransition(() =&gt; {
+      setActiveTab(tab);
+    });
+  };
+
+  <span class="keyword">return</span> (
+    &lt;View&gt;
+      &lt;TabBar
+        activeTab={activeTab}
+        onTabPress={switchTab}
+        isPending={isPending}
+      /&gt;
+      {isPending &amp;&amp; &lt;ActivityIndicator /&gt;}
+      &lt;TabContent tab={activeTab} /&gt;
+    &lt;/View&gt;
+  );
+}
+
+<span class="comment">// Search with deferred results — input stays responsive</span>
+<span class="keyword">function</span> <span class="type">SearchScreen</span>() {
+  <span class="keyword">const</span> [query, setQuery] = useState(<span class="string">''</span>);
+  <span class="keyword">const</span> [results, setResults] = useState([]);
+  <span class="keyword">const</span> [isPending, startTransition] = useTransition();
+
+  <span class="keyword">const</span> handleSearch = (text) =&gt; {
+    <span class="comment">// Immediate: update the text input (SyncLane)</span>
+    setQuery(text);
+
+    <span class="comment">// Deferred: filter/render results (TransitionLane)</span>
+    startTransition(() =&gt; {
+      <span class="keyword">const</span> filtered = allItems.filter(item =&gt;
+        item.name.toLowerCase().includes(text.toLowerCase())
+      );
+      setResults(filtered);
+    });
+  };
+
+  <span class="keyword">return</span> (
+    &lt;View&gt;
+      &lt;TextInput value={query} onChangeText={handleSearch} /&gt;
+      &lt;FlatList
+        data={results}
+        style={{ opacity: isPending ? 0.7 : 1 }}
+        renderItem={({ item }) =&gt; &lt;ResultRow item={item} /&gt;}
+      /&gt;
+    &lt;/View&gt;
+  );
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Pitfall</div>
+        <p><code>startTransition</code> only works with state updates — it cannot defer side effects, network requests, or native module calls. The callback passed to <code>startTransition</code> must be synchronous and should only contain <code>setState</code> calls. If you need to defer a fetch, use Suspense with a data fetching library instead. Also note: transitions can be interrupted and restarted, so the callback may execute multiple times — ensure it's idempotent.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="suspense">6. Suspense in React Native</h2>
+
+    <p>Suspense lets components "wait" for asynchronous data by throwing a Promise during render. React catches the Promise, shows a fallback, and re-renders when the data is ready. In React Native with concurrent rendering, Suspense integrates with the priority system — suspended components don't block higher-priority updates.</p>
+
+    <pre><code><span class="keyword">import</span> { Suspense } <span class="keyword">from</span> <span class="string">'react'</span>;
+<span class="keyword">import</span> { View, Text, ActivityIndicator } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="comment">// Data fetching with Suspense (using a Suspense-compatible library)</span>
+<span class="keyword">function</span> <span class="type">UserProfile</span>({ userId }) {
+  <span class="comment">// This "suspends" if data isn't ready — throws a Promise</span>
+  <span class="keyword">const</span> user = useUserData(userId);
+
+  <span class="keyword">return</span> (
+    &lt;View&gt;
+      &lt;Text&gt;{user.name}&lt;/Text&gt;
+      &lt;Text&gt;{user.email}&lt;/Text&gt;
+    &lt;/View&gt;
+  );
+}
+
+<span class="comment">// Nested Suspense boundaries for granular loading states</span>
+<span class="keyword">function</span> <span class="type">ProfileScreen</span>({ userId }) {
+  <span class="keyword">return</span> (
+    &lt;View&gt;
+      &lt;Suspense fallback={&lt;ProfileSkeleton /&gt;}&gt;
+        &lt;UserProfile userId={userId} /&gt;
+
+        &lt;Suspense fallback={&lt;ActivityIndicator /&gt;}&gt;
+          &lt;UserPosts userId={userId} /&gt;
+        &lt;/Suspense&gt;
+
+        &lt;Suspense fallback={&lt;ActivityIndicator /&gt;}&gt;
+          &lt;UserFriends userId={userId} /&gt;
+        &lt;/Suspense&gt;
+      &lt;/Suspense&gt;
+    &lt;/View&gt;
+  );
+}
+
+<span class="comment">// Suspense + useTransition: navigate without blocking</span>
+<span class="keyword">function</span> <span class="type">App</span>() {
+  <span class="keyword">const</span> [userId, setUserId] = useState(<span class="keyword">null</span>);
+  <span class="keyword">const</span> [isPending, startTransition] = useTransition();
+
+  <span class="keyword">const</span> navigateToProfile = (id) =&gt; {
+    <span class="comment">// Transition: keep showing current screen while</span>
+    <span class="comment">// the profile screen loads its data</span>
+    startTransition(() =&gt; {
+      setUserId(id);
+    });
+  };
+
+  <span class="keyword">return</span> (
+    &lt;View style={{ opacity: isPending ? 0.8 : 1 }}&gt;
+      {userId
+        ? &lt;ProfileScreen userId={userId} /&gt;
+        : &lt;UserList onSelect={navigateToProfile} /&gt;}
+    &lt;/View&gt;
+  );
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="interruptible">7. Interruptible Rendering</h2>
+
+    <p>Interruptible rendering is the core mechanism that makes concurrent features possible. When React is rendering a low-priority update (e.g., a transition), it periodically checks if higher-priority work has arrived. If so, it abandons the in-progress render, processes the high-priority update, and then restarts the low-priority render from scratch with the updated state.</p>
+
+    <div class="diagram">
+Interruptible Rendering Flow
+═════════════════════════════
+
+  Time ──────────────────────────────────────────────►
+
+  1. Transition render:  ┌───┬───┬───┬───┐
+                         │FibA│FibB│FibC│...│
+                         └───┴───┴─┬─┴───┘
+                                   │ User taps! (SyncLane)
+  2. INTERRUPT → process tap:      ▼
+                         ┌─────────────────┐
+                         │ Sync render tap  │
+                         └────────┬────────┘
+  3. Restart transition with merged state:
+                         ┌───┬───┬───┬───┬───┬───┐
+                         │A' │B' │C' │D' │E' │F' │
+                         └───┴───┴───┴───┴───┴───┘
+
+  shouldYield() checks every ~5ms for higher-priority work.
+    </div>
+
+    <pre><code><span class="comment">// React's concurrent work loop (simplified internal code)</span>
+<span class="keyword">function</span> <span class="type">workLoopConcurrent</span>() {
+  <span class="keyword">while</span> (workInProgress !== <span class="keyword">null</span> &amp;&amp; !shouldYield()) {
+    performUnitOfWork(workInProgress);
+  }
+}
+
+<span class="keyword">function</span> <span class="type">shouldYield</span>() {
+  <span class="comment">// Yield if we've worked &gt;5ms and higher-priority work is pending</span>
+  <span class="keyword">if</span> (getCurrentTime() &gt;= deadline) {
+    <span class="keyword">if</span> (needsPaint || scheduling.isInputPending()) {
+      <span class="keyword">return true</span>;
+    }
+  }
+  <span class="keyword">return false</span>;
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="state-transitions">8. State Transitions</h2>
+
+    <p>State transitions in concurrent mode have different semantics than synchronous updates. A transition update can be "in flight" — React has started rendering it but hasn't committed it yet. During this time, the old UI remains visible. This creates a window where the state and the UI are intentionally out of sync, which React manages through the <code>isPending</code> flag.</p>
+
+    <pre><code><span class="comment">// State transition lifecycle</span>
+<span class="keyword">function</span> <span class="type">FilterableList</span>({ items }) {
+  <span class="keyword">const</span> [filter, setFilter] = useState(<span class="string">''</span>);
+  <span class="keyword">const</span> [filteredItems, setFilteredItems] = useState(items);
+  <span class="keyword">const</span> [isPending, startTransition] = useTransition();
+
+  <span class="comment">// Timeline of a transition:</span>
+  <span class="comment">// T=0ms:  User types "a"</span>
+  <span class="comment">// T=0ms:  setFilter("a") — sync, immediate</span>
+  <span class="comment">// T=0ms:  startTransition → setFilteredItems — deferred</span>
+  <span class="comment">// T=0ms:  isPending = true (transition started)</span>
+  <span class="comment">// T=5ms:  React begins rendering filtered list</span>
+  <span class="comment">// T=8ms:  User types "ab" — interrupts transition</span>
+  <span class="comment">// T=8ms:  setFilter("ab") — sync, immediate</span>
+  <span class="comment">// T=8ms:  Previous transition abandoned, new one starts</span>
+  <span class="comment">// T=50ms: Transition render completes</span>
+  <span class="comment">// T=50ms: isPending = false, filtered list displayed</span>
+
+  <span class="keyword">const</span> handleFilter = (text) =&gt; {
+    setFilter(text);
+    startTransition(() =&gt; {
+      setFilteredItems(
+        items.filter(i =&gt; i.name.includes(text))
+      );
+    });
+  };
+
+  <span class="keyword">return</span> (
+    &lt;View&gt;
+      &lt;TextInput value={filter} onChangeText={handleFilter} /&gt;
+      {isPending &amp;&amp; &lt;Text&gt;Filtering...&lt;/Text&gt;}
+      &lt;FlatList data={filteredItems} /&gt;
+    &lt;/View&gt;
+  );
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="sync-vs-concurrent">9. Synchronous vs Concurrent Rendering</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Synchronous Rendering</th>
+                <th>Concurrent Rendering</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Render model</strong></td>
+                <td>Start-to-finish, no interruption</td>
+                <td>Interruptible, priority-based</td>
+            </tr>
+            <tr>
+                <td><strong>UI during render</strong></td>
+                <td>Frozen until render completes</td>
+                <td>Remains responsive to input</td>
+            </tr>
+            <tr>
+                <td><strong>State consistency</strong></td>
+                <td>Always consistent (one version)</td>
+                <td>May show stale UI during transitions</td>
+            </tr>
+            <tr>
+                <td><strong>Total render time</strong></td>
+                <td>Same</td>
+                <td>Same (or slightly more due to restarts)</td>
+            </tr>
+            <tr>
+                <td><strong>Perceived performance</strong></td>
+                <td>Janky during heavy renders</td>
+                <td>Smooth — input always responsive</td>
+            </tr>
+            <tr>
+                <td><strong>Architecture required</strong></td>
+                <td>Old or new architecture</td>
+                <td>New architecture (Fabric) required</td>
+            </tr>
+            <tr>
+                <td><strong>React version</strong></td>
+                <td>Any</td>
+                <td>React 18+</td>
+            </tr>
+            <tr>
+                <td><strong>Complexity</strong></td>
+                <td>Simple mental model</td>
+                <td>Must handle isPending, stale closures</td>
+            </tr>
+            <tr>
+                <td><strong>Side effects</strong></td>
+                <td>Run once per render</td>
+                <td>May run multiple times (render restarts)</td>
+            </tr>
+            <tr>
+                <td><strong>Best for</strong></td>
+                <td>Simple UIs, few updates</td>
+                <td>Complex UIs, frequent updates, navigation</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="limitations">10. Limitations and Current Status</h2>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Current Limitations</div>
+        <p><strong>Requires new architecture:</strong> Concurrent features only work with Fabric. The old renderer cannot support interruptible rendering.</p>
+        <p><strong>Library compatibility:</strong> Libraries using <code>findNodeHandle</code>, direct ref manipulation, or synchronous layout measurements may break. They must update to new APIs.</p>
+        <p><strong>No automatic concurrency:</strong> Existing <code>setState</code> calls remain synchronous. You must explicitly opt in via <code>useTransition</code>, <code>startTransition</code>, or <code>useDeferredValue</code>.</p>
+        <p><strong>Render restarts:</strong> Transition renders can restart multiple times. Components must be pure — concurrent rendering makes render side-effect violations visible as bugs.</p>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Feature</th>
+                <th>Status in React Native</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>useTransition</strong></td>
+                <td>Available (Fabric required)</td>
+                <td>Works for navigation and search patterns</td>
+            </tr>
+            <tr>
+                <td><strong>Suspense (code splitting)</strong></td>
+                <td>Limited</td>
+                <td>React.lazy works but no native bundle splitting</td>
+            </tr>
+            <tr>
+                <td><strong>Suspense (data fetching)</strong></td>
+                <td>Experimental</td>
+                <td>Requires Suspense-compatible data library</td>
+            </tr>
+            <tr>
+                <td><strong>useDeferredValue</strong></td>
+                <td>Available (Fabric required)</td>
+                <td>Useful for expensive derived computations</td>
+            </tr>
+            <tr>
+                <td><strong>startTransition</strong></td>
+                <td>Available</td>
+                <td>Works without useTransition hook</td>
+            </tr>
+            <tr>
+                <td><strong>Offscreen (Activity)</strong></td>
+                <td>Experimental</td>
+                <td>Pre-rendering hidden screens</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">11. Architect Considerations</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>When adopting concurrent rendering, the key architectural decision is <em>where</em> to place transition boundaries. Not every state update should be a transition — only updates that trigger expensive renders and where showing stale UI briefly is acceptable. The pattern: split state into "urgent" (input value, toggle state) and "deferred" (filtered list, search results, new screen content). Use <code>useTransition</code> for the deferred part. Over-using transitions adds complexity without benefit; under-using them leaves performance on the table. Profile with React DevTools to identify which renders actually cause jank before adding transitions.</p>
+    </div>
+
+    <pre><code><span class="comment">// Architecture pattern: separate urgent and deferred state</span>
+<span class="keyword">function</span> <span class="type">SearchableDataGrid</span>({ data }) {
+  <span class="comment">// Urgent state — always renders immediately</span>
+  <span class="keyword">const</span> [query, setQuery] = useState(<span class="string">''</span>);
+  <span class="keyword">const</span> [sortColumn, setSortColumn] = useState(<span class="string">'name'</span>);
+
+  <span class="comment">// Deferred state — renders in transition</span>
+  <span class="keyword">const</span> [isPending, startTransition] = useTransition();
+  <span class="keyword">const</span> [processedData, setProcessedData] = useState(data);
+
+  <span class="keyword">const</span> handleQueryChange = (text) =&gt; {
+    setQuery(text);  <span class="comment">// Urgent: input updates immediately</span>
+    startTransition(() =&gt; {
+      <span class="comment">// Deferred: expensive filter + sort</span>
+      <span class="keyword">const</span> filtered = data.filter(row =&gt;
+        Object.values(row).some(v =&gt;
+          String(v).toLowerCase().includes(text.toLowerCase())
+        )
+      );
+      <span class="keyword">const</span> sorted = [...filtered].sort((a, b) =&gt;
+        a[sortColumn] &gt; b[sortColumn] ? 1 : -1
+      );
+      setProcessedData(sorted);
+    });
+  };
+
+  <span class="keyword">return</span> (
+    &lt;View&gt;
+      &lt;SearchBar value={query} onChange={handleQueryChange} /&gt;
+      &lt;DataGrid
+        data={processedData}
+        isPending={isPending}
+        onSort={(col) =&gt; {
+          setSortColumn(col);
+          startTransition(() =&gt; {
+            setProcessedData(prev =&gt;
+              [...prev].sort((a, b) =&gt; a[col] &gt; b[col] ? 1 : -1)
+            );
+          });
+        }}
+      /&gt;
+    &lt;/View&gt;
+  );
+}</code></pre>
+
+    <div class="nav-footer">
+        <a href="05-bridgeless-mode.html">← Bridgeless Mode</a>
+        <a href="07-migration-guide.html">Migration Guide →</a>
+    </div>
+</div>
+</body>
+</html>

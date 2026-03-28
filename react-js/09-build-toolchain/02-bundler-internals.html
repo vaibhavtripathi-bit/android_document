@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bundler Internals — Build Toolchain — React JS Deep Dive</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Build Toolchain</a>
+  <span class="sep">›</span>
+  Bundler Internals
+</nav>
+
+<nav class="nav">
+  <a href="01-module-systems.html">Module Systems</a>
+  <a href="02-bundler-internals.html" class="active">Bundler Internals</a>
+  <a href="03-transpilation.html">Transpilation</a>
+  <a href="04-typescript-react.html">TypeScript React</a>
+  <a href="05-css-solutions.html">CSS Solutions</a>
+  <a href="06-monorepo-tooling.html">Monorepo Tooling</a>
+  <a href="07-dev-experience.html">Dev Experience</a>
+  <a href="08-interview-qa.html">Interview Q&amp;A</a>
+</nav>
+
+<h1>Bundler Internals</h1>
+<p class="subtitle">Webpack dependency graphs, Vite's native ESM architecture, esbuild's Go-based speed, Turbopack's incremental computation — deep internals of modern JavaScript bundlers.</p>
+
+<h2>1. Why Bundlers Exist</h2>
+
+<p>Browsers can load ES modules natively, but unbundled development at scale creates problems: hundreds of HTTP requests for a single page, no dead code elimination, no asset optimization, and no backward compatibility transforms. Bundlers solve these by producing optimized output from a dependency graph.</p>
+
+<div class="diagram">
+<pre>
+Bundler Pipeline (Generic):
+
+  Entry Points          Dependency Graph         Chunks           Output
+  ┌─────────┐          ┌───────────────┐       ┌────────┐      ┌────────┐
+  │ index.js│──parse──▶│   Module A    │──split▶│ main   │─emit▶│main.js │
+  └─────────┘          │  ┌──▶ B ──▶ D │       │ chunk  │      │ 42kb   │
+                       │  └──▶ C ──▶ E │       ├────────┤      ├────────┤
+                       │       └──▶ D  │       │ vendor │      │vendor.js│
+                       └───────────────┘       │ chunk  │      │ 180kb  │
+                                               ├────────┤      ├────────┤
+                        Loaders/Transforms      │ lazy   │      │lazy.js │
+                        applied per module      │ chunk  │      │ 25kb   │
+                                               └────────┘      └────────┘
+</pre>
+</div>
+
+<h2>2. Webpack Internals</h2>
+
+<h3>2.1 Compilation Lifecycle</h3>
+
+<p>Webpack's architecture is built on the Tapable plugin system — a series of hooks that plugins tap into at various compilation stages.</p>
+
+<pre><code>// Webpack compilation phases (simplified)
+class Compiler {
+  run() {
+    this.hooks.beforeRun.callAsync();    // Pre-compilation
+    this.hooks.run.callAsync();          // Start compilation
+    this.compile();                       // Core compilation
+  }
+
+  compile() {
+    this.hooks.beforeCompile.callAsync();
+    this.hooks.compile.call();
+
+    const compilation = new Compilation(this);
+    this.hooks.make.callAsync(compilation); // Build modules
+
+    compilation.finish();                // Finish modules
+    compilation.seal();                  // Optimize & chunk
+
+    this.hooks.afterCompile.callAsync();
+    this.hooks.emit.callAsync();         // Write to disk
+    this.hooks.done.callAsync();         // Complete
+  }
+}</code></pre>
+
+<h3>2.2 Dependency Graph Construction</h3>
+
+<pre><code>// Webpack builds the graph by:
+// 1. Starting from entry points
+// 2. Parsing each file's AST to find import/require statements
+// 3. Resolving paths using enhanced-resolve
+// 4. Recursively processing dependencies
+
+// Entry configuration
+module.exports = {
+  entry: {
+    main: './src/index.js',
+    admin: './src/admin.js',
+  },
+  // Each entry creates a separate dependency subgraph
+  // Shared modules between entries become shared chunks
+};
+
+// Internal module representation (simplified)
+class Module {
+  constructor(request) {
+    this.request = request;        // './src/index.js'
+    this.dependencies = [];         // Parsed import statements
+    this.blocks = [];               // Async dependencies (dynamic imports)
+    this.source = null;             // Transformed source code
+    this.buildInfo = {};            // Metadata from loaders
+  }
+}</code></pre>
+
+<h3>2.3 Loaders</h3>
+
+<p>Loaders transform individual files before they enter the dependency graph. They're functions that receive source content and return transformed content.</p>
+
+<pre><code>// Loader execution order: RIGHT to LEFT (bottom to top)
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.tsx?$/,
+        use: [
+          'babel-loader',      // 3rd: Babel transforms
+          'ts-loader',         // 2nd: TypeScript compilation
+          'custom-loader',     // 1st: runs first
+        ],
+      },
+      {
+        test: /\.css$/,
+        use: [
+          'style-loader',     // 3rd: injects CSS into DOM
+          'css-loader',       // 2nd: resolves @import and url()
+          'postcss-loader',   // 1st: PostCSS transforms
+        ],
+      },
+    ],
+  },
+};
+
+// Custom loader example
+module.exports = function svgLoader(source) {
+  // 'this' is the loader context
+  const callback = this.async(); // For async loaders
+
+  // Transform SVG to React component
+  const componentCode = `
+    import React from 'react';
+    export default function SvgIcon(props) {
+      return ${svgToJsx(source)};
+    }
+  `;
+
+  callback(null, componentCode);
+};
+
+// Loader context provides:
+// this.resourcePath  — absolute path of the file
+// this.query         — loader options
+// this.emitFile()    — emit additional files
+// this.addDependency() — watch additional files</code></pre>
+
+<h3>2.4 Plugins</h3>
+
+<p>Plugins hook into webpack's compilation lifecycle via the Tapable event system, enabling transformations across the entire bundle.</p>
+
+<pre><code>// Plugin structure
+class MyPlugin {
+  apply(compiler) {
+    // Tap into compilation hooks
+    compiler.hooks.compilation.tap('MyPlugin', (compilation) => {
+
+      // Access module-level hooks
+      compilation.hooks.optimizeModules.tap('MyPlugin', (modules) => {
+        for (const module of modules) {
+          // Analyze or transform modules
+        }
+      });
+
+      // Access chunk-level hooks
+      compilation.hooks.optimizeChunks.tap('MyPlugin', (chunks) => {
+        // Merge or split chunks
+      });
+
+      // Access asset-level hooks
+      compilation.hooks.processAssets.tap(
+        { name: 'MyPlugin', stage: Compilation.PROCESS_ASSETS_STAGE_OPTIMIZE },
+        (assets) => {
+          for (const [name, source] of Object.entries(assets)) {
+            // Transform final output files
+          }
+        }
+      );
+    });
+  }
+}
+
+// Key built-in plugins
+const webpack = require('webpack');
+module.exports = {
+  plugins: [
+    new webpack.DefinePlugin({
+      'process.env.NODE_ENV': JSON.stringify('production'),
+    }),
+    new webpack.ProvidePlugin({
+      React: 'react', // Auto-import React in every module
+    }),
+  ],
+};</code></pre>
+
+<h3>2.5 Code Splitting</h3>
+
+<pre><code>// Three approaches to code splitting in webpack:
+
+// 1. Entry points (manual)
+entry: { main: './src/index.js', vendor: './src/vendor.js' }
+
+// 2. Dynamic imports (automatic)
+const Chart = React.lazy(() => import('./Chart'));
+
+// 3. SplitChunksPlugin (optimization)
+module.exports = {
+  optimization: {
+    splitChunks: {
+      chunks: 'all',
+      cacheGroups: {
+        vendor: {
+          test: /[\\/]node_modules[\\/]/,
+          name: 'vendors',
+          chunks: 'all',
+          priority: 10,
+        },
+        common: {
+          minChunks: 2,        // Used in 2+ entry points
+          name: 'common',
+          chunks: 'all',
+          priority: 5,
+          reuseExistingChunk: true,
+        },
+        // React ecosystem in its own chunk
+        react: {
+          test: /[\\/]node_modules[\\/](react|react-dom)[\\/]/,
+          name: 'react-vendor',
+          chunks: 'all',
+          priority: 20,
+        },
+      },
+    },
+  },
+};</code></pre>
+
+<div class="callout-architect">
+  <h4>Architect Insight: Chunk Strategy</h4>
+  <p>At Staff level, you should design chunk strategies based on route-level code splitting with shared vendor chunks. The goal is maximizing cache hit rates: vendor chunks change rarely (long cache TTL), route chunks change with features (short TTL), and shared utility chunks sit in between. Use <code>webpack-bundle-analyzer</code> to visualize and optimize chunk composition.</p>
+</div>
+
+<h2>3. Vite Architecture</h2>
+
+<p>Vite takes a fundamentally different approach: native ESM for development, Rollup for production.</p>
+
+<div class="diagram">
+<pre>
+Vite Dev Server Architecture:
+
+  Browser                    Vite Dev Server              File System
+  ┌──────────┐              ┌──────────────────┐         ┌──────────┐
+  │ &lt;script   │──GET /src──▶│ Transform on     │◀──read──│ src/     │
+  │  type=    │  /App.tsx   │ demand (esbuild)  │         │ App.tsx  │
+  │  module&gt; │              │                  │         │ main.ts  │
+  │          │◀─────────────│ Serve native ESM  │         └──────────┘
+  │          │  200 OK      │ (no bundling!)    │
+  │          │  App.js      │                  │
+  │          │              │ Pre-bundle deps   │
+  │          │              │ (node_modules     │
+  │          │              │  via esbuild)     │
+  └──────────┘              └──────────────────┘
+
+  Dev: Native ESM + on-demand transforms
+  Prod: Rollup bundle (optimized, code-split)
+</pre>
+</div>
+
+<pre><code>// vite.config.ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+
+  // Dependency pre-bundling (uses esbuild)
+  optimizeDeps: {
+    include: ['react', 'react-dom', 'lodash-es'],
+    exclude: ['my-local-package'],
+  },
+
+  build: {
+    // Production uses Rollup
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ['react', 'react-dom'],
+          router: ['react-router-dom'],
+        },
+      },
+    },
+    target: 'es2020',
+    minify: 'esbuild',     // or 'terser' for more control
+    sourcemap: true,
+    chunkSizeWarningLimit: 500,
+  },
+
+  server: {
+    hmr: { overlay: true },
+    proxy: {
+      '/api': { target: 'http://localhost:3001', changeOrigin: true },
+    },
+  },
+});</code></pre>
+
+<h3>Why Vite Is Fast in Development</h3>
+
+<table>
+<thead>
+<tr><th>Aspect</th><th>Webpack</th><th>Vite</th></tr>
+</thead>
+<tbody>
+<tr><td>Dev startup</td><td>Bundle everything first</td><td>Start server immediately</td></tr>
+<tr><td>Module serving</td><td>Bundled JavaScript</td><td>Native ESM (browser resolves)</td></tr>
+<tr><td>File change</td><td>Rebuild affected chunks</td><td>Transform single file</td></tr>
+<tr><td>Dependencies</td><td>Bundled with app code</td><td>Pre-bundled once (esbuild)</td></tr>
+<tr><td>Cold start (large app)</td><td>30-60 seconds</td><td>1-3 seconds</td></tr>
+<tr><td>HMR speed</td><td>Seconds (rebundle)</td><td>Milliseconds (single file)</td></tr>
+</tbody>
+</table>
+
+<h2>4. esbuild</h2>
+
+<p>esbuild is written in Go and achieves 10-100x faster builds than JavaScript-based tools through parallelism, minimal AST passes, and efficient memory usage.</p>
+
+<pre><code>// esbuild API
+import * as esbuild from 'esbuild';
+
+await esbuild.build({
+  entryPoints: ['src/index.tsx'],
+  bundle: true,
+  minify: true,
+  sourcemap: true,
+  splitting: true,       // Code splitting (ESM output only)
+  format: 'esm',
+  target: ['es2020'],
+  outdir: 'dist',
+  define: {
+    'process.env.NODE_ENV': '"production"',
+  },
+  loader: {
+    '.png': 'dataurl',
+    '.svg': 'text',
+  },
+  plugins: [myPlugin],
+});
+
+// esbuild plugin API
+const myPlugin = {
+  name: 'my-plugin',
+  setup(build) {
+    // Resolve hook — control module resolution
+    build.onResolve({ filter: /^env$/ }, (args) => ({
+      path: args.path,
+      namespace: 'env-ns',
+    }));
+
+    // Load hook — provide module content
+    build.onLoad({ filter: /.*/, namespace: 'env-ns' }, () => ({
+      contents: `export const NODE_ENV = "${process.env.NODE_ENV}"`,
+      loader: 'js',
+    }));
+  },
+};</code></pre>
+
+<h2>5. Turbopack</h2>
+
+<p>Turbopack (by Vercel) is a Rust-based incremental bundler built on the Turbo engine's function-level caching.</p>
+
+<pre><code>// Turbopack key concepts:
+// 1. Function-level memoization — cache individual transform results
+// 2. Incremental computation — only recompute what changed
+// 3. Lazy evaluation — don't compute until needed
+
+// next.config.js — enabling Turbopack in Next.js
+/** @type {import('next').NextConfig} */
+module.exports = {
+  experimental: {
+    turbo: {
+      rules: {
+        '*.svg': {
+          loaders: ['@svgr/webpack'],
+          as: '*.js',
+        },
+      },
+      resolveAlias: {
+        underscore: 'lodash',
+      },
+    },
+  },
+};</code></pre>
+
+<h2>6. Bundler Comparison Matrix</h2>
+
+<table>
+<thead>
+<tr><th>Feature</th><th>Webpack 5</th><th>Vite/Rollup</th><th>esbuild</th><th>Turbopack</th></tr>
+</thead>
+<tbody>
+<tr><td>Language</td><td>JavaScript</td><td>JS / JS</td><td>Go</td><td>Rust</td></tr>
+<tr><td>Dev server</td><td>webpack-dev-server</td><td>Native ESM</td><td>Basic</td><td>Next.js integrated</td></tr>
+<tr><td>Code splitting</td><td>Excellent</td><td>Good (Rollup)</td><td>Basic (ESM only)</td><td>Good</td></tr>
+<tr><td>Plugin ecosystem</td><td>Massive</td><td>Growing (Rollup)</td><td>Limited</td><td>Developing</td></tr>
+<tr><td>HMR</td><td>Yes</td><td>Yes (fast)</td><td>No (use Vite)</td><td>Yes (fast)</td></tr>
+<tr><td>Tree shaking</td><td>Yes</td><td>Yes (Rollup)</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Module Federation</td><td>Yes</td><td>Plugin</td><td>No</td><td>No</td></tr>
+<tr><td>CSS handling</td><td>Loaders</td><td>Built-in</td><td>Basic</td><td>Built-in</td></tr>
+<tr><td>Build speed</td><td>Slow</td><td>Medium</td><td>Very fast</td><td>Very fast</td></tr>
+<tr><td>Maturity</td><td>Very mature</td><td>Mature</td><td>Mature</td><td>Early</td></tr>
+</tbody>
+</table>
+
+<h2>7. Hot Module Replacement (HMR) Internals</h2>
+
+<pre><code>// HMR protocol (simplified):
+// 1. File changes on disk
+// 2. Bundler detects change via file watcher (chokidar/fs.watch)
+// 3. Bundler recompiles affected module(s)
+// 4. Bundler sends update to client via WebSocket
+// 5. Client HMR runtime applies update without full reload
+
+// Webpack HMR API
+if (module.hot) {
+  module.hot.accept('./App', () => {
+    // Re-render with updated module
+    const NextApp = require('./App').default;
+    render(NextApp);
+  });
+
+  module.hot.dispose((data) => {
+    // Cleanup before module is replaced
+    data.savedState = currentState;
+  });
+}
+
+// Vite HMR API (different from webpack)
+if (import.meta.hot) {
+  import.meta.hot.accept((newModule) => {
+    // Handle the updated module
+    if (newModule) {
+      render(newModule.default);
+    }
+  });
+
+  import.meta.hot.dispose(() => {
+    // Cleanup
+  });
+
+  // Vite-specific: invalidate to trigger parent re-import
+  import.meta.hot.invalidate();
+}</code></pre>
+
+<div class="callout-info">
+  <h4>React Fast Refresh vs HMR</h4>
+  <p>React Fast Refresh (built on HMR) preserves component state during edits. It works by: (1) detecting which exports are React components, (2) creating a "registration" for each component, (3) on update, re-rendering only affected components while preserving their state via a signature-based identity check. Non-component edits trigger a full module reload.</p>
+</div>
+
+<h2>8. Source Maps</h2>
+
+<pre><code>// Source map types and trade-offs
+module.exports = {
+  // Webpack devtool options:
+  devtool: 'source-map',
+  // Options (speed vs quality):
+  // 'eval'                    — fastest, no mapping
+  // 'eval-cheap-source-map'   — fast, line-only mapping
+  // 'eval-source-map'         — slow, full mapping (dev recommended)
+  // 'source-map'              — slowest, full mapping (prod)
+  // 'hidden-source-map'       — full mapping, no reference in bundle
+  // 'nosources-source-map'    — mapping without source content
+};
+
+// Source map structure (v3)
+{
+  "version": 3,
+  "file": "bundle.js",
+  "sources": ["../src/index.js", "../src/utils.js"],
+  "sourcesContent": ["import ...", "export ..."],
+  "names": ["render", "App"],
+  "mappings": "AAAA,SAAS,OAAO;AAChB..."
+  // VLQ-encoded segment mappings:
+  // generated line/col → original file/line/col/name
+}</code></pre>
+
+<div class="callout-warning">
+  <h4>Source Maps in Production</h4>
+  <p>Never serve source maps publicly in production — they expose your source code. Use <code>hidden-source-map</code> and upload maps to error tracking services (Sentry, Datadog) separately. Some teams use <code>nosources-source-map</code> to get stack traces without exposing source content.</p>
+</div>
+
+<h2>9. Asset Handling</h2>
+
+<pre><code>// Webpack 5 asset modules (replaced file-loader, url-loader)
+module.exports = {
+  module: {
+    rules: [
+      {
+        test: /\.(png|jpg|gif)$/,
+        type: 'asset',           // auto-choose inline vs file
+        parser: {
+          dataUrlCondition: {
+            maxSize: 8 * 1024,   // Inline if < 8KB
+          },
+        },
+        generator: {
+          filename: 'images/[hash][ext]',
+        },
+      },
+      {
+        test: /\.svg$/,
+        type: 'asset/source',    // Import as string
+      },
+    ],
+  },
+};
+
+// Vite asset handling (built-in)
+import imgUrl from './image.png';          // URL string
+import svgContent from './icon.svg?raw';   // Raw string
+import Worker from './worker.js?worker';   // Web Worker
+
+// Dynamic asset URLs in Vite
+const imageUrl = new URL('./image.png', import.meta.url).href;</code></pre>
+
+<nav class="nav-footer">
+  <a href="01-module-systems.html">← Previous: Module Systems</a>
+  <a href="03-transpilation.html">Next: Transpilation →</a>
+</nav>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Performance Monitoring — Engineering Problems</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Engineering Problems</a>
+  <span class="sep">›</span>
+  Performance Monitoring
+</nav>
+
+<h1>Building a Performance Monitoring System</h1>
+<p class="subtitle">Real User Monitoring, Core Web Vitals, budgets, regression detection, and A/B performance at staff-engineering depth.</p>
+
+<div class="callout-architect">
+  <div class="callout-title">Architecture lens</div>
+  <p>RUM is not “drop in Google Analytics.” At scale you own sampling, PII boundaries, batching, backpressure, and statistical rigor so dashboards reflect user pain—not developer laptops.</p>
+</div>
+
+<h2>Real User Monitoring (RUM) architecture</h2>
+<p>RUM instruments the client, aggregates in an ingestion tier, and materializes rollups for dashboards and alerts. The critical design choice is <em>what runs in the browser</em> versus <em>what runs server-side</em>: browsers should do minimal work; the pipeline does enrichment, joins with deploy metadata, and anomaly detection.</p>
+
+<div class="diagram">┌─────────────┐    beacon/batch     ┌──────────────┐    stream/queue   ┌─────────────┐
+│  Web / RN   │ ──────────────────► │  Ingest API  │ ───────────────► │  Warehouse  │
+│  (collector)│   (gzip + backoff)  │  (validate)  │                  │  (BigQuery) │
+└─────────────┘                     └──────────────┘                    └──────┬──────┘
+       │                                      │                                │
+       │ PerformanceObserver                  │ session id,                    │ dbt / SQL
+       │ + mark/measure                       │ release SHA,                   │ rollups
+       ▼                                      ▼                                ▼
+  buffer + flush                         rate limit                    ┌─────────────┐
+  (requestIdleCallback)                  + dedupe                      │ Dashboards  │
+                                                                         │ + Alerts    │
+                                                                         └─────────────┘</div>
+
+<h3>Collector responsibilities</h3>
+<ul>
+  <li><strong>Schema versioning</strong> — every payload includes <code>schema: 3</code> so you can evolve fields without breaking parsers.</li>
+  <li><strong>Clock skew</strong> — send <code>client_ts</code> and let the server record <code>server_ts</code>; compute offset per session for ordering.</li>
+  <li><strong>Sampling</strong> — deterministic hash on <code>sessionId</code> for 1–5% baseline + 100% for “synthetic” or internal users.</li>
+  <li><strong>Privacy</strong> — strip query strings, hash user IDs, never send raw DOM; route PII through your DLP review.</li>
+</ul>
+
+<div class="callout-info">
+  <div class="callout-title">Why batch?</div>
+  <p>Single-metric beacons amplify connection overhead and can starve low-end devices. Coalesce into ~2–8KB batches flushed on <code>visibilitychange</code>, <code>pagehide</code>, or idle callbacks—with exponential backoff on 429/5xx.</p>
+</div>
+
+<h2>Custom metrics: PerformanceObserver and User Timing</h2>
+<p>The Performance Timeline API gives sub-millisecond resolution for long tasks, resource timing, and navigation. <code>performance.mark</code> / <code>performance.measure</code> bridge React lifecycle to observable durations (e.g., “hydration complete”).</p>
+
+<h3>RUM collector (browser)</h3>
+<pre><code>// rum-collector.ts — minimal production-shaped client
+type RumEvent =
+  | { type: 'cwv'; name: 'LCP' | 'CLS' | 'INP'; value: number; id: string }
+  | { type: 'custom'; name: string; durationMs: number; detail?: Record&lt;string, unknown&gt; };
+
+const QUEUE: RumEvent[] = [];
+let flushTimer: number | null = null;
+
+function enqueue(e: RumEvent) {
+  QUEUE.push(e);
+  if (QUEUE.length &gt;= 20) flush();
+  else scheduleFlush();
+}
+
+function scheduleFlush() {
+  if (flushTimer != null) return;
+  flushTimer = window.setTimeout(() =&gt; {
+    flushTimer = null;
+    if (document.visibilityState === 'hidden') flush();
+  }, 4000);
+}
+
+export async function flush() {
+  if (!QUEUE.length) return;
+  const batch = QUEUE.splice(0, QUEUE.length);
+  const body = JSON.stringify({
+    schema: 3,
+    sessionId: getSessionId(),
+    release: import.meta.env.VITE_RELEASE_SHA,
+    events: batch,
+  });
+  try {
+    await fetch('/api/rum', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+      keepalive: true,
+    });
+  } catch {
+    QUEUE.unshift(...batch);
+  }
+}
+
+function getSessionId(): string {
+  const k = 'rum_sid';
+  let id = sessionStorage.getItem(k);
+  if (!id) {
+    id = crypto.randomUUID();
+    sessionStorage.setItem(k, id);
+  }
+  return id;
+}
+
+document.addEventListener('visibilitychange', () =&gt; {
+  if (document.visibilityState === 'hidden') flush();
+});</code></pre>
+
+<h3>Custom metric hook (React + PerformanceObserver)</h3>
+<pre><code>// usePerfObserver.ts
+import { useEffect } from 'react';
+
+export function useLongTaskReporter(onLongTask: (dur: number) =&gt; void) {
+  useEffect(() =&gt; {
+    if (!('PerformanceObserver' in window)) return;
+    const po = new PerformanceObserver((list) =&gt; {
+      for (const e of list.getEntries()) {
+        if (e.entryType === 'longtask') {
+          onLongTask((e as PerformanceEntry &amp; { duration: number }).duration);
+        }
+      }
+    });
+    try {
+      po.observe({ type: 'longtask', buffered: true } as PerformanceObserverInit);
+    } catch {
+      /* Safari may lack longtask */
+    }
+    return () =&gt; po.disconnect();
+  }, [onLongTask]);
+}
+
+// Component boundary measure
+export function measureHydration(componentName: string) {
+  const markEnd = `${componentName}:hydrated`;
+  performance.mark(markEnd);
+  performance.measure(`${componentName}:hydration`, undefined, markEnd);
+}</code></pre>
+
+<h2>Performance budgets</h2>
+<p>Budgets turn “we should be fast” into failing CI. Split <strong>build-time</strong> budgets (bundle KB, chunk count) from <strong>runtime</strong> budgets (p75 LCP per route).</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Budget type</th>
+      <th>Typical gate</th>
+      <th>Enforcement</th>
+      <th>Rationale</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Main bundle (gzip)</td>
+      <td>&lt; 180 KB initial JS</td>
+      <td>webpack-bundle-analyzer + CI threshold</td>
+      <td>Correlates with TTI on 4G mid-tier</td>
+    </tr>
+    <tr>
+      <td>LCP (lab)</td>
+      <td>&lt; 2.5s p75</td>
+      <td>Lighthouse CI on representative URLs</td>
+      <td>Lab catches regressions before RUM noise</td>
+    </tr>
+    <tr>
+      <td>INP (field)</td>
+      <td>&lt; 200ms p75</td>
+      <td>RUM + SLO alert</td>
+      <td>INP is interaction-heavy; lab is weaker</td>
+    </tr>
+    <tr>
+      <td>Long tasks</td>
+      <td>&lt; 3 per minute p95</td>
+      <td>RUM longtask observer</td>
+      <td>Main-thread jank predictor</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout-warning">
+  <div class="callout-title">Budget anti-pattern</div>
+  <p>Using lab LCP alone for SPA navigations misses client-rendered routes. Pair Lighthouse URLs with <code>web-vitals</code> in production for each route template.</p>
+</div>
+
+<h3>Performance budget CI check (Node)</h3>
+<pre><code>// scripts/check-bundle-budget.mjs
+import fs from 'node:fs';
+import path from 'node:path';
+
+const REPORT = path.join('dist', 'stats.json'); // from --json vite/webpack
+const limits = { main: 190_000, vendor: 350_000 }; // bytes gzip approx via build plugin
+
+const stats = JSON.parse(fs.readFileSync(REPORT, 'utf8'));
+const assets = stats.assets ?? [];
+
+function overBudget() {
+  const main = assets.find((a) =&gt; a.name === 'main.js.gz');
+  if (main &amp;&amp; main.size &gt; limits.main) {
+    console.error(`main.js.gz ${main.size} &gt; ${limits.main}`);
+    return true;
+  }
+  return false;
+}
+
+process.exit(overBudget() ? 1 : 0);</code></pre>
+
+<h2>Core Web Vitals: LCP, CLS, INP</h2>
+<p>Google’s CWV are percentile metrics over 28 days of Chrome field data—but <em>your</em> RUM should compute the same definitions locally for faster feedback.</p>
+
+<ul>
+  <li><strong>LCP</strong> — largest contentful paint; use <code>PerformanceObserver</code> with <code>type: 'largest-contentful-paint'</code>, report the last candidate before user input.</li>
+  <li><strong>CLS</strong> — layout shift score; sum non-expected shifts in session windows; cap with the “session window” algorithm from the spec.</li>
+  <li><strong>INP</strong> — interaction to next paint; track latency of all interactions until the next frame is painted; take worst (or high percentile) per page.</li>
+</ul>
+
+<pre><code>// cwv.ts — pattern aligned with web-vitals library internals
+import { onLCP, onCLS, onINP } from 'web-vitals';
+
+onLCP((m) =&gt; enqueue({ type: 'cwv', name: 'LCP', value: m.value, id: m.id }), { reportAllChanges: true });
+onCLS((m) =&gt; enqueue({ type: 'cwv', name: 'CLS', value: m.value, id: m.id }));
+onINP((m) =&gt; enqueue({ type: 'cwv', name: 'INP', value: m.value, id: m.id }));</code></pre>
+
+<h2>Alerting and regression detection</h2>
+<p>Alerts on raw p75 spikes create pager fatigue. Prefer <strong>release-scoped</strong> comparison: for each deploy SHA, compare the subsequent 24h window to the prior baseline with a <strong>Mann–Whitney</strong> or <strong>bootstrap confidence interval</strong> on the metric delta.</p>
+
+<div class="diagram">Release N-1  ████████████████████░░  p75 LCP = 2.1s
+Release N    ██████████████████████░  p75 LCP = 2.4s
+                    │
+                    ▼
+         Δ = +0.3s  (bootstrap 95% CI: +0.1s .. +0.5s)
+         ─────────────────────────────────────────────
+         IF CI lower &gt; +0.15s AND sample &gt; 5k  → PAGE</div>
+
+<h3>Regression detector (pseudo-SQL + TypeScript glue)</h3>
+<pre><code>// regression-detector.ts — compare windows per route
+type Agg = { route: string; p75: number; n: number };
+
+export function significantRegression(before: Agg, after: Agg): boolean {
+  if (after.n &lt; 5000 || before.n &lt; 5000) return false;
+  const rel = (after.p75 - before.p75) / before.p75;
+  // Production: replace with proper effect size + sequential testing
+  return rel &gt; 0.12;
+}
+
+/*
+-- BigQuery-style rollup
+SELECT
+  APP_INFO.release AS rel,
+  route,
+  APPROX_QUANTILES(lcp_ms, 100)[OFFSET(75)] AS p75_lcp,
+  COUNT(*) AS n
+FROM rum.events
+WHERE event_date BETWEEN @start AND @end
+GROUP BY 1, 2;
+*/</code></pre>
+
+<div class="callout-architect">
+  <div class="callout-title">Sequential testing</div>
+  <p>If you evaluate the same metric every hour after deploy, you inflate false positives. Use sequential methods (e.g., SPRT-style gates) or fixed windows only.</p>
+</div>
+
+<h2>Dashboard design</h2>
+<p>Show what drives action: <strong>segmented</strong> p75/p95, <strong>route × device class</strong>, error bars, and deploy markers. Avoid vanity charts.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Panel</th>
+      <th>Audience</th>
+      <th>Why it matters</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>CWV by route (field)</td>
+      <td>Frontend + PM</td>
+      <td>Localizes which templates regressed</td>
+    </tr>
+    <tr>
+      <td>Long task attribution</td>
+      <td>Engineering</td>
+      <td>Links jank to third-party scripts</td>
+    </tr>
+    <tr>
+      <td>Resource waterfall (synthetic)</td>
+      <td>Perf specialists</td>
+      <td>Catches CDN / HTTP2 regressions</td>
+    </tr>
+    <tr>
+      <td>Release overlay</td>
+      <td>SRE</td>
+      <td>Correlates deploys with drift</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>A/B testing performance impact</h2>
+<p>Variant assignment must tag RUM events so you can compare <em>the same cohort</em> under two experiences. Watch for <strong>Simpson’s paradox</strong>: overall INP may improve while mobile degrades if traffic mix shifts.</p>
+
+<pre><code>// ab-tagging.ts
+declare global {
+  interface Window {
+    __EXP_FLAGS__?: Record&lt;string, string&gt;;
+  }
+}
+
+export function rumContext() {
+  return {
+    experiments: window.__EXP_FLAGS__ ?? {},
+    variant: window.__EXP_FLAGS__?.['checkout_v2'] ?? 'control',
+  };
+}</code></pre>
+
+<p>Analysis tip: stratify by <code>deviceMemory</code>, <code>connection.effectiveType</code>, and geography. Use CUPED or diff-in-diff when you have pre-period data per user.</p>
+
+<div class="callout-info">
+  <div class="callout-title">React-specific</div>
+  <p>Concurrent features and transitions change INP distributions: a deferred update may improve perceived responsiveness while shifting work later—always pair RUM with long-task counts.</p>
+</div>
+
+<h2>Summary comparison: lab vs field</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Dimension</th>
+      <th>Lighthouse / lab</th>
+      <th>RUM / field</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Representativeness</td>
+      <td>Controlled device profile</td>
+      <td>True device + network mix</td>
+    </tr>
+    <tr>
+      <td>INP fidelity</td>
+      <td>Synthetic interactions only</td>
+      <td>Real user paths</td>
+    </tr>
+    <tr>
+      <td>CI integration</td>
+      <td>Excellent gatekeeper</td>
+      <td>Noisy for small PRs</td>
+    </tr>
+    <tr>
+      <td>Cost</td>
+      <td>Low fixed</td>
+      <td>Storage + query $ at scale</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 class="qa-section">Deep-dive Q&amp;A</h2>
+
+<div class="qa-item">
+  <div class="qa-question">How do you prevent RUM from becoming a DDoS vector? <span class="level tag tag-l6">L6</span></div>
+  <div class="qa-answer">
+    <p>Authenticate optional beacons for internal tiers; for public sites use strict rate limits per IP + per session, payload size caps, schema validation, and WAF rules. Prefer edge ingestion (CDN) with anomaly detection on request rate versus unique sessions.</p>
+  </div>
+</div>
+
+<div class="qa-item">
+  <div class="qa-question">Why not sample uniformly random on each event? <span class="level tag tag-architect">Arch</span></div>
+  <div class="qa-answer">
+    <p>Uniform per-event sampling fragments sessions and biases journey metrics. Session-level hashing keeps user paths coherent and stabilizes statistical tests across steps.</p>
+  </div>
+</div>
+
+<div class="qa-item">
+  <div class="qa-question">What breaks CLS measurement in SPAs? <span class="level tag tag-senior">Senior</span></div>
+  <div class="qa-answer">
+    <p>Soft navigations do not reset CLS in the same way as full page loads unless you implement session windows per route change. Align with the soft-nav proposal or reset counters on route transitions with explicit session IDs.</p>
+  </div>
+</div>
+
+<nav class="nav-footer">
+  <a href="04-design-system-at-scale.html">← Prev: Design System at Scale</a>
+  <a href="06-micro-frontend-migration.html">Next: Micro-Frontend Migration →</a>
+</nav>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

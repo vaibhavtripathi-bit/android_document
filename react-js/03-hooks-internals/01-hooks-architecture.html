@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hooks Architecture — React Hooks Internals</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Hooks Internals</a>
+  <span class="sep">›</span>
+  Hooks Architecture
+</nav>
+
+<h1>Hooks Architecture</h1>
+<p class="subtitle">How React stores, resolves, and dispatches hooks via fiber-level linked lists and phase-specific dispatchers.</p>
+
+<nav class="nav">
+  <a href="02-usestate-usereducer.html">useState &amp; useReducer</a>
+  <a href="03-useeffect-lifecycle.html">useEffect Lifecycle</a>
+  <a href="04-usememo-usecallback.html">useMemo &amp; useCallback</a>
+  <a href="05-useref-imperative.html">useRef &amp; Imperative</a>
+  <a href="06-custom-hooks.html">Custom Hooks</a>
+  <a href="07-use-hook-react19.html">use() Hook</a>
+  <a href="08-concurrent-hooks.html">Concurrent Hooks</a>
+  <a href="09-interview-qa.html">Interview Q&amp;A</a>
+</nav>
+
+<h2 id="hooks-on-fiber">Hooks as a Linked List on Fiber</h2>
+
+<p>Every function component in React corresponds to a <strong>fiber node</strong> in the fiber tree. When a component uses hooks, React stores all hook state on the fiber's <code>memoizedState</code> field as a <strong>singly-linked list</strong>. Each node in this list represents one hook call.</p>
+
+<pre><code>// Simplified hook node structure (ReactFiberHooks.js)
+type Hook = {
+  memoizedState: any,    // current state value (varies by hook type)
+  baseState: any,        // base state before pending updates
+  baseQueue: Update | null,  // first update in the base queue
+  queue: UpdateQueue | null, // pending update queue
+  next: Hook | null,     // pointer to next hook in the list
+};
+
+// On the fiber:
+fiber.memoizedState → Hook1 → Hook2 → Hook3 → null
+                      (useState) (useEffect) (useMemo)</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p>The linked-list design means hooks are <strong>positionally identified</strong>. React doesn't use names or keys — it relies on call order. This is the fundamental reason hooks must be called in the same order every render: the Nth hook call maps to the Nth node in the linked list.</p>
+</div>
+
+<h3>What memoizedState Stores Per Hook Type</h3>
+
+<table>
+<thead>
+<tr><th>Hook</th><th>memoizedState Contains</th></tr>
+</thead>
+<tbody>
+<tr><td><code>useState</code></td><td>Current state value</td></tr>
+<tr><td><code>useReducer</code></td><td>Current state value</td></tr>
+<tr><td><code>useEffect</code></td><td>Effect object (create, destroy, deps, tag)</td></tr>
+<tr><td><code>useLayoutEffect</code></td><td>Effect object (same shape, different tag)</td></tr>
+<tr><td><code>useMemo</code></td><td><code>[computedValue, deps]</code></td></tr>
+<tr><td><code>useCallback</code></td><td><code>[callback, deps]</code></td></tr>
+<tr><td><code>useRef</code></td><td><code>{ current: value }</code> ref object</td></tr>
+<tr><td><code>useContext</code></td><td>No hook node — reads from fiber's context chain</td></tr>
+</tbody>
+</table>
+
+<div class="diagram">
+Fiber Node (MyComponent)
+├── tag: FunctionComponent (0)
+├── type: MyComponent
+├── stateNode: null
+├── memoizedState ──────────────────────────────┐
+│                                                │
+│   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│   │ Hook #0      │    │ Hook #1      │    │ Hook #2      │
+│   │ useState     │───▶│ useEffect    │───▶│ useMemo      │──▶ null
+│   │ state: 0     │    │ effect: {...} │    │ [val, deps]  │
+│   │ queue: {...}  │    │ tag: Passive  │    │              │
+│   └──────────────┘    └──────────────┘    └──────────────┘
+│
+├── memoizedProps: { ... }
+├── updateQueue: effect list (for effects)
+└── flags: ...
+</div>
+
+<h2 id="mount-vs-update">Mount vs Update Dispatchers</h2>
+
+<p>React uses two completely different sets of hook implementations depending on whether a component is <strong>mounting</strong> (first render) or <strong>updating</strong> (re-render). These are called <strong>dispatchers</strong>.</p>
+
+<pre><code>// From ReactFiberHooks.js — simplified
+const HooksDispatcherOnMount = {
+  useState:    mountState,
+  useReducer:  mountReducer,
+  useEffect:   mountEffect,
+  useMemo:     mountMemo,
+  useCallback: mountCallback,
+  useRef:      mountRef,
+  // ... other hooks
+};
+
+const HooksDispatcherOnUpdate = {
+  useState:    updateState,
+  useReducer:  updateReducer,
+  useEffect:   updateEffect,
+  useMemo:     updateMemo,
+  useCallback: updateCallback,
+  useRef:      updateRef,
+  // ... other hooks
+};
+
+// During render, React sets:
+ReactCurrentDispatcher.current = isMount
+  ? HooksDispatcherOnMount
+  : HooksDispatcherOnUpdate;</code></pre>
+
+<h3>Mount Phase: Building the Linked List</h3>
+
+<pre><code>function mountWorkInProgressHook(): Hook {
+  const hook: Hook = {
+    memoizedState: null,
+    baseState: null,
+    baseQueue: null,
+    queue: null,
+    next: null,
+  };
+
+  if (workInProgressHook === null) {
+    // First hook in the component — set as head of list
+    currentlyRenderingFiber.memoizedState = hook;
+  } else {
+    // Append to end of list
+    workInProgressHook.next = hook;
+  }
+  workInProgressHook = hook;
+  return hook;
+}
+
+// mountState creates the hook node and initializes state:
+function mountState(initialState) {
+  const hook = mountWorkInProgressHook();
+  if (typeof initialState === 'function') {
+    initialState = initialState(); // lazy initialization
+  }
+  hook.memoizedState = hook.baseState = initialState;
+  const queue = { pending: null, dispatch: null, /* ... */ };
+  hook.queue = queue;
+  const dispatch = queue.dispatch = dispatchSetState.bind(
+    null, currentlyRenderingFiber, queue
+  );
+  return [hook.memoizedState, dispatch];
+}</code></pre>
+
+<h3>Update Phase: Walking the Existing List</h3>
+
+<pre><code>function updateWorkInProgressHook(): Hook {
+  // Walk the existing linked list from the current fiber
+  let nextCurrentHook;
+  if (currentHook === null) {
+    const current = currentlyRenderingFiber.alternate;
+    nextCurrentHook = current?.memoizedState ?? null;
+  } else {
+    nextCurrentHook = currentHook.next;
+  }
+
+  // Clone the hook for the work-in-progress fiber
+  const newHook: Hook = {
+    memoizedState: nextCurrentHook.memoizedState,
+    baseState:     nextCurrentHook.baseState,
+    baseQueue:     nextCurrentHook.baseQueue,
+    queue:         nextCurrentHook.queue,
+    next:          null,
+  };
+
+  // Append to work-in-progress list
+  if (workInProgressHook === null) {
+    currentlyRenderingFiber.memoizedState = newHook;
+  } else {
+    workInProgressHook.next = newHook;
+  }
+  workInProgressHook = newHook;
+  currentHook = nextCurrentHook;
+  return newHook;
+}</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Critical</div>
+  <p>If the number of hooks changes between renders (e.g., a hook inside an <code>if</code> block), <code>updateWorkInProgressHook</code> will walk to the wrong node in the linked list. Hook #3 on update might read state from what was Hook #2 on mount. This causes <strong>silent data corruption</strong>, not just a crash.</p>
+</div>
+
+<h2 id="dispatcher-switching">Dispatcher Switching Mechanism</h2>
+
+<p>React maintains a global variable <code>ReactCurrentDispatcher</code> that points to the active dispatcher. This is how <code>useState()</code> — a plain function call — knows whether to mount or update.</p>
+
+<pre><code>// ReactCurrentDispatcher.js
+const ReactCurrentDispatcher = {
+  current: null  // set before rendering each component
+};
+
+// When you call useState():
+function useState(initialState) {
+  const dispatcher = resolveDispatcher();
+  return dispatcher.useState(initialState);
+}
+
+function resolveDispatcher() {
+  const dispatcher = ReactCurrentDispatcher.current;
+  // In DEV, throws if null (hooks called outside component)
+  return dispatcher;
+}</code></pre>
+
+<h3>Dispatcher Lifecycle During Render</h3>
+
+<div class="diagram">
+renderWithHooks(fiber) called
+│
+├─ 1. Set currentlyRenderingFiber = fiber
+│
+├─ 2. Determine dispatcher:
+│     fiber.alternate === null?
+│     ├── YES → HooksDispatcherOnMount
+│     └── NO  → HooksDispatcherOnUpdate
+│
+├─ 3. ReactCurrentDispatcher.current = chosen dispatcher
+│
+├─ 4. Call Component(props, ref)
+│     └── Each hook call resolves via ReactCurrentDispatcher
+│
+├─ 5. ReactCurrentDispatcher.current = ContextOnlyDispatcher
+│     (prevents hooks outside render)
+│
+├─ 6. Check: did render schedule an update?
+│     ├── YES → re-render (up to 25 times, then throw)
+│     └── NO  → return children
+│
+└─ 7. Reset workInProgressHook, currentHook
+</div>
+
+<h3>The ContextOnlyDispatcher</h3>
+
+<p>After rendering completes, React swaps in a third dispatcher — <code>ContextOnlyDispatcher</code> — where every hook throws an error. This is how React enforces that hooks can only be called during rendering.</p>
+
+<pre><code>const ContextOnlyDispatcher = {
+  useState: throwInvalidHookError,
+  useEffect: throwInvalidHookError,
+  useReducer: throwInvalidHookError,
+  // ... all hooks throw
+};
+
+function throwInvalidHookError() {
+  throw new Error(
+    'Invalid hook call. Hooks can only be called inside ' +
+    'the body of a function component.'
+  );
+}</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">DEV-Only Dispatchers</div>
+  <p>In development mode, React uses additional dispatchers (<code>HooksDispatcherOnMountInDEV</code>, <code>HooksDispatcherOnUpdateInDEV</code>) that wrap each hook with extra validation — checking for hook order changes, invalid nesting, and providing better error messages.</p>
+</div>
+
+<h2 id="rules-of-hooks">Rules of Hooks Enforcement</h2>
+
+<p>The "Rules of Hooks" are not arbitrary conventions — they are structural requirements of the linked-list architecture:</p>
+
+<h3>Rule 1: Only Call Hooks at the Top Level</h3>
+
+<pre><code>// VIOLATION: conditional hook
+function MyComponent({ showExtra }) {
+  const [name, setName] = useState('');  // Hook #0
+
+  if (showExtra) {
+    const [extra, setExtra] = useState(''); // Hook #1 (sometimes)
+  }
+
+  useEffect(() => { /* ... */ });  // Hook #1 or #2 depending on branch
+
+  // On mount with showExtra=true:
+  //   Hook #0: useState('') → name
+  //   Hook #1: useState('') → extra
+  //   Hook #2: useEffect
+  //
+  // On update with showExtra=false:
+  //   Hook #0: useState → reads node #0 ✓ (name)
+  //   Hook #1: useEffect → reads node #1 ✗ (gets extra's state!)
+}</code></pre>
+
+<h3>Rule 2: Only Call Hooks from React Functions</h3>
+
+<p>Hooks rely on <code>ReactCurrentDispatcher.current</code> being set, which only happens inside <code>renderWithHooks()</code>. Calling hooks from a regular function means the dispatcher is <code>ContextOnlyDispatcher</code>, which throws.</p>
+
+<h3>ESLint Plugin: eslint-plugin-react-hooks</h3>
+
+<pre><code>// .eslintrc.js
+module.exports = {
+  plugins: ['react-hooks'],
+  rules: {
+    'react-hooks/rules-of-hooks': 'error',     // checks call order
+    'react-hooks/exhaustive-deps': 'warn',      // checks dependency arrays
+  },
+};
+
+// The rules-of-hooks rule uses static analysis to verify:
+// 1. Hooks are not called inside conditions, loops, or nested functions
+// 2. Hooks are called from React function components or custom hooks
+// 3. Custom hooks (use* prefix) follow the same rules
+//
+// It builds a control flow graph (CFG) and checks that every
+// hook call is on every possible execution path.</code></pre>
+
+<h2 id="how-react-knows">How React Knows Which Component Is Rendering</h2>
+
+<p>React tracks the currently rendering fiber via module-scoped variables in <code>ReactFiberHooks.js</code>:</p>
+
+<pre><code>// Module-scoped state in ReactFiberHooks.js
+let currentlyRenderingFiber: Fiber | null = null;
+let currentHook: Hook | null = null;            // current tree's hook
+let workInProgressHook: Hook | null = null;     // WIP tree's hook
+
+function renderWithHooks(
+  current: Fiber | null,      // current fiber (null on mount)
+  workInProgress: Fiber,      // work-in-progress fiber
+  Component: Function,
+  props: any,
+  secondArg: any,             // ref for forwardRef
+  nextRenderLanes: Lanes,
+): any {
+  currentlyRenderingFiber = workInProgress;
+  workInProgress.memoizedState = null;  // reset on mount
+  workInProgress.updateQueue = null;
+
+  // Choose dispatcher based on mount vs update
+  ReactCurrentDispatcher.current =
+    current === null || current.memoizedState === null
+      ? HooksDispatcherOnMount
+      : HooksDispatcherOnUpdate;
+
+  // Render the component
+  let children = Component(props, secondArg);
+
+  // Handle re-renders triggered during render
+  if (didScheduleRenderPhaseUpdateDuringThisPass) {
+    let numberOfReRenders = 0;
+    do {
+      didScheduleRenderPhaseUpdateDuringThisPass = false;
+      numberOfReRenders++;
+      if (numberOfReRenders > RE_RENDER_LIMIT) { // 25
+        throw new Error('Too many re-renders.');
+      }
+      // Reset and re-render with ReRender dispatcher
+      workInProgressHook = null;
+      currentHook = null;
+      ReactCurrentDispatcher.current = HooksDispatcherOnRerender;
+      children = Component(props, secondArg);
+    } while (didScheduleRenderPhaseUpdateDuringThisPass);
+  }
+
+  // Prevent hooks outside render
+  ReactCurrentDispatcher.current = ContextOnlyDispatcher;
+
+  // Cleanup
+  currentlyRenderingFiber = null;
+  currentHook = null;
+  workInProgressHook = null;
+
+  return children;
+}</code></pre>
+
+<h2 id="hook-resolution">Hook Resolution During Render</h2>
+
+<div class="diagram">
+Component calls useState(0)
+│
+├─ resolveDispatcher()
+│   └─ returns ReactCurrentDispatcher.current
+│       (HooksDispatcherOnMount or HooksDispatcherOnUpdate)
+│
+├─ dispatcher.useState(0)
+│   │
+│   ├── MOUNT PATH (mountState):
+│   │   ├─ mountWorkInProgressHook()
+│   │   │   └─ Create new Hook node, append to linked list
+│   │   ├─ Initialize: hook.memoizedState = initialState
+│   │   ├─ Create update queue
+│   │   ├─ Bind dispatch to fiber + queue
+│   │   └─ Return [state, dispatch]
+│   │
+│   └── UPDATE PATH (updateState → updateReducer):
+│       ├─ updateWorkInProgressHook()
+│       │   └─ Clone next hook from current fiber's list
+│       ├─ Process pending updates from queue
+│       ├─ Compute new state via reducer
+│       └─ Return [newState, dispatch]
+│
+└─ Component receives [state, setState]
+</div>
+
+<h2 id="double-buffering">Double Buffering: Current vs Work-In-Progress</h2>
+
+<p>React maintains two fiber trees: <strong>current</strong> (what's on screen) and <strong>work-in-progress</strong> (being built). Hooks exist on both, and during update, the WIP hooks are cloned from current hooks:</p>
+
+<pre><code>// The alternate relationship:
+currentFiber.alternate = wipFiber;
+wipFiber.alternate = currentFiber;
+
+// During update, hooks are cloned:
+// current fiber:  Hook_A → Hook_B → Hook_C
+// WIP fiber:      Hook_A' → Hook_B' → Hook_C'  (cloned, then updated)
+
+// After commit, the WIP tree becomes the new current tree.
+// On next render, the old current tree becomes the new WIP tree.
+// This is why dispatch functions are stable — they're bound to
+// the queue object, which is shared between current and WIP hooks.</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight — Dispatch Stability</div>
+  <p>The <code>dispatch</code> function returned by <code>useState</code> is created once during mount and bound to the <code>queue</code> object. Since both current and WIP hook nodes share the same queue reference, the dispatch function remains stable across re-renders without needing <code>useCallback</code>.</p>
+</div>
+
+<h2 id="rerender-dispatcher">The Re-render Dispatcher</h2>
+
+<p>When a state update is triggered <em>during</em> rendering (e.g., calling <code>setState</code> inside the render body), React uses a special <code>HooksDispatcherOnRerender</code>. This handles the case where updates are queued on hooks that have already been processed in the current render pass.</p>
+
+<pre><code>// Re-render scenario:
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  // This triggers a re-render during render
+  if (count === 0) {
+    setCount(1); // schedules update on already-processed hook
+  }
+
+  return &lt;div&gt;{count}&lt;/div&gt;;
+}
+
+// React detects this via didScheduleRenderPhaseUpdateDuringThisPass
+// and re-renders with HooksDispatcherOnRerender, which processes
+// the render-phase updates from the queue without cloning from current.</code></pre>
+
+<h2 id="comparison">Dispatcher Comparison</h2>
+
+<table>
+<thead>
+<tr><th>Dispatcher</th><th>When Active</th><th>Behavior</th></tr>
+</thead>
+<tbody>
+<tr><td><code>HooksDispatcherOnMount</code></td><td>First render</td><td>Creates new hook nodes, builds linked list</td></tr>
+<tr><td><code>HooksDispatcherOnUpdate</code></td><td>Re-renders</td><td>Clones hooks from current, processes update queues</td></tr>
+<tr><td><code>HooksDispatcherOnRerender</code></td><td>Render-phase updates</td><td>Processes updates queued during current render</td></tr>
+<tr><td><code>ContextOnlyDispatcher</code></td><td>Outside render</td><td>Throws error for every hook</td></tr>
+<tr><td><code>*InDEV</code> variants</td><td>Development mode</td><td>Wraps hooks with extra validation and warnings</td></tr>
+</tbody>
+</table>
+
+<div class="callout callout-info">
+  <div class="callout-title">Interview Tip</div>
+  <p>When asked "why can't hooks be called conditionally?", don't just say "it's a rule." Explain the linked-list architecture: hooks are positionally mapped to nodes, so changing the call order means reading the wrong node's state. The ESLint plugin enforces this statically by building a control flow graph.</p>
+</div>
+
+<div class="nav-footer">
+  <span></span>
+  <a href="02-usestate-usereducer.html">useState &amp; useReducer →</a>
+</div>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

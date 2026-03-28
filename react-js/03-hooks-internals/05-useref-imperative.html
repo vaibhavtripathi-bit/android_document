@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>useRef &amp; Imperative Handles — React Hooks Internals</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Hooks Internals</a>
+  <span class="sep">›</span>
+  useRef &amp; Imperative
+</nav>
+
+<h1>useRef &amp; Imperative Handles</h1>
+<p class="subtitle">Persistent mutable containers, ref forwarding, callback refs, useImperativeHandle, and ref cleanup in React 19.</p>
+
+<nav class="nav">
+  <a href="01-hooks-architecture.html">Hooks Architecture</a>
+  <a href="02-usestate-usereducer.html">useState &amp; useReducer</a>
+  <a href="03-useeffect-lifecycle.html">useEffect Lifecycle</a>
+  <a href="04-usememo-usecallback.html">useMemo &amp; useCallback</a>
+  <a href="06-custom-hooks.html">Custom Hooks</a>
+  <a href="07-use-hook-react19.html">use() Hook</a>
+  <a href="08-concurrent-hooks.html">Concurrent Hooks</a>
+  <a href="09-interview-qa.html">Interview Q&amp;A</a>
+</nav>
+
+<h2 id="useref-internals">useRef Internal Implementation</h2>
+
+<p><code>useRef</code> is the simplest hook internally. It creates a plain object with a <code>.current</code> property and stores it on the hook's <code>memoizedState</code>. The same object persists across all renders.</p>
+
+<pre><code>// ReactFiberHooks.js — simplified
+function mountRef(initialValue) {
+  const hook = mountWorkInProgressHook();
+  const ref = { current: initialValue };
+  hook.memoizedState = ref;
+  return ref;
+}
+
+function updateRef(initialValue) {
+  const hook = updateWorkInProgressHook();
+  return hook.memoizedState; // return the SAME object
+  // initialValue is completely ignored on updates
+}
+
+// That's it. No queue, no reducer, no effect list.
+// The ref object is created once and returned on every render.</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p>A ref is just a mutable container that survives re-renders because it's stored on the fiber's hook linked list. Unlike state, mutating <code>.current</code> does NOT trigger a re-render. This makes refs the escape hatch for values that need to persist but shouldn't drive the UI.</p>
+</div>
+
+<h2 id="ref-vs-state">Ref vs State: When to Use Which</h2>
+
+<table>
+<thead>
+<tr><th>Characteristic</th><th><code>useRef</code></th><th><code>useState</code></th></tr>
+</thead>
+<tbody>
+<tr><td>Triggers re-render on change</td><td>No</td><td>Yes</td></tr>
+<tr><td>Value persists across renders</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Mutable</td><td>Yes (<code>.current</code>)</td><td>No (must use setter)</td></tr>
+<tr><td>Available during render</td><td>Yes (but don't read in render for mutable values)</td><td>Yes</td></tr>
+<tr><td>Synchronous update</td><td>Yes (immediate mutation)</td><td>No (batched, async)</td></tr>
+<tr><td>Survives unmount/remount</td><td>No (new ref on remount)</td><td>No (new state on remount)</td></tr>
+</tbody>
+</table>
+
+<pre><code>// Use ref for:
+// 1. DOM element references
+const inputRef = useRef(null);
+&lt;input ref={inputRef} /&gt;
+inputRef.current.focus();
+
+// 2. Mutable values that don't affect rendering
+const intervalRef = useRef(null);
+const renderCountRef = useRef(0);
+renderCountRef.current++; // track renders without causing re-render
+
+// 3. Previous value tracking
+function usePrevious(value) {
+  const ref = useRef();
+  useEffect(() => {
+    ref.current = value;
+  });
+  return ref.current; // returns value from previous render
+}
+
+// 4. Stable callback reference (avoiding stale closures)
+function useEventCallback(fn) {
+  const ref = useRef(fn);
+  ref.current = fn; // always points to latest closure
+  return useCallback((...args) => ref.current(...args), []);
+}</code></pre>
+
+<h2 id="dom-refs">DOM Refs: How React Attaches Them</h2>
+
+<pre><code>// When you write: &lt;div ref={myRef} /&gt;
+// React handles ref attachment during the commit phase:
+
+// During commit (commitAttachRef):
+function commitAttachRef(finishedWork) {
+  const ref = finishedWork.ref;
+  if (ref !== null) {
+    const instance = finishedWork.stateNode; // DOM node
+
+    if (typeof ref === 'function') {
+      // Callback ref
+      ref(instance);
+    } else {
+      // Object ref (useRef)
+      ref.current = instance;
+    }
+  }
+}
+
+// During unmount or ref change (commitDetachRef):
+function commitDetachRef(current) {
+  const ref = current.ref;
+  if (ref !== null) {
+    if (typeof ref === 'function') {
+      ref(null);       // callback ref receives null
+    } else {
+      ref.current = null; // object ref cleared
+    }
+  }
+}</code></pre>
+
+<div class="diagram">
+Ref Lifecycle During Commit:
+
+Mount:
+  DOM node created → commitAttachRef → ref.current = DOM node
+
+Update (ref unchanged):
+  No ref work needed
+
+Update (ref changed, e.g., conditional ref):
+  commitDetachRef(old) → old.current = null
+  commitAttachRef(new) → new.current = DOM node
+
+Unmount:
+  commitDetachRef → ref.current = null → DOM node removed
+</div>
+
+<h2 id="callback-refs">Callback Refs</h2>
+
+<p>Callback refs are functions that React calls with the DOM node (on mount) or <code>null</code> (on unmount). They offer more control than object refs.</p>
+
+<pre><code>// Basic callback ref
+function MeasuredComponent() {
+  const [height, setHeight] = useState(0);
+
+  const measuredRef = useCallback((node) => {
+    if (node !== null) {
+      setHeight(node.getBoundingClientRect().height);
+    }
+  }, []);
+
+  return &lt;div ref={measuredRef}&gt;Content&lt;/div&gt;;
+}
+
+// Callback ref advantages:
+// 1. Notified when ref attaches/detaches (unlike useRef)
+// 2. Can perform side effects on attachment
+// 3. Works with conditional rendering
+// 4. Can be used for ref merging
+
+// Ref merging pattern (multiple consumers):
+function mergeRefs(...refs) {
+  return (node) => {
+    refs.forEach(ref => {
+      if (typeof ref === 'function') {
+        ref(node);
+      } else if (ref != null) {
+        ref.current = node;
+      }
+    });
+  };
+}
+
+function MyComponent({ externalRef }) {
+  const internalRef = useRef(null);
+  const mergedRef = useMemo(
+    () => mergeRefs(internalRef, externalRef),
+    [externalRef]
+  );
+  return &lt;div ref={mergedRef} /&gt;;
+}</code></pre>
+
+<h2 id="ref-forwarding">Ref Forwarding with forwardRef</h2>
+
+<pre><code>// Problem: refs don't pass through function components
+function FancyInput(props) {
+  return &lt;input className="fancy" {...props} /&gt;;
+}
+// &lt;FancyInput ref={myRef} /&gt; — ref is NOT forwarded to &lt;input&gt;
+
+// Solution: forwardRef
+const FancyInput = forwardRef(function FancyInput(props, ref) {
+  return &lt;input className="fancy" ref={ref} {...props} /&gt;;
+});
+// &lt;FancyInput ref={myRef} /&gt; — myRef.current = &lt;input&gt; DOM node
+
+// Internal: forwardRef creates a special element type
+function forwardRef(render) {
+  return {
+    $$typeof: REACT_FORWARD_REF_TYPE,
+    render, // the component function that receives (props, ref)
+  };
+}
+
+// During reconciliation, React detects REACT_FORWARD_REF_TYPE
+// and passes the ref as the second argument to render().</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">React 19: forwardRef No Longer Needed</div>
+  <p>In React 19, <code>ref</code> is passed as a regular prop. Function components can accept <code>ref</code> directly in their props without <code>forwardRef</code>. The <code>forwardRef</code> wrapper still works but is no longer necessary.</p>
+</div>
+
+<pre><code>// React 19 — ref as a prop (no forwardRef needed)
+function FancyInput({ ref, ...props }) {
+  return &lt;input className="fancy" ref={ref} {...props} /&gt;;
+}
+
+// Works directly:
+&lt;FancyInput ref={myRef} /&gt;</code></pre>
+
+<h2 id="useimperativehandle">useImperativeHandle</h2>
+
+<p><code>useImperativeHandle</code> customizes the value exposed via a ref. Instead of exposing the DOM node, you expose a custom API.</p>
+
+<pre><code>const FancyInput = forwardRef(function FancyInput(props, ref) {
+  const inputRef = useRef(null);
+
+  useImperativeHandle(ref, () => ({
+    focus() {
+      inputRef.current.focus();
+    },
+    scrollIntoView() {
+      inputRef.current.scrollIntoView({ behavior: 'smooth' });
+    },
+    // DOM node is NOT exposed — only these methods
+  }), []); // deps array — recreate handle when deps change
+
+  return &lt;input ref={inputRef} {...props} /&gt;;
+});
+
+// Usage:
+function Parent() {
+  const inputRef = useRef(null);
+  return (
+    &lt;&gt;
+      &lt;FancyInput ref={inputRef} /&gt;
+      &lt;button onClick={() =&gt; inputRef.current.focus()}&gt;Focus&lt;/button&gt;
+      {/* inputRef.current.value would be undefined — not exposed */}
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<h3>Internal Implementation</h3>
+
+<pre><code>// useImperativeHandle is implemented as a layout effect:
+function mountImperativeHandle(ref, create, deps) {
+  const effectDeps = deps != null ? deps.concat([ref]) : null;
+
+  mountEffectImpl(
+    UpdateEffect | LayoutStaticEffect,
+    HookLayout,
+    imperativeHandleEffect.bind(null, create, ref),
+    effectDeps
+  );
+}
+
+function imperativeHandleEffect(create, ref) {
+  if (typeof ref === 'function') {
+    const refCallback = ref;
+    const inst = create();
+    refCallback(inst);
+    return () => refCallback(null);
+  } else if (ref !== null && ref !== undefined) {
+    const refObject = ref;
+    const inst = create();
+    refObject.current = inst;
+    return () => { refObject.current = null; };
+  }
+}
+
+// Key: it runs as a LAYOUT effect (synchronous, after DOM mutations)
+// This ensures the imperative handle is available before useEffect runs</code></pre>
+
+<h2 id="ref-cleanup-react19">Ref Cleanup in React 19</h2>
+
+<p>React 19 introduces cleanup functions for callback refs, similar to how <code>useEffect</code> returns a cleanup function:</p>
+
+<pre><code>// React 19: callback ref with cleanup
+function MyComponent() {
+  const ref = useCallback((node) => {
+    if (node) {
+      const observer = new ResizeObserver(entries => {
+        console.log('Resized:', entries[0].contentRect);
+      });
+      observer.observe(node);
+
+      // NEW in React 19: return cleanup function
+      return () => {
+        observer.disconnect();
+      };
+    }
+  }, []);
+
+  return &lt;div ref={ref}&gt;Observed&lt;/div&gt;;
+}
+
+// Before React 19, you had to track cleanup manually:
+function MyComponent() {
+  const observerRef = useRef(null);
+
+  const ref = useCallback((node) => {
+    if (observerRef.current) {
+      observerRef.current.disconnect();
+    }
+    if (node) {
+      observerRef.current = new ResizeObserver(/* ... */);
+      observerRef.current.observe(node);
+    }
+  }, []);
+
+  return &lt;div ref={ref}&gt;Observed&lt;/div&gt;;
+}</code></pre>
+
+<h2 id="why-refs-survive">Why Refs Survive Re-Renders</h2>
+
+<pre><code>// Refs survive because the ref OBJECT is stored on the fiber's
+// hook linked list, and the same object is returned every render.
+
+// Render 1: mountRef(0) → creates { current: 0 }, stores on hook
+// Render 2: updateRef(0) → returns hook.memoizedState (same object)
+// Render 3: updateRef(0) → returns hook.memoizedState (same object)
+
+// The object identity never changes:
+const ref = useRef(0);
+// ref === ref from previous render (Object.is returns true)
+
+// But .current can be mutated freely:
+ref.current = 42; // no re-render, immediate mutation
+
+// This is fundamentally different from state:
+const [val, setVal] = useState(0);
+// setVal(42) → schedules re-render, new value available next render</code></pre>
+
+<h2 id="dom-measurement">DOM Measurement Patterns</h2>
+
+<pre><code>// Pattern 1: Measure after render with useLayoutEffect
+function Tooltip({ children, targetRef }) {
+  const tooltipRef = useRef(null);
+  const [position, setPosition] = useState({ top: 0, left: 0 });
+
+  useLayoutEffect(() => {
+    const targetRect = targetRef.current.getBoundingClientRect();
+    const tooltipRect = tooltipRef.current.getBoundingClientRect();
+    setPosition({
+      top: targetRect.bottom + 8,
+      left: targetRect.left + (targetRect.width - tooltipRect.width) / 2,
+    });
+  }, [targetRef]);
+
+  return (
+    &lt;div ref={tooltipRef} style={{ position: 'fixed', ...position }}&gt;
+      {children}
+    &lt;/div&gt;
+  );
+}
+
+// Pattern 2: ResizeObserver with callback ref
+function useResizeObserver() {
+  const [size, setSize] = useState({ width: 0, height: 0 });
+
+  const ref = useCallback((node) => {
+    if (!node) return;
+    const observer = new ResizeObserver(([entry]) => {
+      setSize({
+        width: entry.contentRect.width,
+        height: entry.contentRect.height,
+      });
+    });
+    observer.observe(node);
+    return () => observer.disconnect(); // React 19 cleanup
+  }, []);
+
+  return [ref, size];
+}
+
+// Pattern 3: IntersectionObserver
+function useLazyLoad() {
+  const [isVisible, setIsVisible] = useState(false);
+
+  const ref = useCallback((node) => {
+    if (!node) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setIsVisible(true);
+          observer.disconnect();
+        }
+      },
+      { threshold: 0.1 }
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  return [ref, isVisible];
+}</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight — Ref Anti-Patterns</div>
+  <p>Don't read or write <code>ref.current</code> during render for values that change — this breaks concurrent rendering because React may render a component multiple times before committing. Refs should be read/written in effects, event handlers, or callbacks. The exception is lazy initialization: <code>if (ref.current === null) ref.current = new Thing()</code>.</p>
+</div>
+
+<div class="nav-footer">
+  <a href="04-usememo-usecallback.html">← useMemo &amp; useCallback</a>
+  <a href="06-custom-hooks.html">Custom Hooks →</a>
+</div>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Infinite Scroll &amp; Virtualization — Engineering Problems</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Engineering Problems</a>
+  <span class="sep">›</span>
+  Infinite Scroll &amp; Virtualization
+</nav>
+
+<h1>Infinite Scroll &amp; Virtualization at Scale</h1>
+<p class="subtitle">How windowing libraries approximate O(visible) work for O(total) datasets: internal mechanics of fixed vs variable layouts, bidirectional chat loading, scroll restoration across navigations, memory contracts, IntersectionObserver triggers, and placeholder strategies. Written for Staff interviews where “use react-window” is never enough.</p>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Core Invariant</div>
+  <p>Virtualization is a <strong>projection</strong> from logical index space to DOM nodes. Interviewers probe whether you understand that <em>scroll height</em> is often estimated, <em>measurements</em> are asynchronous, and <em>state</em> must survive remounts (router transitions, React StrictMode double effects).</p>
+</div>
+
+<h2 id="internals">1. How Windowing Libraries Think Internally</h2>
+<p>Libraries like <code>react-window</code> and <code>react-virtuoso</code> share a skeleton: maintain <code>scrollTop</code>, derive <code>startIndex</code>/<code>endIndex</code> from cumulative offsets, render only that slice, and pad with spacer elements (<code>paddingTop</code>/<code>paddingBottom</code> or absolute transforms). Differences show up in <strong>dynamic measurement</strong>, <strong>grouped lists</strong>, and <strong>reverse mode</strong> for chat.</p>
+
+<div class="diagram">
+Fixed-height window (conceptual)
+ totalHeight = itemCount * rowHeight
+ scrollTop -----> [  offscreen  ][ visible window ][  offscreen  ]
+ indices:           0..i0-1        i0..i1              i1+1..N-1
+ DOM nodes:         (spacer)       row elements         (spacer)
+</div>
+
+<table>
+  <thead>
+    <tr>
+      <th>Concern</th>
+      <th>react-window mental model</th>
+      <th>react-virtuoso mental model</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>API shape</td>
+      <td>Explicit <code>List</code>/<code>Grid</code>, size props</td>
+      <td>Higher-level list with followOutput helpers</td>
+    </tr>
+    <tr>
+      <td>Dynamic height</td>
+      <td><code>VariableSizeList</code> + manual cache</td>
+      <td>Built-in measurement pipeline</td>
+    </tr>
+    <tr>
+      <td>Chat / reverse</td>
+      <td>Manual stick-to-bottom recipes</td>
+      <td>First-class inverted scroll patterns</td>
+    </tr>
+    <tr>
+      <td>Staff angle</td>
+      <td>You own offset math edge cases</td>
+      <td>You still own item keys &amp; remount storms</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout callout-info">
+  <div class="callout-title">Why Not Just Paginate?</div>
+  <p>Pagination changes the <strong>information architecture</strong> (explicit next page). Infinite scroll keeps a single growing surface—better for feeds, worse for SEO and some accessibility expectations. Staff answers name <strong>tab traps</strong>, <strong>scroll jank</strong>, and <strong>URL representability</strong> (deep link to “page 3” vs cursor token).</p>
+</div>
+
+<pre><code><span class="comment">// Minimal fixed-row virtualizer core (illustrative, not production-complete)</span>
+<span class="keyword">type</span> <span class="type">VirtualizerConfig</span> = {
+  <span class="attr">itemCount</span>: <span class="keyword">number</span>;
+  <span class="attr">itemHeight</span>: <span class="keyword">number</span>;
+  <span class="attr">viewportHeight</span>: <span class="keyword">number</span>;
+  <span class="attr">scrollTop</span>: <span class="keyword">number</span>;
+  <span class="attr">overscan</span>: <span class="keyword">number</span>; <span class="comment">// render extra rows above/below</span>
+};
+
+<span class="keyword">export function</span> <span class="func">computeWindow</span>(c: <span class="type">VirtualizerConfig</span>): {
+  <span class="attr">start</span>: <span class="keyword">number</span>;
+  <span class="attr">end</span>: <span class="keyword">number</span>;
+  <span class="attr">paddingTop</span>: <span class="keyword">number</span>;
+  <span class="attr">paddingBottom</span>: <span class="keyword">number</span>;
+} {
+  <span class="keyword">const</span> { itemCount, itemHeight, viewportHeight, scrollTop, overscan } = c;
+  <span class="keyword">const</span> start = <span class="type">Math</span>.<span class="func">max</span>(
+    <span class="number">0</span>,
+    <span class="type">Math</span>.<span class="func">floor</span>(scrollTop / itemHeight) - overscan,
+  );
+  <span class="keyword">const</span> end = <span class="type">Math</span>.<span class="func">min</span>(
+    itemCount - <span class="number">1</span>,
+    <span class="type">Math</span>.<span class="func">ceil</span>((scrollTop + viewportHeight) / itemHeight) + overscan,
+  );
+  <span class="keyword">const</span> paddingTop = start * itemHeight;
+  <span class="keyword">const</span> paddingBottom = (itemCount - end - <span class="number">1</span>) * itemHeight;
+  <span class="keyword">return</span> { start, end, paddingTop, paddingBottom };
+}</code></pre>
+
+<h2 id="dynamic-heights">2. Dynamic Row Heights</h2>
+<p>Variable content breaks the cheap arithmetic above. Strategies: (1) <strong>measure after mount</strong> with <code>ResizeObserver</code>, storing heights in a Map keyed by id or index; (2) <strong>binary search</strong> on a prefix-sum array of heights to map scrollTop → index in O(log n); (3) <strong>estimated height</strong> with correction pass (jank risk); (4) <strong>uniform in a band</strong> (e.g., tweet cards ~similar) with occasional remeasure.</p>
+
+<div class="diagram">
+Dynamic measurement lifecycle
+  mount row i -> RO fires -> update height[i] -> recompute prefix sums
+       |                                  |
+       +---- may shift scrollTop if anchor policy = "top"
+</div>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Layout Thrash</div>
+  <p>Reading layout (<code>offsetHeight</code>) after every state change in the same frame forces synchronous reflow. Batch measurements with <code>requestAnimationFrame</code> or <code>queueMicrotask</code> carefully. Prefer <code>ResizeObserver</code> over polling innerHTML heights.</p>
+</div>
+
+<pre><code><span class="comment">// Caching measured heights + prefix binary search (simplified)</span>
+<span class="keyword">export class</span> <span class="type">HeightCache</span> {
+  <span class="keyword">private</span> <span class="attr">heights</span> = <span class="keyword">new</span> <span class="type">Map</span>&lt;<span class="keyword">number</span>, <span class="keyword">number</span>&gt;();
+  <span class="keyword">private</span> <span class="attr">prefix</span>: <span class="keyword">number</span>[] = [];
+
+  <span class="func">setHeight</span>(index: <span class="keyword">number</span>, h: <span class="keyword">number</span>): <span class="keyword">void</span> {
+    <span class="keyword">this</span>.heights.<span class="func">set</span>(index, h);
+    <span class="keyword">this</span>.<span class="func">rebuildPrefix</span>(<span class="keyword">this</span>.<span class="attr">lastCount</span>);
+  }
+
+  <span class="keyword">private</span> <span class="attr">lastCount</span> = <span class="number">0</span>;
+
+  <span class="func">rebuildPrefix</span>(itemCount: <span class="keyword">number</span>): <span class="keyword">void</span> {
+    <span class="keyword">this</span>.lastCount = itemCount;
+    <span class="keyword">this</span>.prefix = <span class="keyword">new</span> <span class="type">Array</span>(itemCount + <span class="number">1</span>).<span class="func">fill</span>(<span class="number">0</span>);
+    <span class="keyword">for</span> (<span class="keyword">let</span> i = <span class="number">0</span>; i &lt; itemCount; i++) {
+      <span class="keyword">const</span> h = <span class="keyword">this</span>.heights.<span class="func">get</span>(i) ?? <span class="number">32</span>; <span class="comment">// estimate fallback</span>
+      <span class="keyword">this</span>.prefix[i + <span class="number">1</span>] = <span class="keyword">this</span>.prefix[i]! + h;
+    }
+  }
+
+  <span class="func">indexAtOffset</span>(y: <span class="keyword">number</span>): <span class="keyword">number</span> {
+    <span class="keyword">const</span> p = <span class="keyword">this</span>.prefix;
+    <span class="keyword">let</span> lo = <span class="number">0</span>,
+      hi = p.length - <span class="number">2</span>;
+    <span class="keyword">while</span> (lo &lt;= hi) {
+      <span class="keyword">const</span> mid = (lo + hi) >> <span class="number">1</span>;
+      <span class="keyword">if</span> (p[mid + <span class="number">1</span>]! &lt;= y) lo = mid + <span class="number">1</span>;
+      <span class="keyword">else</span> hi = mid - <span class="number">1</span>;
+    }
+    <span class="keyword">return</span> lo;
+  }
+}</code></pre>
+
+<h2 id="bidirectional">3. Bidirectional Scrolling (Chat Timelines)</h2>
+<p>Chat UIs prepend older messages when the user scrolls near the top. The hard part is <strong>preserving scroll position</strong> when new items appear above the viewport: capture <code>anchorId</code> + offset from viewport top, splice data, restore so the user’s eyes do not jump.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Technique</th>
+      <th>Pros</th>
+      <th>Cons</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Anchor item + offset</td>
+      <td>Stable across height changes if id stable</td>
+      <td>Requires unique stable ids</td>
+    </tr>
+    <tr>
+      <td>Scroll height delta snapshot</td>
+      <td>Simple math when only prepend</td>
+      <td>Breaks if concurrent image loads resize rows</td>
+    </tr>
+    <tr>
+      <td>Inverted list (flex-end)</td>
+      <td>Natural “stick to bottom”</td>
+      <td>Accessibility / scroll quirks on some browsers</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="scroll-restore">4. Scroll Position Restoration</h2>
+<p>SPAs break native scroll restoration because the DOM is synthetic. Pattern: persist <code>{ key, scrollTop, anchorIndex, subpixel }</code> in session storage or router state. On remount, virtualizer must <strong>seek</strong> before paint—often two-pass: render estimated window, measure, adjust.</p>
+
+<pre><code><span class="comment">// Hook sketch: restore after data + virtualizer ready</span>
+<span class="keyword">import</span> { useEffect, useLayoutEffect, useRef } <span class="keyword">from</span> <span class="string">'react'</span>;
+
+<span class="keyword">export function</span> <span class="func">useVirtualScrollRestoration</span>(args: {
+  <span class="attr">storageKey</span>: <span class="keyword">string</span>;
+  <span class="attr">scrollRef</span>: <span class="type">React</span>.<span class="type">RefObject</span>&lt;<span class="type">HTMLDivElement</span> | <span class="keyword">null</span>&gt;;
+  <span class="attr">ready</span>: <span class="keyword">boolean</span>;
+}) {
+  <span class="keyword">const</span> restored = useRef(<span class="keyword">false</span>);
+
+  useLayoutEffect(() => {
+    <span class="keyword">if</span> (!args.ready || restored.current) <span class="keyword">return</span>;
+    <span class="keyword">const</span> raw = sessionStorage.<span class="func">getItem</span>(args.storageKey);
+    <span class="keyword">if</span> (!raw) <span class="keyword">return</span>;
+    <span class="keyword">const</span> { scrollTop } = <span class="type">JSON</span>.<span class="func">parse</span>(raw) <span class="keyword">as</span> { <span class="attr">scrollTop</span>: <span class="keyword">number</span> };
+    args.scrollRef.current?.<span class="func">scrollTo</span>({ top: scrollTop });
+    restored.current = <span class="keyword">true</span>;
+  }, [args.ready, args.storageKey, args.scrollRef]);
+
+  useEffect(() => {
+    <span class="keyword">const</span> el = args.scrollRef.current;
+    <span class="keyword">if</span> (!el) <span class="keyword">return</span>;
+    <span class="keyword">const</span> onScroll = () => {
+      sessionStorage.<span class="func">setItem</span>(
+        args.storageKey,
+        <span class="type">JSON</span>.<span class="func">stringify</span>({ <span class="attr">scrollTop</span>: el.scrollTop }),
+      );
+    };
+    el.<span class="func">addEventListener</span>(<span class="string">'scroll'</span>, onScroll, { <span class="attr">passive</span>: <span class="keyword">true</span> });
+    <span class="keyword">return</span> () => el.<span class="func">removeEventListener</span>(<span class="string">'scroll'</span>, onScroll);
+  }, [args.storageKey, args.scrollRef]);
+}</code></pre>
+
+<h2 id="memory">5. Memory Management</h2>
+<p>Virtualization reduces DOM nodes, not necessarily <strong>JS heap</strong> for your record store. If you retain full message arrays of 100k objects, you still pay RAM. Mitigations: <strong>LRU eviction</strong> of far-offscreen data with skeleton reload, <strong>WeakRef</strong> patterns for auxiliary caches (limited), <strong>compact encoding</strong> for rows, and <strong>Web Workers</strong> for filtering so React state stays lean.</p>
+
+<div class="diagram">
+Memory layers
+ [ User model cache (LRU) ] ---> [ Visible slice in React state ]
+                                        |
+                                        v
+                                 [ Row components + DOM ]
+</div>
+
+<div class="callout callout-architect">
+  <div class="callout-title">List Stability</div>
+  <p>Random keys destroy reconciliation and cause unnecessary unmounts. Stable keys per logical id prevent state loss inside rows (expanded threads, in-flight mutations). When ids are server-assigned, never fall back to array index for keyed lists in virtualized feeds.</p>
+</div>
+
+<h2 id="intersection">6. IntersectionObserver &amp; Placeholders</h2>
+<p><code>IntersectionObserver</code> is ideal for <strong>fetch triggers</strong> (load next page when sentinel visible) decoupled from scroll event frequency. Combine with a <strong>rootMargin</strong> to prefetch before the user hits the hard bottom. Placeholders should reserve approximate height to avoid CLS; use shimmer only if height estimate exists, otherwise fixed skeleton bands.</p>
+
+<pre><code><span class="comment">// Sentinel + IO for infinite fetch (React)</span>
+<span class="keyword">import</span> { useEffect, useRef } <span class="keyword">from</span> <span class="string">'react'</span>;
+
+<span class="keyword">export function</span> <span class="func">InfiniteSentinel</span>(props: {
+  <span class="attr">onLoadMore</span>: () => <span class="type">Promise</span>&lt;<span class="keyword">void</span>&gt;;
+  <span class="attr">root</span>: <span class="type">Element</span> | <span class="keyword">null</span>;
+}) {
+  <span class="keyword">const</span> ref = useRef&lt;<span class="type">HTMLDivElement</span> | <span class="keyword">null</span>&gt;(<span class="keyword">null</span>);
+  useEffect(() => {
+    <span class="keyword">const</span> el = ref.current;
+    <span class="keyword">if</span> (!el || !props.root) <span class="keyword">return</span>;
+    <span class="keyword">const</span> io = <span class="keyword">new</span> <span class="type">IntersectionObserver</span>(
+      (entries) => {
+        entries.<span class="func">forEach</span>((e) => {
+          <span class="keyword">if</span> (e.isIntersecting) <span class="keyword">void</span> props.<span class="func">onLoadMore</span>();
+        });
+      },
+      { <span class="attr">root</span>: props.root, <span class="attr">rootMargin</span>: <span class="string">'200px'</span> },
+    );
+    io.<span class="func">observe</span>(el);
+    <span class="keyword">return</span> () => io.<span class="func">disconnect</span>();
+  }, [props.root, props.onLoadMore]);
+  <span class="keyword">return</span> &lt;div ref={ref} style={{ <span class="attr">height</span>: <span class="number">1</span> }} /&gt;;
+}</code></pre>
+
+<h2 id="react-concurrent">7. React 18 Concurrent Interactions</h2>
+<p>Virtualized lists interact with <code>startTransition</code>: scrolling should remain urgent; heavy row renders can be deprioritized. If rows fetch per-item data, gate suspense boundaries per row and watch for <strong>waterfall</strong> patterns—batch at the page level when possible.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Symptom</th>
+      <th>Likely cause</th>
+      <th>Fix direction</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Scroll jank on fast flick</td>
+      <td>Main-thread work in scroll handler</td>
+      <td>Passive listeners, move work to rAF</td>
+    </tr>
+    <tr>
+      <td>Rows “jump” after image load</td>
+      <td>Height estimate wrong</td>
+      <td>Reserve aspect ratio box, explicit dims</td>
+    </tr>
+    <tr>
+      <td>Duplicate fetch pages</td>
+      <td>StrictMode + missing request dedupe</td>
+      <td>AbortController + in-flight map keyed by cursor</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout callout-info">
+  <div class="callout-title">Testing</div>
+  <p>Use deterministic seeds, synthetic 100k datasets, and Cypress/Playwright scroll commands. Measure <strong>time to interactive</strong> for first screen vs deep scroll. Profile React commit durations with the Profiler API—virtualizers still pay reconciliation cost per window move.</p>
+</div>
+
+<h2 id="ssr-hydration">8. SSR, Hydration &amp; Virtualization</h2>
+<p>Server-rendering 10 items then hydrating into a virtualizer that expects empty initial scroll is a classic mismatch. Patterns: render the <strong>first window only</strong> on the server with identical props, pass <code>initialScrollTop=0</code>, and defer full dataset attachment until after hydration. For Next.js App Router, watch double data-fetch: RSC payload + client fetch can duplicate work—prefer passing initial items through server components then adopting them into client state once.</p>
+
+<div class="diagram">
+SSR + virtualizer alignment
+  Server HTML: first k rows + spacer metadata (total count optional)
+  Client:   hydrate k rows -> attach RO -> expand measurements
+  Risk:     CLS if server k differs from client estimate -> gate on media/layout
+</div>
+
+<h3>Horizontal virtualization</h3>
+<p>Data grids combine column and row windowing. The complexity is <strong>sticky columns</strong> and <strong>synced scrollbars</strong>. Often split into frozen and scrollable regions with two scroll containers and scroll-linked listeners—document performance implications (passive listeners, transform instead of left/top where possible).</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Grid feature</th>
+      <th>Virtualization impact</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Column resize</td>
+      <td>Invalidate measured widths; recompute horizontal offsets</td>
+    </tr>
+    <tr>
+      <td>Row reorder (DnD)</td>
+      <td>Temporarily disable recycling or pin dragged row portal</td>
+    </tr>
+    <tr>
+      <td>Cell editors</td>
+      <td>Focus retention when row leaves window—commit or cancel?</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Mobile Safari</div>
+  <p>Momentum scrolling and rubber-banding interact badly with manual overflow containers. Test <code>-webkit-overflow-scrolling: touch</code> legacy behavior vs modern iOS. Position fixed toolbars further reduce visible viewport—your <code>viewportHeight</code> measurement must use <code>ResizeObserver</code> on the scroll root, not only <code>window.innerHeight</code>.</p>
+</div>
+
+<h3>Performance budget sanity check</h3>
+<p>As a rule of thumb for interviews, quote <strong>60fps</strong> ≈ 16.6ms per frame budget on the main thread. If each row commit averages 0.5ms and your overscan mounts 40 rows, you risk multi-millisecond commits before layout. Keep rows lean: memoize, avoid inline object literals, split heavy subtrees with <code>React.memo</code> + stable props, and prefer CSS over JS measurement where possible.</p>
+<p>When asked “how large a list can we support?”, answer in terms of <strong>DOM nodes</strong>, <strong>heap retained by row models</strong>, and <strong>scroll event cadence</strong>—not raw item count alone.</p>
+
+<h3>Observability hooks</h3>
+<p>Expose virtualizer metrics to RUM: <code>avgRowHeightEstimateError</code>, <code>windowRecyclesPerSecond</code>, and <code>scrollCorrectionCount</code> after prepend. Spikes correlate with bad keys or image layout pops—useful when debugging “janky feed” tickets escalated from VIP users.</p>
+
+<h2 id="interview-qa">Interview Q&amp;A</h2>
+
+<div class="qa-section">
+  <div class="qa-item">
+    <div class="qa-question">
+      <span>How do you implement sticky section headers inside a virtualized list?</span>
+      <span class="tag tag-l6">L6</span>
+    </div>
+    <div class="qa-answer">
+      <p>Track which section header index is “active” based on scrollTop and prefix offsets; render the sticky header as a separate absolutely positioned layer synchronized with the scroll container. Alternatively, model sections as variable-size groups where the header is the first element in a group—libraries differ; the Staff answer is consistent offset accounting + avoiding double paint.</p>
+    </div>
+  </div>
+  <div class="qa-item">
+    <div class="qa-question">
+      <span>What breaks if the server changes sort order while the user scrolls?</span>
+      <span class="tag tag-architect">Architect</span>
+    </div>
+    <div class="qa-answer">
+      <p>Indices shift; cursor-based pagination may skip or duplicate unless you use stable cursors tied to data identity, not numeric page. Client should reset or reconcile: show toast, snap to nearest stable anchor, or soft refresh with preserved id set.</p>
+    </div>
+  </div>
+  <div class="qa-item">
+    <div class="qa-question">
+      <span>Why might overscan trade off accessibility?</span>
+      <span class="tag tag-senior">Senior</span>
+    </div>
+    <div class="qa-answer">
+      <p>Overscan increases the number of mounted nodes, which can expand the accessibility tree and affect screen reader virtual buffer behavior. Tune overscan per platform; test with VoiceOver/NVDA on large lists.</p>
+    </div>
+  </div>
+  <div class="qa-item">
+    <div class="qa-question">
+      <span>How do you avoid duplicate pages when the user scrolls past multiple sentinels quickly?</span>
+      <span class="tag tag-l6">L6</span>
+    </div>
+    <div class="qa-answer">
+      <p>Maintain an <code>inFlight</code> map keyed by cursor token; ignore IO callbacks while a fetch is active; use AbortController to cancel stale responses. Optionally disable the sentinel until the previous promise settles. Server should be idempotent for the same cursor.</p>
+    </div>
+  </div>
+</div>
+
+<nav class="nav-footer">
+  <a href="01-real-time-collaboration.html">← Real-Time Collaboration</a>
+  <a href="03-offline-first-architecture.html">Offline-First Architecture →</a>
+</nav>
+
+</div>
+
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+    q.addEventListener('click', () => q.nextElementSibling.classList.toggle('open'));
+});
+</script>
+</body>
+</html>

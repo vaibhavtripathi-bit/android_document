@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Monorepo Tooling — Build Toolchain — React JS Deep Dive</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Build Toolchain</a>
+  <span class="sep">›</span>
+  Monorepo Tooling
+</nav>
+
+<nav class="nav">
+  <a href="01-module-systems.html">Module Systems</a>
+  <a href="02-bundler-internals.html">Bundler Internals</a>
+  <a href="03-transpilation.html">Transpilation</a>
+  <a href="04-typescript-react.html">TypeScript React</a>
+  <a href="05-css-solutions.html">CSS Solutions</a>
+  <a href="06-monorepo-tooling.html" class="active">Monorepo Tooling</a>
+  <a href="07-dev-experience.html">Dev Experience</a>
+  <a href="08-interview-qa.html">Interview Q&amp;A</a>
+</nav>
+
+<h1>Monorepo Tooling</h1>
+<p class="subtitle">Turborepo, Nx, pnpm workspaces, Lerna — package management, hoisting, phantom dependencies, build caching, remote caching, and versioning strategies for large-scale React projects.</p>
+
+<h2>1. Monorepo vs Polyrepo</h2>
+
+<div class="diagram">
+<pre>
+Polyrepo:                           Monorepo:
+┌──────────┐ ┌──────────┐          ┌─────────────────────────────┐
+│ repo-web │ │ repo-api │          │ monorepo/                   │
+│ ├─ src/  │ │ ├─ src/  │          │ ├─ apps/                    │
+│ ├─ pkg   │ │ ├─ pkg   │          │ │  ├─ web/                  │
+│ └─ CI    │ │ └─ CI    │          │ │  └─ api/                  │
+└──────────┘ └──────────┘          │ ├─ packages/                │
+┌──────────┐ ┌──────────┐          │ │  ├─ ui/                   │
+│ repo-ui  │ │ repo-util│          │ │  ├─ utils/                │
+│ ├─ src/  │ │ ├─ src/  │          │ │  └─ config/               │
+│ ├─ pkg   │ │ ├─ pkg   │          │ ├─ package.json             │
+│ └─ CI    │ │ └─ CI    │          │ ├─ turbo.json / nx.json     │
+└──────────┘ └──────────┘          │ └─ pnpm-workspace.yaml      │
+                                   └─────────────────────────────┘
+4 repos, 4 CIs,                    1 repo, 1 CI,
+4 dependency sets                   shared dependencies
+</pre>
+</div>
+
+<h3>Monorepo Benefits and Challenges</h3>
+
+<table>
+<thead>
+<tr><th>Benefit</th><th>Challenge</th></tr>
+</thead>
+<tbody>
+<tr><td>Shared code without publishing</td><td>Larger repository size</td></tr>
+<tr><td>Atomic cross-package changes</td><td>Complex CI/CD configuration</td></tr>
+<tr><td>Consistent tooling/config</td><td>Ownership boundaries blur</td></tr>
+<tr><td>Single dependency tree</td><td>Slow builds without caching</td></tr>
+<tr><td>Easier refactoring</td><td>IDE performance at scale</td></tr>
+</tbody>
+</table>
+
+<h2>2. Package Managers: npm vs yarn vs pnpm</h2>
+
+<h3>2.1 Hoisting and Phantom Dependencies</h3>
+
+<div class="diagram">
+<pre>
+npm/yarn (flat hoisting):              pnpm (strict, symlinked):
+
+node_modules/                          node_modules/
+├── react/          ← hoisted          ├── .pnpm/
+├── lodash/         ← hoisted            │  ├── react@18.3.1/
+├── my-dep/                              │  │  └── node_modules/
+│   └── (uses lodash internally)         │  │     └── react/
+└── ...                                  │  └── lodash@4.17.21/
+                                         │     └── node_modules/
+You can import 'lodash' even if          │        └── lodash/
+it's not in YOUR package.json!           ├── react → .pnpm/react@18.3.1/...
+(phantom dependency)                     └── (only YOUR deps are linked here)
+
+                                         Cannot import lodash unless it's
+                                         in YOUR package.json (strict)
+</pre>
+</div>
+
+<pre><code>// Phantom dependency example:
+// package.json has: { "dependencies": { "my-library": "^1.0.0" } }
+// my-library depends on lodash internally
+
+// With npm/yarn (hoisted):
+import _ from 'lodash'; // Works! (but shouldn't — phantom dependency)
+// If my-library drops lodash, YOUR code breaks
+
+// With pnpm (strict):
+import _ from 'lodash'; // ERROR: Module not found
+// You must explicitly add lodash to your package.json</code></pre>
+
+<h3>2.2 Package Manager Comparison</h3>
+
+<table>
+<thead>
+<tr><th>Feature</th><th>npm</th><th>yarn (classic)</th><th>yarn (berry/v3+)</th><th>pnpm</th></tr>
+</thead>
+<tbody>
+<tr><td>Install speed</td><td>Slow</td><td>Fast</td><td>Very fast (PnP)</td><td>Very fast</td></tr>
+<tr><td>Disk usage</td><td>High (copies)</td><td>High (copies)</td><td>Low (PnP)</td><td>Low (hardlinks)</td></tr>
+<tr><td>Strictness</td><td>Loose</td><td>Loose</td><td>Strict (PnP)</td><td>Strict</td></tr>
+<tr><td>Phantom deps</td><td>Allowed</td><td>Allowed</td><td>Blocked</td><td>Blocked</td></tr>
+<tr><td>Workspaces</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes (best)</td></tr>
+<tr><td>Lock file</td><td>package-lock.json</td><td>yarn.lock</td><td>yarn.lock</td><td>pnpm-lock.yaml</td></tr>
+<tr><td>Content-addressable</td><td>No</td><td>No</td><td>Yes (PnP)</td><td>Yes (store)</td></tr>
+</tbody>
+</table>
+
+<h3>2.3 pnpm Workspaces</h3>
+
+<pre><code># pnpm-workspace.yaml
+packages:
+  - 'apps/*'
+  - 'packages/*'
+  - 'tools/*'
+
+# Install dependencies
+pnpm install
+
+# Run command in specific package
+pnpm --filter @myorg/web dev
+
+# Run command in all packages
+pnpm -r build
+
+# Run only in packages that changed since main
+pnpm --filter "...[origin/main]" build
+
+# Add dependency to specific package
+pnpm --filter @myorg/web add react-query
+
+# Add shared dev dependency to root
+pnpm add -Dw typescript eslint prettier</code></pre>
+
+<pre><code>// Internal package reference (packages/ui/package.json)
+{
+  "name": "@myorg/ui",
+  "version": "0.0.0",
+  "main": "./src/index.ts",       // Point to source for dev
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./button": "./src/Button.tsx"
+  }
+}
+
+// Consumer (apps/web/package.json)
+{
+  "name": "@myorg/web",
+  "dependencies": {
+    "@myorg/ui": "workspace:*",    // pnpm workspace protocol
+    "@myorg/utils": "workspace:^"  // Resolves to workspace version
+  }
+}</code></pre>
+
+<h2>3. Turborepo</h2>
+
+<p>Turborepo is a high-performance build system for JavaScript/TypeScript monorepos, focused on task orchestration and caching.</p>
+
+<pre><code>// turbo.json
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": ["**/.env.*local"],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],     // Run deps' build first (topological)
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**"],
+      "env": ["NODE_ENV", "API_URL"]
+    },
+    "test": {
+      "dependsOn": ["build"],
+      "inputs": ["src/**", "test/**"],
+      "outputs": [],                // No cacheable outputs
+      "env": ["CI"]
+    },
+    "lint": {
+      "dependsOn": [],              // No dependencies — can run in parallel
+      "outputs": []
+    },
+    "dev": {
+      "cache": false,               // Don't cache dev server
+      "persistent": true            // Long-running process
+    },
+    "typecheck": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    }
+  }
+}</code></pre>
+
+<div class="diagram">
+<pre>
+Turborepo Task Graph:
+
+  turbo run build
+
+  ┌─────────────┐
+  │ @myorg/utils │ ── build ──┐
+  └─────────────┘             │
+  ┌─────────────┐             ▼
+  │ @myorg/ui    │ ── build ──┬──▶ ┌─────────────┐
+  └─────────────┘             │    │ @myorg/web  │ ── build
+  ┌─────────────┐             │    └─────────────┘
+  │ @myorg/config│ ── build ──┘
+  └─────────────┘                  ┌─────────────┐
+                                   │ @myorg/api  │ ── build
+                                   └─────────────┘
+
+  ^build = run build in dependencies first (topological order)
+  Parallel execution where no dependencies exist
+</pre>
+</div>
+
+<h3>Turborepo Caching</h3>
+
+<pre><code>// Local caching: Turborepo hashes inputs and caches outputs
+// Hash includes: source files, env vars, dependency versions, turbo.json
+
+// Cache hit example:
+// $ turbo run build
+// @myorg/utils:build: cache hit, replaying output
+// @myorg/ui:build: cache hit, replaying output
+// @myorg/web:build: cache miss, executing
+
+// Remote caching (Vercel or self-hosted)
+// turbo.json
+{
+  "remoteCache": {
+    "signature": true  // Sign cache artifacts
+  }
+}
+
+// Enable remote cache:
+// $ npx turbo login
+// $ npx turbo link
+
+// Self-hosted remote cache (Turborepo API compatible)
+// Implementations: turborepo-remote-cache (Node), ducktape (Go)</code></pre>
+
+<h2>4. Nx</h2>
+
+<p>Nx is a more opinionated build system with computation caching, affected commands, code generators, and deep framework integration.</p>
+
+<pre><code>// nx.json
+{
+  "targetDefaults": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": ["production", "^production"],
+      "outputs": ["{projectRoot}/dist"],
+      "cache": true
+    },
+    "test": {
+      "inputs": ["default", "^production", "{workspaceRoot}/jest.preset.js"],
+      "cache": true
+    },
+    "lint": {
+      "inputs": ["default", "{workspaceRoot}/.eslintrc.json"],
+      "cache": true
+    }
+  },
+  "namedInputs": {
+    "default": ["{projectRoot}/**/*", "sharedGlobals"],
+    "production": [
+      "default",
+      "!{projectRoot}/**/?(*.)+(spec|test).[jt]s?(x)",
+      "!{projectRoot}/tsconfig.spec.json",
+      "!{projectRoot}/jest.config.[jt]s"
+    ],
+    "sharedGlobals": ["{workspaceRoot}/tsconfig.base.json"]
+  }
+}
+
+// Nx affected commands — only run on changed packages
+// $ nx affected:build --base=main
+// $ nx affected:test --base=main
+// $ nx affected:lint --base=main
+
+// Nx graph visualization
+// $ nx graph  (opens interactive dependency graph in browser)
+
+// Nx generators (scaffolding)
+// $ nx generate @nx/react:component Button --project=ui
+// $ nx generate @nx/react:library shared-utils</code></pre>
+
+<h3>Turborepo vs Nx Comparison</h3>
+
+<table>
+<thead>
+<tr><th>Feature</th><th>Turborepo</th><th>Nx</th></tr>
+</thead>
+<tbody>
+<tr><td>Philosophy</td><td>Minimal, task runner</td><td>Full-featured, opinionated</td></tr>
+<tr><td>Setup complexity</td><td>Low (add turbo.json)</td><td>Medium (nx.json + plugins)</td></tr>
+<tr><td>Caching</td><td>Local + Vercel remote</td><td>Local + Nx Cloud remote</td></tr>
+<tr><td>Affected commands</td><td>Via --filter</td><td>Built-in (nx affected)</td></tr>
+<tr><td>Code generators</td><td>No</td><td>Yes (rich plugin system)</td></tr>
+<tr><td>Dependency graph UI</td><td>No</td><td>Yes (nx graph)</td></tr>
+<tr><td>Framework plugins</td><td>None (framework-agnostic)</td><td>React, Angular, Node, etc.</td></tr>
+<tr><td>Incremental adoption</td><td>Easy</td><td>Medium</td></tr>
+<tr><td>Performance</td><td>Fast (Go-based)</td><td>Fast (Rust-based daemon)</td></tr>
+</tbody>
+</table>
+
+<h2>5. Lerna</h2>
+
+<pre><code>// lerna.json (now powered by Nx under the hood)
+{
+  "$schema": "node_modules/lerna/schemas/lerna-schema.json",
+  "version": "independent",  // or "fixed" for unified versioning
+  "npmClient": "pnpm",
+  "useWorkspaces": true,
+  "command": {
+    "publish": {
+      "conventionalCommits": true,
+      "message": "chore(release): publish %s"
+    },
+    "version": {
+      "allowBranch": "main",
+      "conventionalCommits": true
+    }
+  }
+}
+
+// Lerna commands
+// $ lerna version          — bump versions based on conventional commits
+// $ lerna publish          — publish changed packages to npm
+// $ lerna run build        — run build in all packages (uses Nx caching)
+// $ lerna changed          — list packages changed since last release</code></pre>
+
+<h2>6. Shared Configuration</h2>
+
+<pre><code>// Monorepo shared config pattern
+// packages/config-eslint/index.js
+module.exports = {
+  extends: ['eslint:recommended', 'plugin:react/recommended'],
+  plugins: ['react', 'react-hooks'],
+  rules: {
+    'react-hooks/rules-of-hooks': 'error',
+    'react-hooks/exhaustive-deps': 'warn',
+  },
+  settings: {
+    react: { version: 'detect' },
+  },
+};
+
+// packages/config-typescript/base.json
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "moduleResolution": "bundler"
+  }
+}
+
+// packages/config-typescript/react.json
+{
+  "extends": "./base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "lib": ["DOM", "DOM.Iterable", "ES2020"],
+    "module": "ESNext",
+    "target": "ES2020",
+    "noEmit": true
+  }
+}
+
+// apps/web/tsconfig.json — consuming shared config
+{
+  "extends": "@myorg/config-typescript/react.json",
+  "compilerOptions": {
+    "paths": { "@/*": ["./src/*"] }
+  },
+  "include": ["src"]
+}</code></pre>
+
+<h2>7. Versioning Strategies</h2>
+
+<pre><code>// Fixed versioning: all packages share the same version
+// Good for: tightly coupled packages (React, Babel)
+// lerna.json: { "version": "2.5.0" }
+// Every publish bumps ALL packages to the same version
+
+// Independent versioning: each package has its own version
+// Good for: loosely coupled packages, internal tools
+// lerna.json: { "version": "independent" }
+// Each package version bumps independently based on its changes
+
+// Changesets — popular alternative to Lerna versioning
+// $ npx changeset        — create a changeset
+// $ npx changeset version — apply changesets, bump versions
+// $ npx changeset publish — publish to npm
+
+// .changeset/cool-feature.md (created by `npx changeset`)
+---
+"@myorg/ui": minor
+"@myorg/utils": patch
+---
+
+Added new Button variant and fixed utility helper.</code></pre>
+
+<div class="callout-architect">
+  <h4>Architect Insight: Monorepo at Scale</h4>
+  <p>For a large React monorepo (50+ packages, 20+ engineers): (1) Use <strong>pnpm</strong> for strict dependency management and disk efficiency, (2) Use <strong>Turborepo</strong> for simple task orchestration with remote caching, or <strong>Nx</strong> if you need code generators and deep framework integration, (3) Use <strong>changesets</strong> for versioning if you publish packages, (4) Set up <strong>CODEOWNERS</strong> for package-level ownership, (5) Use <strong>internal packages</strong> (not published) for shared code that doesn't need versioning. The key architectural decision is whether packages are "publishable" (versioned, published to registry) or "internal" (source-level imports, no versioning).</p>
+</div>
+
+<h2>8. Build Caching and Remote Caching</h2>
+
+<pre><code>// How build caching works:
+// 1. Hash inputs: source files + deps + env vars + config
+// 2. Check cache for matching hash
+// 3. Cache hit → restore outputs from cache (skip build)
+// 4. Cache miss → run build, store outputs in cache
+
+// Turborepo cache structure:
+// node_modules/.cache/turbo/
+//   ├── {hash1}.tar.zst   — compressed build outputs
+//   ├── {hash2}.tar.zst
+//   └── ...
+
+// Remote cache enables sharing across CI and developers:
+// Developer A builds @myorg/ui → uploads to remote cache
+// Developer B pulls @myorg/ui → cache hit, no build needed
+// CI builds @myorg/ui → cache hit from Developer A's build
+
+// Cache invalidation triggers:
+// - Source file changes
+// - Dependency version changes
+// - Environment variable changes
+// - Config file changes (turbo.json, tsconfig.json)
+// - Global dependency changes (root package.json)</code></pre>
+
+<nav class="nav-footer">
+  <a href="05-css-solutions.html">← Previous: CSS Solutions</a>
+  <a href="07-dev-experience.html">Next: Dev Experience →</a>
+</nav>
+
+</div>
+</body>
+</html>

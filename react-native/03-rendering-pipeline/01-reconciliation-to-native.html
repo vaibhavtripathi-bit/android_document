@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reconciliation to Native — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Rendering Pipeline</a><span class="sep">›</span>
+        Reconciliation to Native
+    </nav>
+
+    <h1>Reconciliation to Native</h1>
+    <p class="subtitle">How React's reconciliation algorithm maps to native platform views — from virtual DOM diffing through shadow tree mutations to actual UIView/android.view.View operations. Understanding this pipeline is the foundation for all React Native performance work.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#overview">1. Pipeline Overview</a></li>
+            <li><a href="#component-types">2. Component Types in React Native</a></li>
+            <li><a href="#reconciliation">3. Reconciliation Phase</a></li>
+            <li><a href="#shadow-tree">4. Shadow Tree Construction</a></li>
+            <li><a href="#view-descriptors">5. View Descriptors</a></li>
+            <li><a href="#props-diffing">6. Props Diffing and Native Updates</a></li>
+            <li><a href="#batch-updates">7. Batch Updates to Native</a></li>
+            <li><a href="#event-handling">8. Event Handling: Native → JS</a></li>
+            <li><a href="#fabric-differences">9. Fabric Architecture Differences</a></li>
+            <li><a href="#architect">10. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="overview">1. Pipeline Overview</h2>
+
+    <p>React Native's rendering pipeline transforms React element trees into native platform views through a multi-stage process. Unlike React DOM which targets a single rendering surface (the browser DOM), React Native must bridge two fundamentally different execution environments: JavaScript and native platform code.</p>
+
+    <div class="diagram">
+React Component Tree          Bridge/JSI           Native View Hierarchy
+═══════════════════    ═══════════════════    ═══════════════════════
+
+  &lt;View&gt;               Shadow Tree              UIView (iOS)
+    &lt;Text&gt;Hello&lt;/Text&gt;    ├─ ViewShadowNode       ├─ RCTView
+    &lt;Image src={..}/&gt;    │  ├─ TextShadowNode     │  ├─ RCTText
+  &lt;/View&gt;                │  └─ ImageShadowNode    │  └─ RCTImageView
+                         └─ (Yoga layout)         └─ (Auto Layout)
+
+  Reconciler              Layout Engine            Platform Renderer
+  (JS Thread)             (Background)             (Main/UI Thread)
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>The three-thread model (JS, Shadow/Background, Main/UI) is the fundamental architectural constraint of React Native. Every performance issue traces back to work being done on the wrong thread, or synchronization overhead between threads. Fabric (New Architecture) collapses some of these boundaries with synchronous access via JSI.</p>
+    </div>
+
+    <h3>1.1 The Full Pipeline</h3>
+
+    <div class="diagram">
+Step 1: React Reconciliation (JS Thread)
+  ├─ Component render() produces React Elements
+  ├─ Fiber tree diffing (same algorithm as React DOM)
+  └─ Produces list of mutations (create, update, delete, reorder)
+
+Step 2: Shadow Tree Update (Background Thread — Old Arch / JS Thread — Fabric)
+  ├─ Shadow nodes created/updated to mirror fiber tree
+  ├─ Yoga layout engine computes positions and sizes
+  └─ Layout results stored on shadow nodes
+
+Step 3: Native View Operations (Main/UI Thread)
+  ├─ createView(tag, className, props)
+  ├─ updateView(tag, className, changedProps)
+  ├─ manageChildren(tag, moveFrom, moveTo, addTags, addAtIndices, removeTags)
+  └─ setChildren(tag, childTags)
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="component-types">2. Component Types in React Native</h2>
+
+    <p>React Native distinguishes between two fundamental component categories that determine how reconciliation output maps to native operations.</p>
+
+    <h3>2.1 Host Components</h3>
+
+    <p>Host components are the leaf nodes that map directly to native platform views. They are the equivalent of DOM elements (<code>div</code>, <code>span</code>) in React DOM.</p>
+
+    <pre><code><span class="comment">// Host components map to native views</span>
+<span class="keyword">import</span> { View, Text, Image, ScrollView, TextInput } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="comment">// View → UIView (iOS) / android.view.View (Android)</span>
+<span class="comment">// Text → RCTText → UILabel (iOS) / TextView (Android)</span>
+<span class="comment">// Image → RCTImageView → UIImageView (iOS) / ImageView (Android)</span>
+<span class="comment">// ScrollView → RCTScrollView → UIScrollView (iOS) / ScrollView (Android)</span>
+<span class="comment">// TextInput → RCTTextInput → UITextField (iOS) / EditText (Android)</span>
+
+<span class="comment">// Each host component has a corresponding ViewManager on native side</span>
+<span class="comment">// that knows how to create and update the native view</span></code></pre>
+
+    <h3>2.2 Composite Components</h3>
+
+    <p>Composite components are JavaScript-only constructs that produce a tree of host components. They never appear in the native view hierarchy.</p>
+
+    <pre><code><span class="comment">// Composite component — exists only in JS</span>
+<span class="keyword">const</span> <span class="func">UserCard</span> = ({ name, avatar }) =&gt; (
+  &lt;<span class="type">View</span> style={styles.card}&gt;
+    &lt;<span class="type">Image</span> source={{ uri: avatar }} style={styles.avatar} /&gt;
+    &lt;<span class="type">Text</span> style={styles.name}&gt;{name}&lt;/<span class="type">Text</span>&gt;
+  &lt;/<span class="type">View</span>&gt;
+);
+
+<span class="comment">// After reconciliation, only host components remain:</span>
+<span class="comment">// View (native)</span>
+<span class="comment">//   ├─ Image (native)</span>
+<span class="comment">//   └─ Text (native)</span>
+<span class="comment">// UserCard itself has no native representation</span></code></pre>
+
+    <table>
+        <thead>
+            <tr><th>Aspect</th><th>Host Component</th><th>Composite Component</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Native view</td><td>Yes — creates platform view</td><td>No — JS only</td></tr>
+            <tr><td>ViewManager</td><td>Has corresponding native ViewManager</td><td>None</td></tr>
+            <tr><td>Props</td><td>Serialized and sent to native</td><td>Consumed in JS only</td></tr>
+            <tr><td>Layout</td><td>Participates in Yoga layout</td><td>Transparent to layout</td></tr>
+            <tr><td>Events</td><td>Can receive native events</td><td>Only JS-level callbacks</td></tr>
+            <tr><td>Examples</td><td>View, Text, Image, ScrollView</td><td>FlatList, TouchableOpacity (wrapper)</td></tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="reconciliation">3. Reconciliation Phase</h2>
+
+    <p>React Native uses the exact same reconciliation algorithm (React Fiber) as React DOM. The reconciler is framework-agnostic — it operates on fibers and delegates actual view operations to the host config (renderer).</p>
+
+    <h3>3.1 Fiber Tree Diffing</h3>
+
+    <pre><code><span class="comment">// The reconciler compares previous and next fiber trees</span>
+<span class="comment">// using the same heuristics as React DOM:</span>
+
+<span class="comment">// 1. Different element types → destroy old tree, create new</span>
+<span class="comment">// 2. Same element type → update props, recurse into children</span>
+<span class="comment">// 3. Keys used to match children across reorders</span>
+
+<span class="comment">// Previous render:</span>
+&lt;<span class="type">View</span>&gt;
+  &lt;<span class="type">Text</span> key=<span class="string">"a"</span>&gt;Hello&lt;/<span class="type">Text</span>&gt;
+  &lt;<span class="type">Text</span> key=<span class="string">"b"</span>&gt;World&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+
+<span class="comment">// Next render (reordered):</span>
+&lt;<span class="type">View</span>&gt;
+  &lt;<span class="type">Text</span> key=<span class="string">"b"</span>&gt;World&lt;/<span class="type">Text</span>&gt;
+  &lt;<span class="type">Text</span> key=<span class="string">"a"</span>&gt;Hello&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+
+<span class="comment">// Reconciler output: MOVE operations (not destroy + create)</span>
+<span class="comment">// This maps to manageChildren() on native side</span></code></pre>
+
+    <h3>3.2 Host Config: The Renderer Contract</h3>
+
+    <p>The React reconciler communicates with React Native through a host config — a set of functions that the renderer must implement. This is the contract between React's core and the platform.</p>
+
+    <pre><code><span class="comment">// Simplified React Native host config (renderer)</span>
+<span class="keyword">const</span> hostConfig = {
+  <span class="func">createInstance</span>(type, props, rootContainer, hostContext, fiber) {
+    <span class="comment">// Called when reconciler needs a new native view</span>
+    <span class="comment">// Sends createView command to native via UIManager</span>
+    <span class="keyword">const</span> tag = ReactNativePrivateInterface.allocateTag();
+    UIManager.<span class="func">createView</span>(tag, type, rootContainer, props);
+    <span class="keyword">return</span> tag;
+  },
+
+  <span class="func">commitUpdate</span>(instance, updatePayload, type, oldProps, newProps) {
+    <span class="comment">// Called when props change on an existing native view</span>
+    UIManager.<span class="func">updateView</span>(instance, type, updatePayload);
+  },
+
+  <span class="func">appendChild</span>(parentInstance, child) {
+    UIManager.<span class="func">setChildren</span>(parentInstance, [child]);
+  },
+
+  <span class="func">removeChild</span>(parentInstance, child) {
+    UIManager.<span class="func">manageChildren</span>(
+      parentInstance, [], [], [], [], [<span class="number">0</span>]
+    );
+  },
+
+  <span class="func">prepareUpdate</span>(instance, type, oldProps, newProps) {
+    <span class="comment">// Diff props and return update payload</span>
+    <span class="comment">// Returns null if no changes needed</span>
+    <span class="keyword">return</span> <span class="func">diffProperties</span>(oldProps, newProps);
+  },
+};</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Key Insight</div>
+        <p>The reconciler never directly touches native views. It only calls host config functions. This abstraction is what allows the same React reconciler to power React DOM, React Native, React Three Fiber, Ink (terminal), and any custom renderer.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="shadow-tree">4. Shadow Tree Construction</h2>
+
+    <p>The shadow tree is an intermediate representation between the React fiber tree and the native view hierarchy. Each shadow node mirrors a host component fiber and stores layout information computed by Yoga.</p>
+
+    <h3>4.1 Shadow Node Lifecycle</h3>
+
+    <div class="diagram">
+Fiber Tree (JS)              Shadow Tree (C++)           Native Views (Platform)
+═══════════════          ═══════════════════          ═══════════════════════
+
+ViewFiber ──────────→ ViewShadowNode ──────────→ UIView / android.view.View
+  │                      │                           │
+  ├─ TextFiber ──────→ TextShadowNode ──────────→ UILabel / TextView
+  │                      │                           │
+  └─ ImageFiber ─────→ ImageShadowNode ─────────→ UIImageView / ImageView
+
+                    Yoga Layout Engine
+                    computes: x, y, width, height
+                    for each shadow node
+    </div>
+
+    <h3>4.2 Shadow Node Properties</h3>
+
+    <pre><code><span class="comment">// Each shadow node stores:</span>
+<span class="comment">// 1. React tag (unique identifier)</span>
+<span class="comment">// 2. View config (component type metadata)</span>
+<span class="comment">// 3. Props (serialized from JS)</span>
+<span class="comment">// 4. Yoga node (layout configuration)</span>
+<span class="comment">// 5. Layout results (x, y, width, height)</span>
+<span class="comment">// 6. Children (ordered list of child shadow nodes)</span>
+
+<span class="comment">// In Fabric (New Architecture), shadow nodes are C++ objects</span>
+<span class="comment">// accessible from both JS (via JSI) and native threads</span>
+
+<span class="comment">// Shadow node creation in Fabric:</span>
+<span class="keyword">class</span> <span class="type">ViewShadowNode</span> : <span class="keyword">public</span> <span class="type">ConcreteViewShadowNode</span>&lt;
+  ViewShadowNode,
+  ViewProps,
+  ViewEventEmitter
+&gt; {
+  <span class="comment">// Inherits Yoga layout node</span>
+  <span class="comment">// Stores ViewProps (backgroundColor, borderRadius, etc.)</span>
+  <span class="comment">// Manages child shadow nodes</span>
+};</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="view-descriptors">5. View Descriptors</h2>
+
+    <p>View descriptors are the metadata objects that define how a React component type maps to its native counterpart. They contain the configuration needed to create and update native views.</p>
+
+    <pre><code><span class="comment">// View descriptor contains:</span>
+<span class="keyword">const</span> viewDescriptor = {
+  uiViewClassName: <span class="string">'RCTView'</span>,        <span class="comment">// Native class name</span>
+  bubblingEventTypes: {              <span class="comment">// Events that bubble</span>
+    topChange: {
+      phasedRegistrationNames: {
+        bubbled: <span class="string">'onChange'</span>,
+        captured: <span class="string">'onChangeCapture'</span>,
+      },
+    },
+  },
+  directEventTypes: {                <span class="comment">// Events that don't bubble</span>
+    topLayout: {
+      registrationName: <span class="string">'onLayout'</span>,
+    },
+  },
+  validAttributes: {                 <span class="comment">// Props that can be sent to native</span>
+    style: { process: <span class="func">processStyles</span> },
+    accessible: <span class="keyword">true</span>,
+    accessibilityLabel: <span class="keyword">true</span>,
+    hitSlop: <span class="keyword">true</span>,
+    nativeID: <span class="keyword">true</span>,
+    testID: <span class="keyword">true</span>,
+    <span class="comment">// ... many more</span>
+  },
+};</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Interview Pitfall</div>
+        <p>Candidates often confuse view descriptors with ViewManagers. View descriptors are JS-side metadata used during reconciliation to validate props and route events. ViewManagers are native-side classes that actually create and manage platform views. They work together but live on different sides of the bridge.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="props-diffing">6. Props Diffing and Native Updates</h2>
+
+    <p>When a component re-renders with new props, React Native must determine which props actually changed and serialize only the diff to native. This is a critical performance path.</p>
+
+    <h3>6.1 The diffProperties Algorithm</h3>
+
+    <pre><code><span class="comment">// Simplified props diffing logic</span>
+<span class="keyword">function</span> <span class="func">diffProperties</span>(prevProps, nextProps, validAttributes) {
+  <span class="keyword">let</span> updatePayload = <span class="keyword">null</span>;
+
+  <span class="comment">// Check for removed props</span>
+  <span class="keyword">for</span> (<span class="keyword">const</span> propKey <span class="keyword">in</span> prevProps) {
+    <span class="keyword">if</span> (nextProps[propKey] !== <span class="keyword">undefined</span>) <span class="keyword">continue</span>;
+    <span class="keyword">if</span> (!validAttributes[propKey]) <span class="keyword">continue</span>;
+    <span class="keyword">if</span> (!updatePayload) updatePayload = {};
+    updatePayload[propKey] = <span class="keyword">null</span>; <span class="comment">// Signal removal</span>
+  }
+
+  <span class="comment">// Check for added/changed props</span>
+  <span class="keyword">for</span> (<span class="keyword">const</span> propKey <span class="keyword">in</span> nextProps) {
+    <span class="keyword">const</span> nextValue = nextProps[propKey];
+    <span class="keyword">const</span> prevValue = prevProps[propKey];
+
+    <span class="keyword">if</span> (nextValue === prevValue) <span class="keyword">continue</span>;
+    <span class="keyword">if</span> (!validAttributes[propKey]) <span class="keyword">continue</span>;
+
+    <span class="comment">// Style props get special nested diffing</span>
+    <span class="keyword">if</span> (propKey === <span class="string">'style'</span>) {
+      <span class="keyword">const</span> styleDiff = <span class="func">diffNestedStyles</span>(prevValue, nextValue);
+      <span class="keyword">if</span> (styleDiff) {
+        <span class="keyword">if</span> (!updatePayload) updatePayload = {};
+        updatePayload.style = styleDiff;
+      }
+    } <span class="keyword">else</span> {
+      <span class="keyword">if</span> (!updatePayload) updatePayload = {};
+      updatePayload[propKey] = nextValue;
+    }
+  }
+
+  <span class="keyword">return</span> updatePayload; <span class="comment">// null means no changes</span>
+}</code></pre>
+
+    <h3>6.2 Style Prop Optimization</h3>
+
+    <pre><code><span class="comment">// Style objects are deeply diffed, not replaced wholesale</span>
+<span class="comment">// Previous: { backgroundColor: 'red', padding: 10, margin: 5 }</span>
+<span class="comment">// Next:     { backgroundColor: 'blue', padding: 10, margin: 5 }</span>
+<span class="comment">// Diff:     { backgroundColor: 'blue' }  ← only changed prop sent</span>
+
+<span class="comment">// StyleSheet.create() returns numeric IDs, not objects</span>
+<span class="keyword">const</span> styles = StyleSheet.<span class="func">create</span>({
+  container: { flex: <span class="number">1</span>, backgroundColor: <span class="string">'white'</span> },
+});
+<span class="comment">// styles.container is a number (e.g., 42)</span>
+<span class="comment">// The actual style object is stored in a registry</span>
+<span class="comment">// and resolved during props diffing via StyleSheet.flatten()</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="batch-updates">7. Batch Updates to Native</h2>
+
+    <p>React Native batches multiple view operations into a single native transaction to minimize bridge crossings and ensure atomic UI updates.</p>
+
+    <h3>7.1 Operation Batching (Old Architecture)</h3>
+
+    <div class="diagram">
+JS Thread                          Bridge                    UI Thread
+═════════                    ═══════════════              ═══════════
+
+setState() ──→ Reconcile
+setState() ──→ Reconcile     Batch queue:
+setState() ──→ Reconcile     ┌──────────────────────┐
+                             │ createView(1, View)   │
+  End of JS                  │ createView(2, Text)   │──→ Execute all
+  execution frame            │ updateView(3, props)  │    atomically
+                             │ setChildren(1, [2,3]) │    on UI thread
+                             └──────────────────────┘
+    </div>
+
+    <h3>7.2 Fabric: Synchronous Mounting</h3>
+
+    <pre><code><span class="comment">// In Fabric, the mounting phase can be synchronous</span>
+<span class="comment">// for specific use cases (e.g., text input)</span>
+
+<span class="comment">// Old Architecture: async batch</span>
+<span class="comment">// 1. JS reconciles → queues operations</span>
+<span class="comment">// 2. Operations serialized to JSON</span>
+<span class="comment">// 3. JSON sent over bridge</span>
+<span class="comment">// 4. Native deserializes and executes</span>
+<span class="comment">// Latency: ~3-5 frames for complex updates</span>
+
+<span class="comment">// Fabric: synchronous when needed</span>
+<span class="comment">// 1. JS reconciles → creates C++ shadow tree diff</span>
+<span class="comment">// 2. Diff applied directly to native via JSI</span>
+<span class="comment">// 3. No serialization overhead</span>
+<span class="comment">// Latency: ~1 frame for synchronous path</span>
+
+<span class="comment">// Fabric mutation instructions:</span>
+<span class="keyword">enum class</span> <span class="type">ShadowViewMutation</span>::Type {
+  Create,   <span class="comment">// Create new native view</span>
+  Delete,   <span class="comment">// Remove native view</span>
+  Insert,   <span class="comment">// Insert child at index</span>
+  Remove,   <span class="comment">// Remove child at index</span>
+  Update,   <span class="comment">// Update props on existing view</span>
+};</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Fabric Batching</div>
+        <p>Fabric still batches operations by default for performance. The synchronous path is opt-in for specific scenarios like TextInput where immediate feedback is critical. The key improvement is eliminating JSON serialization — mutations are C++ structs passed via shared memory.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="event-handling">8. Event Handling: Native → JS</h2>
+
+    <p>Events flow in the opposite direction from rendering: from native platform views back to JavaScript. This reverse path has its own performance characteristics and batching behavior.</p>
+
+    <h3>8.1 Event Flow</h3>
+
+    <div class="diagram">
+Native Touch Event                                    JS Event Handler
+══════════════════                                  ═══════════════════
+
+UIView touchesBegan:    ──→  RCTEventDispatcher
+                             ├─ coalescable?
+                             │  (scroll, touch move)
+                             ├─ serialize to JSON
+                             └─ dispatch to JS
+                                    │
+                        ┌───────────┘
+                        ▼
+                  EventEmitter
+                  ├─ find fiber by reactTag
+                  ├─ traverse fiber tree (bubble/capture)
+                  └─ call onPress / onScroll / etc.
+    </div>
+
+    <h3>8.2 Event Types and Coalescing</h3>
+
+    <pre><code><span class="comment">// React Native has three event categories:</span>
+
+<span class="comment">// 1. Discrete events — delivered individually, never coalesced</span>
+<span class="comment">//    Examples: onPress, onLongPress, onChange</span>
+<span class="comment">//    These must be processed in order</span>
+
+<span class="comment">// 2. Coalescing events — merged when queued</span>
+<span class="comment">//    Examples: onScroll, onTouchMove</span>
+<span class="comment">//    Only the latest event is kept if JS is behind</span>
+
+<span class="comment">// 3. Continuous events — high-frequency, special handling</span>
+<span class="comment">//    Examples: onGestureEvent (Reanimated)</span>
+<span class="comment">//    May bypass JS thread entirely (worklets)</span>
+
+<span class="comment">// Event coalescing prevents JS thread flooding:</span>
+<span class="comment">// If user scrolls rapidly and JS is busy,</span>
+<span class="comment">// intermediate scroll positions are dropped.</span>
+<span class="comment">// Only the latest contentOffset is delivered.</span>
+
+<span class="keyword">class</span> <span class="type">ScrollEvent</span> {
+  <span class="func">canCoalesce</span>() { <span class="keyword">return true</span>; }
+  <span class="func">coalesce</span>(newer) {
+    <span class="keyword">return</span> newer; <span class="comment">// Latest scroll position wins</span>
+  }
+}</code></pre>
+
+    <h3>8.3 Fabric Event System</h3>
+
+    <pre><code><span class="comment">// Fabric uses C++ EventEmitter instead of bridge-based dispatch</span>
+<span class="comment">// Events are C++ objects that can be processed synchronously</span>
+
+<span class="comment">// Priority-based event dispatch in Fabric:</span>
+<span class="keyword">enum class</span> <span class="type">EventPriority</span> {
+  SynchronousUnbatched, <span class="comment">// Immediate — text input</span>
+  SynchronousBatched,   <span class="comment">// Sync but batched — discrete touches</span>
+  AsynchronousUnbatched,<span class="comment">// Async — scroll events</span>
+  AsynchronousBatched,  <span class="comment">// Async batched — layout events</span>
+};
+
+<span class="comment">// This priority system allows Fabric to handle</span>
+<span class="comment">// text input synchronously (no frame delay)</span>
+<span class="comment">// while still batching scroll events for efficiency</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="fabric-differences">9. Fabric Architecture Differences</h2>
+
+    <table>
+        <thead>
+            <tr><th>Aspect</th><th>Old Architecture (Paper)</th><th>New Architecture (Fabric)</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Shadow tree</td><td>Java/ObjC objects on native thread</td><td>C++ objects shared across threads</td></tr>
+            <tr><td>Communication</td><td>Async JSON bridge</td><td>Synchronous JSI (C++ → JS)</td></tr>
+            <tr><td>Layout</td><td>Background thread, async results</td><td>Can be synchronous when needed</td></tr>
+            <tr><td>Mounting</td><td>Batched async commands</td><td>Mutation instructions (create/delete/insert/remove/update)</td></tr>
+            <tr><td>Events</td><td>Serialized over bridge</td><td>C++ EventEmitter with priority</td></tr>
+            <tr><td>View flattening</td><td>Basic (layout-only removal)</td><td>Improved (diff-based flattening)</td></tr>
+            <tr><td>Concurrent rendering</td><td>Not supported</td><td>Supported (React 18 features)</td></tr>
+            <tr><td>Synchronous access</td><td>Not possible</td><td>measureInWindow, scrollTo synchronous</td></tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">10. Architect Considerations</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>The reconciliation-to-native pipeline is a <strong>producer-consumer system</strong> with the JS thread as producer and the UI thread as consumer. Performance optimization is fundamentally about: (1) reducing what the producer generates (fewer re-renders, memoization), (2) reducing serialization cost (props diffing, view flattening), and (3) ensuring the consumer can keep up (60fps budget = 16.6ms per frame on UI thread). Fabric's key innovation is making this pipeline partially synchronous, eliminating the async gap that caused visual glitches in the old architecture.</p>
+    </div>
+
+    <h3>10.1 Performance Implications</h3>
+
+    <pre><code><span class="comment">// Anti-pattern: inline style objects cause props diff on every render</span>
+<span class="keyword">const</span> <span class="func">BadComponent</span> = ({ color }) =&gt; (
+  <span class="comment">// New object every render → always triggers native update</span>
+  &lt;<span class="type">View</span> style={{ flex: <span class="number">1</span>, backgroundColor: color }} /&gt;
+);
+
+<span class="comment">// Better: stable references for static styles</span>
+<span class="keyword">const</span> <span class="func">GoodComponent</span> = ({ color }) =&gt; (
+  &lt;<span class="type">View</span> style={[styles.container, { backgroundColor: color }]} /&gt;
+);
+
+<span class="keyword">const</span> styles = StyleSheet.<span class="func">create</span>({
+  container: { flex: <span class="number">1</span> }, <span class="comment">// Stable reference — numeric ID</span>
+});
+
+<span class="comment">// Best: useMemo for computed styles</span>
+<span class="keyword">const</span> <span class="func">BestComponent</span> = ({ color }) =&gt; {
+  <span class="keyword">const</span> dynamicStyle = <span class="func">useMemo</span>(
+    () =&gt; ({ backgroundColor: color }),
+    [color]
+  );
+  <span class="keyword">return</span> &lt;<span class="type">View</span> style={[styles.container, dynamicStyle]} /&gt;;
+};</code></pre>
+
+    <div class="nav-footer">
+        <a href="index.html">← Series Index</a>
+        <a href="02-view-flattening.html">Next: View Flattening →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Redux Internals — React State Management</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">State Management</a>
+  <span class="sep">›</span>
+  Redux Internals
+</nav>
+
+<h1>Redux Internals</h1>
+<p class="subtitle">Redux architecture, Redux Toolkit, middleware pipeline, Immer integration, DevTools time-travel, selector memoization, and comparison with useReducer+Context.</p>
+
+<nav class="nav">
+  <a href="01-local-state-patterns.html">Local State Patterns</a>
+  <a href="02-context-at-scale.html">Context at Scale</a>
+  <a href="04-zustand-jotai-signals.html">Zustand, Jotai &amp; Signals</a>
+  <a href="05-server-state.html">Server State</a>
+  <a href="06-form-state.html">Form State</a>
+  <a href="07-state-machines.html">State Machines</a>
+  <a href="08-interview-qa.html">Interview Q&amp;A</a>
+</nav>
+
+<h2 id="architecture">Redux Architecture</h2>
+
+<div class="diagram">
+Redux Unidirectional Data Flow:
+
+  UI Component
+      │
+      │ dispatch(action)
+      ▼
+  ┌─────────────────────────────────────────┐
+  │           Middleware Pipeline            │
+  │  logger → thunk → saga → ... → reducer  │
+  └─────────────────────────────────────────┘
+      │
+      ▼
+  ┌──────────┐
+  │  Reducer  │  (state, action) => newState
+  └──────────┘
+      │
+      ▼
+  ┌──────────┐
+  │  Store   │  Single source of truth
+  └──────────┘
+      │
+      │ notify subscribers
+      ▼
+  UI Component (re-renders with new state)
+</div>
+
+<h3>Core Redux Implementation</h3>
+
+<pre><code>// Redux createStore (simplified — actual source is ~200 lines)
+function createStore(reducer, preloadedState, enhancer) {
+  if (enhancer) return enhancer(createStore)(reducer, preloadedState);
+
+  let currentState = preloadedState;
+  let currentReducer = reducer;
+  let listeners = [];
+  let isDispatching = false;
+
+  function getState() {
+    return currentState;
+  }
+
+  function subscribe(listener) {
+    listeners.push(listener);
+    return function unsubscribe() {
+      listeners = listeners.filter(l => l !== listener);
+    };
+  }
+
+  function dispatch(action) {
+    if (isDispatching) throw new Error('Reducers may not dispatch actions');
+    try {
+      isDispatching = true;
+      currentState = currentReducer(currentState, action);
+    } finally {
+      isDispatching = false;
+    }
+    listeners.forEach(listener => listener());
+    return action;
+  }
+
+  dispatch({ type: '@@INIT' }); // initialize state
+  return { getState, subscribe, dispatch };
+}</code></pre>
+
+<h2 id="rtk">Redux Toolkit (RTK)</h2>
+
+<p>RTK is the official, recommended way to write Redux. It wraps Redux with opinionated defaults: Immer for immutable updates, built-in thunk middleware, and simplified API.</p>
+
+<h3>createSlice</h3>
+
+<pre><code>import { createSlice, PayloadAction } from '@reduxjs/toolkit';
+
+interface TodoState {
+  items: Todo[];
+  filter: 'all' | 'active' | 'completed';
+  loading: boolean;
+}
+
+const initialState: TodoState = {
+  items: [],
+  filter: 'all',
+  loading: false,
+};
+
+const todosSlice = createSlice({
+  name: 'todos',
+  initialState,
+  reducers: {
+    addTodo: {
+      reducer(state, action: PayloadAction&lt;Todo&gt;) {
+        state.items.push(action.payload); // Immer: mutative syntax OK
+      },
+      prepare(text: string) {
+        return { payload: { id: nanoid(), text, completed: false } };
+      },
+    },
+    toggleTodo(state, action: PayloadAction&lt;string&gt;) {
+      const todo = state.items.find(t =&gt; t.id === action.payload);
+      if (todo) todo.completed = !todo.completed; // Immer handles immutability
+    },
+    removeTodo(state, action: PayloadAction&lt;string&gt;) {
+      state.items = state.items.filter(t =&gt; t.id !== action.payload);
+    },
+    setFilter(state, action: PayloadAction&lt;TodoState['filter']&gt;) {
+      state.filter = action.payload;
+    },
+  },
+});
+
+export const { addTodo, toggleTodo, removeTodo, setFilter } = todosSlice.actions;
+export default todosSlice.reducer;</code></pre>
+
+<h3>configureStore</h3>
+
+<pre><code>import { configureStore } from '@reduxjs/toolkit';
+import todosReducer from './todosSlice';
+import usersReducer from './usersSlice';
+
+const store = configureStore({
+  reducer: {
+    todos: todosReducer,
+    users: usersReducer,
+  },
+  // Default middleware: thunk + serializability check + immutability check
+  // middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(logger),
+});
+
+export type RootState = ReturnType&lt;typeof store.getState&gt;;
+export type AppDispatch = typeof store.dispatch;</code></pre>
+
+<h3>createAsyncThunk</h3>
+
+<pre><code>import { createAsyncThunk, createSlice } from '@reduxjs/toolkit';
+
+export const fetchUsers = createAsyncThunk(
+  'users/fetchAll',
+  async (_, { rejectWithValue }) => {
+    try {
+      const response = await fetch('/api/users');
+      if (!response.ok) throw new Error('Failed');
+      return await response.json();
+    } catch (err) {
+      return rejectWithValue(err.message);
+    }
+  }
+);
+
+const usersSlice = createSlice({
+  name: 'users',
+  initialState: { items: [], loading: false, error: null },
+  reducers: {},
+  extraReducers: (builder) => {
+    builder
+      .addCase(fetchUsers.pending, (state) => {
+        state.loading = true;
+        state.error = null;
+      })
+      .addCase(fetchUsers.fulfilled, (state, action) => {
+        state.loading = false;
+        state.items = action.payload;
+      })
+      .addCase(fetchUsers.rejected, (state, action) => {
+        state.loading = false;
+        state.error = action.payload;
+      });
+  },
+});</code></pre>
+
+<h2 id="rtk-query">RTK Query</h2>
+
+<pre><code>import { createApi, fetchBaseQuery } from '@reduxjs/toolkit/query/react';
+
+const api = createApi({
+  reducerPath: 'api',
+  baseQuery: fetchBaseQuery({ baseUrl: '/api' }),
+  tagTypes: ['User', 'Post'],
+  endpoints: (builder) => ({
+    getUsers: builder.query({
+      query: () => '/users',
+      providesTags: ['User'],
+    }),
+    getUser: builder.query({
+      query: (id) => `/users/${id}`,
+      providesTags: (result, error, id) => [{ type: 'User', id }],
+    }),
+    createUser: builder.mutation({
+      query: (body) => ({ url: '/users', method: 'POST', body }),
+      invalidatesTags: ['User'], // refetch all user queries
+    }),
+    updateUser: builder.mutation({
+      query: ({ id, ...body }) => ({ url: `/users/${id}`, method: 'PUT', body }),
+      invalidatesTags: (result, error, { id }) => [{ type: 'User', id }],
+    }),
+  }),
+});
+
+export const { useGetUsersQuery, useGetUserQuery, useCreateUserMutation } = api;
+
+// Usage in component:
+function UserList() {
+  const { data: users, isLoading, error } = useGetUsersQuery();
+  const [createUser] = useCreateUserMutation();
+
+  if (isLoading) return &lt;Spinner /&gt;;
+  return users.map(u =&gt; &lt;UserCard key={u.id} user={u} /&gt;);
+}</code></pre>
+
+<h2 id="middleware">Middleware Pipeline</h2>
+
+<div class="diagram">
+Middleware Chain (applyMiddleware):
+
+dispatch(action)
+    │
+    ▼
+┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+│  Logger  │──▶│  Thunk   │──▶│  Saga    │──▶│ Reducer  │
+│          │   │          │   │          │   │          │
+│ log prev │   │ if fn,   │   │ watch    │   │ compute  │
+│ log action│  │ call it  │   │ patterns │   │ new state│
+│ log next │   │ else next│   │          │   │          │
+└──────────┘   └──────────┘   └──────────┘   └──────────┘
+</div>
+
+<pre><code>// Middleware signature: store => next => action => result
+// Simplified thunk middleware:
+function thunkMiddleware({ dispatch, getState }) {
+  return (next) => (action) => {
+    if (typeof action === 'function') {
+      return action(dispatch, getState);
+    }
+    return next(action);
+  };
+}
+
+// Logger middleware:
+function loggerMiddleware({ getState }) {
+  return (next) => (action) => {
+    console.log('dispatching', action);
+    console.log('prev state', getState());
+    const result = next(action);
+    console.log('next state', getState());
+    return result;
+  };
+}
+
+// applyMiddleware composes middleware into an enhancer:
+function applyMiddleware(...middlewares) {
+  return (createStore) => (reducer, preloadedState) => {
+    const store = createStore(reducer, preloadedState);
+    let dispatch = store.dispatch;
+
+    const middlewareAPI = {
+      getState: store.getState,
+      dispatch: (action) => dispatch(action),
+    };
+
+    const chain = middlewares.map(mw => mw(middlewareAPI));
+    dispatch = compose(...chain)(store.dispatch);
+
+    return { ...store, dispatch };
+  };
+}</code></pre>
+
+<h2 id="immer">Immer Integration</h2>
+
+<pre><code>// RTK uses Immer under the hood in createSlice reducers.
+// Immer uses JS Proxies to track mutations on a draft object,
+// then produces a new immutable state.
+
+// How Immer works (simplified):
+function produce(baseState, recipe) {
+  const draft = createProxy(baseState); // Proxy wrapping baseState
+  recipe(draft);                         // user mutates the draft
+  return finalize(draft);               // produce new immutable state
+}
+
+// What the Proxy tracks:
+const handler = {
+  get(target, prop) {
+    // Track read access, return proxied child for nested objects
+    return createProxy(target[prop]);
+  },
+  set(target, prop, value) {
+    // Mark this path as modified
+    // Copy-on-write: clone parent objects up to root
+    target[prop] = value;
+    return true;
+  },
+};
+
+// In RTK createSlice, this is transparent:
+reducers: {
+  updateUser(state, action) {
+    // Looks like mutation, but Immer produces immutable update:
+    state.user.name = action.payload.name;
+    state.user.email = action.payload.email;
+    // Equivalent to:
+    // return {
+    //   ...state,
+    //   user: { ...state.user, name: ..., email: ... }
+    // };
+  }
+}</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Immer Gotcha: Return vs Mutate</div>
+  <p>In an Immer-powered reducer, either mutate the draft OR return a new value — never both. If you return a value, Immer uses that instead of the draft. Returning <code>undefined</code> (implicit return) means "use the mutated draft."</p>
+</div>
+
+<h2 id="devtools">Redux DevTools Time-Travel</h2>
+
+<pre><code>// Redux DevTools works because Redux is pure:
+// Given the same initial state and sequence of actions,
+// you always get the same final state.
+
+// Time-travel replays actions from the beginning:
+// 1. Start with initialState
+// 2. Apply action[0] → state[1]
+// 3. Apply action[1] → state[2]
+// 4. Apply action[2] → state[3]
+// To "go back" to state[1], replay only action[0]
+
+// DevTools stores:
+// - Initial state
+// - Every dispatched action (with timestamp)
+// - Computed state at each step (for fast scrubbing)
+
+// configureStore automatically enables DevTools in development:
+const store = configureStore({
+  reducer: rootReducer,
+  devTools: process.env.NODE_ENV !== 'production',
+});</code></pre>
+
+<h2 id="selectors">Selector Memoization with Reselect</h2>
+
+<pre><code>import { createSelector } from '@reduxjs/toolkit'; // re-exports reselect
+
+// Input selectors (not memoized, just extract data):
+const selectTodos = (state: RootState) => state.todos.items;
+const selectFilter = (state: RootState) => state.todos.filter;
+
+// Memoized selector (only recomputes when inputs change):
+const selectFilteredTodos = createSelector(
+  [selectTodos, selectFilter],
+  (todos, filter) => {
+    switch (filter) {
+      case 'active': return todos.filter(t => !t.completed);
+      case 'completed': return todos.filter(t => t.completed);
+      default: return todos;
+    }
+  }
+);
+
+// Chained selectors:
+const selectTodoStats = createSelector(
+  [selectTodos],
+  (todos) => ({
+    total: todos.length,
+    completed: todos.filter(t => t.completed).length,
+    active: todos.filter(t => !t.completed).length,
+  })
+);
+
+// Usage in component:
+function TodoList() {
+  const filteredTodos = useSelector(selectFilteredTodos);
+  const stats = useSelector(selectTodoStats);
+  // Both only recompute when their input selectors return new values
+}</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight — Selector Architecture</div>
+  <p>Reselect's <code>createSelector</code> uses a default cache size of 1 (last result). If called with different arguments in the same render cycle (e.g., in a list), the cache thrashes. Solutions: (1) use <code>createSelector</code> with <code>memoizeOptions: { maxSize: N }</code>, (2) use <code>createEntityAdapter</code> for normalized data, (3) create per-component selector instances with <code>useMemo(() =&gt; createSelector(...), [])</code>.</p>
+</div>
+
+<h2 id="redux-vs-context">Redux vs useReducer + Context</h2>
+
+<table>
+<thead>
+<tr><th>Feature</th><th>Redux (RTK)</th><th>useReducer + Context</th></tr>
+</thead>
+<tbody>
+<tr><td>Selector-based subscriptions</td><td>Yes (<code>useSelector</code>)</td><td>No (all consumers re-render)</td></tr>
+<tr><td>Middleware</td><td>Yes (thunk, saga, etc.)</td><td>No (manual)</td></tr>
+<tr><td>DevTools</td><td>Yes (time-travel, action log)</td><td>No</td></tr>
+<tr><td>Memoized selectors</td><td>Yes (Reselect)</td><td>Manual (useMemo)</td></tr>
+<tr><td>Data fetching</td><td>RTK Query</td><td>Manual (useEffect)</td></tr>
+<tr><td>Bundle size</td><td>~11KB (RTK)</td><td>0KB (built-in)</td></tr>
+<tr><td>Boilerplate</td><td>Low (with RTK)</td><td>Very low</td></tr>
+<tr><td>Learning curve</td><td>Moderate</td><td>Low</td></tr>
+<tr><td>Concurrent mode safe</td><td>Yes (useSyncExternalStore)</td><td>Yes (built-in)</td></tr>
+</tbody>
+</table>
+
+<div class="callout callout-info">
+  <div class="callout-title">When to Choose Redux</div>
+  <p>Choose Redux when: (1) large app with many state slices, (2) need middleware for async logic, (3) need DevTools for debugging, (4) need selector-based subscriptions for performance, (5) team is already familiar with Redux. Choose useReducer+Context when: (1) small/medium app, (2) state is simple, (3) few consumers, (4) want zero dependencies.</p>
+</div>
+
+<div class="nav-footer">
+  <a href="02-context-at-scale.html">← Context at Scale</a>
+  <a href="04-zustand-jotai-signals.html">Zustand, Jotai &amp; Signals →</a>
+</div>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

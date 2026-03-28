@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Next.js Architecture — Server-Side Rendering — React JS Deep Dive</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Server-Side Rendering</a>
+  <span class="sep">›</span>
+  Next.js Architecture
+</nav>
+
+<h1>Next.js Architecture</h1>
+<p class="subtitle">Deep dive into Next.js App Router internals — file-system routing, layouts, Server Actions, the four caching layers, revalidation strategies, and partial prerendering.</p>
+
+<nav class="toc">
+  <h3>Table of Contents</h3>
+  <ul>
+    <li><a href="#app-router">App Router Internals</a></li>
+    <li><a href="#file-routing">File-System Routing Convention</a></li>
+    <li><a href="#layouts-templates">Layouts and Templates</a></li>
+    <li><a href="#server-actions">Server Actions</a></li>
+    <li><a href="#route-handlers">Route Handlers</a></li>
+    <li><a href="#middleware">Middleware</a></li>
+    <li><a href="#rendering-modes">Static and Dynamic Rendering</a></li>
+    <li><a href="#caching-layers">The Four Caching Layers</a></li>
+    <li><a href="#partial-prerendering">Partial Prerendering</a></li>
+  </ul>
+</nav>
+
+<h2 id="app-router">App Router Internals</h2>
+
+<p>The Next.js App Router (introduced in v13.4) is built on React Server Components, Suspense, and streaming. It represents a fundamental architectural shift from the Pages Router — every component is a server component by default, layouts persist across navigations, and data fetching is colocated with components.</p>
+
+<div class="diagram">
+App Router Architecture:
+
+Request → Middleware → Route Matching → Rendering Pipeline
+                                              │
+                    ┌─────────────────────────┤
+                    │                         │
+              Static Route              Dynamic Route
+                    │                         │
+              Serve from cache         Server Render
+              (Full Route Cache)             │
+                                    ┌────────┴────────┐
+                                    │                 │
+                              RSC Render         HTML Stream
+                              (Flight payload)   (renderToPipeableStream)
+                                    │                 │
+                                    └────────┬────────┘
+                                             │
+                                       Client receives
+                                       RSC payload + HTML
+</div>
+
+<h2 id="file-routing">File-System Routing Convention</h2>
+
+<p>The App Router uses a file-system convention where folder structure maps to URL segments. Special file names have specific roles in the rendering pipeline.</p>
+
+<pre><code>app/
+├── layout.tsx          # Root layout (wraps entire app)
+├── page.tsx            # Home page (/)
+├── loading.tsx         # Suspense fallback for /
+├── error.tsx           # Error boundary for /
+├── not-found.tsx       # 404 page
+├── global-error.tsx    # Root error boundary
+│
+├── dashboard/
+│   ├── layout.tsx      # Dashboard layout (persists across sub-routes)
+│   ├── page.tsx        # /dashboard
+│   ├── loading.tsx     # Suspense fallback for /dashboard
+│   │
+│   ├── analytics/
+│   │   └── page.tsx    # /dashboard/analytics
+│   │
+│   └── settings/
+│       ├── page.tsx    # /dashboard/settings
+│       └── error.tsx   # Error boundary for /dashboard/settings
+│
+├── blog/
+│   ├── page.tsx        # /blog (list page)
+│   └── [slug]/
+│       ├── page.tsx    # /blog/:slug (dynamic segment)
+│       └── opengraph-image.tsx  # OG image generation
+│
+├── api/
+│   └── webhook/
+│       └── route.ts    # API route: POST /api/webhook
+│
+└── (marketing)/        # Route group (no URL segment)
+    ├── layout.tsx      # Shared marketing layout
+    ├── about/
+    │   └── page.tsx    # /about
+    └── pricing/
+        └── page.tsx    # /pricing</code></pre>
+
+<h3>Special Files</h3>
+
+<table>
+  <thead>
+    <tr><th>File</th><th>Role</th><th>React Equivalent</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>page.tsx</code></td><td>Route UI — makes the segment publicly accessible</td><td>Component rendered for the route</td></tr>
+    <tr><td><code>layout.tsx</code></td><td>Shared UI — wraps page and child layouts, preserves state</td><td>Persistent wrapper component</td></tr>
+    <tr><td><code>template.tsx</code></td><td>Like layout but re-mounts on navigation</td><td>Wrapper that unmounts/remounts</td></tr>
+    <tr><td><code>loading.tsx</code></td><td>Instant loading UI</td><td><code>&lt;Suspense fallback={...}&gt;</code></td></tr>
+    <tr><td><code>error.tsx</code></td><td>Error UI</td><td>Error boundary (<code>'use client'</code> required)</td></tr>
+    <tr><td><code>not-found.tsx</code></td><td>404 UI</td><td>Rendered when <code>notFound()</code> is called</td></tr>
+    <tr><td><code>route.ts</code></td><td>API endpoint</td><td>Request/Response handler (no React)</td></tr>
+  </tbody>
+</table>
+
+<h3>How Next.js Composes Special Files</h3>
+
+<div class="diagram">
+File Composition for /dashboard/settings:
+
+&lt;RootLayout&gt;                    ← app/layout.tsx
+  &lt;RootErrorBoundary&gt;           ← app/global-error.tsx
+    &lt;DashboardLayout&gt;           ← app/dashboard/layout.tsx
+      &lt;ErrorBoundary&gt;           ← app/dashboard/settings/error.tsx
+        &lt;Suspense&gt;              ← app/dashboard/settings/loading.tsx
+          &lt;SettingsPage /&gt;      ← app/dashboard/settings/page.tsx
+        &lt;/Suspense&gt;
+      &lt;/ErrorBoundary&gt;
+    &lt;/DashboardLayout&gt;
+  &lt;/RootErrorBoundary&gt;
+&lt;/RootLayout&gt;
+</div>
+
+<h2 id="layouts-templates">Layouts and Templates</h2>
+
+<p>Layouts are the key architectural primitive in the App Router. They persist across navigations — their state, effects, and DOM are preserved when navigating between sibling routes.</p>
+
+<pre><code>// app/dashboard/layout.tsx — Server Component
+// This layout persists when navigating between
+// /dashboard/analytics and /dashboard/settings
+export default function DashboardLayout({ children }) {
+  return (
+    &lt;div className="dashboard"&gt;
+      &lt;Sidebar /&gt;
+      &lt;main&gt;{children}&lt;/main&gt;
+    &lt;/div&gt;
+  );
+}
+
+// app/dashboard/template.tsx — Re-mounts on every navigation
+// Use for: entry animations, per-page effects, resetting state
+'use client';
+export default function DashboardTemplate({ children }) {
+  useEffect(() => {
+    // Fires on EVERY navigation (unlike layout)
+    trackPageView();
+  });
+
+  return &lt;motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}&gt;
+    {children}
+  &lt;/motion.div&gt;;
+}</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">Layout vs Template Internals</div>
+  <p>Layouts use React's component identity to persist — the same layout component instance is reused across navigations, so <code>useState</code> and <code>useRef</code> values survive. Templates use a different <code>key</code> prop for each navigation, forcing React to unmount and remount the component tree.</p>
+</div>
+
+<h2 id="server-actions">Server Actions</h2>
+
+<p>Server Actions are async functions that execute on the server, callable from both server and client components. They replace traditional API routes for mutations and form handling.</p>
+
+<pre><code>// actions/posts.ts
+'use server';
+
+import { db } from '@/lib/db';
+import { revalidatePath } from 'next/cache';
+import { redirect } from 'next/navigation';
+import { z } from 'zod';
+
+const CreatePostSchema = z.object({
+  title: z.string().min(1).max(200),
+  content: z.string().min(1),
+});
+
+export async function createPost(formData: FormData) {
+  // Validate input
+  const parsed = CreatePostSchema.safeParse({
+    title: formData.get('title'),
+    content: formData.get('content'),
+  });
+
+  if (!parsed.success) {
+    return { error: parsed.error.flatten().fieldErrors };
+  }
+
+  // Mutate data
+  const post = await db.posts.create({
+    data: parsed.data,
+  });
+
+  // Revalidate cache
+  revalidatePath('/blog');
+
+  // Redirect
+  redirect(`/blog/${post.slug}`);
+}</code></pre>
+
+<pre><code>// Using Server Action in a form (progressive enhancement)
+import { createPost } from '@/actions/posts';
+
+export default function NewPostPage() {
+  return (
+    &lt;form action={createPost}&gt;
+      &lt;input name="title" required /&gt;
+      &lt;textarea name="content" required /&gt;
+      &lt;SubmitButton /&gt;
+    &lt;/form&gt;
+  );
+}
+
+// Client component for pending state
+'use client';
+import { useFormStatus } from 'react-dom';
+
+function SubmitButton() {
+  const { pending } = useFormStatus();
+  return (
+    &lt;button type="submit" disabled={pending}&gt;
+      {pending ? 'Creating...' : 'Create Post'}
+    &lt;/button&gt;
+  );
+}</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p>Server Actions work without JavaScript — the form submits as a standard POST request, and the server handles the redirect. When JavaScript is available, the form submission is intercepted, the action is called via fetch, and the UI updates without a full page reload. This progressive enhancement is a key architectural advantage over traditional SPA mutation patterns.</p>
+</div>
+
+<h2 id="route-handlers">Route Handlers</h2>
+
+<pre><code>// app/api/posts/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+
+// GET /api/posts
+export async function GET(request: NextRequest) {
+  const searchParams = request.nextUrl.searchParams;
+  const page = parseInt(searchParams.get('page') ?? '1');
+
+  const posts = await db.posts.findMany({
+    skip: (page - 1) * 20,
+    take: 20,
+  });
+
+  return NextResponse.json(posts);
+}
+
+// POST /api/posts
+export async function POST(request: NextRequest) {
+  const body = await request.json();
+  const post = await db.posts.create({ data: body });
+  return NextResponse.json(post, { status: 201 });
+}
+
+// Dynamic route: app/api/posts/[id]/route.ts
+export async function GET(
+  request: NextRequest,
+  { params }: { params: { id: string } }
+) {
+  const post = await db.posts.findUnique({
+    where: { id: params.id }
+  });
+
+  if (!post) {
+    return NextResponse.json(
+      { error: 'Not found' },
+      { status: 404 }
+    );
+  }
+
+  return NextResponse.json(post);
+}</code></pre>
+
+<h2 id="middleware">Middleware</h2>
+
+<p>Next.js middleware runs before every request, at the edge. It can rewrite, redirect, modify headers, or return early responses. Middleware runs in the Edge Runtime (V8 isolates, no Node.js APIs).</p>
+
+<pre><code>// middleware.ts (root of project)
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+
+export function middleware(request: NextRequest) {
+  // Authentication check
+  const token = request.cookies.get('session')?.value;
+
+  if (request.nextUrl.pathname.startsWith('/dashboard')) {
+    if (!token) {
+      return NextResponse.redirect(
+        new URL('/login', request.url)
+      );
+    }
+  }
+
+  // Geolocation-based routing
+  const country = request.geo?.country ?? 'US';
+  if (request.nextUrl.pathname === '/') {
+    return NextResponse.rewrite(
+      new URL(`/${country.toLowerCase()}`, request.url)
+    );
+  }
+
+  // Add custom headers
+  const response = NextResponse.next();
+  response.headers.set('x-request-id', crypto.randomUUID());
+  return response;
+}
+
+export const config = {
+  matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)'],
+};</code></pre>
+
+<h2 id="rendering-modes">Static and Dynamic Rendering</h2>
+
+<p>Next.js automatically determines whether a route is static or dynamic based on the APIs used in the component tree.</p>
+
+<table>
+  <thead>
+    <tr><th>Triggers Dynamic Rendering</th><th>Stays Static</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>cookies()</code>, <code>headers()</code></td><td><code>fetch()</code> with default caching</td></tr>
+    <tr><td><code>searchParams</code> prop</td><td><code>generateStaticParams()</code></td></tr>
+    <tr><td><code>export const dynamic = 'force-dynamic'</code></td><td><code>export const dynamic = 'force-static'</code></td></tr>
+    <tr><td>Uncached <code>fetch()</code> (<code>cache: 'no-store'</code>)</td><td><code>export const revalidate = N</code></td></tr>
+    <tr><td><code>unstable_noStore()</code></td><td>No dynamic APIs used</td></tr>
+  </tbody>
+</table>
+
+<h2 id="caching-layers">The Four Caching Layers</h2>
+
+<p>Next.js has four distinct caching layers, each operating at a different level. Understanding all four is critical for debugging caching issues and designing performant applications.</p>
+
+<div class="diagram">
+Next.js Caching Layers:
+
+Layer 1: Request Memoization (per-request, server only)
+├─ Deduplicates identical fetch() calls within a single render
+├─ Scope: Single server request
+└─ Automatic for fetch() with same URL + options
+
+Layer 2: Data Cache (persistent, server only)
+├─ Caches fetch() responses across requests
+├─ Scope: Across requests and deployments
+├─ Revalidation: time-based or on-demand
+└─ Stored in .next/cache or external store
+
+Layer 3: Full Route Cache (persistent, server only)
+├─ Caches rendered RSC payload + HTML at build time
+├─ Scope: Static routes only
+├─ Invalidated when Data Cache is revalidated
+└─ Stored in .next/cache
+
+Layer 4: Router Cache (ephemeral, client only)
+├─ Caches RSC payload in browser memory
+├─ Scope: User session (client-side navigation)
+├─ Duration: 30s (dynamic) / 5min (static)
+└─ Invalidated by router.refresh() or revalidation
+</div>
+
+<pre><code>// Layer 1: Request Memoization
+// These two calls are deduplicated within the same request
+async function ProductPage({ params }) {
+  const product = await fetch(`/api/products/${params.id}`);
+  // ...
+}
+async function ProductReviews({ productId }) {
+  // Same URL = same fetch, deduplicated automatically
+  const product = await fetch(`/api/products/${productId}`);
+  // ...
+}
+
+// Layer 2: Data Cache — controlling cache behavior
+// Cached indefinitely (default)
+fetch('https://api.example.com/data');
+
+// Revalidate every 60 seconds
+fetch('https://api.example.com/data', {
+  next: { revalidate: 60 }
+});
+
+// No caching
+fetch('https://api.example.com/data', {
+  cache: 'no-store'
+});
+
+// Tag-based revalidation
+fetch('https://api.example.com/posts', {
+  next: { tags: ['posts'] }
+});
+// Later: revalidateTag('posts')</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Common Caching Pitfall</div>
+  <p>The Router Cache (Layer 4) caches RSC payloads on the client for 30 seconds (dynamic pages) or 5 minutes (static pages). This means client-side navigations may show stale data even after server-side revalidation. Use <code>router.refresh()</code> to force a fresh fetch, or understand that users may see slightly stale data during client-side navigation.</p>
+</div>
+
+<h2 id="partial-prerendering">Partial Prerendering</h2>
+
+<p>Partial Prerendering (PPR) is an experimental Next.js feature that combines static and dynamic rendering in a single route. The static shell is served from the CDN, and dynamic holes are streamed in.</p>
+
+<div class="diagram">
+Partial Prerendering:
+
+Build Time:
+┌──────────────────────────────────────┐
+│  Static Shell (prerendered)          │
+│  ├─ Header                           │
+│  ├─ Navigation                       │
+│  ├─ [Suspense hole: user greeting]   │ ← dynamic
+│  ├─ Product description (static)     │
+│  ├─ [Suspense hole: price]           │ ← dynamic
+│  ├─ [Suspense hole: inventory]       │ ← dynamic
+│  └─ Footer                           │
+└──────────────────────────────────────┘
+
+Request Time:
+1. CDN serves static shell instantly (0ms TTFB)
+2. Server streams dynamic holes:
+   ├─ User greeting (personalized)
+   ├─ Price (real-time)
+   └─ Inventory (real-time)
+3. Client replaces Suspense fallbacks with streamed content
+</div>
+
+<pre><code>// Partial Prerendering example
+import { Suspense } from 'react';
+import { unstable_noStore } from 'next/cache';
+
+// Static: prerendered at build time
+export default function ProductPage({ params }) {
+  return (
+    &lt;div&gt;
+      &lt;Header /&gt;
+
+      &lt;Suspense fallback={&lt;GreetingSkeleton /&gt;}&gt;
+        &lt;UserGreeting /&gt;  {/* Dynamic: personalized */}
+      &lt;/Suspense&gt;
+
+      &lt;ProductDescription slug={params.slug} /&gt;  {/* Static */}
+
+      &lt;Suspense fallback={&lt;PriceSkeleton /&gt;}&gt;
+        &lt;DynamicPrice productId={params.id} /&gt;  {/* Dynamic */}
+      &lt;/Suspense&gt;
+
+      &lt;Footer /&gt;
+    &lt;/div&gt;
+  );
+}
+
+// This component opts into dynamic rendering
+async function DynamicPrice({ productId }) {
+  unstable_noStore(); // Marks as dynamic
+  const price = await fetchCurrentPrice(productId);
+  return &lt;span&gt;${price}&lt;/span&gt;;
+}</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p>PPR represents the convergence of SSG and SSR — you get CDN-speed TTFB for the static shell with real-time dynamic content streamed in. This eliminates the binary choice between static and dynamic rendering. At L6, understand that PPR requires careful Suspense boundary design: each dynamic section needs its own Suspense boundary to create a "hole" in the static shell.</p>
+</div>
+
+<nav class="nav-footer">
+  <a href="03-streaming-architecture.html">← Streaming Architecture</a>
+  <a href="05-meta-frameworks.html">Meta-Frameworks →</a>
+</nav>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

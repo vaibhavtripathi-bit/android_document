@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Caching Strategies — Server-Side Rendering — React JS Deep Dive</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Server-Side Rendering</a>
+  <span class="sep">›</span>
+  Caching Strategies
+</nav>
+
+<h1>Caching Strategies</h1>
+<p class="subtitle">Multi-layer caching for SSR applications — HTTP caching, CDN strategies, application-level caching, ISR, on-demand revalidation, distributed caching, and cache stampede prevention.</p>
+
+<nav class="toc">
+  <h3>Table of Contents</h3>
+  <ul>
+    <li><a href="#http-caching">HTTP Caching</a></li>
+    <li><a href="#cdn-caching">CDN Caching for SSR</a></li>
+    <li><a href="#app-caching">Application-Level Caching</a></li>
+    <li><a href="#isr">Incremental Static Regeneration</a></li>
+    <li><a href="#on-demand">On-Demand Revalidation</a></li>
+    <li><a href="#tag-invalidation">Tag-Based Cache Invalidation</a></li>
+    <li><a href="#distributed">Distributed Caching</a></li>
+    <li><a href="#stampede">Cache Stampede Prevention</a></li>
+  </ul>
+</nav>
+
+<h2 id="http-caching">HTTP Caching</h2>
+
+<p>HTTP caching is the foundation of SSR performance. The <code>Cache-Control</code> header controls how browsers, CDNs, and proxies cache responses. Understanding every directive is essential for Staff-level SSR architecture.</p>
+
+<h3>Cache-Control Directives</h3>
+
+<pre><code>// Cache-Control header anatomy
+Cache-Control: public, max-age=60, s-maxage=3600, stale-while-revalidate=86400
+
+// Directive breakdown:
+// public          — Any cache (browser, CDN, proxy) can store this
+// private         — Only the browser can cache (personalized content)
+// max-age=60      — Browser cache: fresh for 60 seconds
+// s-maxage=3600   — Shared cache (CDN): fresh for 1 hour
+// no-cache        — Must revalidate with origin before using cached copy
+// no-store        — Never cache (sensitive data)
+// must-revalidate — Once stale, MUST revalidate (no serving stale)
+// stale-while-revalidate=86400 — Serve stale for 24h while revalidating
+// stale-if-error=86400 — Serve stale for 24h if origin errors</code></pre>
+
+<h3>ETag and Conditional Requests</h3>
+
+<pre><code>// Server generates ETag based on content hash
+import crypto from 'crypto';
+
+function handleSSR(req, res) {
+  const html = renderPage(req.url);
+  const etag = crypto
+    .createHash('md5')
+    .update(html)
+    .digest('hex');
+
+  // Check if client has current version
+  if (req.headers['if-none-match'] === `"${etag}"`) {
+    res.status(304).end(); // Not Modified — use cached version
+    return;
+  }
+
+  res.setHeader('ETag', `"${etag}"`);
+  res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+  res.send(html);
+}
+
+// Flow:
+// 1. First request: Server sends HTML + ETag: "abc123"
+// 2. Second request: Browser sends If-None-Match: "abc123"
+// 3. If content unchanged: Server responds 304 (no body)
+// 4. If content changed: Server sends new HTML + new ETag</code></pre>
+
+<h3>Stale-While-Revalidate (SWR)</h3>
+
+<div class="diagram">
+stale-while-revalidate Timeline:
+
+Cache-Control: max-age=60, stale-while-revalidate=3600
+
+t=0s:    Request → Cache MISS → Origin renders → Cache stores → Response
+t=30s:   Request → Cache HIT (fresh) → Instant response
+t=60s:   Content becomes STALE
+t=90s:   Request → Cache serves STALE instantly
+                 → Background revalidation to origin
+                 → Cache updates with fresh content
+t=3660s: Stale window expires → Cache MISS → Origin renders
+</div>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p><code>stale-while-revalidate</code> is the most important caching directive for SSR. It provides instant responses (from stale cache) while ensuring freshness (background revalidation). For most SSR pages, <code>Cache-Control: public, s-maxage=60, stale-while-revalidate=86400</code> provides an excellent balance: CDN serves cached content for 1 minute, then serves stale for up to 24 hours while revalidating in the background.</p>
+</div>
+
+<h2 id="cdn-caching">CDN Caching for SSR</h2>
+
+<p>CDN caching for SSR pages requires careful consideration of cache keys, personalization, and invalidation. Unlike static assets (which are immutable), SSR pages have dynamic content that must be cached intelligently.</p>
+
+<pre><code>// CDN caching strategy for SSR pages
+function getSSRCacheHeaders(req) {
+  const isAuthenticated = req.cookies.session;
+  const isBot = /bot|crawler/i.test(req.headers['user-agent']);
+
+  if (isAuthenticated) {
+    // Personalized pages: no CDN caching
+    return {
+      'Cache-Control': 'private, no-cache',
+      'CDN-Cache-Control': 'no-store',
+    };
+  }
+
+  if (isBot) {
+    // Bots: cache longer (they don't need real-time data)
+    return {
+      'Cache-Control': 'public, max-age=3600',
+      'CDN-Cache-Control': 'public, max-age=86400',
+    };
+  }
+
+  // Public pages: aggressive CDN caching with SWR
+  return {
+    'Cache-Control': 'public, max-age=0, must-revalidate',
+    'CDN-Cache-Control': 'public, s-maxage=300, stale-while-revalidate=86400',
+    'Surrogate-Control': 'max-age=300', // Fastly/Varnish
+  };
+}
+
+// Vary header: different cache entries per variant
+res.setHeader('Vary', 'Accept-Language, Accept-Encoding');
+// CDN caches separate versions for:
+// - Accept-Language: en → English version
+// - Accept-Language: ja → Japanese version
+// - Accept-Encoding: gzip vs br → compression variants</code></pre>
+
+<h3>Cache Key Design</h3>
+
+<table>
+  <thead>
+    <tr><th>Cache Key Component</th><th>When to Include</th><th>Impact</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>URL path</td><td>Always</td><td>Base cache key</td></tr>
+    <tr><td>Query parameters</td><td>When they affect content</td><td>More cache entries, lower hit rate</td></tr>
+    <tr><td>Accept-Language</td><td>Internationalized sites</td><td>N entries per page (N = languages)</td></tr>
+    <tr><td>Cookie (session)</td><td>Never for CDN (use private)</td><td>Would create per-user entries</td></tr>
+    <tr><td>Device type</td><td>If serving different HTML</td><td>2-3x entries (mobile/tablet/desktop)</td></tr>
+    <tr><td>Country/region</td><td>Geo-specific content</td><td>Many entries, consider edge rendering instead</td></tr>
+  </tbody>
+</table>
+
+<h2 id="app-caching">Application-Level Caching</h2>
+
+<h3>React cache() Function</h3>
+
+<pre><code>// React cache() — request-level memoization
+import { cache } from 'react';
+
+// Deduplicated within a single render/request
+const getUser = cache(async (userId: string) => {
+  const response = await fetch(`/api/users/${userId}`);
+  return response.json();
+});
+
+// Both components call getUser('123') but only ONE fetch happens
+async function UserProfile({ userId }) {
+  const user = await getUser(userId);
+  return &lt;div&gt;{user.name}&lt;/div&gt;;
+}
+
+async function UserAvatar({ userId }) {
+  const user = await getUser(userId); // Deduplicated!
+  return &lt;img src={user.avatar} /&gt;;
+}</code></pre>
+
+<h3>Next.js Caching Layers</h3>
+
+<pre><code>// Layer 1: Request Memoization (automatic with fetch)
+// Same fetch URL + options = deduplicated within one request
+const data1 = await fetch('https://api.example.com/data');
+const data2 = await fetch('https://api.example.com/data'); // Reuses data1
+
+// Layer 2: Data Cache (persistent across requests)
+// Default: cached indefinitely
+const data = await fetch('https://api.example.com/data');
+
+// Time-based revalidation
+const data = await fetch('https://api.example.com/data', {
+  next: { revalidate: 60 } // Revalidate every 60s
+});
+
+// Tag-based invalidation
+const data = await fetch('https://api.example.com/posts', {
+  next: { tags: ['posts'] }
+});
+
+// No caching
+const data = await fetch('https://api.example.com/data', {
+  cache: 'no-store'
+});
+
+// Layer 3: Full Route Cache (static routes only)
+// Automatically caches RSC payload + HTML for static routes
+// Invalidated when underlying Data Cache entries are revalidated
+
+// Layer 4: Router Cache (client-side, in-memory)
+// Caches RSC payloads during client-side navigation
+// Duration: 30s (dynamic) / 5min (static) / session-based
+import { useRouter } from 'next/navigation';
+const router = useRouter();
+router.refresh(); // Invalidates Router Cache for current route</code></pre>
+
+<h2 id="isr">Incremental Static Regeneration</h2>
+
+<p>ISR combines the performance of static generation with the freshness of server rendering. Pages are generated at build time and regenerated in the background when the revalidation period expires.</p>
+
+<div class="diagram">
+ISR Lifecycle:
+
+Build Time:
+  Page generated → Cached as static HTML
+  
+t=0:    Request → Serve static HTML (instant, from CDN)
+t=30s:  Request → Serve static HTML (still fresh)
+t=60s:  Revalidation period expires (revalidate: 60)
+t=61s:  Request → Serve STALE static HTML (instant)
+                → Trigger background regeneration
+                → New HTML generated and cached
+t=62s:  Request → Serve NEW static HTML (fresh)
+
+On-Demand:
+  revalidatePath('/blog/post-1') → Immediately regenerate
+  revalidateTag('posts') → Regenerate all pages with 'posts' tag
+</div>
+
+<pre><code>// ISR with time-based revalidation
+// app/blog/[slug]/page.tsx
+export const revalidate = 60; // Revalidate every 60 seconds
+
+export async function generateStaticParams() {
+  const posts = await getAllPosts();
+  return posts.map(post => ({ slug: post.slug }));
+}
+
+export default async function BlogPost({ params }) {
+  const post = await getPost(params.slug);
+  return &lt;Article post={post} /&gt;;
+}
+
+// ISR with on-demand revalidation
+// app/api/revalidate/route.ts
+import { revalidatePath, revalidateTag } from 'next/cache';
+
+export async function POST(request: Request) {
+  const { secret, path, tag } = await request.json();
+
+  if (secret !== process.env.REVALIDATION_SECRET) {
+    return Response.json({ error: 'Invalid secret' }, { status: 401 });
+  }
+
+  if (path) {
+    revalidatePath(path);
+  }
+  if (tag) {
+    revalidateTag(tag);
+  }
+
+  return Response.json({ revalidated: true, now: Date.now() });
+}</code></pre>
+
+<h2 id="on-demand">On-Demand Revalidation</h2>
+
+<pre><code>// Webhook-triggered revalidation (CMS publishes content)
+// app/api/cms-webhook/route.ts
+export async function POST(request: Request) {
+  const payload = await request.json();
+
+  // Verify webhook signature
+  const signature = request.headers.get('x-cms-signature');
+  if (!verifySignature(payload, signature)) {
+    return Response.json({ error: 'Invalid signature' }, { status: 401 });
+  }
+
+  switch (payload.event) {
+    case 'post.published':
+    case 'post.updated':
+      // Revalidate specific post page
+      revalidatePath(`/blog/${payload.data.slug}`);
+      // Revalidate blog listing
+      revalidateTag('blog-posts');
+      break;
+
+    case 'post.deleted':
+      revalidatePath(`/blog/${payload.data.slug}`);
+      revalidateTag('blog-posts');
+      break;
+
+    case 'settings.updated':
+      // Revalidate entire site layout
+      revalidatePath('/', 'layout');
+      break;
+  }
+
+  return Response.json({ revalidated: true });
+}
+
+// Server Action with revalidation
+'use server';
+export async function updateProduct(formData: FormData) {
+  const id = formData.get('id');
+  await db.products.update({
+    where: { id },
+    data: { name: formData.get('name') },
+  });
+
+  // Revalidate the product page and listing
+  revalidatePath(`/products/${id}`);
+  revalidateTag('products');
+}</code></pre>
+
+<h2 id="tag-invalidation">Tag-Based Cache Invalidation</h2>
+
+<pre><code>// Tag-based caching — group related cache entries
+// app/blog/page.tsx
+async function BlogList() {
+  const posts = await fetch('https://api.example.com/posts', {
+    next: { tags: ['posts', 'blog-listing'] }
+  }).then(r => r.json());
+
+  return posts.map(post => &lt;PostCard key={post.id} post={post} /&gt;);
+}
+
+// app/blog/[slug]/page.tsx
+async function BlogPost({ params }) {
+  const post = await fetch(`https://api.example.com/posts/${params.slug}`, {
+    next: { tags: ['posts', `post-${params.slug}`] }
+  }).then(r => r.json());
+
+  const comments = await fetch(
+    `https://api.example.com/posts/${params.slug}/comments`,
+    { next: { tags: [`comments-${params.slug}`] } }
+  ).then(r => r.json());
+
+  return &lt;Article post={post} comments={comments} /&gt;;
+}
+
+// Invalidation scenarios:
+// revalidateTag('posts')              → All post pages + listing
+// revalidateTag('post-hello-world')   → Just one post page
+// revalidateTag('comments-hello-world') → Just comments for one post
+// revalidateTag('blog-listing')       → Just the listing page</code></pre>
+
+<h2 id="distributed">Distributed Caching</h2>
+
+<h3>Redis Caching for SSR</h3>
+
+<pre><code>// Redis-backed SSR cache
+import Redis from 'ioredis';
+
+const redis = new Redis(process.env.REDIS_URL);
+
+async function cachedSSR(req, res, renderFn) {
+  const cacheKey = `ssr:${req.url}`;
+
+  // Try cache first
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    const { html, headers, timestamp } = JSON.parse(cached);
+    res.setHeader('X-Cache', 'HIT');
+    res.setHeader('X-Cache-Age', Math.floor((Date.now() - timestamp) / 1000));
+    Object.entries(headers).forEach(([k, v]) => res.setHeader(k, v));
+    return res.send(html);
+  }
+
+  // Cache miss — render and store
+  const html = await renderFn(req);
+  const cacheEntry = {
+    html,
+    headers: { 'Content-Type': 'text/html' },
+    timestamp: Date.now(),
+  };
+
+  // Store with TTL
+  await redis.setex(cacheKey, 300, JSON.stringify(cacheEntry));
+
+  res.setHeader('X-Cache', 'MISS');
+  res.send(html);
+}
+
+// Cache warming — pre-populate cache for high-traffic pages
+async function warmCache(urls: string[]) {
+  const concurrency = 10;
+  for (let i = 0; i < urls.length; i += concurrency) {
+    const batch = urls.slice(i, i + concurrency);
+    await Promise.all(
+      batch.map(url =>
+        fetch(`https://internal.example.com${url}`, {
+          headers: { 'X-Cache-Warm': 'true' }
+        })
+      )
+    );
+  }
+}</code></pre>
+
+<h2 id="stampede">Cache Stampede Prevention</h2>
+
+<p>A cache stampede occurs when a cached entry expires and many concurrent requests hit the origin simultaneously, overwhelming the server. This is a critical concern for high-traffic SSR applications.</p>
+
+<div class="diagram">
+Cache Stampede:
+
+Normal:   [Cache HIT] [Cache HIT] [Cache HIT] [Expire] [Cache MISS → Origin]
+
+Stampede:
+  [Cache HIT] [Cache HIT] [Expire]
+                                    ├─ Request 1 → Origin (render)
+                                    ├─ Request 2 → Origin (render)
+                                    ├─ Request 3 → Origin (render)
+                                    ├─ ...
+                                    └─ Request N → Origin (render)
+                                    ALL hit origin simultaneously!
+
+Prevention (Lock):
+  [Cache HIT] [Cache HIT] [Expire]
+                                    ├─ Request 1 → Acquires lock → Origin
+                                    ├─ Request 2 → Lock held → Serve stale
+                                    ├─ Request 3 → Lock held → Serve stale
+                                    └─ Request 1 completes → Updates cache
+                                                           → Release lock
+</div>
+
+<pre><code>// Cache stampede prevention with distributed lock
+async function getWithStampedeProtection(key, renderFn, ttl = 300) {
+  const cached = await redis.get(`cache:${key}`);
+
+  if (cached) {
+    const entry = JSON.parse(cached);
+    const age = (Date.now() - entry.timestamp) / 1000;
+
+    if (age < ttl) {
+      return entry.data; // Fresh — serve directly
+    }
+
+    // Stale — try to acquire lock for revalidation
+    const lockKey = `lock:${key}`;
+    const acquired = await redis.set(lockKey, '1', 'EX', 30, 'NX');
+
+    if (acquired) {
+      // We got the lock — revalidate in background
+      renderFn().then(async (data) => {
+        await redis.setex(
+          `cache:${key}`,
+          ttl * 2, // Store for 2x TTL (stale buffer)
+          JSON.stringify({ data, timestamp: Date.now() })
+        );
+        await redis.del(lockKey);
+      });
+    }
+
+    // Serve stale while revalidating (whether we got lock or not)
+    return entry.data;
+  }
+
+  // No cache at all — must render synchronously
+  const data = await renderFn();
+  await redis.setex(
+    `cache:${key}`,
+    ttl * 2,
+    JSON.stringify({ data, timestamp: Date.now() })
+  );
+  return data;
+}
+
+// Probabilistic early expiration (jitter)
+function shouldRevalidateEarly(age, ttl) {
+  // As age approaches TTL, probability of early revalidation increases
+  // This spreads revalidation across time, preventing stampedes
+  const remaining = ttl - age;
+  const probability = Math.exp(-remaining / (ttl * 0.1));
+  return Math.random() < probability;
+}</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p>At L6, your caching strategy should be a multi-layer architecture: (1) Browser cache for repeat visits, (2) CDN/edge cache for geographic distribution, (3) Application cache (Redis) for computed data, (4) Framework cache (Next.js Data Cache) for fetch deduplication. Each layer has different TTLs and invalidation strategies. The key insight: cache invalidation is harder than caching — invest in robust invalidation (tags, webhooks, on-demand) rather than just TTLs.</p>
+</div>
+
+<nav class="nav-footer">
+  <a href="06-edge-rendering.html">← Edge Rendering</a>
+  <a href="08-interview-qa.html">Interview Q&amp;A →</a>
+</nav>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

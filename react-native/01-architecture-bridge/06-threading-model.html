@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Threading Model — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Architecture &amp; Bridge</a><span class="sep">›</span>
+        Threading Model
+    </nav>
+
+    <h1>Threading Model</h1>
+    <p class="subtitle">React Native operates across three primary threads with distinct responsibilities. Understanding thread communication, blocking behavior, and scheduling is essential for building responsive apps and diagnosing performance issues at Staff level.</p>
+
+    <nav class="nav">
+        <a href="01-bridge-architecture.html">Bridge Architecture</a>
+        <a href="02-javascript-runtime.html">JS Runtime</a>
+        <a href="03-native-module-system.html">Native Modules</a>
+        <a href="04-shadow-tree-yoga.html">Shadow Tree &amp; Yoga</a>
+        <a href="05-rendering-pipeline.html">Rendering Pipeline</a>
+        <a href="06-threading-model.html" class="active">Threading Model</a>
+        <a href="07-metro-bundler.html">Metro Bundler</a>
+        <a href="08-interview-qa.html">Interview Q&amp;A</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#three-threads">1. Three Main Threads</a></li>
+            <li><a href="#js-thread">2. JS Thread Deep Dive</a></li>
+            <li><a href="#ui-thread">3. Main/UI Thread Deep Dive</a></li>
+            <li><a href="#shadow-thread">4. Shadow/Background Thread</a></li>
+            <li><a href="#communication">5. Thread Communication via Bridge</a></li>
+            <li><a href="#native-animations">6. Native Animations on UI Thread</a></li>
+            <li><a href="#interaction-manager">7. InteractionManager</a></li>
+            <li><a href="#raf">8. requestAnimationFrame Behavior</a></li>
+            <li><a href="#timers">9. Timers Across Threads</a></li>
+            <li><a href="#thread-safety">10. Thread Safety Considerations</a></li>
+            <li><a href="#architect">11. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="three-threads">1. Three Main Threads</h2>
+
+    <div class="diagram">
+React Native Thread Architecture
+═════════════════════════════════
+
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │  JS Thread   │  │Shadow Thread │  │  Main/UI Thread  │  │
+│  │              │  │              │  │                  │  │
+│  │ • React      │  │ • Yoga       │  │ • View creation  │  │
+│  │ • Business   │  │   layout     │  │ • Touch handling │  │
+│  │   logic      │  │ • Shadow     │  │ • Native anim.  │  │
+│  │ • State mgmt │  │   tree diff  │  │ • System events  │  │
+│  │ • Event      │  │ • Text       │  │ • Accessibility  │  │
+│  │   handlers   │  │   measurement│  │ • Screen render  │  │
+│  │              │  │              │  │                  │  │
+│  │ Single-      │  │ Background   │  │ Must never be    │  │
+│  │ threaded     │  │ serial queue │  │ blocked (>16ms)  │  │
+│  └──────┬───────┘  └──────┬───────┘  └────────┬─────────┘  │
+│         │                 │                    │            │
+│         └────────┬────────┘────────────────────┘            │
+│                  │                                          │
+│         ┌────────▼────────┐                                 │
+│         │    Bridge       │                                 │
+│         │  (MessageQueue) │                                 │
+│         └─────────────────┘                                 │
+│                                                              │
+│  Additional threads:                                         │
+│  • NativeModules thread (Android: shared for all modules)   │
+│  • Timer thread (manages setTimeout/setInterval)            │
+│  • Network threads (per-request, managed by platform)       │
+│  • Image decoding threads                                    │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="js-thread">2. JS Thread Deep Dive</h2>
+
+    <p>The JS thread runs the JavaScript VM (Hermes/JSC) and is <strong>single-threaded</strong>. All React reconciliation, state updates, event handler callbacks, and business logic execute on this thread.</p>
+
+    <pre><code><span class="comment">// Everything on the JS thread is sequential:</span>
+
+<span class="comment">// Frame timeline on JS thread:</span>
+<span class="comment">// 1. Process native events (touch, scroll, timer callbacks)</span>
+<span class="comment">// 2. Execute event handlers (onPress, onScroll, etc.)</span>
+<span class="comment">// 3. Process state updates (setState batching)</span>
+<span class="comment">// 4. React reconciliation (fiber tree walk)</span>
+<span class="comment">// 5. Generate UIManager commands</span>
+<span class="comment">// 6. Flush bridge queue</span>
+<span class="comment">// 7. Execute microtasks (Promise.then, queueMicrotask)</span>
+<span class="comment">// 8. Execute requestAnimationFrame callbacks</span>
+
+<span class="comment">// Why single-threaded?</span>
+<span class="comment">// 1. JavaScript is inherently single-threaded (no shared memory)</span>
+<span class="comment">// 2. React's reconciliation assumes single-threaded execution</span>
+<span class="comment">// 3. Simplifies state management (no locks, no races)</span>
+<span class="comment">// 4. Matches web mental model (event loop)</span>
+
+<span class="comment">// Consequence: long-running JS blocks EVERYTHING</span>
+<span class="keyword">function</span> expensiveCalculation() {
+  <span class="comment">// This blocks the JS thread for 100ms</span>
+  <span class="keyword">let</span> sum = 0;
+  <span class="keyword">for</span> (<span class="keyword">let</span> i = 0; i &lt; 10_000_000; i++) sum += Math.sqrt(i);
+  <span class="keyword">return</span> sum;
+}
+<span class="comment">// During those 100ms:</span>
+<span class="comment">// - No touch events processed</span>
+<span class="comment">// - No state updates</span>
+<span class="comment">// - No animations (JS-driven ones)</span>
+<span class="comment">// - UI thread continues independently (native animations OK)</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Critical Understanding</div>
+        <p>Blocking the JS thread does NOT freeze the UI thread. Native animations, touch recognition, and scroll physics continue running on the UI thread. But any JS-driven response (event handlers, state updates, JS-animated values) will be delayed. This is why native-driven animations (<code>useNativeDriver: true</code>) remain smooth even when JS is busy.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="ui-thread">3. Main/UI Thread Deep Dive</h2>
+
+    <pre><code><span class="comment">// The UI thread (main thread) handles all platform UI operations</span>
+
+<span class="comment">// iOS: Main thread = main dispatch queue</span>
+<span class="comment">// - UIKit operations MUST be on main thread</span>
+<span class="comment">// - CADisplayLink fires on main thread (60/120fps)</span>
+<span class="comment">// - Touch events originate on main thread</span>
+<span class="comment">// - Core Animation compositing</span>
+
+<span class="comment">// Android: Main thread = UI thread = Looper.getMainLooper()</span>
+<span class="comment">// - View operations MUST be on UI thread</span>
+<span class="comment">// - Choreographer.doFrame() on UI thread</span>
+<span class="comment">// - Touch events dispatched on UI thread</span>
+<span class="comment">// - Hardware-accelerated rendering</span>
+
+<span class="comment">// What runs on UI thread in React Native:</span>
+<span class="comment">// 1. Native view creation/mutation (from shadow thread results)</span>
+<span class="comment">// 2. Touch event recognition and dispatch</span>
+<span class="comment">// 3. Native-driven animations (Animated with useNativeDriver)</span>
+<span class="comment">// 4. Scroll physics and momentum</span>
+<span class="comment">// 5. Keyboard show/hide animations</span>
+<span class="comment">// 6. Navigation transitions (native stack)</span>
+<span class="comment">// 7. Accessibility announcements</span>
+<span class="comment">// 8. StatusBar updates</span>
+
+<span class="comment">// DANGER: Blocking UI thread = frozen app</span>
+<span class="comment">// Unlike JS thread (where only JS responses are delayed),</span>
+<span class="comment">// blocking UI thread freezes EVERYTHING:</span>
+<span class="comment">// - No touch response</span>
+<span class="comment">// - No scroll</span>
+<span class="comment">// - No animations</span>
+<span class="comment">// - ANR dialog on Android (>5s block)</span>
+<span class="comment">// - Watchdog kill on iOS (>10s block)</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="shadow-thread">4. Shadow/Background Thread</h2>
+
+    <pre><code><span class="comment">// The shadow thread handles layout computation</span>
+
+<span class="comment">// Responsibilities:</span>
+<span class="comment">// 1. Maintain shadow node tree (C++ objects)</span>
+<span class="comment">// 2. Run Yoga layout calculations</span>
+<span class="comment">// 3. Diff shadow trees to produce minimal mutations</span>
+<span class="comment">// 4. Text measurement coordination</span>
+
+<span class="comment">// iOS: Dedicated serial dispatch queue</span>
+<span class="comment">//   dispatch_queue_create("com.facebook.react.ShadowQueue", SERIAL)</span>
+
+<span class="comment">// Android: Dedicated thread</span>
+<span class="comment">//   Thread("native_modules_thread") — shared with NativeModules</span>
+
+<span class="comment">// Shadow thread workflow per frame:</span>
+<span class="comment">// 1. Receive UIManager commands from bridge</span>
+<span class="comment">// 2. Create/update/delete shadow nodes</span>
+<span class="comment">// 3. Mark dirty nodes in Yoga tree</span>
+<span class="comment">// 4. Calculate layout (YGNodeCalculateLayout)</span>
+<span class="comment">// 5. Collect layout changes</span>
+<span class="comment">// 6. Dispatch view mutations to UI thread</span>
+
+<span class="comment">// The shadow thread is the "translator" between</span>
+<span class="comment">// React's declarative descriptions and native imperative APIs</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="communication">5. Thread Communication via Bridge</h2>
+
+    <div class="diagram">
+Thread Communication Patterns
+═════════════════════════════
+
+1. JS → Native (most common):
+   JS Thread ──bridge──→ Shadow Thread ──dispatch──→ UI Thread
+   (setState)            (layout calc)               (view update)
+
+2. Native → JS (events):
+   UI Thread ──bridge──→ JS Thread
+   (touch)               (onPress handler)
+
+3. Timer flow:
+   Timer Thread ──signal──→ JS Thread
+   (setTimeout expired)     (callback execution)
+
+4. Native animation (bypasses JS):
+   UI Thread ──direct──→ UI Thread
+   (CADisplayLink)        (update animated values)
+   No bridge crossing! No JS involvement!
+
+5. Gesture handler (react-native-gesture-handler):
+   UI Thread ──direct──→ UI Thread (gesture recognition)
+              ──bridge──→ JS Thread (only for state callbacks)
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="native-animations">6. Native Animations on UI Thread</h2>
+
+    <pre><code><span class="comment">// Native-driven animations run entirely on UI thread</span>
+
+<span class="keyword">import</span> { Animated } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="keyword">const</span> opacity = useRef(<span class="keyword">new</span> Animated.Value(0)).current;
+
+<span class="comment">// JS-driven animation (BAD for performance):</span>
+Animated.timing(opacity, {
+  toValue: 1,
+  duration: 300,
+  useNativeDriver: <span class="keyword">false</span>,  <span class="comment">// ← runs on JS thread</span>
+}).start();
+<span class="comment">// Each frame: JS calculates value → bridge → native updates view</span>
+<span class="comment">// If JS thread is busy, animation drops frames</span>
+
+<span class="comment">// Native-driven animation (GOOD):</span>
+Animated.timing(opacity, {
+  toValue: 1,
+  duration: 300,
+  useNativeDriver: <span class="keyword">true</span>,  <span class="comment">// ← runs on UI thread</span>
+}).start();
+<span class="comment">// Animation config sent to native ONCE</span>
+<span class="comment">// Native CADisplayLink/Choreographer drives each frame</span>
+<span class="comment">// JS thread completely uninvolved after start()</span>
+
+<span class="comment">// Limitation: useNativeDriver only supports non-layout props:</span>
+<span class="comment">// ✅ opacity, transform (translateX/Y, scale, rotate)</span>
+<span class="comment">// ❌ width, height, padding, margin, top, left, flex</span>
+<span class="comment">// Reason: layout props require Yoga recalculation (shadow thread)</span>
+
+<span class="comment">// react-native-reanimated v2+ solves this:</span>
+<span class="comment">// Runs JS worklets on UI thread via JSI</span>
+<span class="comment">// Can animate ANY prop including layout props</span>
+<span class="keyword">import</span> Reanimated, { useSharedValue, withTiming } <span class="keyword">from</span> <span class="string">'react-native-reanimated'</span>;
+
+<span class="keyword">const</span> width = useSharedValue(100);
+width.value = withTiming(200, { duration: 300 });
+<span class="comment">// Runs entirely on UI thread, including layout recalculation</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="interaction-manager">7. InteractionManager</h2>
+
+    <p><code>InteractionManager</code> allows deferring expensive work until after animations and interactions complete, preventing jank during transitions.</p>
+
+    <pre><code><span class="keyword">import</span> { InteractionManager } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="comment">// Defer expensive work until after navigation animation</span>
+<span class="keyword">useEffect</span>(() => {
+  <span class="keyword">const</span> task = InteractionManager.runAfterInteractions(() => {
+    <span class="comment">// This runs after all animations/interactions complete</span>
+    fetchLargeDataset();
+    initializeExpensiveModule();
+    precomputeSearchIndex();
+  });
+
+  <span class="keyword">return</span> () => task.cancel();
+}, []);
+
+<span class="comment">// How it works internally:</span>
+<span class="comment">// 1. Animations register as "interactions" when started</span>
+<span class="comment">// 2. InteractionManager maintains a count of active interactions</span>
+<span class="comment">// 3. When count reaches 0, queued callbacks execute</span>
+<span class="comment">// 4. Callbacks run on JS thread (still blocks JS if expensive)</span>
+
+<span class="comment">// Creating custom interactions:</span>
+<span class="keyword">const</span> handle = InteractionManager.createInteractionHandle();
+<span class="comment">// ... do animation or transition ...</span>
+InteractionManager.clearInteractionHandle(handle);
+<span class="comment">// Queued runAfterInteractions callbacks now execute</span>
+
+<span class="comment">// Common pattern: screen load optimization</span>
+<span class="keyword">function</span> <span class="type">ProfileScreen</span>() {
+  <span class="keyword">const</span> [dataReady, setDataReady] = useState(<span class="keyword">false</span>);
+
+  <span class="keyword">useEffect</span>(() => {
+    InteractionManager.runAfterInteractions(() => {
+      <span class="comment">// Load data AFTER navigation animation completes</span>
+      loadProfileData().then(() => setDataReady(<span class="keyword">true</span>));
+    });
+  }, []);
+
+  <span class="keyword">if</span> (!dataReady) <span class="keyword">return</span> &lt;<span class="type">SkeletonLoader</span> /&gt;;
+  <span class="keyword">return</span> &lt;<span class="type">ProfileContent</span> /&gt;;
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="raf">8. requestAnimationFrame Behavior</h2>
+
+    <pre><code><span class="comment">// requestAnimationFrame in React Native vs Browser</span>
+
+<span class="comment">// Browser: callback tied to display refresh (vsync)</span>
+<span class="comment">// - Runs before paint</span>
+<span class="comment">// - Guaranteed to be in sync with display</span>
+<span class="comment">// - Callback receives DOMHighResTimeStamp</span>
+
+<span class="comment">// React Native: callback tied to Choreographer/CADisplayLink</span>
+<span class="comment">// - Fires on JS thread (NOT UI thread)</span>
+<span class="comment">// - Triggered by native vsync signal crossing bridge to JS</span>
+<span class="comment">// - Inherent latency: native vsync → bridge → JS callback</span>
+<span class="comment">// - If JS thread is busy, callback is delayed</span>
+
+requestAnimationFrame((timestamp) => {
+  <span class="comment">// timestamp: performance.now() value</span>
+  <span class="comment">// This runs on JS thread</span>
+  <span class="comment">// Any view updates still need to cross bridge to native</span>
+  <span class="comment">// Total latency: vsync → JS → bridge → shadow → UI = 1-2 frames</span>
+});
+
+<span class="comment">// For smooth 60fps animations, DON'T use rAF + setState:</span>
+<span class="comment">// BAD:</span>
+<span class="keyword">function</span> animate() {
+  requestAnimationFrame(() => {
+    setValue(prev => prev + 1);  <span class="comment">// setState → reconcile → bridge → native</span>
+    animate();                    <span class="comment">// Always 1-2 frames behind</span>
+  });
+}
+
+<span class="comment">// GOOD: Use Animated API with native driver</span>
+<span class="comment">// or react-native-reanimated for UI thread animations</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="timers">9. Timers Across Threads</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Timer API</th>
+                <th>Where Timer Lives</th>
+                <th>Where Callback Runs</th>
+                <th>Precision</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>setTimeout</code></td>
+                <td>Native timer module</td>
+                <td>JS thread</td>
+                <td>~5ms minimum (bridge latency)</td>
+            </tr>
+            <tr>
+                <td><code>setInterval</code></td>
+                <td>Native timer module</td>
+                <td>JS thread</td>
+                <td>~5ms minimum, can drift</td>
+            </tr>
+            <tr>
+                <td><code>requestAnimationFrame</code></td>
+                <td>Native vsync</td>
+                <td>JS thread</td>
+                <td>~16.67ms (60fps) + bridge latency</td>
+            </tr>
+            <tr>
+                <td><code>setImmediate</code></td>
+                <td>JS event loop</td>
+                <td>JS thread</td>
+                <td>Next JS event loop tick</td>
+            </tr>
+            <tr>
+                <td><code>queueMicrotask</code></td>
+                <td>JS microtask queue</td>
+                <td>JS thread</td>
+                <td>Before next macrotask</td>
+            </tr>
+            <tr>
+                <td><code>Promise.then</code></td>
+                <td>JS microtask queue</td>
+                <td>JS thread</td>
+                <td>Before next macrotask</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Timer execution order in React Native:</span>
+
+console.log(<span class="string">'1: synchronous'</span>);
+
+setTimeout(() => console.log(<span class="string">'5: setTimeout'</span>), 0);
+
+setImmediate(() => console.log(<span class="string">'4: setImmediate'</span>));
+
+Promise.resolve().then(() => console.log(<span class="string">'2: microtask'</span>));
+
+queueMicrotask(() => console.log(<span class="string">'3: queueMicrotask'</span>));
+
+<span class="comment">// Output order: 1, 2, 3, 4, 5</span>
+<span class="comment">// Microtasks (Promise, queueMicrotask) run before macrotasks</span>
+<span class="comment">// setImmediate runs before setTimeout(fn, 0) in RN</span>
+<span class="comment">// setTimeout(fn, 0) has bridge latency (~5ms)</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="thread-safety">10. Thread Safety Considerations</h2>
+
+    <pre><code><span class="comment">// Thread safety issues in React Native</span>
+
+<span class="comment">// 1. NativeModule methods can be called from any thread</span>
+<span class="comment">// iOS: Each module has its own methodQueue (serial)</span>
+<span class="comment">// Android: All modules share NativeModulesThread by default</span>
+
+<span class="comment">// 2. Shared state between JS and native is dangerous</span>
+<span class="comment">// The bridge is the synchronization mechanism</span>
+<span class="comment">// No shared memory = no data races (in old arch)</span>
+<span class="comment">// But: stale data is possible (async updates)</span>
+
+<span class="comment">// 3. UI operations MUST be on main thread</span>
+<span class="comment">// iOS: dispatch_async(dispatch_get_main_queue(), ^{ ... });</span>
+<span class="comment">// Android: runOnUiThread { ... } or Handler(Looper.getMainLooper())</span>
+
+<span class="comment">// 4. Yoga is NOT thread-safe</span>
+<span class="comment">// All Yoga operations must be on shadow thread</span>
+<span class="comment">// Never access YGNode from UI thread</span>
+
+<span class="comment">// 5. New architecture (JSI) introduces shared memory</span>
+<span class="comment">// JSI HostObjects are accessible from multiple threads</span>
+<span class="comment">// Must use mutexes or ensure single-thread access</span>
+
+<span class="comment">// Common pattern: thread-safe native module (iOS)</span>
+@implementation ThreadSafeModule {
+  NSMutableDictionary *_cache;
+  dispatch_queue_t _cacheQueue;
+}
+
+- (instancetype)init {
+  <span class="keyword">if</span> (<span class="keyword">self</span> = [<span class="keyword">super</span> init]) {
+    _cache = [NSMutableDictionary new];
+    _cacheQueue = dispatch_queue_create(
+      <span class="string">"com.app.cache"</span>,
+      DISPATCH_QUEUE_CONCURRENT
+    );
+  }
+  <span class="keyword">return</span> <span class="keyword">self</span>;
+}
+
+<span class="comment">// Read: concurrent access OK</span>
+- (id)getFromCache:(NSString *)key {
+  __block id result;
+  dispatch_sync(_cacheQueue, ^{
+    result = _cache[key];
+  });
+  <span class="keyword">return</span> result;
+}
+
+<span class="comment">// Write: barrier for exclusive access</span>
+- (<span class="keyword">void</span>)setInCache:(NSString *)key value:(id)value {
+  dispatch_barrier_async(_cacheQueue, ^{
+    _cache[key] = value;
+  });
+}
+@end</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">11. Architect Considerations</h2>
+
+    <h3>11.1 Thread-Aware Architecture Decisions</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Scenario</th>
+                <th>Thread Impact</th>
+                <th>Solution</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Heavy JS computation</td>
+                <td>Blocks JS thread → no event processing</td>
+                <td>Move to native module or use Web Workers (limited)</td>
+            </tr>
+            <tr>
+                <td>Scroll-driven animation</td>
+                <td>Each frame crosses bridge twice</td>
+                <td>Animated.event with useNativeDriver or Reanimated</td>
+            </tr>
+            <tr>
+                <td>Large list rendering</td>
+                <td>Many createView calls congest bridge</td>
+                <td>FlatList virtualization, view recycling</td>
+            </tr>
+            <tr>
+                <td>Navigation transitions</td>
+                <td>JS busy during transition = jank</td>
+                <td>Native stack navigator, InteractionManager</td>
+            </tr>
+            <tr>
+                <td>Image decoding</td>
+                <td>Can block UI thread if synchronous</td>
+                <td>Async decoding (Fresco/SDWebImage default)</td>
+            </tr>
+            <tr>
+                <td>Database queries</td>
+                <td>Large results congest bridge</td>
+                <td>Paginate, use JSI-based DB (WatermelonDB)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>The threading model is the key to understanding React Native performance. At L6, your mental model should be: <strong>the JS thread is your bottleneck, the UI thread is your lifeline, and the bridge is your tax</strong>. Every architectural decision should minimize JS thread work during interactions (use native drivers, defer with InteractionManager), keep the UI thread free (never block with synchronous native calls), and reduce bridge traffic (batch operations, use JSI where possible). The new architecture fundamentally changes this model by allowing JS and native to share memory via JSI, enabling synchronous communication without serialization — but the threading model itself (JS thread, UI thread, background threads) remains.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="05-rendering-pipeline.html">← Rendering Pipeline</a>
+        <a href="07-metro-bundler.html">Next: Metro Bundler →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>useMemo &amp; useCallback — React Hooks Internals</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Hooks Internals</a>
+  <span class="sep">›</span>
+  useMemo &amp; useCallback
+</nav>
+
+<h1>useMemo &amp; useCallback Internals</h1>
+<p class="subtitle">Memoization hook implementation, dependency comparison, performance trade-offs, and how React Compiler (Forget) eliminates manual memoization.</p>
+
+<nav class="nav">
+  <a href="01-hooks-architecture.html">Hooks Architecture</a>
+  <a href="02-usestate-usereducer.html">useState &amp; useReducer</a>
+  <a href="03-useeffect-lifecycle.html">useEffect Lifecycle</a>
+  <a href="05-useref-imperative.html">useRef &amp; Imperative</a>
+  <a href="06-custom-hooks.html">Custom Hooks</a>
+  <a href="07-use-hook-react19.html">use() Hook</a>
+  <a href="08-concurrent-hooks.html">Concurrent Hooks</a>
+  <a href="09-interview-qa.html">Interview Q&amp;A</a>
+</nav>
+
+<h2 id="internal-implementation">Internal Implementation</h2>
+
+<p>Both <code>useMemo</code> and <code>useCallback</code> store their result and dependencies on the hook's <code>memoizedState</code> as a tuple. The only difference: <code>useMemo</code> stores the computed value; <code>useCallback</code> stores the function itself.</p>
+
+<pre><code>// Mount implementations:
+function mountMemo(nextCreate, deps) {
+  const hook = mountWorkInProgressHook();
+  const nextDeps = deps === undefined ? null : deps;
+  const nextValue = nextCreate(); // compute immediately
+  hook.memoizedState = [nextValue, nextDeps];
+  return nextValue;
+}
+
+function mountCallback(callback, deps) {
+  const hook = mountWorkInProgressHook();
+  const nextDeps = deps === undefined ? null : deps;
+  hook.memoizedState = [callback, nextDeps]; // store function, not result
+  return callback;
+}
+
+// Update implementations:
+function updateMemo(nextCreate, deps) {
+  const hook = updateWorkInProgressHook();
+  const nextDeps = deps === undefined ? null : deps;
+  const prevState = hook.memoizedState;
+
+  if (nextDeps !== null) {
+    const prevDeps = prevState[1];
+    if (areHookInputsEqual(nextDeps, prevDeps)) {
+      return prevState[0]; // deps unchanged — return cached value
+    }
+  }
+
+  const nextValue = nextCreate(); // deps changed — recompute
+  hook.memoizedState = [nextValue, nextDeps];
+  return nextValue;
+}
+
+function updateCallback(callback, deps) {
+  const hook = updateWorkInProgressHook();
+  const nextDeps = deps === undefined ? null : deps;
+  const prevState = hook.memoizedState;
+
+  if (nextDeps !== null) {
+    const prevDeps = prevState[1];
+    if (areHookInputsEqual(nextDeps, prevDeps)) {
+      return prevState[0]; // deps unchanged — return cached function
+    }
+  }
+
+  hook.memoizedState = [callback, nextDeps];
+  return callback;
+}</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p><code>useCallback(fn, deps)</code> is exactly equivalent to <code>useMemo(() =&gt; fn, deps)</code>. The separate API exists purely for readability and intent signaling. Internally, both use the same <code>[value, deps]</code> tuple on <code>hook.memoizedState</code>.</p>
+</div>
+
+<h3>Hook State Shape</h3>
+
+<div class="diagram">
+useMemo(() => expensiveCompute(a, b), [a, b]):
+
+  hook.memoizedState = [
+    computedResult,     // the return value of the factory
+    [a, b]              // frozen dependency snapshot
+  ]
+
+useCallback((x) => doSomething(x, a), [a]):
+
+  hook.memoizedState = [
+    (x) => doSomething(x, a),  // the callback itself
+    [a]                         // frozen dependency snapshot
+  ]
+</div>
+
+<h2 id="dependency-comparison">Dependency Comparison Mechanism</h2>
+
+<pre><code>function areHookInputsEqual(nextDeps, prevDeps) {
+  // Same function used by useEffect, useMemo, useCallback
+  if (prevDeps === null) return false;
+
+  for (let i = 0; i &lt; prevDeps.length && i &lt; nextDeps.length; i++) {
+    if (Object.is(nextDeps[i], prevDeps[i])) continue;
+    return false;
+  }
+  return true;
+}
+
+// Implications:
+// 1. Primitive deps (number, string, boolean) work well
+// 2. Object/array deps compare by reference — new object = cache miss
+// 3. No length check — if deps array length changes, it still
+//    compares up to the shorter length (ESLint plugin catches this)</code></pre>
+
+<h2 id="when-memoization-helps">When Memoization Helps</h2>
+
+<h3>Case 1: Expensive Computation</h3>
+
+<pre><code>function SearchResults({ query, items }) {
+  // WITHOUT useMemo: filters 10,000 items on every render
+  // even if only an unrelated prop changed
+  const filtered = items.filter(item =>
+    item.name.toLowerCase().includes(query.toLowerCase())
+  );
+
+  // WITH useMemo: only recomputes when query or items change
+  const filtered = useMemo(() =>
+    items.filter(item =>
+      item.name.toLowerCase().includes(query.toLowerCase())
+    ),
+    [query, items]
+  );
+
+  return filtered.map(item => &lt;Item key={item.id} data={item} /&gt;);
+}</code></pre>
+
+<h3>Case 2: Referential Equality for Child Props</h3>
+
+<pre><code>// React.memo + useCallback pattern:
+const ExpensiveChild = React.memo(({ onClick, config }) => {
+  // Only re-renders if onClick or config reference changes
+  return &lt;div onClick={onClick}&gt;{/* expensive render */}&lt;/div&gt;;
+});
+
+function Parent({ userId }) {
+  const [count, setCount] = useState(0);
+
+  // WITHOUT useCallback: new function every render → child re-renders
+  const handleClick = () => fetchUser(userId);
+
+  // WITH useCallback: stable reference when userId unchanged
+  const handleClick = useCallback(() => fetchUser(userId), [userId]);
+
+  // WITHOUT useMemo: new object every render → child re-renders
+  const config = { theme: 'dark', userId };
+
+  // WITH useMemo: stable reference when userId unchanged
+  const config = useMemo(() => ({ theme: 'dark', userId }), [userId]);
+
+  return (
+    &lt;&gt;
+      &lt;button onClick={() =&gt; setCount(c =&gt; c + 1)}&gt;{count}&lt;/button&gt;
+      &lt;ExpensiveChild onClick={handleClick} config={config} /&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+<h2 id="when-memoization-hurts">When Memoization Hurts</h2>
+
+<table>
+<thead>
+<tr><th>Scenario</th><th>Why It Hurts</th></tr>
+</thead>
+<tbody>
+<tr><td>Trivial computation</td><td>Overhead of comparing deps + storing tuple exceeds saved work</td></tr>
+<tr><td>Deps change every render</td><td>Cache always misses — you pay comparison cost AND computation cost</td></tr>
+<tr><td>No downstream consumers</td><td>Stable reference doesn't matter if nothing uses <code>React.memo</code></td></tr>
+<tr><td>Primitive return values</td><td>Primitives are compared by value anyway — memoization adds nothing</td></tr>
+<tr><td>Memory pressure</td><td>Each memoized value is retained until deps change, increasing memory</td></tr>
+</tbody>
+</table>
+
+<pre><code>// UNNECESSARY memoization examples:
+
+// 1. Trivial computation
+const doubled = useMemo(() => count * 2, [count]);
+// Just write: const doubled = count * 2;
+
+// 2. Deps change every render
+const result = useMemo(() => transform(data), [data]);
+// If data is a new object every render, this never caches
+
+// 3. No React.memo consumer
+function Parent() {
+  const handler = useCallback(() => doThing(), []);
+  // Pointless if Child is NOT wrapped in React.memo
+  return &lt;Child onClick={handler} /&gt;;
+}
+
+// 4. Inline objects in JSX (common mistake)
+&lt;Child style={useMemo(() => ({ color: 'red' }), [])} /&gt;
+// Only useful if Child is React.memo'd</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">The Memoization Tax</div>
+  <p>Every <code>useMemo</code>/<code>useCallback</code> call: (1) allocates a hook node on mount, (2) stores a <code>[value, deps]</code> tuple, (3) runs <code>Object.is</code> comparison per dependency on every render. For cheap computations, this overhead exceeds the cost of just recomputing. Profile before memoizing.</p>
+</div>
+
+<h2 id="react-memo">React.memo: The Other Half</h2>
+
+<pre><code>// React.memo wraps a component to skip re-renders when props are equal
+const MemoizedComponent = React.memo(function MyComponent(props) {
+  return &lt;div&gt;{props.name}&lt;/div&gt;;
+});
+
+// Default comparison: shallow equality (Object.is per prop)
+// Custom comparison:
+const MemoizedComponent = React.memo(MyComponent, (prevProps, nextProps) => {
+  // Return true to SKIP re-render (props are "equal")
+  // Return false to RE-RENDER
+  return prevProps.id === nextProps.id;
+});
+
+// Internal implementation (simplified):
+function memo(type, compare) {
+  const elementType = {
+    $$typeof: REACT_MEMO_TYPE,
+    type,                    // the wrapped component
+    compare: compare || null, // custom comparator
+  };
+  return elementType;
+}
+
+// During reconciliation, React checks:
+// 1. If compare exists: compare(prevProps, nextProps)
+// 2. Otherwise: shallowEqual(prevProps, nextProps)
+// If equal AND no state/context changes: bail out of rendering</code></pre>
+
+<h3>The Full Pattern: React.memo + useCallback + useMemo</h3>
+
+<div class="diagram">
+Parent re-renders (state change)
+│
+├─ useCallback(fn, [dep]) → stable function ref (if dep unchanged)
+├─ useMemo(() => obj, [dep]) → stable object ref (if dep unchanged)
+│
+├─ &lt;MemoizedChild onClick={stableFn} data={stableObj} /&gt;
+│   │
+│   └─ React.memo comparison:
+│       Object.is(prevProps.onClick, nextProps.onClick) → true ✓
+│       Object.is(prevProps.data, nextProps.data) → true ✓
+│       → SKIP re-render of MemoizedChild
+│
+└─ Without useCallback/useMemo:
+    &lt;MemoizedChild onClick={newFn} data={newObj} /&gt;
+    │
+    └─ React.memo comparison:
+        Object.is(prevFn, newFn) → false ✗
+        → RE-RENDER MemoizedChild (memo defeated)
+</div>
+
+<h2 id="usememo-derived-state">useMemo for Derived State</h2>
+
+<pre><code>// Anti-pattern: storing derived state
+function TodoList({ todos, filter }) {
+  const [filteredTodos, setFilteredTodos] = useState([]);
+
+  useEffect(() => {
+    setFilteredTodos(todos.filter(t => t.status === filter));
+  }, [todos, filter]);
+  // Problem: extra render cycle, effect runs after paint
+
+  // Correct: derive during render with useMemo
+  const filteredTodos = useMemo(
+    () => todos.filter(t => t.status === filter),
+    [todos, filter]
+  );
+  // Computed synchronously during render, no extra cycle
+}
+
+// Even simpler — if the computation is cheap, skip useMemo:
+function TodoList({ todos, filter }) {
+  const filteredTodos = todos.filter(t => t.status === filter);
+  // Fine for small lists — no memoization overhead
+}</code></pre>
+
+<h2 id="react-compiler">React Compiler (React Forget)</h2>
+
+<p>The React Compiler is a build-time tool that automatically inserts memoization, eliminating the need for manual <code>useMemo</code>, <code>useCallback</code>, and <code>React.memo</code>.</p>
+
+<h3>How It Works</h3>
+
+<pre><code>// What you write:
+function ProductPage({ product }) {
+  const price = formatPrice(product.price);
+  const handleBuy = () => addToCart(product.id);
+
+  return (
+    &lt;div&gt;
+      &lt;span&gt;{price}&lt;/span&gt;
+      &lt;BuyButton onClick={handleBuy} /&gt;
+    &lt;/div&gt;
+  );
+}
+
+// What the compiler outputs (conceptually):
+function ProductPage({ product }) {
+  const $ = useMemoCache(4); // compiler-managed cache
+
+  let price;
+  if ($[0] !== product.price) {
+    price = formatPrice(product.price);
+    $[0] = product.price;
+    $[1] = price;
+  } else {
+    price = $[1];
+  }
+
+  let handleBuy;
+  if ($[2] !== product.id) {
+    handleBuy = () => addToCart(product.id);
+    $[2] = product.id;
+    $[3] = handleBuy;
+  } else {
+    handleBuy = $[3];
+  }
+
+  return (
+    &lt;div&gt;
+      &lt;span&gt;{price}&lt;/span&gt;
+      &lt;BuyButton onClick={handleBuy} /&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<h3>What the Compiler Analyzes</h3>
+
+<div class="diagram">
+React Compiler Pipeline:
+
+Source Code → Parse AST → Analyze Dependencies
+                              │
+                    ┌─────────┴──────────┐
+                    │ For each expression │
+                    │ track which values  │
+                    │ it depends on       │
+                    └─────────┬──────────┘
+                              │
+                    ┌─────────┴──────────┐
+                    │ Build dependency    │
+                    │ graph (reactive     │
+                    │ scopes)             │
+                    └─────────┬──────────┘
+                              │
+                    ┌─────────┴──────────┐
+                    │ Insert cache slots  │
+                    │ with guards for     │
+                    │ each scope          │
+                    └─────────┬──────────┘
+                              │
+                    Optimized Output
+</div>
+
+<h3>What the Compiler Eliminates</h3>
+
+<table>
+<thead>
+<tr><th>Manual Pattern</th><th>Compiler Equivalent</th></tr>
+</thead>
+<tbody>
+<tr><td><code>useMemo(() =&gt; compute(a), [a])</code></td><td>Auto-cached with dependency tracking</td></tr>
+<tr><td><code>useCallback(fn, [a])</code></td><td>Auto-cached function reference</td></tr>
+<tr><td><code>React.memo(Component)</code></td><td>JSX elements auto-memoized</td></tr>
+<tr><td>Manual dependency arrays</td><td>Compiler infers dependencies from code</td></tr>
+</tbody>
+</table>
+
+<div class="callout callout-info">
+  <div class="callout-title">Compiler Limitations</div>
+  <p>The compiler assumes code follows the <a href="https://react.dev/reference/rules">Rules of React</a>: components are pure, props/state are immutable, hooks follow the rules. Code that mutates props, uses non-idempotent renders, or relies on render-time side effects will produce incorrect results. The compiler includes a validation pass and will skip functions it can't safely optimize.</p>
+</div>
+
+<h2 id="cache-invalidation">Cache Invalidation Behavior</h2>
+
+<pre><code>// useMemo/useCallback cache is invalidated when:
+// 1. Any dependency changes (Object.is comparison)
+// 2. The component unmounts (hook state is destroyed)
+// 3. React drops the fiber (e.g., key change forces remount)
+
+// Cache is NOT invalidated by:
+// - Sibling re-renders
+// - Parent re-renders (if deps unchanged)
+// - Context changes (unless context value is a dependency)
+
+// React reserves the right to drop memoized values:
+// "You may rely on useMemo as a performance optimization,
+//  not as a semantic guarantee." — React docs
+//
+// In practice, React currently never drops cached values
+// unless the component unmounts, but future versions might
+// (e.g., offscreen components could have their cache evicted).</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight — Memoization Strategy</div>
+  <p>For L6 interviews: (1) Default to no memoization — React is fast enough for most cases. (2) Profile first with React DevTools Profiler. (3) Apply <code>React.memo</code> to expensive subtrees, then <code>useCallback</code>/<code>useMemo</code> for their props. (4) Consider the React Compiler for greenfield projects. (5) Never memoize as a premature optimization — it adds complexity and can mask real performance issues.</p>
+</div>
+
+<div class="nav-footer">
+  <a href="03-useeffect-lifecycle.html">← useEffect Lifecycle</a>
+  <a href="05-useref-imperative.html">useRef &amp; Imperative →</a>
+</div>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Render Phases — React JS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Rendering &amp; Reconciliation</a><span class="sep">›</span>
+        Render Phases
+    </nav>
+
+    <h1>Render Phases</h1>
+    <p class="subtitle">The two-phase rendering model: render phase (pure, interruptible, may run multiple times) and commit phase (synchronous, side-effects, touches DOM). beginWork, completeWork, and commitWork internals with fiber tree traversal diagrams.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#two-phases">1. The Two-Phase Model</a></li>
+            <li><a href="#render-phase">2. Render Phase Deep Dive</a></li>
+            <li><a href="#begin-work">3. beginWork — Descending Into Children</a></li>
+            <li><a href="#complete-work">4. completeWork — Bubbling Up</a></li>
+            <li><a href="#commit-phase">5. Commit Phase Deep Dive</a></li>
+            <li><a href="#commit-sub">6. Commit Sub-Phases</a></li>
+            <li><a href="#strict-mode">7. Why Render Must Be Pure (StrictMode)</a></li>
+            <li><a href="#traversal">8. Phase Diagram with Fiber Traversal</a></li>
+            <li><a href="#architect">9. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="two-phases">1. The Two-Phase Model</h2>
+
+    <p>Every React update goes through exactly two phases. Understanding the boundary between them is critical for writing correct, performant React code.</p>
+
+    <div class="diagram">
+setState() called
+       │
+       ▼
+┌──────────────────────────────────────────────────┐
+│              RENDER PHASE                         │
+│                                                   │
+│  • Pure computation (no side effects)             │
+│  • Interruptible (can pause and resume)           │
+│  • May be called multiple times (StrictMode)      │
+│  • Builds workInProgress fiber tree               │
+│  • Calls component functions / render methods     │
+│  • Diffs old vs new elements                      │
+│  • Collects effect flags on fibers                │
+│                                                   │
+│  Functions: beginWork() → completeWork()          │
+└──────────────────────┬───────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────┐
+│              COMMIT PHASE                         │
+│                                                   │
+│  • Synchronous (cannot be interrupted)            │
+│  • Runs exactly once per update                   │
+│  • Touches the real DOM                           │
+│  • Runs layout effects (useLayoutEffect)          │
+│  • Runs passive effects (useEffect)               │
+│  • Swaps current ↔ workInProgress trees           │
+│                                                   │
+│  Functions: commitWork() (3 sub-phases)           │
+└──────────────────────────────────────────────────┘
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>The render/commit split is React's fundamental architectural decision. By making the render phase pure and interruptible, React can: (1) pause rendering to handle user input, (2) render multiple versions of the UI simultaneously (concurrent features), (3) throw away incomplete renders without side effects, (4) call render functions multiple times safely (StrictMode). The commit phase is the "point of no return" — once it starts, it must finish synchronously to avoid showing partial DOM updates.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="render-phase">2. Render Phase Deep Dive</h2>
+
+    <p>The render phase walks the fiber tree, calling component functions and diffing their output against the previous render. It produces a list of effects (DOM mutations needed) but does not apply them.</p>
+
+    <pre><code><span class="comment">// The render phase work loop (simplified)</span>
+<span class="keyword">function</span> <span class="func">renderRootConcurrent</span>(root, lanes) {
+  <span class="comment">// Prepare the workInProgress tree</span>
+  <span class="func">prepareFreshStack</span>(root, lanes);
+
+  <span class="comment">// Process fibers one at a time</span>
+  <span class="keyword">while</span> (workInProgress !== <span class="keyword">null</span> && !<span class="func">shouldYield</span>()) {
+    <span class="func">performUnitOfWork</span>(workInProgress);
+  }
+
+  <span class="keyword">if</span> (workInProgress !== <span class="keyword">null</span>) {
+    <span class="comment">// Incomplete — schedule continuation</span>
+    <span class="keyword">return</span> RootInProgress;
+  }
+
+  <span class="comment">// Complete — ready for commit</span>
+  <span class="keyword">return</span> RootCompleted;
+}
+
+<span class="keyword">function</span> <span class="func">performUnitOfWork</span>(unitOfWork) {
+  <span class="keyword">const</span> current = unitOfWork.alternate;
+
+  <span class="comment">// Phase 1: Process this fiber, get first child</span>
+  <span class="keyword">const</span> next = <span class="func">beginWork</span>(current, unitOfWork, renderLanes);
+  unitOfWork.memoizedProps = unitOfWork.pendingProps;
+
+  <span class="keyword">if</span> (next === <span class="keyword">null</span>) {
+    <span class="comment">// No children — complete this fiber and siblings</span>
+    <span class="func">completeUnitOfWork</span>(unitOfWork);
+  } <span class="keyword">else</span> {
+    workInProgress = next; <span class="comment">// Descend into child</span>
+  }
+}</code></pre>
+
+    <h3>2.1 What Happens During Render</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Action</th>
+                <th>Allowed in Render?</th>
+                <th>Why</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Call component functions</td>
+                <td>Yes</td>
+                <td>Core purpose of render phase</td>
+            </tr>
+            <tr>
+                <td>Create new ReactElements</td>
+                <td>Yes</td>
+                <td>Elements are just objects</td>
+            </tr>
+            <tr>
+                <td>Diff old vs new elements</td>
+                <td>Yes</td>
+                <td>Pure comparison</td>
+            </tr>
+            <tr>
+                <td>Read from state/props</td>
+                <td>Yes</td>
+                <td>Pure data access</td>
+            </tr>
+            <tr>
+                <td>Mutate DOM</td>
+                <td>No</td>
+                <td>Render may be discarded</td>
+            </tr>
+            <tr>
+                <td>Start subscriptions</td>
+                <td>No</td>
+                <td>Can't clean up if discarded</td>
+            </tr>
+            <tr>
+                <td>Call setState</td>
+                <td>No (during render)</td>
+                <td>Infinite loop</td>
+            </tr>
+            <tr>
+                <td>Throw promises</td>
+                <td>Yes (Suspense)</td>
+                <td>Suspense mechanism</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="begin-work">3. beginWork — Descending Into Children</h2>
+
+    <p><code>beginWork</code> is called for each fiber during the downward traversal. Its job: process the fiber based on its tag and return the first child fiber (or null if leaf).</p>
+
+    <pre><code><span class="comment">// Simplified beginWork (from ReactFiberBeginWork.js)</span>
+<span class="keyword">function</span> <span class="func">beginWork</span>(current, workInProgress, renderLanes) {
+  <span class="comment">// Bailout check: can we skip this fiber?</span>
+  <span class="keyword">if</span> (current !== <span class="keyword">null</span>) {
+    <span class="keyword">const</span> oldProps = current.memoizedProps;
+    <span class="keyword">const</span> newProps = workInProgress.pendingProps;
+
+    <span class="keyword">if</span> (oldProps === newProps && !<span class="func">hasScheduledUpdate</span>(current, renderLanes)) {
+      <span class="comment">// No changes — bail out of entire subtree</span>
+      <span class="keyword">return</span> <span class="func">bailoutOnAlreadyFinishedWork</span>(current, workInProgress);
+    }
+  }
+
+  <span class="comment">// Process based on fiber tag</span>
+  <span class="keyword">switch</span> (workInProgress.tag) {
+    <span class="keyword">case</span> FunctionComponent:
+      <span class="keyword">return</span> <span class="func">updateFunctionComponent</span>(current, workInProgress, renderLanes);
+    <span class="keyword">case</span> ClassComponent:
+      <span class="keyword">return</span> <span class="func">updateClassComponent</span>(current, workInProgress, renderLanes);
+    <span class="keyword">case</span> HostComponent:
+      <span class="keyword">return</span> <span class="func">updateHostComponent</span>(current, workInProgress, renderLanes);
+    <span class="keyword">case</span> HostText:
+      <span class="keyword">return</span> <span class="keyword">null</span>; <span class="comment">// Text nodes have no children</span>
+    <span class="keyword">case</span> SuspenseComponent:
+      <span class="keyword">return</span> <span class="func">updateSuspenseComponent</span>(current, workInProgress, renderLanes);
+    <span class="keyword">case</span> ContextProvider:
+      <span class="keyword">return</span> <span class="func">updateContextProvider</span>(current, workInProgress, renderLanes);
+    <span class="comment">// ... more cases for each fiber tag</span>
+  }
+}</code></pre>
+
+    <h3>3.1 beginWork for Function Components</h3>
+
+    <pre><code><span class="comment">// What happens when beginWork processes a FunctionComponent:</span>
+<span class="keyword">function</span> <span class="func">updateFunctionComponent</span>(current, workInProgress, renderLanes) {
+  <span class="keyword">const</span> Component = workInProgress.type;
+  <span class="keyword">const</span> props = workInProgress.pendingProps;
+
+  <span class="comment">// 1. Set up hooks dispatcher (mount vs update)</span>
+  <span class="func">prepareHooks</span>(current, workInProgress);
+
+  <span class="comment">// 2. Call the component function</span>
+  <span class="keyword">let</span> children = <span class="func">Component</span>(props);
+  <span class="comment">// → This is where YOUR component code runs</span>
+  <span class="comment">// → useState, useEffect, useMemo all execute here</span>
+  <span class="comment">// → Returns ReactElement tree</span>
+
+  <span class="comment">// 3. Finalize hooks</span>
+  <span class="func">finishHooks</span>();
+
+  <span class="comment">// 4. Reconcile children (diff old vs new)</span>
+  <span class="func">reconcileChildren</span>(current, workInProgress, children, renderLanes);
+
+  <span class="comment">// 5. Return first child fiber</span>
+  <span class="keyword">return</span> workInProgress.child;
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="complete-work">4. completeWork — Bubbling Up</h2>
+
+    <p><code>completeWork</code> is called for each fiber during the upward traversal (after all children are processed). Its job: create DOM nodes for host components and bubble up effect flags.</p>
+
+    <pre><code><span class="comment">// Simplified completeWork</span>
+<span class="keyword">function</span> <span class="func">completeWork</span>(current, workInProgress) {
+  <span class="keyword">switch</span> (workInProgress.tag) {
+    <span class="keyword">case</span> HostComponent: {
+      <span class="keyword">const</span> type = workInProgress.type; <span class="comment">// "div", "span", etc.</span>
+
+      <span class="keyword">if</span> (current !== <span class="keyword">null</span> && workInProgress.stateNode !== <span class="keyword">null</span>) {
+        <span class="comment">// UPDATE: DOM node exists, diff props</span>
+        <span class="keyword">const</span> updatePayload = <span class="func">diffProperties</span>(
+          current.memoizedProps,
+          workInProgress.pendingProps
+        );
+        <span class="keyword">if</span> (updatePayload) {
+          workInProgress.flags |= Update;
+          workInProgress.updateQueue = updatePayload;
+        }
+      } <span class="keyword">else</span> {
+        <span class="comment">// MOUNT: Create new DOM node</span>
+        <span class="keyword">const</span> domElement = <span class="func">createElement</span>(type);
+        <span class="func">appendAllChildren</span>(domElement, workInProgress);
+        workInProgress.stateNode = domElement;
+        <span class="func">setInitialProperties</span>(domElement, type, workInProgress.pendingProps);
+      }
+      <span class="comment">// Bubble up flags from children</span>
+      <span class="func">bubbleProperties</span>(workInProgress);
+      <span class="keyword">break</span>;
+    }
+    <span class="keyword">case</span> FunctionComponent:
+    <span class="keyword">case</span> ClassComponent:
+      <span class="func">bubbleProperties</span>(workInProgress);
+      <span class="keyword">break</span>;
+  }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">bubbleProperties — Effect Flag Aggregation</div>
+        <p><code>bubbleProperties</code> collects <code>flags</code> and <code>subtreeFlags</code> from all children into the parent's <code>subtreeFlags</code>. This creates a bitmask that tells the commit phase whether any descendant needs work. If <code>subtreeFlags === NoFlags</code>, the commit phase can skip the entire subtree — a critical optimization for large trees where most nodes don't change.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="commit-phase">5. Commit Phase Deep Dive</h2>
+
+    <p>The commit phase takes the completed workInProgress tree and applies all collected effects to the real DOM. It runs synchronously — once started, it cannot be interrupted.</p>
+
+    <pre><code><span class="comment">// Simplified commitRoot</span>
+<span class="keyword">function</span> <span class="func">commitRoot</span>(root) {
+  <span class="keyword">const</span> finishedWork = root.finishedWork;
+
+  <span class="comment">// Sub-phase 1: Before Mutation</span>
+  <span class="func">commitBeforeMutationEffects</span>(finishedWork);
+
+  <span class="comment">// Sub-phase 2: Mutation (DOM changes happen here)</span>
+  <span class="func">commitMutationEffects</span>(finishedWork);
+
+  <span class="comment">// SWAP: workInProgress becomes current</span>
+  root.current = finishedWork;
+
+  <span class="comment">// Sub-phase 3: Layout (synchronous effects)</span>
+  <span class="func">commitLayoutEffects</span>(finishedWork);
+
+  <span class="comment">// Schedule passive effects (useEffect) as microtask</span>
+  <span class="func">schedulePassiveEffects</span>();
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="commit-sub">6. Commit Sub-Phases</h2>
+
+    <h3>6.1 Before Mutation Phase</h3>
+
+    <pre><code><span class="comment">// Runs BEFORE any DOM changes</span>
+<span class="comment">// - getSnapshotBeforeUpdate (class components)</span>
+<span class="comment">// - Read DOM measurements that will change</span>
+<span class="comment">// - Schedule useEffect cleanup/setup</span>
+
+<span class="comment">// This is the last chance to read the "old" DOM</span>
+<span class="comment">// before mutations are applied.</span></code></pre>
+
+    <h3>6.2 Mutation Phase</h3>
+
+    <pre><code><span class="comment">// Applies DOM changes</span>
+<span class="comment">// For each fiber with effect flags:</span>
+
+<span class="comment">// Placement flag → appendChild / insertBefore</span>
+<span class="comment">// Update flag → update DOM properties (className, style, etc.)</span>
+<span class="comment">// Deletion flag → removeChild, run cleanup effects</span>
+<span class="comment">// Ref flag → detach old refs</span>
+
+<span class="comment">// Order: deletions first, then placements/updates</span>
+<span class="comment">// This ensures removed nodes don't interfere with insertions</span></code></pre>
+
+    <h3>6.3 Layout Phase</h3>
+
+    <pre><code><span class="comment">// Runs AFTER DOM mutations, synchronously</span>
+<span class="comment">// DOM is updated but browser hasn't painted yet</span>
+
+<span class="comment">// - useLayoutEffect callbacks run here</span>
+<span class="comment">// - componentDidMount / componentDidUpdate run here</span>
+<span class="comment">// - Ref callbacks and ref.current assignments</span>
+<span class="comment">// - Can read updated DOM layout (getBoundingClientRect)</span>
+<span class="comment">// - Can synchronously trigger re-renders (setState in layout effect)</span>
+
+<span class="comment">// WARNING: Long-running code here blocks painting!</span></code></pre>
+
+    <h3>6.4 Passive Effects (useEffect)</h3>
+
+    <pre><code><span class="comment">// Scheduled AFTER the commit phase completes</span>
+<span class="comment">// Runs asynchronously (after browser paint)</span>
+
+<span class="comment">// 1. Run cleanup functions from previous render's effects</span>
+<span class="comment">// 2. Run new effect functions</span>
+
+<span class="comment">// This is why useEffect doesn't block painting —</span>
+<span class="comment">// the user sees the updated DOM before effects run.</span>
+<span class="comment">// Use useLayoutEffect only when you need to read/write</span>
+<span class="comment">// DOM layout synchronously before paint.</span></code></pre>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Sub-Phase</th>
+                <th>DOM State</th>
+                <th>What Runs</th>
+                <th>Blocking?</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Before Mutation</td>
+                <td>Old DOM</td>
+                <td>getSnapshotBeforeUpdate</td>
+                <td>Yes (sync)</td>
+            </tr>
+            <tr>
+                <td>Mutation</td>
+                <td>Being changed</td>
+                <td>DOM insertions, updates, deletions</td>
+                <td>Yes (sync)</td>
+            </tr>
+            <tr>
+                <td>Layout</td>
+                <td>New DOM (pre-paint)</td>
+                <td>useLayoutEffect, componentDidMount/Update, refs</td>
+                <td>Yes (sync)</td>
+            </tr>
+            <tr>
+                <td>Passive Effects</td>
+                <td>New DOM (post-paint)</td>
+                <td>useEffect cleanup + setup</td>
+                <td>No (async)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="strict-mode">7. Why Render Must Be Pure (StrictMode)</h2>
+
+    <pre><code><span class="comment">// StrictMode double-invokes render functions to detect impurity</span>
+&lt;<span class="type">React.StrictMode</span>&gt;
+  &lt;<span class="type">App</span> /&gt;
+&lt;/<span class="type">React.StrictMode</span>&gt;
+
+<span class="comment">// In development, React calls each component function TWICE:</span>
+<span class="comment">// 1. First call: normal render</span>
+<span class="comment">// 2. Second call: detect side effects (result should be identical)</span>
+
+<span class="comment">// If your render has side effects, the double call exposes them:</span>
+
+<span class="comment">// BAD: Side effect in render</span>
+<span class="keyword">let</span> count = <span class="number">0</span>;
+<span class="keyword">function</span> <span class="func">Counter</span>() {
+  count++; <span class="comment">// Side effect! Double-invoked = count incremented twice</span>
+  <span class="keyword">return</span> &lt;<span class="type">div</span>&gt;{count}&lt;/<span class="type">div</span>&gt;;
+}
+
+<span class="comment">// GOOD: Pure render</span>
+<span class="keyword">function</span> <span class="func">Counter</span>({ initialCount }) {
+  <span class="keyword">const</span> [count, setCount] = <span class="func">useState</span>(initialCount);
+  <span class="keyword">return</span> &lt;<span class="type">div</span>&gt;{count}&lt;/<span class="type">div</span>&gt;; <span class="comment">// Same output for same input</span>
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Why Purity Matters for Concurrent Rendering</div>
+        <p>In concurrent mode, React may start rendering a component, pause to handle user input, and then either resume or <strong>discard</strong> the partial render. If the render had side effects (network requests, DOM mutations, global state changes), discarding it would leave the app in an inconsistent state. Purity guarantees that discarding a render is always safe — no observable effects occurred.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="traversal">8. Phase Diagram with Fiber Traversal</h2>
+
+    <div class="diagram">
+Component tree:     App
+                   ╱   ╲
+               Header   Main
+              ╱    ╲      ╲
+           Logo    Nav   Content
+
+RENDER PHASE (depth-first traversal):
+──────────────────────────────────────
+beginWork(App)        → child: Header
+beginWork(Header)     → child: Logo
+beginWork(Logo)       → child: null
+completeWork(Logo)    → sibling: Nav
+beginWork(Nav)        → child: null
+completeWork(Nav)     → return: Header
+completeWork(Header)  → sibling: Main
+beginWork(Main)       → child: Content
+beginWork(Content)    → child: null
+completeWork(Content) → return: Main
+completeWork(Main)    → return: App
+completeWork(App)     → RENDER COMPLETE
+
+COMMIT PHASE (effect list traversal):
+──────────────────────────────────────
+commitBeforeMutation: walk fibers with BeforeMutation flags
+commitMutation:       walk fibers with Mutation flags (DOM changes)
+  ─ root.current = finishedWork ─ (tree swap)
+commitLayout:         walk fibers with Layout flags (effects)
+schedulePassiveEffects: queue useEffect callbacks
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">9. Architect Considerations</h2>
+
+    <h3>9.1 Effect Timing Cheat Sheet</h3>
+
+    <pre><code><span class="comment">// When does each effect type run?</span>
+
+<span class="comment">// useEffect: AFTER paint (non-blocking)</span>
+<span class="func">useEffect</span>(() =&gt; {
+  <span class="comment">// DOM is updated AND painted</span>
+  <span class="comment">// Safe for: data fetching, subscriptions, analytics</span>
+  <span class="comment">// NOT for: DOM measurements that affect layout</span>
+}, [deps]);
+
+<span class="comment">// useLayoutEffect: BEFORE paint (blocking)</span>
+<span class="func">useLayoutEffect</span>(() =&gt; {
+  <span class="comment">// DOM is updated but NOT painted</span>
+  <span class="comment">// Safe for: DOM measurements, scroll position, tooltips</span>
+  <span class="comment">// WARNING: blocks painting — keep it fast</span>
+}, [deps]);
+
+<span class="comment">// useInsertionEffect: BEFORE DOM mutations (React 18+)</span>
+<span class="func">useInsertionEffect</span>(() =&gt; {
+  <span class="comment">// Runs before any DOM changes</span>
+  <span class="comment">// For CSS-in-JS libraries to inject styles</span>
+  <span class="comment">// before layout effects read them</span>
+}, [deps]);</code></pre>
+
+    <h3>9.2 Common Render Phase Violations</h3>
+
+    <pre><code><span class="comment">// These are side effects that break render purity:</span>
+
+<span class="comment">// ❌ Mutating external variables</span>
+<span class="keyword">let</span> renderCount = <span class="number">0</span>;
+<span class="keyword">function</span> <span class="func">App</span>() { renderCount++; <span class="comment">/* ... */</span> }
+
+<span class="comment">// ❌ Calling APIs during render</span>
+<span class="keyword">function</span> <span class="func">App</span>() { <span class="func">fetch</span>(<span class="string">'/api'</span>); <span class="comment">/* ... */</span> }
+
+<span class="comment">// ❌ Subscribing during render</span>
+<span class="keyword">function</span> <span class="func">App</span>() { window.<span class="func">addEventListener</span>(<span class="string">'resize'</span>, fn); <span class="comment">/* ... */</span> }
+
+<span class="comment">// ❌ Writing to DOM during render</span>
+<span class="keyword">function</span> <span class="func">App</span>() { document.title = <span class="string">'New'</span>; <span class="comment">/* ... */</span> }
+
+<span class="comment">// ✅ All of these belong in useEffect or event handlers</span></code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Insight</div>
+        <p>The render/commit boundary is the single most important concept for understanding React's concurrent features. Everything in the render phase can be thrown away (transitions, Suspense retries, interrupted renders). Everything in the commit phase is permanent (DOM mutations, effect callbacks). When designing components, ask: "If React called my render function twice and threw away the first result, would anything break?" If yes, you have a purity violation that will cause bugs in concurrent mode.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="index.html">← Series Index</a>
+        <a href="02-scheduler-internals.html">Next: Scheduler Internals →</a>
+    </div>
+</div>
+</body>
+</html>

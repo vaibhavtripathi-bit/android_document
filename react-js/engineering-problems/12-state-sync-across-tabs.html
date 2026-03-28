@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>State Sync Across Tabs — Engineering Problems</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Engineering Problems</a>
+  <span class="sep">›</span>
+  State Sync Across Tabs
+</nav>
+
+<h1>State Sync Across Tabs</h1>
+<p class="subtitle">BroadcastChannel pub/sub, SharedWorker coordination, storage events, leader election for single-flight API calls, CRDT-style conflict handling, auth and cart synchronization, and notification deduplication across browsing contexts.</p>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architecture lens</div>
+  <p>Cross-tab sync is a <strong>distributed systems problem</strong> with unreliable message ordering and partial failure. Choose a transport (BroadcastChannel vs SharedWorker vs storage) based on <strong>latency, payload size, and Safari support matrix</strong>, then layer <strong>version vectors or logical clocks</strong> for merge semantics.</p>
+</div>
+
+<h2 id="broadcast">BroadcastChannel API</h2>
+
+<p><code>BroadcastChannel</code> delivers same-origin messages to every browsing context—tabs, windows, workers (if constructed with channel name). It is faster than <code>localStorage</code> ping-pong and avoids writing disk. Caveat: no message persistence; receivers not yet subscribed miss messages.</p>
+
+<pre><code>// broadcastSync.ts
+const CHANNEL = 'app:state:v1';
+
+export type TabMessage =
+  | { type: 'STATE_PATCH'; payload: unknown; from: string; ts: number }
+  | { type: 'PING' };
+
+export function createTabChannel(tabId: string) {
+  const bc = new BroadcastChannel(CHANNEL);
+
+  return {
+    post(patch: unknown) {
+      const msg: TabMessage = {
+        type: 'STATE_PATCH',
+        payload: patch,
+        from: tabId,
+        ts: performance.now(),
+      };
+      bc.postMessage(msg);
+    },
+    subscribe(handler: (m: TabMessage) =&gt; void) {
+      const fn = (e: MessageEvent&lt;TabMessage&gt;) =&gt; {
+        if (e.data.from === tabId) return; // ignore self (optional)
+        handler(e.data);
+      };
+      bc.addEventListener('message', fn);
+      return () =&gt; bc.removeEventListener('message', fn);
+    },
+    close() {
+      bc.close();
+    },
+  };
+}</code></pre>
+
+<pre><code>// useBroadcastSync.ts
+import { useEffect, useId, useRef } from 'react';
+
+export function useBroadcastSync&lt;T&gt;(
+  state: T,
+  applyRemote: (patch: Partial&lt;T&gt;) =&gt; void,
+  makePatch: (prev: T, next: T) =&gt; Partial&lt;T&gt; | null
+) {
+  const id = useId();
+  const prev = useRef(state);
+
+  useEffect(() =&gt; {
+    const ch = createTabChannel(id);
+    const off = ch.subscribe((m) =&gt; {
+      if (m.type === 'STATE_PATCH') applyRemote(m.payload as Partial&lt;T&gt;);
+    });
+    return () =&gt; {
+      off();
+      ch.close();
+    };
+  }, [applyRemote]);
+
+  useEffect(() =&gt; {
+    const patch = makePatch(prev.current, state);
+    prev.current = state;
+    if (!patch) return;
+    const ch = createTabChannel(id);
+    ch.post(patch);
+    ch.close();
+  }, [state, id]);
+}</code></pre>
+
+<div class="diagram">Tab A                Tab B                Tab C
+  │                    │                    │
+  │──── postMessage ───┼───────────────────▶│
+  │                    │◀───────────────────│
+  │◀───────────────────┼────────────────────│
+  ▼                    ▼                    ▼
+ handlers run in same tick order (per browser, best-effort)</div>
+
+<table>
+<thead>
+<tr><th>Transport</th><th>Persistence</th><th>Max payload</th><th>Safari notes</th></tr>
+</thead>
+<tbody>
+<tr><td>BroadcastChannel</td><td>No</td><td>Structured clone limits (~MB scale)</td><td>Supported modern Safari</td></tr>
+<tr><td>localStorage + storage event</td><td>Yes</td><td>~5MB total origin</td><td>storage event only fires in <em>other</em> documents</td></tr>
+<tr><td>SharedWorker port</td><td>No (in-memory)</td><td>Same as structured clone</td><td>Verify iOS restrictions historically</td></tr>
+<tr><td>service worker + clients.matchAll</td><td>SW cache optional</td><td>Message port</td><td>More moving parts</td></tr>
+</tbody>
+</table>
+
+<h2 id="shared-worker">SharedWorker: centralized state</h2>
+
+<p>A SharedWorker holds canonical state; tabs connect via <code>MessagePort</code>. Benefits: single connection to WebSocket, deduplicated subscriptions, authoritative merge. Costs: worker lifecycle complexity and harder debugging.</p>
+
+<pre><code>// sharedWorkerState.ts (worker file)
+const ports: MessagePort[] = [];
+let state: Record&lt;string, unknown&gt; = {};
+
+self.onconnect = (e: MessageEvent) =&gt; {
+  const port = (e as any).ports[0] as MessagePort;
+  ports.push(port);
+  port.start();
+  port.postMessage({ type: 'HYDRATE', state });
+
+  port.onmessage = (ev) =&gt; {
+    if (ev.data.type === 'PATCH') {
+      state = { ...state, ...ev.data.payload };
+      broadcast({ type: 'STATE', state }, port);
+    }
+  };
+};
+
+function broadcast(msg: unknown, except?: MessagePort) {
+  for (const p of ports) {
+    if (p !== except) p.postMessage(msg);
+  }
+}</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">Fallback</div>
+  <p>When SharedWorker is unavailable, degrade to BroadcastChannel with <strong>last-writer-wins</strong> and visible conflict UI for high-value entities (cart quantities).</p>
+</div>
+
+<h2 id="storage">localStorage and the storage event</h2>
+
+<p>Writing <code>localStorage.setItem</code> fires <code>storage</code> events in <em>other</em> tabs on the same origin. Use a single key with JSON payloads and throttle writes (e.g., <code>requestAnimationFrame</code> coalescing) to avoid main-thread jank.</p>
+
+<pre><code>export function useStorageSync&lt;T&gt;(key: string, value: T, onRemote: (v: T) =&gt; void) {
+  useEffect(() =&gt; {
+    const onStorage = (e: StorageEvent) =&gt; {
+      if (e.key !== key || e.newValue == null) return;
+      try {
+        onRemote(JSON.parse(e.newValue) as T);
+      } catch {
+        /* ignore */
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return () =&gt; window.removeEventListener('storage', onStorage);
+  }, [key, onRemote]);
+
+  useEffect(() =&gt; {
+    localStorage.setItem(key, JSON.stringify(value));
+  }, [key, value]);
+}</code></pre>
+
+<h2 id="leader">Leader election: single API tab</h2>
+
+<p>Only the leader refreshes tokens, polls the inbox, or runs expensive sync. Use <strong>random backoff + BroadcastChannel</strong> or <code>navigator.locks.request('leader', { ifAvailable: true })</code> when available.</p>
+
+<pre><code>// leaderElection.ts
+const LEADER_KEY = 'app:leader';
+const HEARTBEAT_MS = 2000;
+
+export async function electLeader(tabId: string, onLeader: () =&gt; void, onFollower: () =&gt; void) {
+  if (navigator.locks) {
+    navigator.locks.request(LEADER_KEY, async () =&gt; {
+      onLeader();
+      await new Promise&lt;void&gt;(() =&gt; {}); // hold lock until tab dies
+    });
+    return;
+  }
+
+  // Storage-based lease fallback
+  const tryAcquire = () =&gt; {
+    const now = Date.now();
+    const raw = localStorage.getItem(LEADER_KEY);
+    const lease = raw ? JSON.parse(raw) as { id: string; until: number } : null;
+    if (!lease || lease.until &lt; now) {
+      localStorage.setItem(LEADER_KEY, JSON.stringify({ id: tabId, until: now + HEARTBEAT_MS * 3 }));
+      return true;
+    }
+    return lease.id === tabId;
+  };
+
+  const tick = () =&gt; {
+    if (tryAcquire()) onLeader();
+    else onFollower();
+  };
+
+  const iv = setInterval(tick, HEARTBEAT_MS);
+  tick();
+  return () =&gt; clearInterval(iv);
+}</code></pre>
+
+<div class="diagram">Tab1 acquires lock ──▶ LEADER (API refresh)
+Tab2 observes lease held ──▶ FOLLOWER (read-only cache)
+Tab1 crash ──▶ lease expires ──▶ Tab2 promotes</div>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Clock skew</div>
+  <p>Storage leases depend on local clocks. Prefer <code>navigator.locks</code> when supported; it is tied to browser lifecycle, not wall clock.</p>
+</div>
+
+<h2 id="conflict">Conflict resolution</h2>
+
+<table>
+<thead>
+<tr><th>Strategy</th><th>When</th><th>Tradeoff</th></tr>
+</thead>
+<tbody>
+<tr><td>Last-write-wins (LWW)</td><td>Low-stakes UI prefs</td><td>Silent data loss</td></tr>
+<tr><td>Per-field merge</td><td>Independent keys</td><td>Requires schema discipline</td></tr>
+<tr><td>Version vector / LWW-element-set</td><td>Collaborative lists</td><td>Complexity</td></tr>
+<tr><td>Server authoritative</td><td>Commerce / inventory</td><td>Needs online round-trip</td></tr>
+</tbody>
+</table>
+
+<pre><code>export type Versioned&lt;T&gt; = { v: number; data: T };
+
+export function mergeLWW&lt;T&gt;(a: Versioned&lt;T&gt;, b: Versioned&lt;T&gt;): Versioned&lt;T&gt; {
+  if (a.v === b.v) return { v: a.v + 1, data: b.data }; // tie-break: prefer incoming
+  return a.v &gt; b.v ? a : b;
+}</code></pre>
+
+<h2 id="auth">Authentication state sync</h2>
+
+<p>On logout, broadcast <code>{ type: 'LOGOUT_ALL' }</code> and clear <code>IndexedDB</code> caches in every tab. Token refresh should be coordinated: leader refreshes, others listen for <code>TOKEN_UPDATE</code> patches. Avoid storing refresh tokens in <code>localStorage</code> if XSS is a concern—use HttpOnly cookies and still broadcast <code>session_revoked</code> via channel.</p>
+
+<pre><code>export function initAuthSync(
+  onLogout: () =&gt; void,
+  onToken: (t: string) =&gt; void
+) {
+  const bc = new BroadcastChannel('auth:v1');
+  bc.onmessage = (e) =&gt; {
+    if (e.data.type === 'LOGOUT_ALL') onLogout();
+    if (e.data.type === 'TOKEN_UPDATE') onToken(e.data.token);
+  };
+  return {
+    broadcastLogout() {
+      bc.postMessage({ type: 'LOGOUT_ALL' });
+    },
+    broadcastToken(token: string) {
+      bc.postMessage({ type: 'TOKEN_UPDATE', token });
+    },
+  };
+}</code></pre>
+
+<h2 id="cart">Cart state sync</h2>
+
+<p>Maintain cart as <code>Versioned&lt;Cart&gt;</code> in worker or <code>sessionStorage</code> + BroadcastChannel. On add-to-cart racing across tabs, increment op counter client-side; server reconciles with idempotent line-item IDs (<code>sku + priceSnapshotId</code>).</p>
+
+<div class="diagram">Tab A: addItem(X) ──v5──▶ merge ──▶ v6
+Tab B: addItem(Y) ──v5──▶   │
+                             ▼
+                    server or CRDT merge
+                    emits v6 snapshot to all tabs</div>
+
+<h2 id="notifications">Notification deduplication</h2>
+
+<p>When multiple tabs subscribe to push or SSE, only the leader shows OS notifications; others increment an in-app badge. Use a deterministic <code>notificationId</code> hash so duplicate events collapse.</p>
+
+<pre><code>export function dedupeNotification(id: string, ttlMs = 60_000) {
+  const key = `notif:${id}`;
+  const now = Date.now();
+  const prev = sessionStorage.getItem(key);
+  if (prev &amp;&amp; now - Number(prev) &lt; ttlMs) return false;
+  sessionStorage.setItem(key, String(now));
+  return true;
+}</code></pre>
+
+<pre><code>// showNotification.ts
+export function showTabAwareNotification(title: string, body: string, id: string) {
+  const bc = new BroadcastChannel('notify:v1');
+  bc.postMessage({ type: 'CLAIM', id });
+
+  let claimed = false;
+  const onMsg = (e: MessageEvent) =&gt; {
+    if (e.data.type === 'CLAIM_ACK' &amp;&amp; e.data.id === id) {
+      claimed = true;
+    }
+  };
+  bc.addEventListener('message', onMsg);
+
+  // naive leader: first tab to post CLAIM wins within 50ms window
+  setTimeout(() =&gt; {
+    bc.removeEventListener('message', onMsg);
+    if (!claimed &amp;&amp; dedupeNotification(id)) {
+      new Notification(title, { body });
+      bc.postMessage({ type: 'CLAIM_ACK', id });
+    }
+  }, 50);
+}</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Staff takeaway</div>
+  <p>Document a <strong>single sync protocol</strong> (message types, versioning, backoff). Add integration tests with Playwright <code>browser.newContext()</code> multiple pages. Without tests, every new feature becomes a race-shaped bug report.</p>
+</div>
+
+<h2 id="comparison">Transport comparison summary</h2>
+
+<table>
+<thead>
+<tr><th>Need</th><th>Prefer</th></tr>
+</thead>
+<tbody>
+<tr><td>Ephemeral UI sync</td><td>BroadcastChannel</td></tr>
+<tr><td>Survive refresh</td><td>localStorage + versioned JSON</td></tr>
+<tr><td>Single socket fanout</td><td>SharedWorker</td></tr>
+<tr><td>Guaranteed single writer</td><td>Web Locks API + fallback lease</td></tr>
+</tbody>
+</table>
+
+<h2 id="service-worker">Service worker fan-out</h2>
+
+<p>When tabs cannot use SharedWorker (policy or platform), a service worker can hold state and relay messages via <code>clients.matchAll()</code>. This pattern also enables background sync for queued mutations—at the cost of SW lifecycle complexity and extra latency on cold start.</p>
+
+<pre><code>// sw-sync.ts (service worker)
+self.addEventListener('message', (event) =&gt; {
+  if (event.data?.type === 'RELAY') {
+    event.waitUntil(
+      self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) =&gt; {
+        for (const c of clients) {
+          if (c.id !== event.source?.id) {
+            c.postMessage({ type: 'RELAY', payload: event.data.payload });
+          }
+        }
+      })
+    );
+  }
+});</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">Registration timing</div>
+  <p>Until the SW activates, fall back to BroadcastChannel. Race dual-publish during upgrade windows or you will miss messages on slow networks.</p>
+</div>
+
+<h2 id="bfcache">bfcache and <code>pageshow</code> reconciliation</h2>
+
+<p>When users navigate back, frozen pages may display stale cart or auth. Subscribe to <code>window.addEventListener('pageshow', (e) =&gt; { if (e.persisted) resync(); })</code> and re-read canonical state from the worker or <code>sessionStorage</code> revision counter.</p>
+
+<pre><code>export function useBfCacheResync(resync: () =&gt; void) {
+  useEffect(() =&gt; {
+    const onShow = (e: PageTransitionEvent) =&gt; {
+      if (e.persisted) resync();
+    };
+    window.addEventListener('pageshow', onShow);
+    return () =&gt; window.removeEventListener('pageshow', onShow);
+  }, [resync]);
+}</code></pre>
+
+<table>
+<thead>
+<tr><th>Lifecycle event</th><th>Typical sync action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>pageshow</code> persisted</td><td>Full snapshot reconcile</td></tr>
+<tr><td><code>visibilitychange</code> visible</td><td>Lightweight version check</td></tr>
+<tr><td><code>focus</code></td><td>Refresh auth token if near expiry</td></tr>
+</tbody>
+</table>
+
+<h2 id="playwright-testing">Integration testing with multiple pages</h2>
+
+<pre><code>// playwright.multiTab.spec.ts
+import { test, expect } from '@playwright/test';
+
+test('cart syncs across tabs', async ({ browser }) =&gt; {
+  const ctx = await browser.newContext();
+  const a = await ctx.newPage();
+  const b = await ctx.newPage();
+  await a.goto('/cart');
+  await b.goto('/cart');
+  await a.getByRole('button', { name: 'Add' }).click();
+  await expect(b.getByTestId('cart-count')).toHaveText('1');
+});</code></pre>
+
+<div class="diagram">Test runner
+    │
+    ├── context (same storage partition)
+    │       ├── page A ──BroadcastChannel──▶ page B
+    │       └── shared cookies / origin</div>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Safari / ITP</div>
+  <p>Intelligent Tracking Prevention can partition storage for embedded contexts. Cross-tab sync for first-party top-level documents is usually fine; avoid relying on <code>localStorage</code> in iframes for authoritative state.</p>
+</div>
+
+<h2 id="message-schema">Versioned message schema</h2>
+
+<p>Prefix every message with <code>v: number</code>. On unknown version, drop or route to a compatibility shim. This avoids cascading failures when you add required fields during deploys.</p>
+
+<pre><code>export type TabEnvelope&lt;T&gt; = { v: 1; type: string; payload: T };
+
+export function parseEnvelope(raw: unknown): TabEnvelope&lt;unknown&gt; | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const v = (raw as { v?: unknown }).v;
+  if (v !== 1) return null;
+  return raw as TabEnvelope&lt;unknown&gt;;
+}</code></pre>
+
+<h2 id="qa">Interview Q&amp;A</h2>
+<div class="qa-section">
+  <div class="qa-item">
+    <div class="qa-question">Why not always use localStorage for cross-tab state? <span class="level tag tag-l6">L6</span></div>
+    <div class="qa-answer">
+      <p>Synchronous main-thread writes, quota limits, and lack of binary efficiency make it poor for high-frequency updates. It is excellent as a <strong>persistence anchor</strong> combined with BroadcastChannel for live propagation.</p>
+    </div>
+  </div>
+  <div class="qa-item">
+    <div class="qa-question">How does this interact with bfcache? <span class="level tag tag-senior">Senior</span></div>
+    <div class="qa-answer">
+      <p>Pages in back-forward cache freeze. On <code>pageshow</code> with <code>persisted</code>, revalidate snapshots from the worker or storage and reconcile. Otherwise users see stale UI after navigating back.</p>
+    </div>
+  </div>
+</div>
+
+<nav class="nav-footer">
+  <a href="11-feature-flag-system.html">← Feature Flag System</a>
+  <a href="index.html">Engineering Problems index →</a>
+</nav>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Feature Flag System — Engineering Problems</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Engineering Problems</a>
+  <span class="sep">›</span>
+  Feature Flag System
+</nav>
+
+<h1>Feature Flag System</h1>
+<p class="subtitle">Client vs server evaluation, rollout strategies, experiment variants, dependency graphs, stale flag hygiene, render performance, React context design, and SSR-safe hydration patterns for production flag platforms.</p>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architecture lens</div>
+  <p>Flags are <strong>configuration snapshots</strong> versioned by <code>etag</code> or <code>revision</code>. The React layer should consume an <strong>immutable snapshot per request (SSR)</strong> or <strong>per tick (client poll/stream)</strong>, never ad hoc fetches inside arbitrary components.</p>
+</div>
+
+<h2 id="evaluation">Client-side evaluation for latency</h2>
+
+<p>Ship a compact rules payload (JSON or WASM evaluator) so toggles resolve in microseconds. For security-sensitive flags, evaluate on the server only and pass boolean props—never embed secret gating rules in the bundle.</p>
+
+<div class="diagram">Bootstrap (inline script / SSR payload)
+        │
+        ▼
+┌───────────────────┐
+│ FlagSnapshot v=N  │  ← immutable for this session tick
+└─────────┬─────────┘
+          │
+   ┌──────┴──────┐
+   ▼             ▼
+useFlag('x')   useFlag('y')
+(memoized)     (memoized)</div>
+
+<pre><code>// flagEngine.ts — pure evaluation, easy to unit test
+export type FlagRule =
+  | { type: 'const'; value: boolean }
+  | { type: 'pct'; key: string; rollout: number } // 0-100
+  | { type: 'segment'; segment: string };
+
+export type FlagSnapshot = {
+  revision: string;
+  rules: Record&lt;string, FlagRule&gt; | ReadonlyMap&lt;string, FlagRule&gt;;
+  segments: Record&lt;string, (ctx: EvalContext) =&gt; boolean&gt;;
+};
+
+export type EvalContext = { userId: string; attrs: Record&lt;string, unknown&gt; };
+
+export function evalFlag(
+  name: string,
+  snapshot: FlagSnapshot,
+  ctx: EvalContext,
+  salt: string
+): boolean {
+  const rule = snapshot.rules instanceof Map ? snapshot.rules.get(name) : snapshot.rules[name];
+  if (!rule) return false;
+
+  switch (rule.type) {
+    case 'const':
+      return rule.value;
+    case 'segment': {
+      const fn = snapshot.segments[rule.segment];
+      return fn ? fn(ctx) : false;
+    }
+    case 'pct': {
+      const bucket = stableBucket(`${salt}:${ctx.userId}:${rule.key}`, 100);
+      return bucket &lt; rule.rollout;
+    }
+    default:
+      return false;
+  }
+}
+
+function stableBucket(key: string, mod: number): number {
+  let h = 2166136261;
+  for (let i = 0; i &lt; key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return Math.abs(h) % mod;
+}</code></pre>
+
+<table>
+<thead>
+<tr><th>Approach</th><th>Pros</th><th>Cons</th></tr>
+</thead>
+<tbody>
+<tr><td>Local rules blob</td><td>Instant; offline tolerant</td><td>Exposes rule structure; size grows</td></tr>
+<tr><td>Remote eval API</td><td>Secrets stay server-side</td><td>Latency; needs caching</td></tr>
+<tr><td>Edge config (CDN KV)</td><td>Global low latency</td><td>Eventual consistency windows</td></tr>
+</tbody>
+</table>
+
+<h2 id="server-flags">Server-side flags and API fetch</h2>
+
+<p>On the client, poll or SSE with <code>If-None-Match</code>. When the revision changes, swap snapshot atomically and notify subscribers once. Avoid per-flag HTTP calls—batch always.</p>
+
+<pre><code>// flagClient.ts
+export class FlagClient {
+  private snapshot: FlagSnapshot | null = null;
+  private listeners = new Set&lt;() =&gt; void&gt;();
+
+  constructor(private baseUrl: string) {}
+
+  subscribe(cb: () =&gt; void) {
+    this.listeners.add(cb);
+    return () =&gt; this.listeners.delete(cb);
+  }
+
+  private emit() {
+    this.listeners.forEach((l) =&gt; l());
+  }
+
+  async refresh(etag?: string) {
+    const res = await fetch(`${this.baseUrl}/flags`, {
+      headers: etag ? { 'If-None-Match': etag } : {},
+    });
+    if (res.status === 304) return;
+    const next = (await res.json()) as FlagSnapshot;
+    this.snapshot = Object.freeze(next);
+    this.emit();
+  }
+
+  getSnapshot() {
+    return this.snapshot;
+  }
+}</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">Consistency</div>
+  <p>For A/B analysis, persist the <strong>assignment</strong> server-side the first time a user hits the experiment, then return the same variant on subsequent evaluations. Pure client hashing drifts if you change percentages mid-flight.</p>
+</div>
+
+<h2 id="rollouts">Gradual rollouts: percentage and segments</h2>
+
+<p>Percentage rollouts use a <strong>stable hash</strong> of (userId, flagKey, salt) so users do not flip on every page load. Segment rollouts compose predicates (country, plan, internal tester list). Order of operations: kill switch (const false) overrides everything.</p>
+
+<pre><code>export function rolloutPlan(
+  flag: string,
+  ctx: EvalContext,
+  pct: number,
+  salt: string
+): boolean {
+  if (pct &lt;= 0) return false;
+  if (pct &gt;= 100) return true;
+  const b = stableBucket(`${salt}:${ctx.userId}:${flag}`, 10_000);
+  return b &lt; pct * 100; // basis points
+}</code></pre>
+
+<h2 id="ab-testing">A/B testing: variants as flags</h2>
+
+<p>Represent experiments as <code>enum</code> variants resolved by the same engine. React renders <code>variant === 'B' ? ...</code>. Track exposure with an <code>impression</code> event fired once per session per experiment (guard with <code>useRef</code>).</p>
+
+<pre><code>export function useExperiment(name: string): 'control' | 'variant' {
+  const { evalVariant } = useFeatureFlags();
+  const logged = useRef(false);
+
+  const v = evalVariant(name);
+
+  useEffect(() =&gt; {
+    if (logged.current) return;
+    logged.current = true;
+    analytics.track('experiment_impression', { name, variant: v });
+  }, [name, v]);
+
+  return v;
+}</code></pre>
+
+<div class="diagram">Server assigns variant A/B (sticky)
+        │
+        ▼
+Client renders branch
+        │
+        ├── exposure event (once)
+        │
+        └── conversion events tagged with variant</div>
+
+<h2 id="dependencies">Flag dependencies</h2>
+
+<p>Model dependencies as a DAG: <code>newCheckoutUi</code> requires <code>checkoutV2Api</code>. Evaluate in topological order; cycles are a build-time error in your flag registry CI.</p>
+
+<pre><code>// dependencyResolver.ts
+export function resolveWithDeps(
+  flags: string[],
+  snapshot: FlagSnapshot,
+  ctx: EvalContext,
+  salt: string,
+  deps: Record&lt;string, string[]&gt;
+): Record&lt;string, boolean&gt; {
+  const memo: Record&lt;string, boolean&gt; = {};
+  const visit = (name: string): boolean =&gt; {
+    if (name in memo) return memo[name];
+    const parents = deps[name] ?? [];
+    const ok = parents.every((p) =&gt; visit(p)) &amp;&amp; evalFlag(name, snapshot, ctx, salt);
+    memo[name] = ok;
+    return ok;
+  };
+  return Object.fromEntries(flags.map((f) =&gt; [f, visit(f)]));
+}</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Kill switches</div>
+  <p>Emergency-off flags should bypass dependency checks or short-circuit first. Document the precedence rule in one place—otherwise on-call flips a parent flag and nothing happens because a child dependency still reads false.</p>
+</div>
+
+<h2 id="stale">Stale flag cleanup</h2>
+
+<table>
+<thead>
+<tr><th>Signal</th><th>Detection</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td>100% on for 30 days</td><td>Scheduled job over metrics API</td><td>Create ticket to remove branch</td></tr>
+<tr><td>No references in git</td><td>AST grep in CI</td><td>Fail build or warn</td></tr>
+<tr><td>Flag owner left company</td><td>Metadata on flag</td><td>Reassign or archive</td></tr>
+<tr><td>Dead code behind flag</td><td>Coverage + Vulture-style scan</td><td>Delete code path in same PR as flag</td></tr>
+</tbody>
+</table>
+
+<pre><code>// staleFlagDetector.ts — CI script sketch
+import { execSync } from 'child_process';
+
+export function findOrphanFlagKeys(declared: string[]) {
+  const src = execSync('git ls-files "*.tsx" "*.ts"', { encoding: 'utf8' })
+    .split('\n')
+    .filter(Boolean)
+    .map((f) =&gt; require('fs').readFileSync(f, 'utf8'))
+    .join('\n');
+
+  return declared.filter((key) =&gt; !src.includes(`'${key}'`) &amp;&amp; !src.includes(`"${key}"`));
+}</code></pre>
+
+<h2 id="performance">Performance: minimizing re-renders</h2>
+
+<p>Do not put the entire snapshot in a context value that changes reference on every poll. Split into:</p>
+<ul>
+  <li><code>FlagSnapshotContext</code> (stable until revision changes)</li>
+  <li><code>useSyncExternalStore</code> for subscribing components</li>
+  <li>Per-flag selectors with memoized equality</li>
+</ul>
+
+<pre><code>import {
+  createContext,
+  useContext,
+  useMemo,
+  useSyncExternalStore,
+  type ReactNode,
+} from 'react';
+
+type Ctx = { client: FlagClient };
+
+const FlagCtx = createContext&lt;Ctx | null&gt;(null);
+
+export function FeatureFlagProvider({
+  client,
+  children,
+}: {
+  client: FlagClient;
+  children: ReactNode;
+}) {
+  const value = useMemo(() =&gt; ({ client }), [client]);
+  return &lt;FlagCtx.Provider value={value}&gt;{children}&lt;/FlagCtx.Provider&gt;;
+}
+
+export function useFeatureFlag(name: string): boolean {
+  const ctx = useContext(FlagCtx);
+  if (!ctx) throw new Error('FeatureFlagProvider missing');
+
+  return useSyncExternalStore(
+    (cb) =&gt; ctx.client.subscribe(cb),
+    () =&gt; {
+      const snap = ctx.client.getSnapshot();
+      const evalCtx = readEvalContextFromSession(); // your auth hook
+      return snap ? evalFlag(name, snap, evalCtx, snap.revision) : false;
+    },
+    () =&gt; false // SSR fallback; see next section
+  );
+}</code></pre>
+
+<h2 id="ssr">SSR: snapshots and hydration mismatch prevention</h2>
+
+<p>The server must pass the same flag snapshot to the client in the HTML (serialized JSON). On hydrate, the client uses that bootstrap before opening SSE. If remote flags differ seconds later, prefer <strong>soft update</strong> (post-paint) for non-critical UI; for layout-changing flags, accept flicker or gate rendering until client confirms.</p>
+
+<pre><code>// SSR-safe provider
+export function createBootstrapSnapshot(): FlagSnapshot {
+  if (typeof window === 'undefined') {
+    return globalThis.__FLAGS_FROM_SSR__;
+  }
+  return window.__FLAG_BOOTSTRAP__;
+}
+
+export function HydrationSafeFlags({
+  bootstrap,
+  client,
+  children,
+}: {
+  bootstrap: FlagSnapshot;
+  client: FlagClient;
+  children: ReactNode;
+}) {
+  // Initialize client with same revision as SSR
+  useMemo(() =&gt; {
+    (client as any).hydrate?.(bootstrap);
+  }, [client, bootstrap]);
+
+  return &lt;FeatureFlagProvider client={client}&gt;{children}&lt;/FeatureFlagProvider&gt;;
+}</code></pre>
+
+<div class="diagram">SSR HTML contains:
+&lt;script&gt;window.__FLAG_BOOTSTRAP__ = {...rev:42...}&lt;/script&gt;
+
+Server render uses rev 42
+Client hydrate reads rev 42  →  DOM matches
+After idle: refresh → rev 43 (optional re-render)</div>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Staff takeaway</div>
+  <p>Your flag system is really a <strong>config delivery plane</strong>. Invest in schema migration, typed codegen (<code>flags.gen.ts</code>), and CI that fails when code references undeclared keys. The React hooks are the easy part.</p>
+</div>
+
+<h2 id="codegen">Typed codegen and registry CI</h2>
+
+<p>Generate a union type of flag keys from the control plane export (<code>flags.json</code>). ESLint custom rule or TypeScript template literal types prevent typos. When a flag is archived, CI removes the key from the union and breaks builds until call sites are deleted—intentional pressure to delete dead branches.</p>
+
+<pre><code>// flags.gen.ts (generated — do not edit)
+export const FLAG_KEYS = [
+  'checkout_redesign',
+  'billing_new_tax',
+  'kill_switch_payments',
+] as const;
+
+export type FlagKey = (typeof FLAG_KEYS)[number];
+
+export function assertFlagKey(k: string): asserts k is FlagKey {
+  if (!(FLAG_KEYS as readonly string[]).includes(k)) {
+    throw new Error(`Unknown flag key: ${k}`);
+  }
+}</code></pre>
+
+<pre><code>// useTypedFlag.ts
+import type { FlagKey } from './flags.gen';
+
+export function useTypedFlag(key: FlagKey): boolean {
+  assertFlagKey(key);
+  return useFeatureFlag(key);
+}</code></pre>
+
+<table>
+<thead>
+<tr><th>CI check</th><th>Prevents</th></tr>
+</thead>
+<tbody>
+<tr><td>AST grep for string literals not in registry</td><td>Shadow flags outside dashboard</td></tr>
+<tr><td>Bundle diff on flag JSON size</td><td>Accidental megabyte configs in client</td></tr>
+<tr><td>Schema validation (AJV) on snapshot</td><td>Malformed rollouts reaching production</td></tr>
+<tr><td>Playwright matrix: user in segment A/B</td><td>Broken gating on critical paths</td></tr>
+</tbody>
+</table>
+
+<h2 id="streaming">Streaming updates: SSE vs long poll</h2>
+
+<p>For near-real-time flag changes, Server-Sent Events keeps a single connection per tab. Reconnect with <code>Last-Event-ID</code>. On snapshot apply, diff revisions: if only unrelated flags changed, skip React updates by comparing derived booleans per subscribed key.</p>
+
+<pre><code>export function subscribeFlagsSSE(url: string, onRevision: (s: FlagSnapshot) =&gt; void) {
+  const es = new EventSource(url, { withCredentials: true });
+  es.addEventListener('flags', (e) =&gt; {
+    const snap = JSON.parse((e as MessageEvent).data) as FlagSnapshot;
+    onRevision(snap);
+  });
+  es.onerror = () =&gt; {
+    es.close();
+    setTimeout(() =&gt; subscribeFlagsSSE(url, onRevision), 2000 + Math.random() * 1000);
+  };
+  return () =&gt; es.close();
+}</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">Multivariate flags</div>
+  <p>Boolean flags are a subset. Multivariate payloads (JSON config per variant) should be validated with the same schema on server and client. Store the <strong>resolved config</strong> in the snapshot, not just the variant name, to avoid double-eval divergence.</p>
+</div>
+
+<h2 id="flag-edge">Edge cases: anonymous users and bot traffic</h2>
+
+<p>Before <code>userId</code> exists, derive a stable <strong>anonymous distinct id</strong> from a first-party cookie or localStorage UUID created on first visit. Bots may churn ids—exclude them from percentage experiments via a server-side bot score or lightweight heuristics (headless UA, zero interaction).</p>
+
+<div class="diagram">Anonymous ──▶ assign anonId (cookie)
+Logged in ──▶ merge assignments: map anonId → userId
+               (server sticky table; client receives merged snapshot)</div>
+
+<pre><code>export type EvalContext = {
+  userId?: string;
+  anonId: string;
+  attrs: Record&lt;string, unknown&gt;;
+};
+
+export function stableSubject(ctx: EvalContext): string {
+  return ctx.userId ?? ctx.anonId;
+}</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Privacy</div>
+  <p>Do not send raw email or phone in flag evaluation context from the browser. Hash or tokenize identifiers; segments should resolve server-side when possible.</p>
+</div>
+
+<h2 id="qa">Interview Q&amp;A</h2>
+<div class="qa-section">
+  <div class="qa-item">
+    <div class="qa-question">How do you prevent layout shift when a flag flips after load? <span class="level tag tag-l6">L6</span></div>
+    <div class="qa-answer">
+      <p>Reserve space with skeletons, defer mounting until flags resolve for above-the-fold content, or use CSS that accommodates both states. For marketing hero experiments, server-assign variant and inline critical CSS for the chosen branch only.</p>
+    </div>
+  </div>
+  <div class="qa-item">
+    <div class="qa-question">Why useSyncExternalStore for flags? <span class="level tag tag-senior">Senior</span></div>
+    <div class="qa-answer">
+      <p>It is the supported pattern for external stores in React 18 concurrent rendering: tearing is avoided when the store updates during render. Context alone is easy to misuse with frequent snapshot swaps.</p>
+    </div>
+  </div>
+</div>
+
+<nav class="nav-footer">
+  <a href="10-error-tracking-system.html">← Error Tracking System</a>
+  <a href="12-state-sync-across-tabs.html">State Sync Across Tabs →</a>
+</nav>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

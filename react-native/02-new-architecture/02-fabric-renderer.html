@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fabric Renderer — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">New Architecture</a><span class="sep">›</span>
+        Fabric Renderer
+    </nav>
+
+    <nav class="nav">
+        <a href="01-jsi-foundation.html">JSI Foundation</a>
+        <a href="02-fabric-renderer.html" class="active">Fabric Renderer</a>
+        <a href="03-turbo-modules.html">TurboModules</a>
+        <a href="04-codegen.html">Codegen</a>
+        <a href="05-bridgeless-mode.html">Bridgeless Mode</a>
+        <a href="06-concurrent-rendering.html">Concurrent Rendering</a>
+        <a href="07-migration-guide.html">Migration Guide</a>
+        <a href="08-interview-qa.html">Interview Q&amp;A</a>
+    </nav>
+
+    <h1>Fabric Renderer</h1>
+    <p class="subtitle">Fabric is React Native's new rendering system — a C++ core that manages a ShadowNode tree, performs synchronous layout via Yoga, supports concurrent rendering, and delegates platform-specific mounting to iOS ComponentViews and Android Fabric Mounting. It replaces the old UIManager and eliminates the asynchronous bridge bottleneck in the rendering pipeline.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#what-is-fabric">1. What Fabric Is</a></li>
+            <li><a href="#shadow-tree">2. The ShadowNode Tree</a></li>
+            <li><a href="#rendering-pipeline">3. Rendering Pipeline</a></li>
+            <li><a href="#concurrent-rendering">4. Concurrent Rendering Support</a></li>
+            <li><a href="#view-flattening">5. View Flattening</a></li>
+            <li><a href="#mounting-layer">6. The Mounting Layer</a></li>
+            <li><a href="#platform-renderers">7. Platform-Specific Renderers</a></li>
+            <li><a href="#fabric-vs-uimanager">8. Fabric vs Old UIManager</a></li>
+            <li><a href="#architect">9. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="what-is-fabric">1. What Fabric Is</h2>
+
+    <p>Fabric is the complete rewrite of React Native's rendering system. The old renderer (UIManager) communicated with native views through the asynchronous JSON bridge, creating unavoidable latency between React's virtual tree and the actual platform UI. Fabric moves the entire rendering pipeline into C++, communicates via JSI, and performs layout synchronously on the JS thread.</p>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>Fabric's core design decision was to make the ShadowNode tree a <strong>C++ data structure shared between JS and native</strong> via JSI. This eliminates the serialization boundary that existed in the old architecture. The JS thread can read layout results synchronously (no round-trip), and the native thread can read the tree without waiting for a bridge message. This shared-memory model is what enables synchronous <code>onLayout</code> and concurrent rendering.</p>
+    </div>
+
+    <p>The name "Fabric" comes from the concept of weaving together the JS and native rendering pipelines into a single, unified system — rather than two separate systems communicating through a message queue.</p>
+
+    <div class="diagram">
+Old Renderer (UIManager)                 New Renderer (Fabric)
+────────────────────────                 ─────────────────────
+
+  React Reconciler                         React Reconciler
+       │                                        │
+       ▼                                        ▼
+  JS Shadow Tree                           C++ ShadowNode Tree
+  (JS objects)                             (shared via JSI)
+       │                                        │
+       │ JSON bridge (async)                    │ Direct C++ (sync)
+       ▼                                        ▼
+  Native UIManager                         Yoga Layout (C++)
+  (dispatches commands)                         │
+       │                                        ▼
+       ▼                                   Mounting Layer
+  Platform Views                           (diff + commit)
+  (created one-by-one)                          │
+                                                ▼
+                                           Platform Views
+                                           (batched mutations)
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="shadow-tree">2. The ShadowNode Tree</h2>
+
+    <p>The ShadowNode tree is Fabric's central data structure — a C++ tree that mirrors the React element tree. Each ShadowNode holds the component's props, state, layout information (computed by Yoga), and a reference to its children. The tree is <strong>immutable</strong>: updates create new tree revisions rather than mutating in place.</p>
+
+    <h3>2.1 ShadowNode Structure</h3>
+
+    <pre><code><span class="comment">// Simplified ShadowNode (from ReactCommon/react/renderer/core/ShadowNode.h)</span>
+<span class="keyword">class</span> <span class="type">ShadowNode</span> {
+<span class="keyword">public</span>:
+  <span class="keyword">using</span> <span class="type">Shared</span> = std::shared_ptr&lt;<span class="keyword">const</span> <span class="type">ShadowNode</span>&gt;;
+  <span class="keyword">using</span> <span class="type">ListOfShared</span> = std::vector&lt;<span class="type">Shared</span>&gt;;
+
+  <span class="comment">// Every node has a unique tag (like React's key but for native views)</span>
+  <span class="type">Tag</span> <span class="func">getTag</span>() <span class="keyword">const</span>;
+
+  <span class="comment">// Component descriptor (View, Text, Image, etc.)</span>
+  <span class="keyword">const</span> <span class="type">ComponentDescriptor</span>&amp; <span class="func">getComponentDescriptor</span>() <span class="keyword">const</span>;
+
+  <span class="comment">// Props — immutable, shared_ptr for structural sharing</span>
+  <span class="type">Props::Shared</span> <span class="func">getProps</span>() <span class="keyword">const</span>;
+
+  <span class="comment">// State — component-local mutable state (e.g., image load state)</span>
+  <span class="type">State::Shared</span> <span class="func">getState</span>() <span class="keyword">const</span>;
+
+  <span class="comment">// Children — ordered list of child ShadowNodes</span>
+  <span class="keyword">const</span> <span class="type">ListOfShared</span>&amp; <span class="func">getChildren</span>() <span class="keyword">const</span>;
+
+  <span class="comment">// Layout metrics computed by Yoga</span>
+  <span class="type">LayoutMetrics</span> <span class="func">getLayoutMetrics</span>() <span class="keyword">const</span>;
+
+<span class="keyword">private</span>:
+  <span class="type">Tag</span> tag_;
+  <span class="type">Props::Shared</span> props_;
+  <span class="type">State::Shared</span> state_;
+  <span class="type">ListOfShared</span> children_;
+  <span class="type">LayoutMetrics</span> layoutMetrics_;
+};</code></pre>
+
+    <h3>2.2 Immutability and Structural Sharing</h3>
+
+    <p>ShadowNodes are immutable — once created, they never change. When React updates a component, Fabric creates a <strong>new revision</strong> of the affected nodes, reusing (sharing) unchanged subtrees via <code>shared_ptr</code>. This is the same structural sharing pattern used by persistent data structures in Clojure or Immutable.js.</p>
+
+    <div class="diagram">
+Tree Revision N                    Tree Revision N+1
+(before update)                    (after updating Node B)
+
+      A ─────────────┐                  A' ────────────┐
+     / \             │                 / \             │
+    B   C            │                B'  C ◄──shared  │
+   / \               │               / \               │
+  D   E              │              D'  E ◄──shared    │
+                     │                                 │
+                     │                                 │
+Nodes A,B,D cloned (new props)     C and E reused (same shared_ptr)
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Key Insight</div>
+        <p>Immutability is what enables concurrent rendering. Multiple tree revisions can exist simultaneously — one being rendered on screen, another being prepared in the background. There are no race conditions because no tree is ever mutated. The mounting layer atomically swaps from one revision to the next.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="rendering-pipeline">3. Rendering Pipeline</h2>
+
+    <p>Fabric's rendering pipeline has three distinct phases: <strong>Render</strong> (create/update ShadowNodes), <strong>Layout</strong> (compute positions via Yoga), and <strong>Mount</strong> (apply changes to platform views). Understanding which thread each phase runs on is critical.</p>
+
+    <h3>3.1 Three-Phase Pipeline</h3>
+
+    <div class="diagram">
+Phase 1: RENDER (JS Thread)
+──────────────────────────────────────────────────
+React reconciler diffs virtual tree → creates new ShadowNodes
+via JSI calls to C++ ShadowNodeFactory
+
+    setState({count: 1})
+         │
+         ▼
+    React Reconciler (JS)
+         │
+         ▼ JSI call (synchronous)
+    ShadowNodeFactory.createNode(tag, props)
+         │
+         ▼
+    New ShadowNode tree revision (C++)
+
+
+Phase 2: LAYOUT (JS Thread or Background Thread)
+──────────────────────────────────────────────────
+Yoga computes layout for the new tree revision.
+Can run on JS thread (sync) or background (concurrent).
+
+    ShadowNode tree
+         │
+         ▼
+    Yoga::calculateLayout(root, width, height)
+         │
+         ▼
+    LayoutMetrics populated on each node
+    (x, y, width, height, padding, border)
+
+
+Phase 3: MOUNT (UI Thread)
+──────────────────────────────────────────────────
+Diff old tree vs new tree → generate MountingInstructions
+→ execute on UI thread as batched view mutations.
+
+    Tree(N) vs Tree(N+1)
+         │
+         ▼
+    Diff algorithm → MountingInstructions
+    [Create(tag=5, View), Update(tag=3, {color:"red"}), Delete(tag=7)]
+         │
+         ▼
+    Platform Mounting Manager executes on UI thread
+    </div>
+
+    <h3>3.2 Synchronous Layout</h3>
+
+    <p>In the old architecture, layout was computed asynchronously: JS would send layout props over the bridge, native Yoga would compute layout on a separate thread, and results would be sent back over the bridge. This created a minimum one-frame delay for layout-dependent operations.</p>
+
+    <pre><code><span class="comment">// Old architecture: onLayout fires asynchronously (next frame)</span>
+<span class="comment">// JS cannot read layout results synchronously</span>
+
+<span class="comment">// Fabric: layout is computed synchronously in C++</span>
+<span class="comment">// JS can read layout results immediately via JSI</span>
+<span class="keyword">const</span> layout = fabricNode.<span class="func">getLayoutMetrics</span>();
+<span class="comment">// { x: 0, y: 44, width: 375, height: 600 }</span>
+<span class="comment">// Available IMMEDIATELY — no async, no next-frame delay</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Warning</div>
+        <p>Synchronous layout means Yoga runs on the JS thread. Complex layout trees (1000+ nodes with flexbox) can block the JS thread for several milliseconds. Fabric mitigates this with <strong>incremental layout</strong> — only re-computing layout for the subtree that changed — but deeply nested flex layouts remain a performance concern. Profile with <code>Systrace</code> if you see JS thread jank.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="concurrent-rendering">4. Concurrent Rendering Support</h2>
+
+    <p>Fabric was designed from the ground up to support React 18's concurrent rendering. The immutable ShadowNode tree enables multiple in-progress renders without race conditions, and priority-based scheduling allows urgent updates (touch responses) to interrupt lower-priority renders (data fetches).</p>
+
+    <h3>4.1 Priority-Based Rendering</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Priority</th>
+                <th>Source</th>
+                <th>Behavior</th>
+                <th>Example</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Discrete (highest)</td>
+                <td>Touch, press events</td>
+                <td>Synchronous, cannot be interrupted</td>
+                <td>Button press handler</td>
+            </tr>
+            <tr>
+                <td>Continuous</td>
+                <td>Scroll, drag events</td>
+                <td>High priority, batched per frame</td>
+                <td>Scroll position update</td>
+            </tr>
+            <tr>
+                <td>Default</td>
+                <td>setState, network response</td>
+                <td>Normal priority, interruptible</td>
+                <td>API data rendering</td>
+            </tr>
+            <tr>
+                <td>Transition (lowest)</td>
+                <td>useTransition, startTransition</td>
+                <td>Background, fully interruptible</td>
+                <td>Screen navigation prep</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>4.2 Multiple Tree Revisions</h3>
+
+    <div class="diagram">
+Concurrent Rendering — Multiple Trees in Flight
+
+Time ──────────────────────────────────────────────────▶
+
+  Tree v1 (on screen)
+  ════════════════════════════════════════
+
+  Tree v2 (transition render, in progress)
+  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+                    │
+                    │ Touch event arrives! (discrete priority)
+                    │ v2 render is INTERRUPTED
+                    ▼
+  Tree v1' (urgent update applied to v1)
+  ════════════════════════════════════════
+                    │
+                    │ Urgent update committed to screen
+                    ▼
+  Tree v2' (transition resumes from v1')
+       ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+                                        │
+                                        ▼ committed
+  Tree v2' (now on screen)
+  ════════════════════════════════════════
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>Concurrent rendering in Fabric is possible <strong>only because</strong> the ShadowNode tree is immutable. If trees were mutable, an interrupted render would leave the tree in an inconsistent state. Immutability guarantees that any tree revision is always complete and consistent — you can safely discard a partially-computed revision and start over from the latest committed tree.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="view-flattening">5. View Flattening</h2>
+
+    <p>View flattening is an optimization where Fabric removes unnecessary wrapper views from the native hierarchy. React components often create deeply nested <code>&lt;View&gt;</code> wrappers for styling purposes that have no visual effect — no background color, no border, no opacity, no event handlers. Fabric detects these "layout-only" views and flattens them out of the native tree.</p>
+
+    <h3>5.1 Before and After Flattening</h3>
+
+    <div class="diagram">
+React Tree (what you write)          Native View Tree (old)       Native View Tree (Fabric)
+───────────────────────────          ──────────────────────       ─────────────────────────
+
+  &lt;View style={styles.outer}&gt;        View (outer)                 View (outer)
+    &lt;View style={styles.row}&gt;          View (row) ◄─ layout only    Text "Hello"
+      &lt;Text&gt;Hello&lt;/Text&gt;                Text "Hello"               Text "World"
+      &lt;Text&gt;World&lt;/Text&gt;                Text "World"
+    &lt;/View&gt;                          View (spacer) ◄─ layout only
+    &lt;View style={{height: 20}} /&gt;
+  &lt;/View&gt;                           3 native views eliminated     2 views flattened away
+                                     (5 total)                    (3 total)
+    </div>
+
+    <h3>5.2 Flattening Criteria</h3>
+
+    <p>A view is eligible for flattening if it has <strong>none</strong> of the following:</p>
+
+    <pre><code><span class="comment">// A ShadowNode is "layout-only" if ALL of these are true:</span>
+<span class="keyword">bool</span> <span class="func">isLayoutOnly</span>(<span class="keyword">const</span> <span class="type">ViewProps</span>&amp; props) {
+  <span class="keyword">return</span>
+    props.backgroundColor == <span class="type">ClearColor</span> &amp;&amp;
+    props.borderWidth == <span class="number">0</span> &amp;&amp;
+    props.borderRadius == <span class="number">0</span> &amp;&amp;
+    props.opacity == <span class="number">1.0</span> &amp;&amp;
+    props.shadowRadius == <span class="number">0</span> &amp;&amp;
+    props.transform == <span class="type">Identity</span> &amp;&amp;
+    !props.hasEventHandlers &amp;&amp;     <span class="comment">// no onPress, onLayout, etc.</span>
+    !props.nativeId.empty() &amp;&amp;     <span class="comment">// no testID / nativeID</span>
+    !props.accessible &amp;&amp;           <span class="comment">// no accessibility role</span>
+    props.pointerEvents == <span class="string">"box-none"</span>;
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Key Insight</div>
+        <p>View flattening reduces the native view count by 30-50% in typical apps. Fewer native views means less memory, faster layout, and faster mounting. However, adding <code>onLayout</code>, <code>testID</code>, or a background color to a previously layout-only view will <strong>un-flatten</strong> it, potentially causing a layout shift. Be deliberate about which views carry visual or interactive properties.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="mounting-layer">6. The Mounting Layer</h2>
+
+    <p>The mounting layer is responsible for diffing two tree revisions and producing a minimal set of <code>MountingInstructions</code> that transform the on-screen view hierarchy from revision N to revision N+1. It runs on the UI thread.</p>
+
+    <h3>6.1 Mounting Instructions</h3>
+
+    <pre><code><span class="comment">// MountingInstructions generated by tree diff</span>
+<span class="keyword">enum class</span> <span class="type">MountingInstruction</span> {
+  <span class="type">Create</span>,       <span class="comment">// Create a new native view</span>
+  <span class="type">Delete</span>,       <span class="comment">// Remove a native view</span>
+  <span class="type">Insert</span>,       <span class="comment">// Insert a view into a parent at index</span>
+  <span class="type">Remove</span>,       <span class="comment">// Remove a view from its parent</span>
+  <span class="type">UpdateProps</span>,  <span class="comment">// Update props on an existing view</span>
+  <span class="type">UpdateState</span>,  <span class="comment">// Update component state</span>
+  <span class="type">UpdateLayout</span> <span class="comment">// Update layout metrics (position, size)</span>
+};
+
+<span class="comment">// Example: updating a Text component's color</span>
+<span class="comment">// Diff produces: [UpdateProps(tag=42, {color: "red"})]</span>
+<span class="comment">// Mounting manager calls: textView.setTextColor(Color.RED)</span></code></pre>
+
+    <h3>6.2 Batched Mounting</h3>
+
+    <div class="diagram">
+Mounting Transaction (atomic, on UI thread)
+
+  ┌─────────────────────────────────────────────────┐
+  │  1. Pre-mount: allocate native views for Create │
+  │  2. Execute mutations in dependency order:       │
+  │     a. Remove children from deleted parents      │
+  │     b. Delete removed views                      │
+  │     c. Create new views                          │
+  │     d. Insert views into parents                 │
+  │     e. Update props on existing views            │
+  │     f. Update layout metrics                     │
+  │  3. Post-mount: trigger onLayout callbacks       │
+  └─────────────────────────────────────────────────┘
+
+  All mutations are batched into a single UI thread
+  dispatch — no intermediate states are visible to
+  the user. This eliminates the "flickering" that
+  could occur with the old bridge's unbatched updates.
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="platform-renderers">7. Platform-Specific Renderers</h2>
+
+    <p>Fabric's C++ core is platform-agnostic. The platform-specific rendering is handled by <strong>ComponentViews</strong> (iOS) and <strong>Fabric Mounting Manager</strong> (Android), which translate MountingInstructions into UIKit/Android View operations.</p>
+
+    <h3>7.1 iOS: ComponentView</h3>
+
+    <pre><code><span class="comment">// iOS ComponentView — maps a ShadowNode to a UIView</span>
+<span class="keyword">@interface</span> <span class="type">RCTViewComponentView</span> : <span class="type">UIView</span> &lt;<span class="type">RCTComponentViewProtocol</span>&gt;
+
+<span class="comment">// Called when props change (from UpdateProps instruction)</span>
+- (<span class="keyword">void</span>)<span class="func">updateProps:</span>(<span class="type">Props::Shared</span> <span class="keyword">const</span> &amp;)props
+          oldProps:(<span class="type">Props::Shared</span> <span class="keyword">const</span> &amp;)oldProps;
+
+<span class="comment">// Called when layout changes (from UpdateLayout instruction)</span>
+- (<span class="keyword">void</span>)<span class="func">updateLayoutMetrics:</span>(<span class="type">LayoutMetrics</span> <span class="keyword">const</span> &amp;)metrics
+              oldLayoutMetrics:(<span class="type">LayoutMetrics</span> <span class="keyword">const</span> &amp;)oldMetrics;
+
+<span class="comment">// Called when state changes (e.g., Image loaded state)</span>
+- (<span class="keyword">void</span>)<span class="func">updateState:</span>(<span class="type">State::Shared</span> <span class="keyword">const</span> &amp;)state
+          oldState:(<span class="type">State::Shared</span> <span class="keyword">const</span> &amp;)oldState;
+
+<span class="comment">// Mounting lifecycle</span>
+- (<span class="keyword">void</span>)<span class="func">mountChildComponentView:</span>(<span class="type">UIView</span>&lt;<span class="type">RCTComponentViewProtocol</span>&gt; *)child
+                          index:(<span class="type">NSInteger</span>)index;
+- (<span class="keyword">void</span>)<span class="func">unmountChildComponentView:</span>(<span class="type">UIView</span>&lt;<span class="type">RCTComponentViewProtocol</span>&gt; *)child
+                            index:(<span class="type">NSInteger</span>)index;
+
+<span class="keyword">@end</span></code></pre>
+
+    <h3>7.2 Android: Fabric Mounting Manager</h3>
+
+    <pre><code><span class="comment">// Android MountingManager — executes MountingInstructions</span>
+<span class="keyword">public class</span> <span class="type">MountingManager</span> {
+
+  <span class="keyword">public void</span> <span class="func">createView</span>(
+      <span class="type">String</span> componentName,
+      <span class="keyword">int</span> reactTag,
+      <span class="type">ReadableMap</span> props) {
+    <span class="comment">// Instantiate Android View via ViewManager registry</span>
+    <span class="type">ViewManager</span> vm = mViewManagerRegistry.<span class="func">get</span>(componentName);
+    <span class="type">View</span> view = vm.<span class="func">createView</span>(reactTag, mThemedContext, props);
+    mTagToView.<span class="func">put</span>(reactTag, view);
+  }
+
+  <span class="keyword">public void</span> <span class="func">updateProps</span>(<span class="keyword">int</span> reactTag, <span class="type">ReadableMap</span> props) {
+    <span class="type">View</span> view = mTagToView.<span class="func">get</span>(reactTag);
+    <span class="type">ViewManager</span> vm = mTagToViewManager.<span class="func">get</span>(reactTag);
+    vm.<span class="func">updateProperties</span>(view, props);
+  }
+
+  <span class="keyword">public void</span> <span class="func">manageChildren</span>(
+      <span class="keyword">int</span> parentTag,
+      <span class="keyword">int</span>[] indicesToRemove,
+      <span class="type">ViewAtIndex</span>[] viewsToAdd,
+      <span class="keyword">int</span>[] tagsToDelete) {
+    <span class="comment">// Batched child manipulation on UI thread</span>
+    <span class="type">ViewGroup</span> parent = (<span class="type">ViewGroup</span>) mTagToView.<span class="func">get</span>(parentTag);
+    <span class="comment">// Remove, add, delete in correct order</span>
+  }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="fabric-vs-uimanager">8. Fabric vs Old UIManager</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Old UIManager</th>
+                <th>Fabric</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Shadow tree location</td>
+                <td>JS objects (JS thread)</td>
+                <td>C++ ShadowNodes (shared via JSI)</td>
+            </tr>
+            <tr>
+                <td>JS ↔ Native communication</td>
+                <td>Async JSON bridge</td>
+                <td>Synchronous JSI calls</td>
+            </tr>
+            <tr>
+                <td>Layout engine</td>
+                <td>Yoga (called async via bridge)</td>
+                <td>Yoga (called sync in C++)</td>
+            </tr>
+            <tr>
+                <td>Layout results available</td>
+                <td>Next frame (async callback)</td>
+                <td>Immediately (synchronous)</td>
+            </tr>
+            <tr>
+                <td>Concurrent rendering</td>
+                <td>Not possible (mutable tree)</td>
+                <td>Supported (immutable tree)</td>
+            </tr>
+            <tr>
+                <td>View flattening</td>
+                <td>Limited (JS-side only)</td>
+                <td>Automatic (C++ analysis)</td>
+            </tr>
+            <tr>
+                <td>Mounting</td>
+                <td>Unbatched, one-by-one commands</td>
+                <td>Batched atomic transactions</td>
+            </tr>
+            <tr>
+                <td>Cross-platform code</td>
+                <td>Minimal (mostly JS)</td>
+                <td>Extensive (C++ core shared)</td>
+            </tr>
+            <tr>
+                <td>Priority scheduling</td>
+                <td>FIFO queue (no priorities)</td>
+                <td>Priority-based (discrete, continuous, default, transition)</td>
+            </tr>
+            <tr>
+                <td>Memory overhead</td>
+                <td>Dual trees (JS + native copies)</td>
+                <td>Single C++ tree with structural sharing</td>
+            </tr>
+            <tr>
+                <td>Startup cost</td>
+                <td>Lower (no C++ initialization)</td>
+                <td>Slightly higher (C++ infrastructure setup)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Warning</div>
+        <p>Fabric is <strong>not backward-compatible</strong> with old native view managers. Components using the legacy <code>requireNativeComponent</code> API must be migrated to Fabric ComponentViews. React Native provides an <strong>interop layer</strong> that wraps legacy components in a Fabric-compatible shell, but this layer adds overhead and does not support all Fabric features (e.g., concurrent rendering for wrapped components is degraded).</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">9. Architect Considerations</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>Fabric is not just a performance optimization — it is an <strong>architectural paradigm shift</strong>. By moving the shadow tree to C++ and making it immutable, Fabric transforms React Native from a "JS app with native views" into a "C++ rendering engine driven by JS." This has profound implications: the rendering pipeline is now deterministic (same input → same output), testable in isolation (C++ unit tests without a device), and extensible across platforms (the same C++ core renders on iOS, Android, and potentially desktop/web). The key trade-off is complexity: debugging now spans three languages (JS, C++, ObjC/Java), and the learning curve for custom native components is steeper.</p>
+    </div>
+
+    <h3>Key Interview Points</h3>
+
+    <ul>
+        <li><strong>Immutable ShadowNode tree</strong> — enables concurrent rendering, structural sharing, and deterministic diffing. Multiple tree revisions can coexist safely.</li>
+        <li><strong>Three-phase pipeline</strong> — Render (JS thread, creates ShadowNodes), Layout (Yoga, synchronous), Mount (UI thread, batched mutations). Know which thread each phase runs on.</li>
+        <li><strong>Synchronous layout</strong> — JS can read layout results immediately via JSI, eliminating the one-frame delay of the old architecture. Critical for gesture-driven animations.</li>
+        <li><strong>View flattening</strong> — automatically removes layout-only wrapper views, reducing native view count by 30-50%. Understand what disqualifies a view from flattening.</li>
+        <li><strong>Priority-based rendering</strong> — discrete events (touch) preempt transitions (navigation), ensuring UI responsiveness during heavy renders.</li>
+        <li><strong>Platform mounting</strong> — iOS uses ComponentViews (UIView subclasses), Android uses MountingManager. Both receive batched MountingInstructions from the C++ diff algorithm.</li>
+    </ul>
+
+    <div class="nav-footer">
+        <a href="01-jsi-foundation.html">← Prev: JSI Foundation</a>
+        <a href="03-turbo-modules.html">Next: TurboModules →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>React DOM Internals — React JS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Rendering &amp; Reconciliation</a><span class="sep">›</span>
+        React DOM Internals
+    </nav>
+
+    <h1>React DOM Internals</h1>
+    <p class="subtitle">react-dom as a host renderer, createRoot vs legacy render, property vs attribute handling, controlled vs uncontrolled components, event delegation, SyntheticEvent, and event priorities.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#host-renderer">1. react-dom as Host Renderer</a></li>
+            <li><a href="#create-root">2. createRoot vs Legacy ReactDOM.render</a></li>
+            <li><a href="#properties">3. Property vs Attribute Handling</a></li>
+            <li><a href="#controlled">4. Controlled vs Uncontrolled Components</a></li>
+            <li><a href="#event-delegation">5. Event Delegation System</a></li>
+            <li><a href="#synthetic-event">6. SyntheticEvent</a></li>
+            <li><a href="#event-priorities">7. Event Priorities</a></li>
+            <li><a href="#architect">8. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="host-renderer">1. react-dom as Host Renderer</h2>
+
+    <p>React's architecture separates the reconciler (react-reconciler) from the renderer. <code>react-dom</code> is the host renderer for web browsers — it implements the "host config" interface that tells the reconciler how to create, update, and delete DOM nodes.</p>
+
+    <div class="diagram">
+React Architecture:
+
+┌─────────────┐     ┌──────────────────┐     ┌───────────────┐
+│    react     │     │ react-reconciler │     │   react-dom   │
+│              │     │                  │     │               │
+│ createElement│────►│ Fiber tree       │────►│ createElement │
+│ hooks        │     │ Diffing          │     │ appendChild   │
+│ Component    │     │ Scheduling       │     │ removeChild   │
+│              │     │ Effect mgmt      │     │ setProperty   │
+└─────────────┘     └──────────────────┘     │ Event system  │
+                                              └───────────────┘
+
+Other renderers use the same reconciler:
+  react-native → native views
+  react-three-fiber → Three.js objects
+  ink → terminal output
+  react-pdf → PDF documents
+    </div>
+
+    <pre><code><span class="comment">// The host config interface (simplified)</span>
+<span class="comment">// react-dom implements these for the browser DOM:</span>
+
+<span class="keyword">const</span> hostConfig = {
+  <span class="func">createInstance</span>(type, props) {
+    <span class="keyword">return</span> document.<span class="func">createElement</span>(type);
+  },
+  <span class="func">createTextInstance</span>(text) {
+    <span class="keyword">return</span> document.<span class="func">createTextNode</span>(text);
+  },
+  <span class="func">appendChild</span>(parent, child) {
+    parent.<span class="func">appendChild</span>(child);
+  },
+  <span class="func">removeChild</span>(parent, child) {
+    parent.<span class="func">removeChild</span>(child);
+  },
+  <span class="func">commitUpdate</span>(domElement, updatePayload) {
+    <span class="comment">// Apply property changes to DOM element</span>
+    <span class="func">applyDOMProperties</span>(domElement, updatePayload);
+  },
+  <span class="comment">// ... ~40 more methods</span>
+};</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="create-root">2. createRoot vs Legacy ReactDOM.render</h2>
+
+    <pre><code><span class="comment">// Legacy API (React 17 and earlier)</span>
+ReactDOM.<span class="func">render</span>(&lt;<span class="type">App</span> /&gt;, document.<span class="func">getElementById</span>(<span class="string">'root'</span>));
+
+<span class="comment">// React 18 API</span>
+<span class="keyword">const</span> root = ReactDOM.<span class="func">createRoot</span>(document.<span class="func">getElementById</span>(<span class="string">'root'</span>));
+root.<span class="func">render</span>(&lt;<span class="type">App</span> /&gt;);</code></pre>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Feature</th>
+                <th><code>ReactDOM.render</code> (legacy)</th>
+                <th><code>createRoot</code> (React 18)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Automatic batching</td>
+                <td>Only in React events</td>
+                <td>Everywhere</td>
+            </tr>
+            <tr>
+                <td>Concurrent features</td>
+                <td>Not available</td>
+                <td>Full support</td>
+            </tr>
+            <tr>
+                <td>Transitions</td>
+                <td>Not available</td>
+                <td>startTransition, useTransition</td>
+            </tr>
+            <tr>
+                <td>Suspense for data</td>
+                <td>Limited</td>
+                <td>Full support</td>
+            </tr>
+            <tr>
+                <td>Error callbacks</td>
+                <td>None</td>
+                <td>onCaughtError, onUncaughtError, onRecoverableError</td>
+            </tr>
+            <tr>
+                <td>Hydration</td>
+                <td><code>ReactDOM.hydrate</code></td>
+                <td><code>hydrateRoot</code></td>
+            </tr>
+            <tr>
+                <td>Unmounting</td>
+                <td><code>ReactDOM.unmountComponentAtNode</code></td>
+                <td><code>root.unmount()</code></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="properties">3. Property vs Attribute Handling</h2>
+
+    <p>React uses DOM properties (not HTML attributes) for most element interactions. This distinction is subtle but important.</p>
+
+    <pre><code><span class="comment">// React JSX → DOM property (not attribute)</span>
+&lt;<span class="type">div</span> <span class="attr">className</span>=<span class="string">"box"</span> /&gt;
+<span class="comment">// → element.className = "box" (property)</span>
+<span class="comment">// NOT element.setAttribute("class", "box")</span>
+
+&lt;<span class="type">label</span> <span class="attr">htmlFor</span>=<span class="string">"input"</span> /&gt;
+<span class="comment">// → element.htmlFor = "input" (property)</span>
+<span class="comment">// HTML attribute is "for", but JS property is "htmlFor"</span>
+
+&lt;<span class="type">input</span> <span class="attr">value</span>=<span class="string">"hello"</span> /&gt;
+<span class="comment">// → element.value = "hello" (property)</span>
+<span class="comment">// This is how controlled inputs work</span>
+
+&lt;<span class="type">div</span> <span class="attr">tabIndex</span>={<span class="number">0</span>} /&gt;
+<span class="comment">// → element.tabIndex = 0 (property)</span>
+<span class="comment">// HTML attribute is "tabindex" (lowercase)</span></code></pre>
+
+    <h3>3.1 JSX to DOM Name Mapping</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>JSX Prop</th>
+                <th>HTML Attribute</th>
+                <th>DOM Property</th>
+                <th>Why Different</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>className</code></td>
+                <td><code>class</code></td>
+                <td><code>className</code></td>
+                <td><code>class</code> is a JS reserved word</td>
+            </tr>
+            <tr>
+                <td><code>htmlFor</code></td>
+                <td><code>for</code></td>
+                <td><code>htmlFor</code></td>
+                <td><code>for</code> is a JS reserved word</td>
+            </tr>
+            <tr>
+                <td><code>onChange</code></td>
+                <td><code>onchange</code></td>
+                <td>N/A (React event)</td>
+                <td>React's synthetic event system</td>
+            </tr>
+            <tr>
+                <td><code>dangerouslySetInnerHTML</code></td>
+                <td><code>innerHTML</code></td>
+                <td><code>innerHTML</code></td>
+                <td>Name signals danger</td>
+            </tr>
+            <tr>
+                <td><code>style</code> (object)</td>
+                <td><code>style</code> (string)</td>
+                <td><code>style</code> (CSSStyleDeclaration)</td>
+                <td>React uses object, sets properties individually</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="controlled">4. Controlled vs Uncontrolled Components</h2>
+
+    <pre><code><span class="comment">// CONTROLLED: React owns the value</span>
+<span class="keyword">function</span> <span class="func">ControlledInput</span>() {
+  <span class="keyword">const</span> [value, setValue] = <span class="func">useState</span>(<span class="string">''</span>);
+  <span class="keyword">return</span> (
+    &lt;<span class="type">input</span>
+      <span class="attr">value</span>={value}
+      <span class="attr">onChange</span>={e =&gt; <span class="func">setValue</span>(e.target.value)}
+    /&gt;
+  );
+}
+<span class="comment">// React sets element.value on every render</span>
+<span class="comment">// User input triggers onChange → setState → re-render → DOM update</span>
+<span class="comment">// React is the "source of truth"</span>
+
+<span class="comment">// UNCONTROLLED: DOM owns the value</span>
+<span class="keyword">function</span> <span class="func">UncontrolledInput</span>() {
+  <span class="keyword">const</span> ref = <span class="func">useRef</span>(<span class="keyword">null</span>);
+  <span class="keyword">return</span> (
+    &lt;<span class="type">input</span>
+      <span class="attr">ref</span>={ref}
+      <span class="attr">defaultValue</span>=<span class="string">"initial"</span>
+      <span class="attr">onChange</span>={() =&gt; console.<span class="func">log</span>(ref.current.value)}
+    /&gt;
+  );
+}
+<span class="comment">// React sets defaultValue only on mount</span>
+<span class="comment">// DOM manages the value after that</span>
+<span class="comment">// Read value via ref when needed</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Controlled Input Internals</div>
+        <p>When React sets <code>element.value</code> on a controlled input, the browser doesn't fire a <code>change</code> event (programmatic value changes don't trigger events). React must explicitly set the value after every render to keep the DOM in sync with state. If you set <code>value</code> without <code>onChange</code>, the input becomes read-only — user typing is immediately overwritten by React's render.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="event-delegation">5. Event Delegation System</h2>
+
+    <p>React doesn't attach event listeners to individual DOM elements. Instead, it uses <strong>event delegation</strong> — a single listener on the root container captures all events.</p>
+
+    <pre><code><span class="comment">// React 17+ attaches listeners to the root container</span>
+<span class="comment">// (React 16 attached to document)</span>
+
+<span class="keyword">const</span> root = <span class="func">createRoot</span>(container);
+<span class="comment">// React attaches listeners to `container`:</span>
+<span class="comment">// container.addEventListener('click', dispatchEvent, false)</span>
+<span class="comment">// container.addEventListener('click', dispatchEvent, true) // capture</span>
+<span class="comment">// container.addEventListener('change', dispatchEvent, false)</span>
+<span class="comment">// ... for ALL supported event types</span>
+
+<span class="comment">// When a click happens on &lt;button&gt; inside the tree:</span>
+<span class="comment">// 1. Native event bubbles up to container</span>
+<span class="comment">// 2. React's dispatchEvent fires</span>
+<span class="comment">// 3. React finds the fiber for the event target</span>
+<span class="comment">// 4. Walks UP the fiber tree collecting onClick handlers</span>
+<span class="comment">// 5. Creates a SyntheticEvent</span>
+<span class="comment">// 6. Calls handlers in order (capture phase, then bubble phase)</span></code></pre>
+
+    <div class="diagram">
+Event flow in React 17+:
+
+Native DOM event:
+  button → div → section → container (React root)
+                                │
+                                ▼
+                    React's dispatchEvent()
+                                │
+                                ▼
+                    Find fiber for event.target
+                                │
+                                ▼
+                    Walk fiber tree (return pointers)
+                    Collect all onClick handlers
+                                │
+                                ▼
+                    Create SyntheticEvent
+                                │
+                                ▼
+                    Execute handlers:
+                    1. Capture phase (top → bottom)
+                    2. Bubble phase (bottom → top)
+    </div>
+
+    <h3>5.1 Why Event Delegation?</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Benefit</th>
+                <th>Explanation</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Memory efficiency</td>
+                <td>One listener per event type vs one per element</td>
+            </tr>
+            <tr>
+                <td>Dynamic elements</td>
+                <td>New elements automatically handled (no add/remove listeners)</td>
+            </tr>
+            <tr>
+                <td>Consistent behavior</td>
+                <td>React controls event timing and batching</td>
+            </tr>
+            <tr>
+                <td>Priority integration</td>
+                <td>React assigns lanes based on event type</td>
+            </tr>
+            <tr>
+                <td>Portals</td>
+                <td>Events from portals bubble through React tree, not DOM tree</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="synthetic-event">6. SyntheticEvent</h2>
+
+    <pre><code><span class="comment">// SyntheticEvent wraps the native browser event</span>
+<span class="comment">// with a cross-browser compatible interface</span>
+
+<span class="keyword">function</span> <span class="func">handleClick</span>(event) {
+  <span class="comment">// event is a SyntheticEvent, not a native Event</span>
+  event.type;            <span class="comment">// "click"</span>
+  event.target;          <span class="comment">// DOM element that was clicked</span>
+  event.currentTarget;   <span class="comment">// DOM element with the handler</span>
+  event.nativeEvent;     <span class="comment">// The underlying native browser event</span>
+  event.<span class="func">preventDefault</span>();  <span class="comment">// Works as expected</span>
+  event.<span class="func">stopPropagation</span>(); <span class="comment">// Stops React's synthetic propagation</span>
+}
+
+<span class="comment">// React 17+ changes:</span>
+<span class="comment">// - Event pooling REMOVED (events are no longer reused)</span>
+<span class="comment">// - Events attached to root, not document</span>
+<span class="comment">// - onScroll no longer bubbles (matches native behavior)</span>
+<span class="comment">// - onFocus/onBlur use native focusin/focusout under the hood</span>
+
+<span class="comment">// React 16 had event pooling:</span>
+<span class="comment">// SyntheticEvents were reused across different events</span>
+<span class="comment">// event.persist() was needed to keep a reference</span>
+<span class="comment">// This was removed in React 17 — events are normal objects now</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="event-priorities">7. Event Priorities</h2>
+
+    <pre><code><span class="comment">// React assigns different priorities to different event types</span>
+<span class="comment">// This determines the lane for setState calls within handlers</span>
+
+<span class="comment">// Discrete events → SyncLane (highest priority)</span>
+<span class="comment">// click, keydown, keyup, mousedown, mouseup, input, change,</span>
+<span class="comment">// focus, blur, submit, reset, pointerdown, pointerup</span>
+<span class="comment">// → Processed synchronously, user expects immediate response</span>
+
+<span class="comment">// Continuous events → InputContinuousLane</span>
+<span class="comment">// mousemove, mouseenter, mouseleave, mouseover, mouseout,</span>
+<span class="comment">// pointermove, pointerenter, pointerleave, scroll, drag,</span>
+<span class="comment">// dragenter, dragleave, dragover, touchmove, wheel</span>
+<span class="comment">// → May be batched more aggressively, slight delay acceptable</span>
+
+<span class="comment">// Default events → DefaultLane</span>
+<span class="comment">// Everything else (load, error, animation events, etc.)</span>
+<span class="comment">// → Standard priority</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">8. Architect Considerations</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Event System Knowledge</div>
+        <p>Understanding React's event delegation explains several behaviors: (1) <code>event.stopPropagation()</code> in React doesn't stop native propagation to the root — use <code>event.nativeEvent.stopImmediatePropagation()</code> if needed. (2) Events from portals bubble through the React tree (fiber return pointers), not the DOM tree — a click inside a portal bubbles to the portal's React parent, not its DOM parent. (3) Mixing React and non-React event handlers on the same element can cause ordering issues — React's handler runs when the event reaches the root, which may be after native handlers on intermediate elements.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="05-batching-updates.html">← Prev: Batching Updates</a>
+        <a href="07-hydration.html">Next: Hydration →</a>
+    </div>
+</div>
+</body>
+</html>

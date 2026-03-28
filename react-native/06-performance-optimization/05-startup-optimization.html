@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Startup Optimization — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Performance Optimization</a><span class="sep">›</span>
+        Startup Optimization
+    </nav>
+
+    <h1>Startup Optimization</h1>
+    <p class="subtitle">App startup time is the first impression users have of your app. React Native adds overhead compared to pure native — JS bundle loading, bridge initialization, and module registration all contribute. This doc covers every technique from Hermes bytecode to lazy loading to reduce cold start time to under 2 seconds.</p>
+
+    <nav class="nav">
+        <a href="04-memory-optimization.html">Memory Optimization</a>
+        <a href="06-animation-performance.html">Animation Performance</a>
+        <a href="07-network-optimization.html">Network Optimization</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#cold-warm">1. Cold Start vs Warm Start</a></li>
+            <li><a href="#hermes-bytecode">2. Hermes Bytecode Precompilation</a></li>
+            <li><a href="#ram-bundles">3. RAM Bundles and Inline Requires</a></li>
+            <li><a href="#lazy-modules">4. Lazy Module Initialization</a></li>
+            <li><a href="#native-lazy">5. Native Module Lazy Loading</a></li>
+            <li><a href="#splash">6. Splash Screen Strategies</a></li>
+            <li><a href="#measuring">7. Measuring Startup Time</a></li>
+            <li><a href="#bundle-size">8. Reducing Bundle Size</a></li>
+            <li><a href="#tree-shaking">9. Tree Shaking and Dead Code</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="cold-warm">1. Cold Start vs Warm Start</h2>
+
+    <div class="diagram">
+Startup Timeline
+════════════════
+
+Cold Start (app not in memory):
+─────────────────────────────────────────────────────────────
+│ OS Load │ Native Init │ Bridge │ Bundle Load │ React Render │ TTI
+│  50ms   │   100ms     │ 50ms  │   200ms     │    300ms     │
+─────────────────────────────────────────────────────────────
+                                                        ~700ms total
+
+Warm Start (app in memory, process alive):
+──────────────────────────────────────────
+│ Resume │ Re-render │
+│  50ms  │   100ms   │
+──────────────────────
+                ~150ms total
+
+Cold Start Breakdown (typical RN app):
+┌────────────────────────────────────────────────┐
+│ 1. OS process creation          ~50ms          │
+│ 2. Native app initialization    ~100ms         │
+│    - AppDelegate / Application                 │
+│    - Third-party SDK init                      │
+│ 3. RN bridge initialization     ~50ms          │
+│    - Create bridge instance                    │
+│    - Initialize native modules                 │
+│ 4. JS bundle loading            ~100-300ms     │
+│    - Load from disk (mmap for Hermes)          │
+│    - Parse/compile (JSC) or verify (Hermes)    │
+│ 5. JS execution                 ~100-300ms     │
+│    - Module initialization (require())         │
+│    - React tree creation                       │
+│ 6. Native view creation         ~50-100ms      │
+│    - Create native views from React tree       │
+│    - Layout computation (Yoga)                 │
+│ 7. First meaningful paint       ~50ms          │
+│    - Rasterize and display                     │
+└────────────────────────────────────────────────┘
+│ Total cold start: 500-1000ms (optimized)       │
+│                   1500-3000ms (unoptimized)     │
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="hermes-bytecode">2. Hermes Bytecode Precompilation</h2>
+
+    <pre><code><span class="comment">// Hermes compiles JS to bytecode at BUILD time</span>
+<span class="comment">// This eliminates parse + compile at runtime</span>
+
+<span class="comment">// Without Hermes (JSC):</span>
+<span class="comment">// 1. Load .jsbundle from disk (~50ms)</span>
+<span class="comment">// 2. Parse JavaScript source (~100-200ms)</span>
+<span class="comment">// 3. Compile to machine code (~100-300ms)</span>
+<span class="comment">// Total: 250-550ms</span>
+
+<span class="comment">// With Hermes:</span>
+<span class="comment">// 1. mmap .hbc file from disk (~5ms)</span>
+<span class="comment">// 2. Verify bytecode header (~1ms)</span>
+<span class="comment">// 3. Execute bytecode directly</span>
+<span class="comment">// Total: ~6ms</span>
+
+<span class="comment">// Enable Hermes in react-native.config.js or app.json</span>
+<span class="comment">// Android: android/app/build.gradle</span>
+<span class="comment">// project.ext.react = [</span>
+<span class="comment">//   enableHermes: true</span>
+<span class="comment">// ]</span>
+
+<span class="comment">// iOS: ios/Podfile</span>
+<span class="comment">// :hermes_enabled => true</span>
+
+<span class="comment">// Verify Hermes bytecode is being used</span>
+<span class="keyword">if</span> (global.HermesInternal) {
+  console.log(<span class="string">'Hermes bytecode engine active'</span>);
+  console.log(<span class="string">`Version: ${global.HermesInternal.getRuntimeProperties()['OSS Release Version']}`</span>);
+}</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Hermes mmap Optimization</div>
+        <p>Hermes bytecode files (.hbc) are memory-mapped (mmap), not loaded into heap memory. The OS loads pages on demand as code is executed. This means: (1) only executed code pages are loaded into RAM, (2) the OS can evict pages under memory pressure and reload them transparently, (3) startup doesn't wait for the entire bundle to load. This is the single biggest startup optimization in React Native's history — it reduced bundle load time by 90%+.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="ram-bundles">3. RAM Bundles and Inline Requires</h2>
+
+    <pre><code><span class="comment">// RAM Bundles split the bundle into modules loaded on demand</span>
+<span class="comment">// Each module is a separate entry that can be loaded independently</span>
+
+<span class="comment">// metro.config.js — enable RAM bundles</span>
+module.exports = {
+  serializer: {
+    getModulesRunBeforeMainModule() {
+      <span class="keyword">return</span> [
+        require.resolve(<span class="string">'./src/polyfills'</span>),
+      ];
+    },
+    createModuleIdFactory() {
+      <span class="keyword">return</span> (path) => {
+        <span class="comment">// Stable module IDs for consistent RAM bundle layout</span>
+      };
+    },
+  },
+};
+
+<span class="comment">// Inline requires — defer module loading until first use</span>
+<span class="comment">// BEFORE: All modules loaded at startup</span>
+<span class="keyword">import</span> HeavyChart <span class="keyword">from</span> <span class="string">'./HeavyChart'</span>;
+<span class="keyword">import</span> PDFViewer <span class="keyword">from</span> <span class="string">'./PDFViewer'</span>;
+<span class="keyword">import</span> VideoPlayer <span class="keyword">from</span> <span class="string">'./VideoPlayer'</span>;
+
+<span class="comment">// AFTER: Modules loaded when first accessed</span>
+<span class="keyword">function</span> <span class="func">ChartScreen</span>() {
+  <span class="keyword">const</span> HeavyChart = require(<span class="string">'./HeavyChart'</span>).default;
+  <span class="keyword">return</span> &lt;HeavyChart /&gt;;
+}
+
+<span class="comment">// Enable inline requires globally in metro.config.js</span>
+module.exports = {
+  transformer: {
+    getTransformOptions: <span class="keyword">async</span> () => ({
+      transform: {
+        experimentalImportSupport: <span class="keyword">false</span>,
+        inlineRequires: <span class="keyword">true</span>,
+      },
+    }),
+  },
+};</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="lazy-modules">4. Lazy Module Initialization</h2>
+
+    <pre><code><span class="comment">// React.lazy + Suspense for screen-level code splitting</span>
+<span class="keyword">const</span> SettingsScreen = React.lazy(() => <span class="keyword">import</span>(<span class="string">'./screens/Settings'</span>));
+<span class="keyword">const</span> ProfileScreen = React.lazy(() => <span class="keyword">import</span>(<span class="string">'./screens/Profile'</span>));
+<span class="keyword">const</span> AnalyticsScreen = React.lazy(() => <span class="keyword">import</span>(<span class="string">'./screens/Analytics'</span>));
+
+<span class="keyword">function</span> <span class="func">App</span>() {
+  <span class="keyword">return</span> (
+    &lt;NavigationContainer&gt;
+      &lt;Stack.Navigator&gt;
+        &lt;Stack.Screen name=<span class="string">"Home"</span> component={HomeScreen} /&gt;
+        &lt;Stack.Screen name=<span class="string">"Settings"</span>&gt;
+          {() => (
+            &lt;Suspense fallback={&lt;LoadingScreen /&gt;}&gt;
+              &lt;SettingsScreen /&gt;
+            &lt;/Suspense&gt;
+          )}
+        &lt;/Stack.Screen&gt;
+      &lt;/Stack.Navigator&gt;
+    &lt;/NavigationContainer&gt;
+  );
+}
+
+<span class="comment">// Lazy initialization pattern for heavy singletons</span>
+<span class="keyword">let</span> _analyticsInstance = <span class="keyword">null</span>;
+<span class="keyword">function</span> <span class="func">getAnalytics</span>() {
+  <span class="keyword">if</span> (!_analyticsInstance) {
+    <span class="keyword">const</span> Analytics = require(<span class="string">'./analytics/heavy-sdk'</span>).default;
+    _analyticsInstance = <span class="keyword">new</span> Analytics({ apiKey: CONFIG.ANALYTICS_KEY });
+  }
+  <span class="keyword">return</span> _analyticsInstance;
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="native-lazy">5. Native Module Lazy Loading</h2>
+
+    <div class="diagram">
+Native Module Loading: Legacy vs TurboModules
+══════════════════════════════════════════════
+
+Legacy (all loaded at startup):
+  App Start → Load Module A → Load Module B → ... → Load Module N
+  Each module: ~1-5ms init time
+  50 modules × 3ms = 150ms added to startup
+
+TurboModules (lazy loaded):
+  App Start → Install proxy → Ready!
+  Module A accessed → Load Module A (3ms)
+  Module B never accessed → Never loaded (0ms)
+
+  Startup savings = (total modules - used modules) × avg init time
+  If 50 modules exist but only 10 used at startup:
+  Savings = 40 × 3ms = 120ms
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="splash">6. Splash Screen Strategies</h2>
+
+    <pre><code><span class="comment">// react-native-splash-screen or expo-splash-screen</span>
+<span class="keyword">import</span> * <span class="keyword">as</span> SplashScreen <span class="keyword">from</span> <span class="string">'expo-splash-screen'</span>;
+
+<span class="comment">// Keep splash visible while loading</span>
+SplashScreen.preventAutoHideAsync();
+
+<span class="keyword">function</span> <span class="func">App</span>() {
+  <span class="keyword">const</span> [isReady, setIsReady] = useState(<span class="keyword">false</span>);
+
+  useEffect(() => {
+    <span class="keyword">async function</span> <span class="func">prepare</span>() {
+      <span class="keyword">try</span> {
+        <span class="comment">// Pre-load critical data</span>
+        <span class="keyword">await</span> Promise.all([
+          loadFonts(),
+          loadUserSession(),
+          prefetchCriticalData(),
+        ]);
+      } <span class="keyword">finally</span> {
+        setIsReady(<span class="keyword">true</span>);
+      }
+    }
+    prepare();
+  }, []);
+
+  <span class="keyword">const</span> onLayoutRootView = useCallback(<span class="keyword">async</span> () => {
+    <span class="keyword">if</span> (isReady) {
+      <span class="comment">// Hide splash after first render is committed</span>
+      <span class="keyword">await</span> SplashScreen.hideAsync();
+    }
+  }, [isReady]);
+
+  <span class="keyword">if</span> (!isReady) <span class="keyword">return</span> <span class="keyword">null</span>;
+
+  <span class="keyword">return</span> (
+    &lt;View onLayout={onLayoutRootView} style={{ flex: 1 }}&gt;
+      &lt;AppNavigator /&gt;
+    &lt;/View&gt;
+  );
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="measuring">7. Measuring Startup Time</h2>
+
+    <pre><code><span class="comment">// Measuring startup phases</span>
+<span class="keyword">const</span> startupMetrics = {
+  nativeStart: <span class="keyword">null</span>,      <span class="comment">// Set in native code (AppDelegate/Application)</span>
+  jsStart: Date.now(),    <span class="comment">// Set at top of index.js</span>
+  appMounted: <span class="keyword">null</span>,       <span class="comment">// Set in App component useEffect</span>
+  firstRender: <span class="keyword">null</span>,      <span class="comment">// Set in onLayout of root view</span>
+  interactive: <span class="keyword">null</span>,      <span class="comment">// Set when data loaded + UI ready</span>
+};
+
+<span class="comment">// In index.js (earliest JS execution point)</span>
+global.__jsStartTime = Date.now();
+
+<span class="comment">// In App.tsx</span>
+<span class="keyword">function</span> <span class="func">App</span>() {
+  useEffect(() => {
+    <span class="keyword">const</span> mountTime = Date.now();
+    <span class="keyword">const</span> jsToMount = mountTime - global.__jsStartTime;
+    console.log(<span class="string">`JS → Mount: ${jsToMount}ms`</span>);
+
+    <span class="comment">// Report to analytics</span>
+    analytics.track(<span class="string">'startup_complete'</span>, {
+      jsToMount,
+      totalColdStart: mountTime - global.__nativeStartTime,
+    });
+  }, []);
+}
+
+<span class="comment">// Native side measurement (iOS)</span>
+<span class="comment">// In AppDelegate.swift:</span>
+<span class="comment">// let startTime = CFAbsoluteTimeGetCurrent()</span>
+<span class="comment">// ... after bridge ready ...</span>
+<span class="comment">// let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="bundle-size">8. Reducing Bundle Size</h2>
+
+    <pre><code><span class="comment">// Analyze bundle contents</span>
+<span class="comment">// npx react-native-bundle-visualizer</span>
+<span class="comment">// or: npx source-map-explorer main.jsbundle main.jsbundle.map</span>
+
+<span class="comment">// Common bundle bloat sources:</span>
+<span class="comment">// 1. moment.js (330KB) → use date-fns (tree-shakeable) or dayjs (2KB)</span>
+<span class="comment">// 2. lodash (72KB) → use lodash-es or individual imports</span>
+<span class="comment">// 3. Unused exports from large libraries</span>
+<span class="comment">// 4. Polyfills for features Hermes already supports</span>
+<span class="comment">// 5. Development-only code not stripped in production</span>
+
+<span class="comment">// Import optimization</span>
+<span class="comment">// BEFORE: imports entire library</span>
+<span class="keyword">import</span> _ <span class="keyword">from</span> <span class="string">'lodash'</span>;
+_.debounce(fn, 300);
+
+<span class="comment">// AFTER: imports only what's needed</span>
+<span class="keyword">import</span> debounce <span class="keyword">from</span> <span class="string">'lodash/debounce'</span>;
+debounce(fn, 300);</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="tree-shaking">9. Tree Shaking and Dead Code</h2>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Metro's Tree Shaking Limitations</div>
+        <p>Metro bundler has <strong>limited tree shaking</strong> compared to webpack or Rollup. It cannot eliminate unused exports from CommonJS modules (only ES modules). Many React Native libraries use CommonJS, so unused code is included in the bundle. Workarounds: (1) use libraries that ship ES modules, (2) import specific files instead of barrel exports, (3) use <code>babel-plugin-transform-remove-console</code> to strip console.log in production.</p>
+    </div>
+
+    <pre><code><span class="comment">// babel.config.js — production optimizations</span>
+module.exports = {
+  presets: [<span class="string">'module:@react-native/babel-preset'</span>],
+  plugins: [
+    <span class="comment">// Remove console.log in production</span>
+    ...(process.env.NODE_ENV === <span class="string">'production'</span>
+      ? [<span class="string">'transform-remove-console'</span>]
+      : []),
+  ],
+  env: {
+    production: {
+      plugins: [
+        <span class="comment">// Dead code elimination for __DEV__ checks</span>
+        [<span class="string">'transform-inline-environment-variables'</span>],
+      ],
+    },
+  },
+};</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>Startup optimization is a pipeline problem — you must optimize every stage because the total time is the sum of all stages. The highest-impact optimizations in order: (1) <strong>Hermes bytecode</strong> — eliminates parse/compile time (saves 200-500ms), (2) <strong>Inline requires</strong> — defers module loading (saves 50-200ms), (3) <strong>TurboModule lazy loading</strong> — defers native module init (saves 50-150ms), (4) <strong>Bundle size reduction</strong> — less code to load and execute (saves 50-200ms), (5) <strong>Splash screen management</strong> — perceived performance while loading. Measure each stage independently and optimize the largest contributor first.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="04-memory-optimization.html">← Memory Optimization</a>
+        <a href="06-animation-performance.html">Next: Animation Performance →</a>
+    </div>
+</div>
+</body>
+</html>

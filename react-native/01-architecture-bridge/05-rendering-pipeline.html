@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rendering Pipeline — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Architecture &amp; Bridge</a><span class="sep">›</span>
+        Rendering Pipeline
+    </nav>
+
+    <h1>Rendering Pipeline</h1>
+    <p class="subtitle">The rendering pipeline transforms React component descriptions into native platform views through a multi-stage process spanning three threads. Understanding each stage — reconciliation, shadow tree diffing, and native view mutation — is essential for diagnosing performance issues.</p>
+
+    <nav class="nav">
+        <a href="01-bridge-architecture.html">Bridge Architecture</a>
+        <a href="02-javascript-runtime.html">JS Runtime</a>
+        <a href="03-native-module-system.html">Native Modules</a>
+        <a href="04-shadow-tree-yoga.html">Shadow Tree &amp; Yoga</a>
+        <a href="05-rendering-pipeline.html" class="active">Rendering Pipeline</a>
+        <a href="06-threading-model.html">Threading Model</a>
+        <a href="07-metro-bundler.html">Metro Bundler</a>
+        <a href="08-interview-qa.html">Interview Q&amp;A</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#overview">1. Pipeline Overview</a></li>
+            <li><a href="#reconciliation">2. React Reconciliation Phase</a></li>
+            <li><a href="#uimanager">3. UIManager and Its Role</a></li>
+            <li><a href="#shadow-diff">4. Shadow Tree Diffing</a></li>
+            <li><a href="#native-mutations">5. Native View Mutations</a></li>
+            <li><a href="#batch-native">6. Batching Native Calls</a></li>
+            <li><a href="#view-flattening">7. View Flattening Optimization</a></li>
+            <li><a href="#set-native-props">8. setNativeProps: Direct Manipulation</a></li>
+            <li><a href="#platform-rendering">9. Platform-Specific Rendering</a></li>
+            <li><a href="#architect">10. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="overview">1. Pipeline Overview</h2>
+
+    <div class="diagram">
+Complete Rendering Pipeline (Old Architecture)
+═══════════════════════════════════════════════
+
+Frame N: User taps button → setState({ count: 1 })
+
+JS Thread (Frame N):
+┌─────────────────────────────────────────────────────────┐
+│ 1. setState enqueued                                     │
+│ 2. React reconciliation (fiber tree walk)                │
+│ 3. Diff: old elements vs new elements                    │
+│ 4. Generate UIManager commands:                          │
+│    - createView(tag, type, props)                        │
+│    - updateView(tag, type, changedProps)                  │
+│    - manageChildren(tag, moveFrom, moveTo, addTags, ...) │
+│ 5. Enqueue commands on BatchedBridge                     │
+└──────────────────────────┬──────────────────────────────┘
+                           │ Bridge (JSON serialize)
+                           ▼
+Shadow Thread (Frame N+1):
+┌─────────────────────────────────────────────────────────┐
+│ 6. Create/update shadow nodes                            │
+│ 7. Run Yoga layout calculation                           │
+│ 8. Compute layout diffs                                  │
+│ 9. Generate native view update commands                  │
+└──────────────────────────┬──────────────────────────────┘
+                           │ Dispatch to main thread
+                           ▼
+UI Thread (Frame N+1 or N+2):
+┌─────────────────────────────────────────────────────────┐
+│ 10. Create native views (UIView / android.view.View)     │
+│ 11. Set view properties (backgroundColor, etc.)          │
+│ 12. Set frames/layouts from Yoga results                 │
+│ 13. Add/remove/reorder child views                       │
+│ 14. Trigger platform layout pass                         │
+│ 15. Platform composites and renders to screen             │
+└─────────────────────────────────────────────────────────┘
+
+Total latency: 1-3 frames (16-50ms) from setState to pixels
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>The rendering pipeline spans 3 threads and 2 bridge crossings (JS→Shadow, Shadow→UI). Each bridge crossing adds at minimum one frame of latency. This means a <code>setState</code> call takes 2-3 frames to appear on screen — a fundamental limitation of the old architecture that Fabric addresses by moving the shadow tree to C++ shared memory.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="reconciliation">2. React Reconciliation Phase</h2>
+
+    <p>The first stage runs entirely on the JS thread. React's reconciler walks the fiber tree, comparing old and new element trees to determine what changed.</p>
+
+    <pre><code><span class="comment">// React reconciliation produces UIManager commands</span>
+
+<span class="comment">// Given this state change:</span>
+<span class="comment">// Before: &lt;View&gt;&lt;Text&gt;Count: 0&lt;/Text&gt;&lt;/View&gt;</span>
+<span class="comment">// After:  &lt;View&gt;&lt;Text&gt;Count: 1&lt;/Text&gt;&lt;View style={styles.badge}/&gt;&lt;/View&gt;</span>
+
+<span class="comment">// Reconciler detects:</span>
+<span class="comment">// 1. Text content changed: "Count: 0" → "Count: 1"</span>
+<span class="comment">// 2. New child added: View with badge style</span>
+
+<span class="comment">// Generates these UIManager commands:</span>
+UIManager.updateView(textTag, <span class="string">'RCTText'</span>, {
+  text: <span class="string">'Count: 1'</span>
+});
+
+UIManager.createView(newTag, <span class="string">'RCTView'</span>, rootTag, {
+  backgroundColor: <span class="string">'red'</span>,
+  width: 20,
+  height: 20,
+  borderRadius: 10
+});
+
+UIManager.manageChildren(
+  parentTag,
+  [],           <span class="comment">// moveFrom indices</span>
+  [],           <span class="comment">// moveTo indices</span>
+  [newTag],     <span class="comment">// addChildTags</span>
+  [1],          <span class="comment">// addAtIndices</span>
+  []            <span class="comment">// removeAtIndices</span>
+);</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="uimanager">3. UIManager and Its Role</h2>
+
+    <p>UIManager is the central native module that manages the shadow tree and dispatches view operations. It's the most heavily used native module in any React Native app.</p>
+
+    <pre><code><span class="comment">// UIManager API (key methods)</span>
+
+<span class="comment">// Create a new shadow node + native view</span>
+UIManager.createView(
+  reactTag: number,      <span class="comment">// unique identifier for this view</span>
+  viewName: string,      <span class="comment">// 'RCTView', 'RCTText', 'RCTImage', etc.</span>
+  rootTag: number,       <span class="comment">// root container tag</span>
+  props: Object          <span class="comment">// initial properties</span>
+);
+
+<span class="comment">// Update properties on existing view</span>
+UIManager.updateView(
+  reactTag: number,
+  viewName: string,
+  props: Object          <span class="comment">// only changed properties</span>
+);
+
+<span class="comment">// Manage child view hierarchy</span>
+UIManager.manageChildren(
+  parentTag: number,
+  moveFromIndices: number[],
+  moveToIndices: number[],
+  addChildReactTags: number[],
+  addAtIndices: number[],
+  removeAtIndices: number[]
+);
+
+<span class="comment">// Set children (simpler version for initial mount)</span>
+UIManager.setChildren(
+  parentTag: number,
+  childrenTags: number[]
+);
+
+<span class="comment">// Measure a view (async — requires bridge round-trip)</span>
+UIManager.measure(
+  reactTag: number,
+  callback: (x, y, width, height, pageX, pageY) => void
+);
+
+<span class="comment">// Dispatch a command to a view manager</span>
+UIManager.dispatchViewManagerCommand(
+  reactTag: number,
+  commandID: number,
+  args: any[]
+);</code></pre>
+
+    <div class="diagram">
+UIManager Internal Flow
+═══════════════════════
+
+JS Thread                Shadow Thread              UI Thread
+─────────                ─────────────              ─────────
+createView(tag,props) ──→ Create ShadowNode    ──→  Create UIView
+                          Create YGNode              Set initial props
+                          Set Yoga styles
+
+updateView(tag,props) ──→ Update ShadowNode    ──→  Update UIView props
+                          Mark Yoga dirty            (if layout changed)
+                          Recalc layout
+
+manageChildren(...)   ──→ Reorder ShadowNodes  ──→  addSubview/removeFromSuperview
+                          Recalc layout              reorder child views
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="shadow-diff">4. Shadow Tree Diffing</h2>
+
+    <pre><code><span class="comment">// Shadow tree diffing produces minimal native mutations</span>
+
+<span class="comment">// The shadow thread maintains two versions:</span>
+<span class="comment">// - committed tree: matches current native view state</span>
+<span class="comment">// - working tree: being updated from JS commands</span>
+
+<span class="comment">// After Yoga layout calculation, diff the trees:</span>
+<span class="keyword">function</span> diffShadowTrees(committed, working) {
+  <span class="keyword">const</span> mutations = [];
+
+  <span class="comment">// Compare each node</span>
+  <span class="keyword">for</span> (<span class="keyword">const</span> tag <span class="keyword">of</span> working.allTags()) {
+    <span class="keyword">const</span> oldNode = committed.getNode(tag);
+    <span class="keyword">const</span> newNode = working.getNode(tag);
+
+    <span class="keyword">if</span> (!oldNode) {
+      <span class="comment">// New node — create native view</span>
+      mutations.push({ type: <span class="string">'CREATE'</span>, tag, viewType, props, layout });
+    } <span class="keyword">else if</span> (propsChanged(oldNode, newNode)) {
+      <span class="comment">// Props changed — update native view</span>
+      mutations.push({ type: <span class="string">'UPDATE'</span>, tag, changedProps });
+    }
+
+    <span class="keyword">if</span> (layoutChanged(oldNode, newNode)) {
+      <span class="comment">// Layout changed — update frame</span>
+      mutations.push({ type: <span class="string">'LAYOUT'</span>, tag, layout: newNode.layout });
+    }
+  }
+
+  <span class="comment">// Check for removed nodes</span>
+  <span class="keyword">for</span> (<span class="keyword">const</span> tag <span class="keyword">of</span> committed.allTags()) {
+    <span class="keyword">if</span> (!working.hasNode(tag)) {
+      mutations.push({ type: <span class="string">'DELETE'</span>, tag });
+    }
+  }
+
+  <span class="keyword">return</span> mutations;
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="native-mutations">5. Native View Mutations</h2>
+
+    <pre><code><span class="comment">// Native view mutations (iOS example)</span>
+
+<span class="comment">// CREATE: instantiate native view</span>
+- (<span class="type">UIView</span> *)createViewWithTag:(NSNumber *)tag
+                      viewName:(NSString *)viewName
+                         props:(NSDictionary *)props {
+  RCTComponentData *componentData = _componentDataByName[viewName];
+  UIView *view = [componentData createViewWithTag:tag];
+  [componentData setProps:props forView:view];
+  _viewRegistry[tag] = view;
+  <span class="keyword">return</span> view;
+}
+
+<span class="comment">// UPDATE: modify existing view properties</span>
+- (<span class="keyword">void</span>)updateView:(NSNumber *)tag
+           viewName:(NSString *)viewName
+              props:(NSDictionary *)props {
+  UIView *view = _viewRegistry[tag];
+  RCTComponentData *componentData = _componentDataByName[viewName];
+  [componentData setProps:props forView:view];
+}
+
+<span class="comment">// LAYOUT: set frame from Yoga calculation</span>
+- (<span class="keyword">void</span>)setFrame:(CGRect)frame forView:(UIView *)view {
+  <span class="comment">// Only update if frame actually changed (avoid unnecessary layout)</span>
+  <span class="keyword">if</span> (!CGRectEqualToRect(view.frame, frame)) {
+    view.frame = frame;
+  }
+}
+
+<span class="comment">// DELETE: remove and deallocate view</span>
+- (<span class="keyword">void</span>)removeView:(NSNumber *)tag {
+  UIView *view = _viewRegistry[tag];
+  [view removeFromSuperview];
+  [_viewRegistry removeObjectForKey:tag];
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="batch-native">6. Batching Native Calls</h2>
+
+    <pre><code><span class="comment">// All UIManager operations in a single JS frame are batched</span>
+
+<span class="comment">// A typical render cycle might produce:</span>
+<span class="comment">// 1. createView × 5 (new list items)</span>
+<span class="comment">// 2. updateView × 3 (changed props)</span>
+<span class="comment">// 3. manageChildren × 1 (add new items to list)</span>
+<span class="comment">// 4. setChildren × 5 (set children of new items)</span>
+
+<span class="comment">// These 14 operations are batched into a single bridge message:</span>
+<span class="comment">// [[1,1,1,1,1,1,1,1,1,1,1,1,1,1],  // moduleIDs (all UIManager)</span>
+<span class="comment">//  [0,0,0,0,0,1,1,1,2,3,3,3,3,3],  // methodIDs</span>
+<span class="comment">//  [[params1], [params2], ...]]       // params arrays</span>
+
+<span class="comment">// On the native side, operations are executed in order:</span>
+<span class="comment">// 1. Shadow thread: process all create/update/manage operations</span>
+<span class="comment">// 2. Shadow thread: run Yoga layout for dirty subtrees</span>
+<span class="comment">// 3. UI thread: apply all view mutations in a single CATransaction</span>
+
+<span class="comment">// iOS batches within CATransaction for atomic updates:</span>
+[CATransaction begin];
+[CATransaction setDisableActions:YES]; <span class="comment">// no implicit animations</span>
+<span class="comment">// ... apply all view mutations ...</span>
+[CATransaction commit];
+
+<span class="comment">// Android batches within a single Choreographer frame:</span>
+<span class="comment">// All mutations applied before next VSYNC</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="view-flattening">7. View Flattening Optimization</h2>
+
+    <p>View flattening removes "layout-only" views from the native view hierarchy. A layout-only view is one that exists solely for Flexbox layout purposes and has no visual properties (no background color, border, shadow, opacity, transforms, or event handlers).</p>
+
+    <div class="diagram">
+View Flattening Example
+═══════════════════════
+
+React Tree:                    Native Tree (without flattening):
+&lt;View style={styles.row}&gt;     UIView (row)
+  &lt;View style={styles.col}&gt;     UIView (col)        ← layout-only
+    &lt;Text&gt;Hello&lt;/Text&gt;            RCTTextView
+  &lt;/View&gt;                       UIView (col)        ← layout-only
+  &lt;View style={styles.col}&gt;       RCTTextView
+    &lt;Text&gt;World&lt;/Text&gt;
+  &lt;/View&gt;
+&lt;/View&gt;
+
+Native Tree (with flattening):
+UIView (row)
+  RCTTextView (Hello)    ← positioned using parent's Yoga layout
+  RCTTextView (World)    ← positioned using parent's Yoga layout
+
+Result: 5 native views → 3 native views (40% reduction)
+    </div>
+
+    <pre><code><span class="comment">// View flattening criteria (Android)</span>
+<span class="comment">// A view is "layout-only" if ALL of these are true:</span>
+<span class="comment">// 1. No background color or border</span>
+<span class="comment">// 2. No opacity &lt; 1</span>
+<span class="comment">// 3. No transform</span>
+<span class="comment">// 4. No shadow</span>
+<span class="comment">// 5. No overflow: hidden (clipping)</span>
+<span class="comment">// 6. No event handlers (onPress, onLayout, etc.)</span>
+<span class="comment">// 7. No accessibility properties</span>
+<span class="comment">// 8. No native ID (nativeID prop)</span>
+
+<span class="comment">// Disable flattening for a specific view:</span>
+&lt;<span class="type">View</span> collapsable={<span class="keyword">false</span>}&gt;
+  <span class="comment">{/* This view will always exist in native hierarchy */}</span>
+&lt;/<span class="type">View</span>&gt;
+
+<span class="comment">// Common reason to disable: you need to measure this view</span>
+<span class="comment">// or use it as a ref target for findNodeHandle()</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Key Detail</div>
+        <p>View flattening happens on Android by default (<code>collapsable={true}</code>). On iOS in the old architecture, view flattening is less aggressive. In Fabric (new architecture), view flattening is more sophisticated and works consistently across platforms, removing even more unnecessary native views.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="set-native-props">8. setNativeProps: Direct Manipulation</h2>
+
+    <p><code>setNativeProps</code> bypasses React reconciliation to update native view properties directly. It's an escape hatch for performance-critical updates that would otherwise cause unnecessary re-renders.</p>
+
+    <pre><code><span class="comment">// setNativeProps: direct bridge call, no React re-render</span>
+
+<span class="keyword">const</span> viewRef = useRef(null);
+
+<span class="comment">// Normal React way (triggers reconciliation):</span>
+<span class="keyword">const</span> [color, setColor] = useState(<span class="string">'red'</span>);
+&lt;<span class="type">View</span> style={{ backgroundColor: color }} /&gt;
+<span class="comment">// setState → reconcile → diff → bridge → shadow → native</span>
+
+<span class="comment">// setNativeProps (bypasses reconciliation):</span>
+viewRef.current.setNativeProps({
+  style: { backgroundColor: <span class="string">'blue'</span> }
+});
+<span class="comment">// Direct: bridge → updateView → native</span>
+<span class="comment">// No React re-render, no reconciliation, no shadow tree diff</span>
+
+<span class="comment">// Use case: high-frequency updates (gesture handlers)</span>
+<span class="keyword">const</span> onPanGesture = (event) => {
+  <span class="comment">// 60fps gesture tracking — can't afford React re-renders</span>
+  viewRef.current.setNativeProps({
+    style: {
+      transform: [
+        { translateX: event.translationX },
+        { translateY: event.translationY }
+      ]
+    }
+  });
+};
+
+<span class="comment">// WARNING: setNativeProps creates divergence between</span>
+<span class="comment">// React's virtual tree and actual native state.</span>
+<span class="comment">// Next React re-render may overwrite setNativeProps changes.</span>
+<span class="comment">// Use sparingly and only for transient visual updates.</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Deprecation Note</div>
+        <p><code>setNativeProps</code> is effectively deprecated in the new architecture (Fabric). Fabric's synchronous rendering and concurrent features make it unnecessary. For gesture-driven animations, use <code>react-native-reanimated</code> which runs animations on the UI thread via JSI, completely bypassing both React and the bridge.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="platform-rendering">9. Platform-Specific Rendering</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>iOS (UIKit)</th>
+                <th>Android (View System)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Base view class</td>
+                <td><code>UIView</code></td>
+                <td><code>android.view.View</code> / <code>ViewGroup</code></td>
+            </tr>
+            <tr>
+                <td>Text rendering</td>
+                <td><code>NSAttributedString</code> + Core Text</td>
+                <td><code>StaticLayout</code> / <code>BoringLayout</code></td>
+            </tr>
+            <tr>
+                <td>Image loading</td>
+                <td><code>UIImage</code> + <code>SDWebImage</code></td>
+                <td><code>Fresco</code> (default) / <code>Glide</code></td>
+            </tr>
+            <tr>
+                <td>Scroll views</td>
+                <td><code>UIScrollView</code></td>
+                <td><code>ReactScrollView</code> (extends ScrollView)</td>
+            </tr>
+            <tr>
+                <td>Layout trigger</td>
+                <td><code>setNeedsLayout</code> → <code>layoutSubviews</code></td>
+                <td><code>requestLayout</code> → <code>onLayout</code></td>
+            </tr>
+            <tr>
+                <td>Frame update</td>
+                <td><code>view.frame = CGRect(...)</code></td>
+                <td><code>view.layout(l, t, r, b)</code></td>
+            </tr>
+            <tr>
+                <td>Rendering pipeline</td>
+                <td>Core Animation → Metal/OpenGL</td>
+                <td>Hardware-accelerated Canvas → Skia/OpenGL</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// iOS: RCTView (React Native's base view)</span>
+@interface RCTView : UIView
+<span class="comment">// Adds: borderRadius, shadow, accessibility, hit testing</span>
+<span class="comment">// Overrides: layoutSubviews for Yoga integration</span>
+- (<span class="keyword">void</span>)reactSetFrame:(CGRect)frame {
+  <span class="comment">// Called by RN with Yoga-computed layout</span>
+  <span class="comment">// Applies frame + triggers platform layout if needed</span>
+  [<span class="keyword">super</span> setFrame:frame];
+  <span class="comment">// Notify JS of layout via onLayout callback (if registered)</span>
+}
+@end
+
+<span class="comment">// Android: ReactViewGroup (React Native's base ViewGroup)</span>
+<span class="keyword">class</span> <span class="type">ReactViewGroup</span> : ViewGroup {
+  <span class="comment">// Overrides onLayout to apply Yoga-computed child positions</span>
+  <span class="keyword">override fun</span> onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
+    <span class="comment">// Children already positioned by Yoga — just confirm layout</span>
+    <span class="comment">// No additional layout calculation needed</span>
+  }
+
+  <span class="comment">// View flattening: removes layout-only views from native hierarchy</span>
+  <span class="comment">// Children of flattened views are re-parented with adjusted offsets</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">10. Architect Considerations</h2>
+
+    <h3>10.1 Rendering Performance Budget</h3>
+
+    <div class="diagram">
+16.67ms Frame Budget (60fps)
+════════════════════════════
+
+┌──────────────────────────────────────────────────────────┐
+│ JS Reconciliation    │ Bridge │ Shadow/Layout │ Native   │
+│ ████████ (4-8ms)     │ ██     │ ████ (2-4ms)  │ ████     │
+│                      │ (1-2ms)│               │ (2-4ms)  │
+└──────────────────────────────────────────────────────────┘
+Total: 9-18ms — often exceeds 16.67ms budget!
+
+Optimization priorities:
+1. Reduce JS reconciliation (React.memo, useMemo, useCallback)
+2. Reduce bridge traffic (batch updates, native driver)
+3. Reduce shadow tree size (view flattening, virtualization)
+4. Reduce native view count (flattening, recycling)
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>The rendering pipeline is where React Native's architecture tax is most visible. Each stage (reconciliation, bridge, shadow, native) has its own cost, and they're sequential across threads. At L6, you should be able to profile each stage independently: use React DevTools Profiler for reconciliation, Systrace/Perfetto for bridge and shadow thread, and platform profilers (Instruments/Android Profiler) for native rendering. The key insight is that the <strong>bridge is the multiplier</strong> — every optimization that reduces bridge crossings (native driver, view flattening, batching) has outsized impact because it eliminates serialization AND inter-thread latency.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="04-shadow-tree-yoga.html">← Shadow Tree &amp; Yoga</a>
+        <a href="06-threading-model.html">Next: Threading Model →</a>
+    </div>
+</div>
+</body>
+</html>

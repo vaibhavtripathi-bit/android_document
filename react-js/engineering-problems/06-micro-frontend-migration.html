@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Micro-Frontend Migration — Engineering Problems</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Engineering Problems</a>
+  <span class="sep">›</span>
+  Micro-Frontend Migration
+</nav>
+
+<h1>Migrating a Monolithic React App to Micro-Frontends</h1>
+<p class="subtitle">Strangler fig, shared auth, routing bridges, independent deploys, and the performance trade-offs staff engineers negotiate.</p>
+
+<div class="callout-architect">
+  <div class="callout-title">Migration thesis</div>
+  <p>Micro-frontends are an organizational scaling tool. The hard problems are not “import remote” but <em>consistent identity</em>, <em>routing truth</em>, <em>dependency duplication</em>, and <em>blast-radius control</em> during the years-long transition.</p>
+</div>
+
+<h2>Strangler fig pattern</h2>
+<p>Incrementally replace slices of the monolith behind a stable shell. Each vertical owns UI, data fetching, and release cadence; the shell owns chrome, auth bootstrap, and top-level navigation.</p>
+
+<div class="diagram">Year 0     [████████████████ Monolith ████████████████]
+Year 1     [Shell │██ MFE-A ██│████████ Monolith ████████]
+Year 2     [Shell │ MFE-A │ MFE-B │██ Monolith (legacy) ██]
+Year 3     [Shell │ MFE-A │ MFE-B │ MFE-C │  (monolith retired) ]</div>
+
+<p>The strangler <strong>wrapper</strong> mounts legacy routes until the MFE is ready, then swaps the implementation without changing the URL contract seen by users.</p>
+
+<h3>Strangler fig wrapper (React)</h3>
+<pre><code>// StranglerHost.tsx — feature-toggled boundary
+import { lazy, Suspense, type ComponentType } from 'react';
+
+const LegacyCheckout = lazy(() =&gt; import('../legacy/CheckoutApp'));
+const MfeCheckout = lazy(() =&gt; import('checkout_mfe/Checkout'));
+
+type Props = { useMfe: boolean };
+
+export function StranglerCheckout({ useMfe }: Props) {
+  const Cmp: ComponentType = useMfe ? MfeCheckout : LegacyCheckout;
+  return (
+    &lt;Suspense fallback={&lt;ChromeSkeleton /&gt;}&gt;
+      &lt;ErrorBoundary onError={reportToShell}&gt;
+        &lt;Cmp /&gt;
+      &lt;/ErrorBoundary&gt;
+    &lt;/Suspense&gt;
+  );
+}</code></pre>
+
+<div class="callout-info">
+  <div class="callout-title">Boundary discipline</div>
+  <p>Each MFE should fail independently. The shell provides a shared error boundary contract (error IDs, retry, support links) so UX stays coherent when a remote fails to load.</p>
+</div>
+
+<h2>Shared state during migration</h2>
+<p>Monoliths lean on a single Redux store; MFEs cannot safely share mutable singletons across webpack runtimes without version skew. Patterns:</p>
+<ul>
+  <li><strong>Shell-owned global store</strong> — Zustand/Redux in the shell; MFEs receive props or subscribe via a narrow <code>window.__SHELL_BUS__</code> adapter (versioned events).</li>
+  <li><strong>URL as source of truth</strong> — encode cart ID, org ID, and feature flags in the route or query where possible.</li>
+  <li><strong>Backend-for-frontend</strong> — duplicate client state is replaced by server reconciliation (GraphQL/REST) keyed by session.</li>
+</ul>
+
+<table>
+  <thead>
+    <tr>
+      <th>Approach</th>
+      <th>Coupling</th>
+      <th>Risk</th>
+      <th>When to use</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Props from shell</td>
+      <td>Low</td>
+      <td>Prop drilling at depth</td>
+      <td>Leaf MFEs, short-lived data</td>
+    </tr>
+    <tr>
+      <td>Custom events / bus</td>
+      <td>Medium</td>
+      <td>Implicit contracts</td>
+      <td>Cross-MFE notifications</td>
+    </tr>
+    <tr>
+      <td>Shared npm package</td>
+      <td>High</td>
+      <td>Version hell</td>
+      <td>Design tokens, auth client</td>
+    </tr>
+    <tr>
+      <td>Module Federation shared</td>
+      <td>High</td>
+      <td>Singleton mismatch</td>
+      <td>react/react-dom only</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout-warning">
+  <div class="callout-title">React duplication</div>
+  <p>Two copies of React break hooks and context. Federation <code>shared: { react: { singleton: true, strictVersion: true } }</code> is mandatory—but align minor versions across CI or builds fail mysteriously at runtime.</p>
+</div>
+
+<h2>Authentication across micro-frontends</h2>
+<p>Single auth <em>context</em> in the shell; MFEs never parse JWTs independently unless they are separately deployed SPAs with their own OIDC client (usually worse). The shell refreshes tokens and exposes a stable API.</p>
+
+<h3>Shared auth context</h3>
+<pre><code>// shell/auth/AuthProvider.tsx
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
+
+type User = { sub: string; orgId: string; roles: string[] };
+type AuthState =
+  | { status: 'loading' }
+  | { status: 'authenticated'; user: User; accessToken: string }
+  | { status: 'anonymous' };
+
+const AuthCtx = createContext&lt;AuthState | null&gt;(null);
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [state, setState] = useState&lt;AuthState&gt;({ status: 'loading' });
+
+  useEffect(() =&gt; {
+    let cancelled = false;
+    (async () =&gt; {
+      const s = await bootstrapSession(); // silent refresh, cookie session, etc.
+      if (!cancelled) setState(s);
+    })();
+    return () =&gt; {
+      cancelled = true;
+    };
+  }, []);
+
+  const value = useMemo(() =&gt; state, [state]);
+  return &lt;AuthCtx.Provider value={value}&gt;{children}&lt;/AuthCtx.Provider&gt;;
+}
+
+export function useShellAuth(): AuthState {
+  const v = useContext(AuthCtx);
+  if (!v) throw new Error('useShellAuth must run under shell');
+  return v;
+}</code></pre>
+
+<p>Expose a thin <code>@org/shell-auth</code> package that only re-exports types and hooks backed by the same context instance from the shell bundle—not a second provider.</p>
+
+<h2>Routing integration</h2>
+<p>The shell router owns <strong>prefixes</strong>; each MFE owns sub-routes. Example: shell matches <code>/app/billing/*</code> and renders a remote; inside, the MFE uses memory history or a basename-aware router.</p>
+
+<h3>Routing bridge</h3>
+<pre><code>// shell/routing/MfeMount.tsx
+import { useNavigate, useLocation, Routes, Route } from 'react-router-dom';
+import { useEffect } from 'react';
+
+type BridgeProps = {
+  basename: string;
+  children: JSX.Element;
+};
+
+/** Syncs shell URL ↔ MFE internal navigations via postMessage or shared history adapter */
+export function MfeHistoryBridge({ basename, children }: BridgeProps) {
+  const nav = useNavigate();
+  const loc = useLocation();
+
+  useEffect(() =&gt; {
+    function onMessage(e: MessageEvent) {
+      if (e.origin !== window.origin) return;
+      if (e.data?.type === 'mfe:navigate' &amp;&amp; e.data.basename === basename) {
+        nav(e.data.to);
+      }
+    }
+    window.addEventListener('message', onMessage);
+    return () =&gt; window.removeEventListener('message', onMessage);
+  }, [basename, nav]);
+
+  useEffect(() =&gt; {
+    window.dispatchEvent(
+      new CustomEvent('shell:location', {
+        detail: { pathname: loc.pathname, basename },
+      }),
+    );
+  }, [loc.pathname, basename]);
+
+  return children;
+}</code></pre>
+
+<div class="diagram">User URL: /app/billing/invoices/42
+                    │
+       Shell router │  prefix=/app/billing
+                    ▼
+            ┌───────────────┐
+            │  MFE Billing  │  internal: /invoices/42  (basename)
+            └───────────────┘
+                    │
+         deep link │ postMessage or shared navigate()
+                    ▼
+            Shell updates browser URL (bookmarkable)</div>
+
+<h2>Deployment pipeline</h2>
+<p>Independent CI/CD per MFE implies independent SemVer and contract tests. Minimum bar:</p>
+<ol>
+  <li><strong>Consumer-driven contracts</strong> (Pact) between shell and remotes for manifest URLs and exposed modules.</li>
+  <li><strong>Preview environments</strong> per PR with the shell loading the preview remote URL.</li>
+  <li><strong>Artifact registry</strong> for <code>remoteEntry.js</code> with immutable versions; shell pins ranges deliberately.</li>
+</ol>
+
+<h3>Deployment config (GitHub Actions excerpt)</h3>
+<pre><code># .github/workflows/mfe-billing.yml
+name: mfe-billing
+on:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      - run: npm run build
+      - name: Upload remoteEntry
+        run: |
+          aws s3 cp dist/remoteEntry.js s3://cdn.example.com/billing/${{ github.sha }}/remoteEntry.js
+      - name: Invalidate CDN
+        run: aws cloudfront create-invalidation --distribution-id $CF_ID --paths "/billing/${{ github.sha }}/*"</code></pre>
+
+<h2>Rollback strategies</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Strategy</th>
+      <th>Recovery time</th>
+      <th>Complexity</th>
+      <th>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Feature flag in shell</td>
+      <td>Seconds</td>
+      <td>Low</td>
+      <td>Points manifest URL to last good SHA</td>
+    </tr>
+    <tr>
+      <td>Canary by cohort</td>
+      <td>Minutes</td>
+      <td>Medium</td>
+      <td>Progressive % + automatic rollback on SLO breach</td>
+    </tr>
+    <tr>
+      <td>Blue/green remote host</td>
+      <td>Minutes</td>
+      <td>High</td>
+      <td>Two CDNs; DNS or config switch</td>
+    </tr>
+    <tr>
+      <td>Full shell rollback</td>
+      <td>Varies</td>
+      <td>Low</td>
+      <td>Coarse; avoids MFE-only fixes</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout-architect">
+  <div class="callout-title">Manifest pinning</div>
+  <p>Never load “latest” remoteEntry in production. The shell should resolve <code>billing@1.4.x</code> to an exact build hash recorded in a manifest service so rollbacks are flipping a pointer, not redeploying the shell.</p>
+</div>
+
+<h2>Performance implications</h2>
+<ul>
+  <li><strong>Waterfall loading</strong> — shell parses, then fetches remoteEntry, then chunks. Mitigate with <code>rel=preload</code> for critical remotes and route-based prefetching on intent (hover).</li>
+  <li><strong>Duplicate dependencies</strong> — lodash, date libs, and charting stacks multiply. Enforce shared federation config and dependency budgets per MFE.</li>
+  <li><strong>Runtime integration cost</strong> — postMessage bridges and extra error boundaries add overhead; measure INP on navigation boundaries.</li>
+</ul>
+
+<pre><code>// federation shared snippet (webpack.config / rspack)
+new ModuleFederationPlugin({
+  name: 'shell',
+  remotes: {
+    billing: `promise new Promise(resolve =&gt; {
+      const url = window.__MFE_MANIFEST__.billing;
+      const script = document.createElement('script');
+      script.src = url;
+      script.onload = () =&gt; resolve(window.billing);
+      document.head.appendChild(script);
+    })`,
+  },
+  shared: {
+    react: { singleton: true, requiredVersion: '^18.3.1' },
+    'react-dom': { singleton: true, requiredVersion: '^18.3.1' },
+  },
+});</code></pre>
+
+<h2>Migration timeline (ASCII)</h2>
+<div class="diagram">Q1  Discovery     │ inventory routes, owners, shared libs
+Q2  Shell v1       │ auth, layout, feature flags, logging
+Q3  First MFE     │ strangler on 1 vertical + contract tests
+Q4  Scale-out      │ 2–3 MFEs, manifest service, SLO dashboards
+Y2  Decommission   │ shrink monolith bundle; delete dead routes
+────────────────────────────────────────────────────────────
+Risk spikes:        ^ federation version skew
+                     ^ routing deep-link bugs
+                     ^ cookie/session cross-subdomain</div>
+
+<h2>Monolith vs MFE (comparison)</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Concern</th>
+      <th>Monolith</th>
+      <th>MFE (mature)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Deploy independence</td>
+      <td>Single train</td>
+      <td>Parallel releases</td>
+    </tr>
+    <tr>
+      <td>Consistency</td>
+      <td>Single design system import</td>
+      <td>Requires enforced DS contracts</td>
+    </tr>
+    <tr>
+      <td>Performance ceiling</td>
+      <td>One optimized graph</td>
+      <td>Multiple chunk graphs + integration tax</td>
+    </tr>
+    <tr>
+      <td>Onboarding</td>
+      <td>One repo mental model</td>
+      <td>Platform docs + tooling</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout-info">
+  <div class="callout-title">When not to migrate</div>
+  <p>If team size and deploy pain do not justify integration complexity, modular monolith + package boundaries often delivers 80% of the benefit with 20% of the operational load.</p>
+</div>
+
+<h2>Cross-cutting observability during migration</h2>
+<p>Treat each strangler boundary as a release candidate with its own SLO slice: shell TTFB, remote load time (time-to-<code>remoteEntry</code>), and post-hydration INP. Tag RUM with <code>mfe_id</code> and <code>manifest_sha</code> so regressions roll up to the owning squad instead of flooding a central frontend on-call.</p>
+
+<h3>Telemetry contract (sketch)</h3>
+<pre><code>// shell/telemetry/mfeMetrics.ts
+export function recordRemoteLoad(mfeId: string, durationMs: number, ok: boolean) {
+  // Caller marks start when import() begins; we mark end after remote resolves.
+  const name = `mfe:${mfeId}:load`;
+  performance.mark(`${name}:end`);
+  performance.measure(name, `${name}:start`, `${name}:end`);
+  navigator.sendBeacon?.(
+    '/api/rum',
+    JSON.stringify({ type: 'mfe_load', mfeId, durationMs, ok }),
+  );
+}</code></pre>
+
+<p>Correlate remote load spikes with CDN cache hit ratio and geographic latency. A sudden climb in p95 often precedes a bad shared dependency upgrade rather than application logic changes.</p>
+
+<h2 class="qa-section">Deep-dive Q&amp;A</h2>
+
+<div class="qa-item">
+  <div class="qa-question">How do you test MFE integrations locally? <span class="level tag tag-senior">Senior</span></div>
+  <div class="qa-answer">
+    <p>Use a “shell dev proxy” that serves remotes from localhost ports with liveModule Federation, plus Cypress/Playwright suites that boot shell + stubbed remotes for speed, and nightly full integration against preview URLs.</p>
+  </div>
+</div>
+
+<div class="qa-item">
+  <div class="qa-question">What breaks SSR with Module Federation? <span class="level tag tag-l6">L6</span></div>
+  <div class="qa-answer">
+    <p>Classic Federation assumes browser script tags. SSR needs either a server-side remote resolver, RSC boundaries, or streaming fallbacks. Align with your meta-framework’s supported story (Next multi-zone, custom Node middleware) before committing.</p>
+  </div>
+</div>
+
+<div class="qa-item">
+  <div class="qa-question">How do you share design tokens without coupling? <span class="level tag tag-architect">Arch</span></div>
+  <div class="qa-answer">
+    <p>Publish a versioned tokens package consumed at build time; avoid runtime CSS-in-JS singletons across bundles. Prefer CSS variables emitted once from the shell theme layer.</p>
+  </div>
+</div>
+
+<nav class="nav-footer">
+  <a href="05-performance-monitoring.html">← Prev: Performance Monitoring</a>
+  <a href="07-search-typeahead.html">Next: Search Typeahead →</a>
+</nav>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

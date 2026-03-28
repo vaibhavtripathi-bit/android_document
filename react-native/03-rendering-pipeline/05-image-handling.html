@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Handling — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Rendering Pipeline</a><span class="sep">›</span>
+        Image Handling
+    </nav>
+
+    <h1>Image Handling</h1>
+    <p class="subtitle">Deep dive into React Native's image loading pipeline — from source resolution through download, decode, and display. Understanding platform-specific caching (NSURLCache, Fresco), memory management, and optimization libraries like FastImage is essential for performant media-rich apps.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#image-component">1. Image Component Internals</a></li>
+            <li><a href="#loading-pipeline">2. Image Loading Pipeline</a></li>
+            <li><a href="#caching">3. Image Caching</a></li>
+            <li><a href="#progressive">4. Progressive Loading</a></li>
+            <li><a href="#resize-modes">5. Image Resize Modes</a></li>
+            <li><a href="#svg">6. SVG Support</a></li>
+            <li><a href="#prefetching">7. Image Prefetching</a></li>
+            <li><a href="#memory">8. Memory Management</a></li>
+            <li><a href="#fastimage">9. FastImage Library</a></li>
+            <li><a href="#architect">10. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="image-component">1. Image Component Internals</h2>
+
+    <p>React Native's <code>&lt;Image&gt;</code> component wraps platform-specific image views with a unified API that handles source resolution, loading states, and display.</p>
+
+    <div class="diagram">
+React Native &lt;Image&gt;
+       │
+       ├──── iOS ────────────────────────────────────────
+       │     RCTImageView (UIImageView subclass)
+       │       └─ RCTImageLoader (centralized loading)
+       │       └─ NSURLSession for network requests
+       │       └─ ImageIO framework for decoding
+       │       └─ NSURLCache for HTTP caching
+       │
+       └──── Android ────────────────────────────────────
+             ReactImageView (extends GenericDraweeView)
+               └─ Fresco library (Facebook's image pipeline)
+               └─ OkHttp for network requests
+               └─ Android BitmapFactory for decoding
+               └─ Multi-tier cache (bitmap, encoded, disk)
+    </div>
+
+    <h3>1.1 Image Source Types</h3>
+
+    <pre><code><span class="comment">// 1. Network images — loaded from URL</span>
+&lt;<span class="type">Image</span>
+  source={{ uri: <span class="string">'https://example.com/photo.jpg'</span> }}
+  style={{ width: <span class="number">200</span>, height: <span class="number">200</span> }}
+/&gt;
+<span class="comment">// MUST specify width and height for network images</span>
+<span class="comment">// React Native cannot know dimensions before download</span>
+
+<span class="comment">// 2. Local/bundled images — resolved at build time</span>
+&lt;<span class="type">Image</span> source={<span class="func">require</span>(<span class="string">'./photo.png'</span>)} /&gt;
+<span class="comment">// Metro bundler resolves to platform-specific asset</span>
+<span class="comment">// Dimensions known at build time — width/height optional</span>
+<span class="comment">// @1x, @2x, @3x variants selected by pixel density</span>
+
+<span class="comment">// 3. Base64 data URI</span>
+&lt;<span class="type">Image</span>
+  source={{ uri: <span class="string">'data:image/png;base64,iVBOR...'</span> }}
+  style={{ width: <span class="number">100</span>, height: <span class="number">100</span> }}
+/&gt;
+<span class="comment">// Decoded in-memory — no caching, no network</span>
+<span class="comment">// Avoid for large images (blocks JS thread during base64 decode)</span>
+
+<span class="comment">// 4. Native asset (Android drawable / iOS asset catalog)</span>
+&lt;<span class="type">Image</span>
+  source={{ uri: <span class="string">'asset:/icon.png'</span> }}  <span class="comment">// Android drawable</span>
+  style={{ width: <span class="number">24</span>, height: <span class="number">24</span> }}
+/&gt;</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="loading-pipeline">2. Image Loading Pipeline</h2>
+
+    <div class="diagram">
+Image Loading Pipeline (Network Image):
+
+1. Source Resolution
+   ├─ Parse URI, headers, cache policy
+   └─ Determine loader (network, local, data URI)
+
+2. Cache Check
+   ├─ iOS: NSURLCache (HTTP cache)
+   ├─ Android: Fresco disk cache → encoded memory cache → bitmap cache
+   └─ Hit? → Skip to step 5
+
+3. Download
+   ├─ iOS: NSURLSession data task
+   ├─ Android: OkHttp request via Fresco
+   ├─ Progress callbacks (onProgress)
+   └─ HTTP caching headers respected (Cache-Control, ETag)
+
+4. Decode
+   ├─ iOS: ImageIO (CGImageSource) — supports JPEG, PNG, GIF, HEIF, WebP
+   ├─ Android: BitmapFactory — supports JPEG, PNG, GIF, WebP
+   ├─ Decode happens on background thread
+   ├─ Downsampling if image larger than display size
+   └─ Memory allocation for decoded bitmap
+
+5. Display
+   ├─ Bitmap assigned to native image view
+   ├─ Resize mode applied (cover, contain, stretch, etc.)
+   ├─ onLoad callback fired
+   └─ View composited into screen
+    </div>
+
+    <h3>2.1 Loading Callbacks</h3>
+
+    <pre><code>&lt;<span class="type">Image</span>
+  source={{ uri: imageUrl }}
+  style={{ width: <span class="number">300</span>, height: <span class="number">200</span> }}
+  onLoadStart={() =&gt; console.<span class="func">log</span>(<span class="string">'Loading started'</span>)}
+  onProgress={({ nativeEvent: { loaded, total } }) =&gt; {
+    console.<span class="func">log</span>(<span class="string">`Progress: ${Math.round(loaded/total*100)}%`</span>);
+  }}
+  onLoad={({ nativeEvent: { source: { width, height } } }) =&gt; {
+    console.<span class="func">log</span>(<span class="string">`Loaded: ${width}x${height}`</span>);
+  }}
+  onError={({ nativeEvent: { error } }) =&gt; {
+    console.<span class="func">log</span>(<span class="string">`Error: ${error}`</span>);
+  }}
+  onLoadEnd={() =&gt; console.<span class="func">log</span>(<span class="string">'Loading finished'</span>)}
+/&gt;
+
+<span class="comment">// Callback order: onLoadStart → onProgress* → onLoad/onError → onLoadEnd</span>
+<span class="comment">// onProgress only fires for network images (not local/cached)</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="caching">3. Image Caching</h2>
+
+    <h3>3.1 iOS Caching (NSURLCache)</h3>
+
+    <pre><code><span class="comment">// iOS uses NSURLCache — standard HTTP cache</span>
+<span class="comment">// Respects HTTP caching headers:</span>
+<span class="comment">// - Cache-Control: max-age=3600</span>
+<span class="comment">// - ETag / If-None-Match</span>
+<span class="comment">// - Last-Modified / If-Modified-Since</span>
+
+<span class="comment">// Default cache size: 50MB memory, 200MB disk</span>
+
+<span class="comment">// Cache control via source prop:</span>
+&lt;<span class="type">Image</span>
+  source={{
+    uri: <span class="string">'https://example.com/photo.jpg'</span>,
+    cache: <span class="string">'force-cache'</span>,  <span class="comment">// iOS only</span>
+  }}
+/&gt;
+
+<span class="comment">// cache options (iOS):</span>
+<span class="comment">// 'default'     — use HTTP cache headers</span>
+<span class="comment">// 'reload'      — skip cache, always download</span>
+<span class="comment">// 'force-cache' — use cache even if expired</span>
+<span class="comment">// 'only-if-cached' — only use cache, fail if not cached</span></code></pre>
+
+    <h3>3.2 Android Caching (Fresco)</h3>
+
+    <div class="diagram">
+Fresco Cache Architecture (Android):
+
+Request → Bitmap Memory Cache (L1)
+              │ miss
+              ↓
+          Encoded Memory Cache (L2)
+              │ miss
+              ↓
+          Disk Cache (L3)
+              │ miss
+              ↓
+          Network Fetch
+              │
+              ↓
+          Store in all cache levels
+
+L1: Decoded bitmaps — fastest, limited by memory
+L2: Encoded bytes (JPEG/PNG) — needs decode, less memory
+L3: Disk files — persistent across app launches
+    </div>
+
+    <pre><code><span class="comment">// Fresco cache configuration (in MainApplication.java)</span>
+<span class="comment">// Default: 24MB bitmap cache, 2MB encoded cache, 40MB disk cache</span>
+
+<span class="comment">// Clearing caches programmatically:</span>
+<span class="keyword">import</span> { Image } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="comment">// Query cache for a specific URL:</span>
+Image.<span class="func">queryCache</span>([<span class="string">'https://example.com/photo.jpg'</span>])
+  .<span class="func">then</span>(result =&gt; {
+    <span class="comment">// result: { 'https://example.com/photo.jpg': 'disk' | 'memory' }</span>
+    console.<span class="func">log</span>(result);
+  });</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Caching Pitfall</div>
+        <p>React Native's built-in Image component has no cross-platform cache control. iOS uses NSURLCache (HTTP-based), Android uses Fresco (custom). The <code>cache</code> prop only works on iOS. For consistent cross-platform caching, use react-native-fast-image which provides a unified caching API on both platforms.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="progressive">4. Progressive Loading</h2>
+
+    <pre><code><span class="comment">// Placeholder pattern: low-res → high-res</span>
+<span class="keyword">const</span> <span class="func">ProgressiveImage</span> = ({ thumbnailUri, fullUri, style }) =&gt; {
+  <span class="keyword">const</span> [loaded, setLoaded] = <span class="func">useState</span>(<span class="keyword">false</span>);
+
+  <span class="keyword">return</span> (
+    &lt;<span class="type">View</span> style={style}&gt;
+      &lt;<span class="type">Image</span>
+        source={{ uri: thumbnailUri }}
+        style={[StyleSheet.absoluteFill, { opacity: loaded ? <span class="number">0</span> : <span class="number">1</span> }]}
+        blurRadius={<span class="number">10</span>}
+      /&gt;
+      &lt;<span class="type">Image</span>
+        source={{ uri: fullUri }}
+        style={StyleSheet.absoluteFill}
+        onLoad={() =&gt; <span class="func">setLoaded</span>(<span class="keyword">true</span>)}
+      /&gt;
+    &lt;/<span class="type">View</span>&gt;
+  );
+};
+
+<span class="comment">// defaultSource — shows while loading (iOS only)</span>
+&lt;<span class="type">Image</span>
+  source={{ uri: <span class="string">'https://example.com/large.jpg'</span> }}
+  defaultSource={<span class="func">require</span>(<span class="string">'./placeholder.png'</span>)}
+  style={{ width: <span class="number">300</span>, height: <span class="number">200</span> }}
+/&gt;
+<span class="comment">// defaultSource only works on iOS</span>
+<span class="comment">// Android: use the two-Image overlay pattern above</span>
+
+<span class="comment">// Progressive JPEG support:</span>
+<span class="comment">// iOS: Supported natively — renders progressively as data arrives</span>
+<span class="comment">// Android: Fresco supports progressive JPEG rendering</span>
+<span class="comment">// Enable in Fresco config: .setProgressiveRenderingEnabled(true)</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="resize-modes">5. Image Resize Modes</h2>
+
+    <pre><code><span class="comment">// resizeMode controls how image fits its container</span>
+
+<span class="comment">// 'cover' (default) — scales to fill, may crop</span>
+&lt;<span class="type">Image</span> source={src} resizeMode=<span class="string">"cover"</span> style={{ width: <span class="number">200</span>, height: <span class="number">200</span> }} /&gt;
+<span class="comment">// Maintains aspect ratio, fills container, crops excess</span>
+<span class="comment">// iOS: UIViewContentModeScaleAspectFill</span>
+<span class="comment">// Android: ScaleType.CENTER_CROP</span>
+
+<span class="comment">// 'contain' — scales to fit, may letterbox</span>
+&lt;<span class="type">Image</span> source={src} resizeMode=<span class="string">"contain"</span> style={{ width: <span class="number">200</span>, height: <span class="number">200</span> }} /&gt;
+<span class="comment">// Maintains aspect ratio, fits within container</span>
+<span class="comment">// iOS: UIViewContentModeScaleAspectFit</span>
+<span class="comment">// Android: ScaleType.FIT_CENTER</span>
+
+<span class="comment">// 'stretch' — fills exactly, may distort</span>
+&lt;<span class="type">Image</span> source={src} resizeMode=<span class="string">"stretch"</span> style={{ width: <span class="number">200</span>, height: <span class="number">200</span> }} /&gt;
+<span class="comment">// Ignores aspect ratio, fills container exactly</span>
+<span class="comment">// iOS: UIViewContentModeScaleToFill</span>
+<span class="comment">// Android: ScaleType.FIT_XY</span>
+
+<span class="comment">// 'center' — no scaling, centered</span>
+&lt;<span class="type">Image</span> source={src} resizeMode=<span class="string">"center"</span> style={{ width: <span class="number">200</span>, height: <span class="number">200</span> }} /&gt;
+<span class="comment">// Original size, centered in container</span>
+
+<span class="comment">// 'repeat' — tiles the image (iOS only)</span>
+&lt;<span class="type">Image</span> source={src} resizeMode=<span class="string">"repeat"</span> style={{ width: <span class="number">400</span>, height: <span class="number">400</span> }} /&gt;</code></pre>
+
+    <table>
+        <thead>
+            <tr><th>resizeMode</th><th>Aspect Ratio</th><th>Fills Container</th><th>May Crop</th><th>May Letterbox</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>cover</td><td>Preserved</td><td>Yes</td><td>Yes</td><td>No</td></tr>
+            <tr><td>contain</td><td>Preserved</td><td>No</td><td>No</td><td>Yes</td></tr>
+            <tr><td>stretch</td><td>Distorted</td><td>Yes</td><td>No</td><td>No</td></tr>
+            <tr><td>center</td><td>Preserved</td><td>No</td><td>No</td><td>No</td></tr>
+            <tr><td>repeat</td><td>Preserved</td><td>Yes (tiled)</td><td>No</td><td>No</td></tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="svg">6. SVG Support</h2>
+
+    <pre><code><span class="comment">// React Native does NOT support SVG natively</span>
+<span class="comment">// Use react-native-svg for SVG rendering</span>
+
+<span class="keyword">import</span> Svg, { Circle, Rect, Path } <span class="keyword">from</span> <span class="string">'react-native-svg'</span>;
+
+&lt;<span class="type">Svg</span> width=<span class="string">"100"</span> height=<span class="string">"100"</span> viewBox=<span class="string">"0 0 100 100"</span>&gt;
+  &lt;<span class="type">Circle</span> cx=<span class="string">"50"</span> cy=<span class="string">"50"</span> r=<span class="string">"40"</span> fill=<span class="string">"blue"</span> /&gt;
+  &lt;<span class="type">Rect</span> x=<span class="string">"10"</span> y=<span class="string">"10"</span> width=<span class="string">"30"</span> height=<span class="string">"30"</span> fill=<span class="string">"red"</span> /&gt;
+&lt;/<span class="type">Svg</span>&gt;
+
+<span class="comment">// SVG from file (using react-native-svg-transformer):</span>
+<span class="keyword">import</span> Logo <span class="keyword">from</span> <span class="string">'./logo.svg'</span>;
+&lt;<span class="type">Logo</span> width={<span class="number">120</span>} height={<span class="number">40</span>} /&gt;
+
+<span class="comment">// react-native-svg renders to:</span>
+<span class="comment">// iOS: CAShapeLayer (Core Graphics paths)</span>
+<span class="comment">// Android: Canvas draw operations</span>
+<span class="comment">// NOT rasterized — truly vector, scales without quality loss</span>
+
+<span class="comment">// Performance consideration:</span>
+<span class="comment">// Complex SVGs with many paths are expensive to render</span>
+<span class="comment">// For icons: prefer icon fonts or pre-rasterized PNGs</span>
+<span class="comment">// For illustrations: SVG is fine (rendered once, cached)</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="prefetching">7. Image Prefetching</h2>
+
+    <pre><code><span class="comment">// Prefetch images before they're displayed</span>
+<span class="keyword">import</span> { Image } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="comment">// Single image prefetch</span>
+<span class="keyword">await</span> Image.<span class="func">prefetch</span>(<span class="string">'https://example.com/photo.jpg'</span>);
+
+<span class="comment">// Batch prefetch for a list</span>
+<span class="keyword">const</span> urls = items.<span class="func">map</span>(item =&gt; item.imageUrl);
+<span class="keyword">await</span> Promise.<span class="func">all</span>(urls.<span class="func">map</span>(url =&gt; Image.<span class="func">prefetch</span>(url)));
+
+<span class="comment">// Prefetch with callback (deprecated in newer versions)</span>
+Image.<span class="func">prefetch</span>(url)
+  .<span class="func">then</span>(() =&gt; console.<span class="func">log</span>(<span class="string">'Prefetched'</span>))
+  .<span class="func">catch</span>(err =&gt; console.<span class="func">log</span>(<span class="string">'Prefetch failed'</span>, err));
+
+<span class="comment">// Get image dimensions before display</span>
+Image.<span class="func">getSize</span>(
+  <span class="string">'https://example.com/photo.jpg'</span>,
+  (width, height) =&gt; {
+    console.<span class="func">log</span>(<span class="string">`Image: ${width}x${height}`</span>);
+  },
+  (error) =&gt; {
+    console.<span class="func">log</span>(<span class="string">'Failed to get size'</span>, error);
+  }
+);
+
+<span class="comment">// getSize with headers (for authenticated images)</span>
+Image.<span class="func">getSizeWithHeaders</span>(
+  <span class="string">'https://example.com/private.jpg'</span>,
+  { Authorization: <span class="string">'Bearer token'</span> },
+  (width, height) =&gt; { <span class="comment">/* ... */</span> },
+  (error) =&gt; { <span class="comment">/* ... */</span> }
+);</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="memory">8. Memory Management</h2>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Memory Budget</div>
+        <p>A single 4000×3000 photo decoded to RGBA bitmap consumes <strong>48MB</strong> of memory (4000 × 3000 × 4 bytes). iOS typically kills apps at 1-2GB memory usage. A photo gallery showing 10 full-resolution images would consume 480MB — nearly half the budget. Always resize images to display size before decoding.</p>
+    </div>
+
+    <pre><code><span class="comment">// Memory calculation: width × height × 4 bytes (RGBA)</span>
+<span class="comment">// 4000×3000 → 48,000,000 bytes → 48 MB</span>
+<span class="comment">// 1000×750  → 3,000,000 bytes  → 3 MB</span>
+<span class="comment">// 200×150   → 120,000 bytes    → 0.12 MB</span>
+
+<span class="comment">// Strategy 1: Server-side resizing</span>
+<span class="keyword">const</span> <span class="func">getOptimizedUrl</span> = (url, width, height) =&gt;
+  <span class="string">`${url}?w=${width}&h=${height}&fit=crop&q=80`</span>;
+
+&lt;<span class="type">Image</span>
+  source={{ uri: <span class="func">getOptimizedUrl</span>(photo.url, <span class="number">400</span>, <span class="number">300</span>) }}
+  style={{ width: <span class="number">200</span>, height: <span class="number">150</span> }}
+/&gt;
+<span class="comment">// Request 2x display size for retina (200×150 display = 400×300 pixels)</span>
+
+<span class="comment">// Strategy 2: Use thumbnails in lists</span>
+<span class="keyword">const</span> <span class="func">renderItem</span> = ({ item }) =&gt; (
+  &lt;<span class="type">Image</span>
+    source={{ uri: item.thumbnailUrl }}  <span class="comment">// 200×200 thumbnail</span>
+    style={{ width: <span class="number">100</span>, height: <span class="number">100</span> }}
+  /&gt;
+);
+
+<span class="comment">// Strategy 3: Fresco memory configuration (Android)</span>
+<span class="comment">// In MainApplication.java:</span>
+<span class="comment">// ImagePipelineConfig config = ImagePipelineConfig.newBuilder(context)</span>
+<span class="comment">//   .setBitmapMemoryCacheParamsSupplier(new CustomCacheParams())</span>
+<span class="comment">//   .setDownsampleEnabled(true)  // Auto-downsample large images</span>
+<span class="comment">//   .build();</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="fastimage">9. FastImage Library</h2>
+
+    <p><code>react-native-fast-image</code> wraps SDWebImage (iOS) and Glide (Android) for superior caching and performance compared to the built-in Image component.</p>
+
+    <pre><code><span class="keyword">import</span> FastImage <span class="keyword">from</span> <span class="string">'react-native-fast-image'</span>;
+
+&lt;<span class="type">FastImage</span>
+  source={{
+    uri: <span class="string">'https://example.com/photo.jpg'</span>,
+    headers: { Authorization: <span class="string">'Bearer token'</span> },
+    priority: FastImage.priority.high,
+    cache: FastImage.cacheControl.immutable,
+  }}
+  resizeMode={FastImage.resizeMode.cover}
+  style={{ width: <span class="number">200</span>, height: <span class="number">200</span> }}
+/&gt;
+
+<span class="comment">// Cache control options:</span>
+<span class="comment">// FastImage.cacheControl.immutable — cache forever (URL-based versioning)</span>
+<span class="comment">// FastImage.cacheControl.web — respect HTTP cache headers</span>
+<span class="comment">// FastImage.cacheControl.cacheOnly — only show if cached</span>
+
+<span class="comment">// Priority options:</span>
+<span class="comment">// FastImage.priority.low</span>
+<span class="comment">// FastImage.priority.normal</span>
+<span class="comment">// FastImage.priority.high</span>
+
+<span class="comment">// Preload multiple images:</span>
+FastImage.<span class="func">preload</span>([
+  { uri: <span class="string">'https://example.com/1.jpg'</span> },
+  { uri: <span class="string">'https://example.com/2.jpg'</span> },
+  { uri: <span class="string">'https://example.com/3.jpg'</span> },
+]);
+
+<span class="comment">// Clear cache:</span>
+FastImage.<span class="func">clearMemoryCache</span>();
+FastImage.<span class="func">clearDiskCache</span>();</code></pre>
+
+    <table>
+        <thead>
+            <tr><th>Feature</th><th>Built-in Image</th><th>FastImage</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>iOS backend</td><td>NSURLSession + NSURLCache</td><td>SDWebImage</td></tr>
+            <tr><td>Android backend</td><td>Fresco</td><td>Glide</td></tr>
+            <tr><td>Cache control</td><td>iOS only (cache prop)</td><td>Cross-platform</td></tr>
+            <tr><td>Priority loading</td><td>No</td><td>Yes (low/normal/high)</td></tr>
+            <tr><td>Auth headers</td><td>Limited</td><td>Full support</td></tr>
+            <tr><td>GIF support</td><td>Limited</td><td>Full</td></tr>
+            <tr><td>Preloading</td><td>Image.prefetch (basic)</td><td>FastImage.preload (batch)</td></tr>
+            <tr><td>Cache clearing</td><td>No API</td><td>clearMemoryCache/clearDiskCache</td></tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">10. Architect Considerations</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>Image handling is the second most common source of performance issues in React Native (after lists). The key architectural decisions are: (1) <strong>Server-side image optimization</strong> — always serve images at the size they'll be displayed, not original resolution. (2) <strong>Caching strategy</strong> — use URL-based versioning with immutable cache for maximum performance. (3) <strong>Memory budgeting</strong> — calculate the memory cost of your image-heavy screens and ensure you stay within platform limits. (4) <strong>Library choice</strong> — FastImage (or Expo Image) should be the default for any production app. The built-in Image component is adequate only for simple use cases.</p>
+    </div>
+
+    <h3>10.1 Image Architecture Decision Tree</h3>
+
+    <pre><code><span class="comment">// Decision tree for image handling:</span>
+
+<span class="comment">// Q: Is it an icon/small graphic?</span>
+<span class="comment">//   → Use bundled assets (require('./icon.png'))</span>
+<span class="comment">//   → Or icon font (react-native-vector-icons)</span>
+<span class="comment">//   → Or SVG (react-native-svg) for scalable icons</span>
+
+<span class="comment">// Q: Is it a user photo / content image?</span>
+<span class="comment">//   → Use FastImage with CDN-resized URLs</span>
+<span class="comment">//   → Implement progressive loading (thumbnail → full)</span>
+<span class="comment">//   → Set appropriate cache policy</span>
+
+<span class="comment">// Q: Is it in a list?</span>
+<span class="comment">//   → Use thumbnails (not full resolution)</span>
+<span class="comment">//   → Prefetch next page of images</span>
+<span class="comment">//   → Consider placeholder shimmer while loading</span>
+
+<span class="comment">// Q: Is it a hero/banner image?</span>
+<span class="comment">//   → Prefetch on previous screen</span>
+<span class="comment">//   → Use progressive JPEG</span>
+<span class="comment">//   → Consider blur-up placeholder</span></code></pre>
+
+    <div class="nav-footer">
+        <a href="04-text-rendering.html">← Text Rendering</a>
+        <a href="06-native-view-management.html">Next: Native View Management →</a>
+    </div>
+</div>
+</body>
+</html>

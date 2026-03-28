@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data Architecture — Architecture Patterns</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Architecture Patterns</a>
+  <span class="sep">›</span>
+  Data Architecture
+</nav>
+
+<h1>Data Architecture in Large React Apps</h1>
+<p class="subtitle">API abstraction layers, repository pattern, normalization, optimistic updates, real-time data, offline-first, event sourcing, and CQRS for React.</p>
+
+<nav class="nav">
+  <a href="01-component-architecture.html">Component Architecture</a>
+  <a href="02-design-system.html">Design Systems</a>
+  <a href="03-micro-frontends.html">Micro-Frontends</a>
+  <a href="05-error-handling-architecture.html">Error Handling</a>
+  <a href="06-scalability-patterns.html">Scalability</a>
+  <a href="07-accessibility-architecture.html">Accessibility</a>
+  <a href="08-interview-qa.html">Interview Q&amp;A</a>
+</nav>
+
+<h2 id="api-abstraction">API Abstraction Layers</h2>
+
+<p>In large applications, direct <code>fetch</code> calls scattered throughout components create tight coupling to API implementation details. A layered abstraction provides a clean separation between data fetching mechanics and business logic.</p>
+
+<div class="diagram">
+Data Layer Architecture
+═══════════════════════════════════════════════════════════
+
+┌─────────────────────────────────────────────────────┐
+│                   COMPONENTS                         │
+│  useUsers()  useProducts()  useOrders()             │
+└──────────────────────┬──────────────────────────────┘
+                       │ Custom hooks
+┌──────────────────────┴──────────────────────────────┐
+│               QUERY LAYER                            │
+│  React Query / SWR / Apollo                          │
+│  (caching, deduplication, background refresh)        │
+└──────────────────────┬──────────────────────────────┘
+                       │ Repository methods
+┌──────────────────────┴──────────────────────────────┐
+│              REPOSITORY LAYER                        │
+│  UserRepository  ProductRepository  OrderRepository  │
+│  (business logic, data transformation)               │
+└──────────────────────┬──────────────────────────────┘
+                       │ API client methods
+┌──────────────────────┴──────────────────────────────┐
+│               API CLIENT                             │
+│  Axios / Fetch wrapper                               │
+│  (auth headers, base URL, interceptors, retry)       │
+└──────────────────────┬──────────────────────────────┘
+                       │ HTTP
+                  ┌────┴────┐
+                  │ Backend │
+                  └─────────┘
+</div>
+
+<pre><code>// Layer 1: API Client — handles transport concerns
+class ApiClient {
+  private baseUrl: string;
+  private getToken: () => string | null;
+
+  constructor(config: { baseUrl: string; getToken: () => string | null }) {
+    this.baseUrl = config.baseUrl;
+    this.getToken = config.getToken;
+  }
+
+  private async request&lt;T&gt;(endpoint: string, options: RequestInit = {}): Promise&lt;T&gt; {
+    const token = this.getToken();
+    const response = await fetch(`${this.baseUrl}${endpoint}`, {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...options.headers,
+      },
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new ApiError(response.status, error.message, error.code);
+    }
+
+    return response.json();
+  }
+
+  get&lt;T&gt;(endpoint: string, params?: Record&lt;string, string&gt;) {
+    const url = params ? `${endpoint}?${new URLSearchParams(params)}` : endpoint;
+    return this.request&lt;T&gt;(url);
+  }
+
+  post&lt;T&gt;(endpoint: string, data: unknown) {
+    return this.request&lt;T&gt;(endpoint, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  put&lt;T&gt;(endpoint: string, data: unknown) {
+    return this.request&lt;T&gt;(endpoint, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    });
+  }
+
+  delete&lt;T&gt;(endpoint: string) {
+    return this.request&lt;T&gt;(endpoint, { method: 'DELETE' });
+  }
+}
+
+// Layer 2: Repository — handles business logic
+class UserRepository {
+  constructor(private api: ApiClient) {}
+
+  async getUsers(filters?: UserFilters): Promise&lt;User[]&gt; {
+    const raw = await this.api.get&lt;ApiUser[]&gt;('/users', filters);
+    return raw.map(this.toDomain);
+  }
+
+  async getUser(id: string): Promise&lt;User&gt; {
+    const raw = await this.api.get&lt;ApiUser&gt;(`/users/${id}`);
+    return this.toDomain(raw);
+  }
+
+  async createUser(data: CreateUserInput): Promise&lt;User&gt; {
+    const raw = await this.api.post&lt;ApiUser&gt;('/users', this.toApi(data));
+    return this.toDomain(raw);
+  }
+
+  private toDomain(raw: ApiUser): User {
+    return {
+      id: raw.id,
+      fullName: `${raw.first_name} ${raw.last_name}`,
+      email: raw.email_address,
+      role: raw.role_id === 1 ? 'admin' : 'user',
+      createdAt: new Date(raw.created_at),
+    };
+  }
+
+  private toApi(data: CreateUserInput): Partial&lt;ApiUser&gt; {
+    const [firstName, ...rest] = data.fullName.split(' ');
+    return {
+      first_name: firstName,
+      last_name: rest.join(' '),
+      email_address: data.email,
+    };
+  }
+}
+
+// Layer 3: React Query hooks — handles caching and UI state
+function useUsers(filters?: UserFilters) {
+  const repo = useUserRepository();
+  return useQuery({
+    queryKey: ['users', filters],
+    queryFn: () => repo.getUsers(filters),
+    staleTime: 5 * 60 * 1000,
+  });
+}
+
+function useCreateUser() {
+  const repo = useUserRepository();
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (data: CreateUserInput) => repo.createUser(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['users'] });
+    },
+  });
+}</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p>The repository pattern provides a critical boundary: components never see API response shapes. When the backend changes field names from <code>email_address</code> to <code>email</code>, you update one mapper in the repository — not 50 components. This is especially valuable during API migrations or when consuming multiple backends.</p>
+</div>
+
+<h2 id="normalization">Data Normalization</h2>
+
+<p>Normalization eliminates data duplication by storing entities in flat lookup tables, similar to a relational database. This prevents inconsistencies when the same entity appears in multiple places.</p>
+
+<pre><code>// DENORMALIZED (typical API response)
+const postsResponse = {
+  posts: [
+    {
+      id: '1',
+      title: 'React Patterns',
+      author: { id: 'a1', name: 'Alice', avatar: 'alice.jpg' },
+      comments: [
+        { id: 'c1', text: 'Great!', author: { id: 'a2', name: 'Bob' } },
+        { id: 'c2', text: 'Thanks!', author: { id: 'a1', name: 'Alice' } },
+      ],
+    },
+  ],
+};
+// Problem: Alice appears twice — update one, the other is stale
+
+// NORMALIZED (entity tables)
+const normalizedState = {
+  entities: {
+    users: {
+      'a1': { id: 'a1', name: 'Alice', avatar: 'alice.jpg' },
+      'a2': { id: 'a2', name: 'Bob', avatar: 'bob.jpg' },
+    },
+    posts: {
+      '1': { id: '1', title: 'React Patterns', authorId: 'a1', commentIds: ['c1', 'c2'] },
+    },
+    comments: {
+      'c1': { id: 'c1', text: 'Great!', authorId: 'a2', postId: '1' },
+      'c2': { id: 'c2', text: 'Thanks!', authorId: 'a1', postId: '1' },
+    },
+  },
+  result: { posts: ['1'] },
+};
+
+// Using normalizr library
+import { normalize, schema } from 'normalizr';
+
+const userSchema = new schema.Entity('users');
+const commentSchema = new schema.Entity('comments', { author: userSchema });
+const postSchema = new schema.Entity('posts', {
+  author: userSchema,
+  comments: [commentSchema],
+});
+
+const normalized = normalize(postsResponse, { posts: [postSchema] });
+
+// With Redux Toolkit's createEntityAdapter
+import { createEntityAdapter, createSlice } from '@reduxjs/toolkit';
+
+const usersAdapter = createEntityAdapter&lt;User&gt;();
+
+const usersSlice = createSlice({
+  name: 'users',
+  initialState: usersAdapter.getInitialState(),
+  reducers: {
+    userAdded: usersAdapter.addOne,
+    userUpdated: usersAdapter.updateOne,
+    usersReceived: usersAdapter.setMany,
+  },
+});
+
+// Selectors are auto-generated
+const { selectById: selectUserById, selectAll: selectAllUsers } =
+  usersAdapter.getSelectors((state) => state.users);</code></pre>
+
+<h2 id="optimistic-updates">Optimistic Updates Architecture</h2>
+
+<pre><code>// Optimistic update with React Query
+function useToggleLike(postId: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (liked: boolean) =>
+      api.post(`/posts/${postId}/like`, { liked }),
+
+    onMutate: async (liked) => {
+      await queryClient.cancelQueries({ queryKey: ['post', postId] });
+
+      const previous = queryClient.getQueryData&lt;Post&gt;(['post', postId]);
+
+      queryClient.setQueryData&lt;Post&gt;(['post', postId], (old) => ({
+        ...old!,
+        liked,
+        likeCount: old!.likeCount + (liked ? 1 : -1),
+      }));
+
+      return { previous };
+    },
+
+    onError: (_err, _liked, context) => {
+      queryClient.setQueryData(['post', postId], context?.previous);
+      toast.error('Failed to update. Please try again.');
+    },
+
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['post', postId] });
+    },
+  });
+}
+
+// Optimistic update with pending queue (offline-capable)
+interface PendingMutation {
+  id: string;
+  type: 'like' | 'comment' | 'edit';
+  payload: unknown;
+  timestamp: number;
+  retryCount: number;
+  status: 'pending' | 'in-flight' | 'failed';
+}
+
+class MutationQueue {
+  private queue: PendingMutation[] = [];
+  private processing = false;
+
+  add(mutation: Omit&lt;PendingMutation, 'id' | 'timestamp' | 'retryCount' | 'status'&gt;) {
+    const entry: PendingMutation = {
+      ...mutation,
+      id: crypto.randomUUID(),
+      timestamp: Date.now(),
+      retryCount: 0,
+      status: 'pending',
+    };
+    this.queue.push(entry);
+    this.persist();
+    this.process();
+    return entry.id;
+  }
+
+  private async process() {
+    if (this.processing || !navigator.onLine) return;
+    this.processing = true;
+
+    while (this.queue.length > 0) {
+      const mutation = this.queue[0];
+      mutation.status = 'in-flight';
+
+      try {
+        await this.execute(mutation);
+        this.queue.shift();
+      } catch (error) {
+        mutation.retryCount++;
+        mutation.status = 'failed';
+        if (mutation.retryCount >= 3) {
+          this.queue.shift();
+          this.onPermanentFailure(mutation);
+        } else {
+          await this.delay(Math.pow(2, mutation.retryCount) * 1000);
+        }
+      }
+    }
+
+    this.processing = false;
+    this.persist();
+  }
+
+  private persist() {
+    localStorage.setItem('mutation-queue', JSON.stringify(this.queue));
+  }
+}</code></pre>
+
+<h2 id="realtime">Real-Time Data Patterns</h2>
+
+<pre><code>// WebSocket with React Query integration
+function useRealtimeQuery&lt;T&gt;(queryKey: string[], fetchFn: () => Promise&lt;T&gt;, wsChannel: string) {
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    const ws = new WebSocket(`wss://api.example.com/ws`);
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'subscribe', channel: wsChannel }));
+    };
+
+    ws.onmessage = (event) => {
+      const update = JSON.parse(event.data);
+      queryClient.setQueryData(queryKey, (old: T) => {
+        return applyUpdate(old, update);
+      });
+    };
+
+    return () => {
+      ws.send(JSON.stringify({ type: 'unsubscribe', channel: wsChannel }));
+      ws.close();
+    };
+  }, [queryKey, wsChannel, queryClient]);
+
+  return useQuery({ queryKey, queryFn: fetchFn });
+}
+
+// Server-Sent Events for one-way real-time
+function useSSE&lt;T&gt;(url: string, queryKey: string[]) {
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    const source = new EventSource(url);
+
+    source.onmessage = (event) => {
+      const data = JSON.parse(event.data) as T;
+      queryClient.setQueryData(queryKey, data);
+    };
+
+    source.onerror = () => {
+      source.close();
+      setTimeout(() => {
+        // Reconnect logic
+      }, 5000);
+    };
+
+    return () => source.close();
+  }, [url, queryKey, queryClient]);
+
+  return useQuery&lt;T&gt;({ queryKey, enabled: false });
+}
+
+// Polling fallback (simplest, most reliable)
+function usePolling&lt;T&gt;(queryKey: string[], fetchFn: () => Promise&lt;T&gt;, interval = 5000) {
+  return useQuery({
+    queryKey,
+    queryFn: fetchFn,
+    refetchInterval: interval,
+    refetchIntervalInBackground: false,
+  });
+}</code></pre>
+
+<h3>Real-Time Strategy Comparison</h3>
+
+<table>
+<thead>
+<tr><th>Strategy</th><th>Direction</th><th>Reconnection</th><th>Binary Data</th><th>HTTP/2 Compatible</th><th>Complexity</th></tr>
+</thead>
+<tbody>
+<tr><td>WebSocket</td><td>Bidirectional</td><td>Manual</td><td>Yes</td><td>Separate connection</td><td>High</td></tr>
+<tr><td>SSE</td><td>Server → Client</td><td>Automatic</td><td>No (text)</td><td>Yes (multiplexed)</td><td>Low</td></tr>
+<tr><td>Polling</td><td>Client → Server</td><td>N/A</td><td>Yes</td><td>Yes</td><td>Lowest</td></tr>
+<tr><td>Long Polling</td><td>Server → Client</td><td>Per-request</td><td>Yes</td><td>Yes</td><td>Medium</td></tr>
+</tbody>
+</table>
+
+<h2 id="offline-first">Offline-First Architecture</h2>
+
+<pre><code>// Offline-first data layer
+class OfflineFirstRepository {
+  constructor(
+    private api: ApiClient,
+    private cache: IndexedDBCache,
+    private syncQueue: MutationQueue
+  ) {}
+
+  async getUsers(): Promise&lt;User[]&gt; {
+    try {
+      const remote = await this.api.get&lt;User[]&gt;('/users');
+      await this.cache.set('users', remote);
+      return remote;
+    } catch (error) {
+      if (!navigator.onLine) {
+        const cached = await this.cache.get&lt;User[]&gt;('users');
+        if (cached) return cached;
+      }
+      throw error;
+    }
+  }
+
+  async createUser(data: CreateUserInput): Promise&lt;User&gt; {
+    const optimisticUser: User = {
+      id: `temp-${crypto.randomUUID()}`,
+      ...data,
+      _pending: true,
+    };
+
+    const cached = await this.cache.get&lt;User[]&gt;('users') || [];
+    await this.cache.set('users', [...cached, optimisticUser]);
+
+    if (navigator.onLine) {
+      const user = await this.api.post&lt;User&gt;('/users', data);
+      await this.cache.set('users',
+        cached.map(u => u.id === optimisticUser.id ? user : u)
+      );
+      return user;
+    } else {
+      this.syncQueue.add({
+        type: 'createUser',
+        payload: data,
+        optimisticId: optimisticUser.id,
+      });
+      return optimisticUser;
+    }
+  }
+}</code></pre>
+
+<h2 id="cqrs">CQRS Pattern Adaptation for React</h2>
+
+<div class="diagram">
+CQRS in React
+═══════════════════════════════════════════════════════════
+
+Traditional CQRS:
+  Commands (writes) → Write Model → Event Store
+  Queries (reads)   → Read Model  → Projections
+
+React Adaptation:
+  Mutations (useMutation) → API POST/PUT/DELETE → Invalidate
+  Queries (useQuery)      → API GET             → Cache
+
+┌─────────────────────────────────────────────────────┐
+│                    COMPONENTS                        │
+├──────────────────┬──────────────────────────────────┤
+│   QUERY SIDE     │        COMMAND SIDE              │
+│                  │                                   │
+│  useQuery()      │  useMutation()                   │
+│  useInfinite()   │  optimistic updates              │
+│  prefetch()      │  mutation queue                  │
+│                  │                                   │
+│  Stale-while-    │  Fire-and-forget                 │
+│  revalidate      │  or await confirmation           │
+│                  │                                   │
+│  Read from cache │  Write to API                    │
+│  Background      │  Invalidate queries              │
+│  refresh         │  on success                      │
+└──────────────────┴──────────────────────────────────┘
+</code></pre>
+
+<pre><code>// CQRS-style separation in React
+// queries.ts — read side
+export const userQueries = {
+  all: () => ({ queryKey: ['users'], queryFn: () => userRepo.getAll() }),
+  detail: (id: string) => ({
+    queryKey: ['users', id],
+    queryFn: () => userRepo.getById(id),
+  }),
+  byRole: (role: string) => ({
+    queryKey: ['users', { role }],
+    queryFn: () => userRepo.getByRole(role),
+  }),
+};
+
+// commands.ts — write side
+export function useCreateUser() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: userRepo.create,
+    onSuccess: (newUser) => {
+      queryClient.setQueryData(
+        userQueries.detail(newUser.id).queryKey,
+        newUser
+      );
+      queryClient.invalidateQueries({ queryKey: ['users'] });
+    },
+  });
+}
+
+export function useUpdateUser() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, data }: { id: string; data: UpdateUserInput }) =>
+      userRepo.update(id, data),
+    onMutate: async ({ id, data }) => {
+      await queryClient.cancelQueries({ queryKey: ['users', id] });
+      const previous = queryClient.getQueryData(['users', id]);
+      queryClient.setQueryData(['users', id], (old: User) => ({ ...old, ...data }));
+      return { previous };
+    },
+    onError: (_err, { id }, context) => {
+      queryClient.setQueryData(['users', id], context?.previous);
+    },
+    onSettled: (_data, _err, { id }) => {
+      queryClient.invalidateQueries({ queryKey: ['users', id] });
+    },
+  });
+}</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">Interview Tip</div>
+  <p>When discussing data architecture, emphasize the <strong>separation of concerns</strong>: transport (API client), business logic (repository), caching (React Query), and UI state (component). Explain that this layering makes it possible to swap backends, add offline support, or change caching strategies without touching component code. This is the kind of systems thinking expected at L6.</p>
+</div>
+
+<div class="nav-footer">
+  <a href="03-micro-frontends.html">← Micro-Frontends</a>
+  <a href="05-error-handling-architecture.html">Error Handling Architecture →</a>
+</div>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>List Rendering — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Rendering Pipeline</a><span class="sep">›</span>
+        List Rendering
+    </nav>
+
+    <h1>List Rendering</h1>
+    <p class="subtitle">Deep dive into FlatList, VirtualizedList, and FlashList internals — windowed rendering, cell recycling, memory management, and optimization strategies for rendering thousands of items at 60fps.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#virtualizedlist">1. VirtualizedList: The Foundation</a></li>
+            <li><a href="#flatlist">2. FlatList Internals</a></li>
+            <li><a href="#windowing">3. Windowed Rendering</a></li>
+            <li><a href="#cell-recycling">4. Cell Recycling</a></li>
+            <li><a href="#getitemlayout">5. getItemLayout Optimization</a></li>
+            <li><a href="#keyextractor">6. keyExtractor and Reconciliation</a></li>
+            <li><a href="#infinite-scroll">7. Infinite Scroll with onEndReached</a></li>
+            <li><a href="#sectionlist">8. SectionList</a></li>
+            <li><a href="#flashlist">9. FlashList (Shopify)</a></li>
+            <li><a href="#optimization">10. Large List Optimization Strategies</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="virtualizedlist">1. VirtualizedList: The Foundation</h2>
+
+    <p>All list components in React Native are built on <code>VirtualizedList</code>, which implements the core windowed rendering algorithm. Understanding VirtualizedList is essential because FlatList and SectionList are thin wrappers around it.</p>
+
+    <div class="diagram">
+Component Hierarchy:
+
+FlatList ──────────→ VirtualizedList ──────────→ ScrollView
+  │                      │                           │
+  │ data[]               │ getItem(data, index)      │ Native ScrollView
+  │ renderItem           │ getItemCount(data)         │ (UIScrollView /
+  │ keyExtractor         │ renderItem                 │  android ScrollView)
+  │                      │ windowSize                 │
+  │                      │ maxToRenderPerBatch        │
+  └──────────────────────┘                            │
+                                                      │
+SectionList ───────→ VirtualizedList ─────────────────┘
+  │
+  │ sections[]
+  │ renderItem
+  │ renderSectionHeader
+    </div>
+
+    <h3>1.1 VirtualizedList Architecture</h3>
+
+    <pre><code><span class="comment">// VirtualizedList core state</span>
+<span class="keyword">interface</span> <span class="type">VirtualizedListState</span> {
+  first: <span class="type">number</span>;      <span class="comment">// First rendered item index</span>
+  last: <span class="type">number</span>;       <span class="comment">// Last rendered item index</span>
+}
+
+<span class="comment">// The rendering window is defined by:</span>
+<span class="comment">// - Visible area (what the user sees)</span>
+<span class="comment">// - Overscan area (buffer above/below visible area)</span>
+<span class="comment">// - windowSize prop controls total window = visible * windowSize</span>
+
+<span class="comment">// VirtualizedList key props:</span>
+<span class="keyword">interface</span> <span class="type">VirtualizedListProps</span> {
+  data: <span class="type">any</span>;                    <span class="comment">// Data source</span>
+  getItem: (data, index) =&gt; <span class="type">any</span>; <span class="comment">// Extract item from data</span>
+  getItemCount: (data) =&gt; <span class="type">number</span>;<span class="comment">// Total item count</span>
+  renderItem: (info) =&gt; <span class="type">Element</span>; <span class="comment">// Render function</span>
+  windowSize: <span class="type">number</span>;            <span class="comment">// Render window multiplier (default: 21)</span>
+  maxToRenderPerBatch: <span class="type">number</span>;   <span class="comment">// Items per render batch (default: 10)</span>
+  updateCellsBatchingPeriod: <span class="type">number</span>; <span class="comment">// ms between batches (default: 50)</span>
+  initialNumToRender: <span class="type">number</span>;   <span class="comment">// Items in first render (default: 10)</span>
+  onEndReachedThreshold: <span class="type">number</span>; <span class="comment">// Trigger distance (default: 2)</span>
+}</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>VirtualizedList's <code>windowSize</code> default of 21 means it renders 10 screens worth of content above and below the visible area. This is deliberately generous to prevent blank areas during fast scrolling. For memory-constrained scenarios, reducing windowSize to 5-11 trades scroll smoothness for lower memory usage.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="flatlist">2. FlatList Internals</h2>
+
+    <p>FlatList is the primary list component. It wraps VirtualizedList with a simpler API that assumes array data.</p>
+
+    <pre><code><span class="comment">// FlatList is essentially:</span>
+<span class="keyword">class</span> <span class="type">FlatList</span> <span class="keyword">extends</span> <span class="type">React.PureComponent</span> {
+  <span class="func">render</span>() {
+    <span class="keyword">return</span> (
+      &lt;<span class="type">VirtualizedList</span>
+        {...this.props}
+        getItem={(data, index) =&gt; data[index]}
+        getItemCount={(data) =&gt; data?.length ?? <span class="number">0</span>}
+        keyExtractor={this.props.keyExtractor ?? this._defaultKeyExtractor}
+      /&gt;
+    );
+  }
+
+  <span class="func">_defaultKeyExtractor</span> = (item, index) =&gt; {
+    <span class="keyword">return</span> item.key ?? item.id ?? String(index);
+  };
+}
+
+<span class="comment">// FlatList adds convenience features:</span>
+<span class="comment">// - numColumns support (wraps items in row containers)</span>
+<span class="comment">// - columnWrapperStyle for multi-column layouts</span>
+<span class="comment">// - Automatic key extraction from item.key or item.id</span></code></pre>
+
+    <h3>2.1 Render Cycle</h3>
+
+    <div class="diagram">
+FlatList Render Cycle:
+
+1. Initial Mount
+   ├─ Render initialNumToRender items (default: 10)
+   ├─ Measure visible area
+   └─ Schedule fill batches
+
+2. Fill Phase (async, batched)
+   ├─ Render maxToRenderPerBatch items (default: 10)
+   ├─ Wait updateCellsBatchingPeriod ms (default: 50)
+   ├─ Repeat until window is filled
+   └─ Window = visible area × windowSize
+
+3. Scroll Update
+   ├─ onScroll fires (from native ScrollView)
+   ├─ Recalculate visible range
+   ├─ Determine items to add/remove
+   └─ Batch render new items, unmount distant items
+
+4. Steady State
+   ├─ Only items within window are mounted
+   ├─ Items outside window are unmounted (not recycled!)
+   └─ Blank spacers fill unmounted regions
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="windowing">3. Windowed Rendering</h2>
+
+    <p>Windowed rendering is the core optimization: only items within a "window" around the visible area are actually rendered as React components. Items outside the window are replaced with blank spacer views.</p>
+
+    <h3>3.1 Window Calculation</h3>
+
+    <pre><code><span class="comment">// Window size calculation</span>
+<span class="comment">// windowSize = 21 (default)</span>
+<span class="comment">// visibleLength = 800px (screen height)</span>
+
+<span class="comment">// Total window = visibleLength × windowSize = 800 × 21 = 16,800px</span>
+<span class="comment">// Above visible: (21-1)/2 × 800 = 8,000px</span>
+<span class="comment">// Below visible: (21-1)/2 × 800 = 8,000px</span>
+
+<span class="comment">// With 50px items: ~336 items rendered at any time</span>
+<span class="comment">// Out of potentially thousands in the data array</span>
+
+<span class="comment">// Reducing windowSize:</span>
+&lt;<span class="type">FlatList</span>
+  data={items}
+  renderItem={renderItem}
+  windowSize={<span class="number">5</span>}  <span class="comment">// Only 2 screens above + visible + 2 screens below</span>
+  <span class="comment">// Total window = 800 × 5 = 4,000px</span>
+  <span class="comment">// ~80 items rendered (vs 336 with default)</span>
+  <span class="comment">// Trade-off: may see blank areas during fast scroll</span>
+/&gt;</code></pre>
+
+    <h3>3.2 Spacer Views</h3>
+
+    <pre><code><span class="comment">// VirtualizedList renders the list as:</span>
+
+<span class="comment">// [Header spacer — height of all unmounted items above window]</span>
+<span class="comment">// [Rendered item 50]</span>
+<span class="comment">// [Rendered item 51]</span>
+<span class="comment">// [Rendered item 52]</span>
+<span class="comment">// ... (items within window)</span>
+<span class="comment">// [Rendered item 150]</span>
+<span class="comment">// [Footer spacer — height of all unmounted items below window]</span>
+
+<span class="comment">// Spacer heights are calculated from:</span>
+<span class="comment">// 1. getItemLayout (if provided) — exact heights</span>
+<span class="comment">// 2. Cached measurements from previously rendered items</span>
+<span class="comment">// 3. Estimated heights (can cause scroll jumps)</span>
+
+<span class="comment">// This is why getItemLayout is so important:</span>
+<span class="comment">// Without it, spacer heights are estimates that may be wrong,</span>
+<span class="comment">// causing the scroll position to jump when items are measured</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="cell-recycling">4. Cell Recycling</h2>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Critical Distinction</div>
+        <p>React Native's built-in FlatList does <strong>NOT</strong> recycle cells. When an item scrolls out of the window, its React component is <strong>unmounted</strong> (destroyed). When it scrolls back in, a <strong>new</strong> component is created. This is fundamentally different from native UITableView/RecyclerView which reuse view instances. FlashList (covered in section 9) adds true cell recycling.</p>
+    </div>
+
+    <h3>4.1 FlatList: Mount/Unmount Model</h3>
+
+    <div class="diagram">
+FlatList (VirtualizedList) — No Recycling:
+
+Scroll Down:
+  Item 1  [MOUNTED]     →  Item 1  [UNMOUNTED — destroyed]
+  Item 2  [MOUNTED]     →  Item 2  [MOUNTED]
+  Item 3  [MOUNTED]     →  Item 3  [MOUNTED]
+  Item 4  [not mounted] →  Item 4  [MOUNTED — new instance]
+
+Cost: Full React component lifecycle for each mount/unmount
+  - constructor / useState initialization
+  - useEffect setup/cleanup
+  - Native view creation/destruction
+  - Memory allocation/GC pressure
+
+Native Equivalent (UITableView/RecyclerView) — Recycling:
+  Cell A  [showing Item 1] →  Cell A  [showing Item 4] ← reused!
+  Cell B  [showing Item 2] →  Cell B  [showing Item 2]
+  Cell C  [showing Item 3] →  Cell C  [showing Item 3]
+
+Cost: Only prop updates on existing views — much cheaper
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="getitemlayout">5. getItemLayout Optimization</h2>
+
+    <p><code>getItemLayout</code> is the single most impactful optimization for FlatList. It provides exact layout information without requiring measurement, enabling instant scroll-to-index and accurate spacer heights.</p>
+
+    <pre><code><span class="comment">// Without getItemLayout:</span>
+<span class="comment">// - Items must be rendered to be measured</span>
+<span class="comment">// - scrollToIndex requires rendering all items up to target</span>
+<span class="comment">// - Spacer heights are estimates → scroll jumps</span>
+
+<span class="comment">// With getItemLayout (fixed-size items):</span>
+<span class="keyword">const</span> ITEM_HEIGHT = <span class="number">72</span>;
+<span class="keyword">const</span> SEPARATOR_HEIGHT = <span class="number">1</span>;
+
+&lt;<span class="type">FlatList</span>
+  data={items}
+  renderItem={renderItem}
+  getItemLayout={(data, index) =&gt; ({
+    length: ITEM_HEIGHT,
+    offset: (ITEM_HEIGHT + SEPARATOR_HEIGHT) * index,
+    index,
+  })}
+  ItemSeparatorComponent={Separator}
+/&gt;
+
+<span class="comment">// With getItemLayout (variable-size items with known heights):</span>
+<span class="keyword">const</span> itemHeights = items.<span class="func">map</span>(item =&gt;
+  item.type === <span class="string">'header'</span> ? <span class="number">120</span> : <span class="number">72</span>
+);
+
+<span class="keyword">const</span> offsets = itemHeights.<span class="func">reduce</span>((acc, h, i) =&gt; {
+  acc[i] = i === <span class="number">0</span> ? <span class="number">0</span> : acc[i - <span class="number">1</span>] + itemHeights[i - <span class="number">1</span>];
+  <span class="keyword">return</span> acc;
+}, []);
+
+<span class="keyword">const</span> <span class="func">getItemLayout</span> = (data, index) =&gt; ({
+  length: itemHeights[index],
+  offset: offsets[index],
+  index,
+});</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="keyextractor">6. keyExtractor and Reconciliation</h2>
+
+    <p>Keys in FlatList serve the same purpose as keys in React DOM lists — they enable the reconciler to match items across re-renders and minimize unnecessary work.</p>
+
+    <pre><code><span class="comment">// Bad: using index as key</span>
+&lt;<span class="type">FlatList</span>
+  data={items}
+  renderItem={renderItem}
+  keyExtractor={(item, index) =&gt; String(index)}
+/&gt;
+<span class="comment">// Problem: if items are reordered, inserted, or deleted,</span>
+<span class="comment">// React will update props on wrong components instead of moving them</span>
+<span class="comment">// This causes: wrong data displayed, lost component state,</span>
+<span class="comment">// unnecessary re-renders, animation glitches</span>
+
+<span class="comment">// Good: stable unique ID</span>
+&lt;<span class="type">FlatList</span>
+  data={items}
+  renderItem={renderItem}
+  keyExtractor={(item) =&gt; item.id}
+/&gt;
+<span class="comment">// React can correctly match items across re-renders</span>
+<span class="comment">// Reorders become move operations, not destroy+create</span>
+
+<span class="comment">// Key collision detection (development only):</span>
+<span class="comment">// React Native warns when duplicate keys are found</span>
+<span class="comment">// "Encountered two children with the same key"</span>
+<span class="comment">// This causes unpredictable behavior — items may disappear or duplicate</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="infinite-scroll">7. Infinite Scroll with onEndReached</h2>
+
+    <pre><code><span class="keyword">const</span> <span class="func">InfiniteList</span> = () =&gt; {
+  <span class="keyword">const</span> [data, setData] = <span class="func">useState</span>(initialData);
+  <span class="keyword">const</span> [loading, setLoading] = <span class="func">useState</span>(<span class="keyword">false</span>);
+  <span class="keyword">const</span> [hasMore, setHasMore] = <span class="func">useState</span>(<span class="keyword">true</span>);
+
+  <span class="keyword">const</span> <span class="func">loadMore</span> = <span class="func">useCallback</span>(<span class="keyword">async</span> () =&gt; {
+    <span class="keyword">if</span> (loading || !hasMore) <span class="keyword">return</span>;
+    setLoading(<span class="keyword">true</span>);
+    <span class="keyword">const</span> newItems = <span class="keyword">await</span> <span class="func">fetchPage</span>(data.length);
+    <span class="keyword">if</span> (newItems.length === <span class="number">0</span>) {
+      setHasMore(<span class="keyword">false</span>);
+    } <span class="keyword">else</span> {
+      setData(prev =&gt; [...prev, ...newItems]);
+    }
+    setLoading(<span class="keyword">false</span>);
+  }, [loading, hasMore, data.length]);
+
+  <span class="keyword">return</span> (
+    &lt;<span class="type">FlatList</span>
+      data={data}
+      renderItem={renderItem}
+      keyExtractor={item =&gt; item.id}
+      onEndReached={loadMore}
+      onEndReachedThreshold={<span class="number">0.5</span>}
+      ListFooterComponent={loading ? &lt;<span class="type">ActivityIndicator</span> /&gt; : <span class="keyword">null</span>}
+    /&gt;
+  );
+};
+
+<span class="comment">// onEndReachedThreshold = 0.5 means:</span>
+<span class="comment">// Trigger when user is within 0.5 × visibleLength from the end</span>
+<span class="comment">// With 800px visible area: triggers at 400px from bottom</span>
+
+<span class="comment">// Common bug: onEndReached fires multiple times</span>
+<span class="comment">// Fix: guard with loading flag (shown above)</span>
+<span class="comment">// Or use onMomentumScrollEnd for more controlled triggering</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="sectionlist">8. SectionList</h2>
+
+    <pre><code><span class="comment">// SectionList wraps VirtualizedList with section support</span>
+<span class="keyword">const</span> sections = [
+  { title: <span class="string">'Active'</span>, data: activeItems },
+  { title: <span class="string">'Completed'</span>, data: completedItems },
+];
+
+&lt;<span class="type">SectionList</span>
+  sections={sections}
+  renderItem={({ item, section }) =&gt; &lt;<span class="type">ItemRow</span> item={item} /&gt;}
+  renderSectionHeader={({ section }) =&gt; (
+    &lt;<span class="type">Text</span> style={styles.header}&gt;{section.title}&lt;/<span class="type">Text</span>&gt;
+  )}
+  renderSectionFooter={({ section }) =&gt; (
+    &lt;<span class="type">Text</span>&gt;{section.data.length} items&lt;/<span class="type">Text</span>&gt;
+  )}
+  stickySectionHeadersEnabled={<span class="keyword">true</span>}
+  keyExtractor={(item) =&gt; item.id}
+/&gt;
+
+<span class="comment">// SectionList internally flattens sections into a single VirtualizedList</span>
+<span class="comment">// Each section header/footer is an item in the virtual list</span>
+<span class="comment">// getItemLayout must account for headers and footers:</span>
+<span class="keyword">const</span> HEADER_HEIGHT = <span class="number">40</span>;
+<span class="keyword">const</span> ITEM_HEIGHT = <span class="number">60</span>;
+
+<span class="comment">// Sticky headers use native ScrollView stickyHeaderIndices</span>
+<span class="comment">// on iOS (UIScrollView) and a JS-based implementation on Android</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="flashlist">9. FlashList (Shopify)</h2>
+
+    <p>FlashList is Shopify's high-performance replacement for FlatList that introduces true cell recycling to React Native, similar to native UITableView/RecyclerView behavior.</p>
+
+    <h3>9.1 Architecture</h3>
+
+    <div class="diagram">
+FlashList Architecture:
+
+FlashList (JS)
+  └─ RecyclerListView (JS) — layout management
+       └─ AutoLayoutView (Native) — native layout tracking
+            └─ Cell Pool
+                 ├─ Cell A [type: "message"]  ← reused across items
+                 ├─ Cell B [type: "message"]  ← reused across items
+                 ├─ Cell C [type: "image"]    ← reused for image items
+                 └─ Cell D [type: "header"]   ← reused for headers
+
+Key Difference from FlatList:
+  FlatList:  scroll out → UNMOUNT → scroll in → MOUNT (new instance)
+  FlashList: scroll out → RECYCLE → scroll in → UPDATE PROPS (same instance)
+    </div>
+
+    <h3>9.2 Cell Recycling Mechanism</h3>
+
+    <pre><code><span class="comment">// FlashList reuses component instances by changing their props</span>
+<span class="comment">// This avoids the cost of mount/unmount cycles</span>
+
+<span class="keyword">import</span> { FlashList } <span class="keyword">from</span> <span class="string">'@shopify/flash-list'</span>;
+
+&lt;<span class="type">FlashList</span>
+  data={messages}
+  renderItem={({ item }) =&gt; &lt;<span class="type">MessageRow</span> message={item} /&gt;}
+  estimatedItemSize={<span class="number">72</span>}
+  <span class="comment">// estimatedItemSize is REQUIRED — FlashList uses it for</span>
+  <span class="comment">// initial layout before items are measured</span>
+/&gt;
+
+<span class="comment">// overrideItemLayout for variable-size items:</span>
+&lt;<span class="type">FlashList</span>
+  data={items}
+  renderItem={renderItem}
+  estimatedItemSize={<span class="number">72</span>}
+  overrideItemLayout={(layout, item, index, maxColumns, extraData) =&gt; {
+    layout.size = item.type === <span class="string">'header'</span> ? <span class="number">120</span> : <span class="number">72</span>;
+    layout.span = item.type === <span class="string">'header'</span> ? maxColumns : <span class="number">1</span>;
+  }}
+/&gt;
+
+<span class="comment">// getItemType for recycling pools:</span>
+&lt;<span class="type">FlashList</span>
+  data={items}
+  renderItem={renderItem}
+  estimatedItemSize={<span class="number">72</span>}
+  getItemType={(item) =&gt; item.type}
+  <span class="comment">// Items with same type share a recycling pool</span>
+  <span class="comment">// "message" cells are only reused for other "message" items</span>
+  <span class="comment">// This prevents expensive re-renders when cell structure differs</span>
+/&gt;</code></pre>
+
+    <h3>9.3 Performance Comparison</h3>
+
+    <table>
+        <thead>
+            <tr><th>Metric</th><th>FlatList</th><th>FlashList</th><th>Improvement</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Blank area during scroll</td><td>Frequent (especially fast scroll)</td><td>Rare (cells recycled instantly)</td><td>~10x less blank</td></tr>
+            <tr><td>Memory usage (10K items)</td><td>High (mount/unmount GC pressure)</td><td>Low (fixed cell pool)</td><td>~30-50% less</td></tr>
+            <tr><td>JS thread usage</td><td>Heavy (component lifecycle)</td><td>Light (prop updates only)</td><td>~5x less JS work</td></tr>
+            <tr><td>Scroll FPS (complex cells)</td><td>45-55 FPS</td><td>58-60 FPS</td><td>Consistent 60fps</td></tr>
+            <tr><td>Initial render</td><td>Fast (simple mount)</td><td>Fast (similar)</td><td>Comparable</td></tr>
+            <tr><td>API complexity</td><td>Simple</td><td>Requires estimatedItemSize</td><td>Slightly more config</td></tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">FlashList Gotcha: Component Identity</div>
+        <p>Because FlashList recycles cells, your <code>renderItem</code> component receives new props on the same instance. This means <code>useState</code> inside list items persists across different data items. Always derive state from props, or use <code>key</code> on the inner component to force remount when the item identity changes.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="optimization">10. Large List Optimization Strategies</h2>
+
+    <h3>10.1 Comprehensive Optimization Checklist</h3>
+
+    <pre><code><span class="comment">// 1. Use React.memo on renderItem component</span>
+<span class="keyword">const</span> <span class="func">ItemRow</span> = React.<span class="func">memo</span>(({ item }) =&gt; (
+  &lt;<span class="type">View</span> style={styles.row}&gt;
+    &lt;<span class="type">Text</span>&gt;{item.title}&lt;/<span class="type">Text</span>&gt;
+  &lt;/<span class="type">View</span>&gt;
+));
+
+<span class="comment">// 2. Stable renderItem reference</span>
+<span class="keyword">const</span> renderItem = <span class="func">useCallback</span>(
+  ({ item }) =&gt; &lt;<span class="type">ItemRow</span> item={item} /&gt;,
+  []
+);
+
+<span class="comment">// 3. Avoid inline functions in renderItem</span>
+<span class="comment">// Bad: creates new function every render</span>
+renderItem={({ item }) =&gt; (
+  &lt;<span class="type">Pressable</span> onPress={() =&gt; <span class="func">handlePress</span>(item.id)}&gt;
+    &lt;<span class="type">Text</span>&gt;{item.title}&lt;/<span class="type">Text</span>&gt;
+  &lt;/<span class="type">Pressable</span>&gt;
+)}
+
+<span class="comment">// Good: pass id as prop, handle in memoized component</span>
+<span class="keyword">const</span> <span class="func">ItemRow</span> = React.<span class="func">memo</span>(({ id, title, onPress }) =&gt; (
+  &lt;<span class="type">Pressable</span> onPress={() =&gt; <span class="func">onPress</span>(id)}&gt;
+    &lt;<span class="type">Text</span>&gt;{title}&lt;/<span class="type">Text</span>&gt;
+  &lt;/<span class="type">Pressable</span>&gt;
+));
+
+<span class="comment">// 4. Reduce re-renders with extraData</span>
+&lt;<span class="type">FlatList</span>
+  data={items}
+  renderItem={renderItem}
+  extraData={selectedId} <span class="comment">// Only re-render when selection changes</span>
+/&gt;
+
+<span class="comment">// 5. removeClippedSubviews (use with caution)</span>
+&lt;<span class="type">FlatList</span>
+  removeClippedSubviews={<span class="keyword">true</span>}
+  <span class="comment">// Detaches off-screen views from native hierarchy</span>
+  <span class="comment">// Reduces memory but can cause rendering artifacts</span>
+/&gt;</code></pre>
+
+    <h3>10.2 Memory Management</h3>
+
+    <pre><code><span class="comment">// Memory optimization for large lists:</span>
+
+<span class="comment">// 1. Image memory — use thumbnails in lists</span>
+<span class="keyword">const</span> <span class="func">ListImage</span> = ({ uri }) =&gt; (
+  &lt;<span class="type">Image</span>
+    source={{ uri: <span class="func">getThumbnailUrl</span>(uri, <span class="number">100</span>, <span class="number">100</span>) }}
+    style={{ width: <span class="number">50</span>, height: <span class="number">50</span> }}
+  /&gt;
+);
+
+<span class="comment">// 2. Reduce windowSize for memory-constrained devices</span>
+<span class="keyword">const</span> windowSize = Platform.OS === <span class="string">'android'</span>
+  ? <span class="number">5</span>   <span class="comment">// Android: more memory-constrained</span>
+  : <span class="number">11</span>; <span class="comment">// iOS: more generous</span>
+
+<span class="comment">// 3. maxToRenderPerBatch — smaller batches = less memory spikes</span>
+&lt;<span class="type">FlatList</span>
+  maxToRenderPerBatch={<span class="number">5</span>}
+  updateCellsBatchingPeriod={<span class="number">100</span>}
+  <span class="comment">// Renders 5 items every 100ms instead of 10 every 50ms</span>
+  <span class="comment">// Smoother memory allocation, slightly slower fill</span>
+/&gt;</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>List performance is the most common React Native performance bottleneck. The key architectural decision is <strong>FlatList vs FlashList</strong>: FlatList is simpler and works well for lists under ~100 items with simple cells. FlashList is essential for lists with 1000+ items, complex cells, or when blank area during scroll is unacceptable. At Staff level, you should also know when to drop down to native list components (UICollectionView/RecyclerView) via native modules for the most demanding scenarios.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="02-view-flattening.html">← View Flattening</a>
+        <a href="04-text-rendering.html">Next: Text Rendering →</a>
+    </div>
+</div>
+</body>
+</html>

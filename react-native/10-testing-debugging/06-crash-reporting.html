@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crash Reporting — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Testing &amp; Debugging</a><span class="sep">›</span>
+        Crash Reporting
+    </nav>
+
+    <h1>Crash Reporting in React Native</h1>
+    <p class="subtitle">React Native apps can crash in two distinct layers — JavaScript exceptions and native crashes — each requiring different capture, symbolication, and reporting mechanisms. Staff engineers must architect a crash reporting pipeline that covers both layers, provides actionable stack traces, and enables crash-free rate monitoring across releases.</p>
+
+    <nav class="nav">
+        <a href="05-profiling.html">← Performance Profiling</a>
+        <a href="07-ci-cd-mobile.html">Next: CI/CD for Mobile →</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#js-vs-native">1. JavaScript vs Native Crashes</a></li>
+            <li><a href="#error-boundaries">2. Error Boundaries</a></li>
+            <li><a href="#sentry">3. Sentry Integration</a></li>
+            <li><a href="#crashlytics">4. Firebase Crashlytics</a></li>
+            <li><a href="#symbolication">5. Symbolication Pipeline</a></li>
+            <li><a href="#breadcrumbs">6. Breadcrumbs &amp; Context</a></li>
+            <li><a href="#release-tracking">7. Release Tracking</a></li>
+            <li><a href="#crash-free">8. Crash-Free Rate Monitoring</a></li>
+            <li><a href="#anr">9. ANR Detection</a></li>
+            <li><a href="#architect">10. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="js-vs-native">1. JavaScript vs Native Crashes</h2>
+
+    <div class="diagram">
+Crash Types in React Native
+════════════════════════════
+
+  JavaScript Crashes                Native Crashes
+  ──────────────────                ──────────────
+  │ Unhandled exceptions  │        │ SIGSEGV, SIGABRT      │
+  │ Unhandled Promise     │        │ NSException (iOS)      │
+  │   rejections          │        │ Java Exception (And.)  │
+  │ Syntax errors         │        │ Out of memory          │
+  │ Type errors           │        │ Stack overflow         │
+  │ Network errors        │        │ Native module crash    │
+  └───────────────────────┘        └────────────────────────┘
+          │                                  │
+          ↓                                  ↓
+  Caught by:                       Caught by:
+  - ErrorUtils.setGlobalHandler    - Signal handlers
+  - Error boundaries (React)       - NSUncaughtExceptionHandler
+  - Promise rejection handler      - Thread.setDefaultUncaught-
+                                     ExceptionHandler
+          │                                  │
+          ↓                                  ↓
+  Symbolicated via:                Symbolicated via:
+  - JS sourcemaps                  - dSYM files (iOS)
+  - Hermes bytecode maps           - mapping.txt (Android)
+                                   - native debug symbols
+    </div>
+
+    <pre><code><span class="comment">// Global JS error handler</span>
+<span class="keyword">import</span> { ErrorUtils } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="keyword">const</span> originalHandler = ErrorUtils.<span class="func">getGlobalHandler</span>();
+
+ErrorUtils.<span class="func">setGlobalHandler</span>((error, isFatal) =&gt; {
+  <span class="keyword">if</span> (isFatal) {
+    crashReporter.<span class="func">captureException</span>(error, {
+      level: <span class="string">'fatal'</span>,
+      tags: { fatal: <span class="keyword">true</span> },
+    });
+  } <span class="keyword">else</span> {
+    crashReporter.<span class="func">captureException</span>(error, {
+      level: <span class="string">'error'</span>,
+    });
+  }
+  <span class="func">originalHandler</span>(error, isFatal);
+});
+
+<span class="comment">// Unhandled Promise rejection handler</span>
+<span class="keyword">const</span> tracking = <span class="keyword">require</span>(<span class="string">'promise/setimmediate/rejection-tracking'</span>);
+tracking.<span class="func">enable</span>({
+  allRejections: <span class="keyword">true</span>,
+  onUnhandled: (id, error) =&gt; {
+    crashReporter.<span class="func">captureException</span>(error, {
+      tags: { unhandledRejection: <span class="keyword">true</span> },
+    });
+  },
+});</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="error-boundaries">2. Error Boundaries</h2>
+
+    <pre><code><span class="keyword">class</span> <span class="type">ErrorBoundary</span> <span class="keyword">extends</span> React.Component {
+  state = { hasError: <span class="keyword">false</span>, error: <span class="keyword">null</span> };
+
+  <span class="keyword">static</span> <span class="func">getDerivedStateFromError</span>(error) {
+    <span class="keyword">return</span> { hasError: <span class="keyword">true</span>, error };
+  }
+
+  <span class="func">componentDidCatch</span>(error, errorInfo) {
+    Sentry.<span class="func">captureException</span>(error, {
+      extra: { componentStack: errorInfo.componentStack },
+    });
+  }
+
+  <span class="func">render</span>() {
+    <span class="keyword">if</span> (<span class="keyword">this</span>.state.hasError) {
+      <span class="keyword">return</span> (
+        &lt;View style={styles.errorContainer}&gt;
+          &lt;Text style={styles.errorTitle}&gt;Something went wrong&lt;/Text&gt;
+          &lt;TouchableOpacity
+            onPress={() =&gt; <span class="keyword">this</span>.<span class="func">setState</span>({ hasError: <span class="keyword">false</span> })}
+          &gt;
+            &lt;Text&gt;Try Again&lt;/Text&gt;
+          &lt;/TouchableOpacity&gt;
+        &lt;/View&gt;
+      );
+    }
+    <span class="keyword">return</span> <span class="keyword">this</span>.props.children;
+  }
+}
+
+<span class="comment">// Granular error boundaries per feature</span>
+<span class="keyword">const</span> <span class="func">App</span> = () =&gt; (
+  &lt;ErrorBoundary fallback={&lt;AppCrashScreen /&gt;}&gt;
+    &lt;NavigationContainer&gt;
+      &lt;ErrorBoundary fallback={&lt;ScreenError /&gt;}&gt;
+        &lt;HomeScreen /&gt;
+      &lt;/ErrorBoundary&gt;
+    &lt;/NavigationContainer&gt;
+  &lt;/ErrorBoundary&gt;
+);</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Warning</div>
+        <p>Error boundaries only catch errors during rendering, lifecycle methods, and constructors. They do NOT catch: event handler errors, async code (setTimeout, Promises), or errors in the error boundary itself. For event handlers, use try/catch. For async code, use the global error handler or Promise rejection tracking.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="sentry">3. Sentry Integration</h2>
+
+    <pre><code><span class="keyword">import</span> * <span class="keyword">as</span> Sentry <span class="keyword">from</span> <span class="string">'@sentry/react-native'</span>;
+
+Sentry.<span class="func">init</span>({
+  dsn: <span class="string">'https://key@sentry.io/project'</span>,
+  environment: __DEV__ ? <span class="string">'development'</span> : <span class="string">'production'</span>,
+  release: <span class="string">`com.myapp@</span>${version}<span class="string">+</span>${buildNumber}<span class="string">`</span>,
+  dist: buildNumber,
+  tracesSampleRate: 0.2,  <span class="comment">// 20% of transactions</span>
+  enableAutoSessionTracking: <span class="keyword">true</span>,
+  sessionTrackingIntervalMillis: 30000,
+  attachStacktrace: <span class="keyword">true</span>,
+  enableNative: <span class="keyword">true</span>,     <span class="comment">// capture native crashes</span>
+  enableNativeCrashHandling: <span class="keyword">true</span>,
+
+  beforeSend(event) {
+    <span class="comment">// Scrub sensitive data</span>
+    <span class="keyword">if</span> (event.request?.headers) {
+      <span class="keyword">delete</span> event.request.headers[<span class="string">'Authorization'</span>];
+    }
+    <span class="keyword">return</span> event;
+  },
+
+  integrations: [
+    <span class="keyword">new</span> Sentry.ReactNativeTracing({
+      routingInstrumentation:
+        <span class="keyword">new</span> Sentry.ReactNavigationInstrumentation(),
+    }),
+  ],
+});
+
+<span class="comment">// Manual error capture with context</span>
+<span class="keyword">try</span> {
+  <span class="keyword">await</span> <span class="func">processPayment</span>(order);
+} <span class="keyword">catch</span> (error) {
+  Sentry.<span class="func">captureException</span>(error, {
+    tags: { feature: <span class="string">'checkout'</span>, paymentMethod: <span class="string">'card'</span> },
+    extra: { orderId: order.id, amount: order.total },
+    level: <span class="string">'error'</span>,
+  });
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="crashlytics">4. Firebase Crashlytics</h2>
+
+    <pre><code><span class="keyword">import</span> crashlytics <span class="keyword">from</span> <span class="string">'@react-native-firebase/crashlytics'</span>;
+
+<span class="comment">// Initialize</span>
+<span class="keyword">await</span> crashlytics().<span class="func">setCrashlyticsCollectionEnabled</span>(<span class="keyword">true</span>);
+
+<span class="comment">// Set user context</span>
+<span class="keyword">await</span> crashlytics().<span class="func">setUserId</span>(<span class="string">'user-123'</span>);
+<span class="keyword">await</span> crashlytics().<span class="func">setAttribute</span>(<span class="string">'plan'</span>, <span class="string">'premium'</span>);
+<span class="keyword">await</span> crashlytics().<span class="func">setAttributes</span>({
+  role: <span class="string">'admin'</span>,
+  version: <span class="string">'2.1.0'</span>,
+});
+
+<span class="comment">// Log breadcrumbs</span>
+crashlytics().<span class="func">log</span>(<span class="string">'User navigated to checkout'</span>);
+
+<span class="comment">// Record non-fatal error</span>
+<span class="keyword">try</span> {
+  <span class="keyword">await</span> <span class="func">riskyOperation</span>();
+} <span class="keyword">catch</span> (error) {
+  crashlytics().<span class="func">recordError</span>(error);
+}
+
+<span class="comment">// Force crash (testing)</span>
+crashlytics().<span class="func">crash</span>();</code></pre>
+
+    <table>
+        <thead><tr><th>Feature</th><th>Sentry</th><th>Firebase Crashlytics</th></tr></thead>
+        <tbody>
+            <tr><td>JS crash capture</td><td>Excellent</td><td>Good (via recordError)</td></tr>
+            <tr><td>Native crash capture</td><td>Excellent</td><td>Excellent</td></tr>
+            <tr><td>Sourcemap support</td><td>Full (upload via CLI)</td><td>Limited (manual setup)</td></tr>
+            <tr><td>Breadcrumbs</td><td>Automatic + manual</td><td>Manual only</td></tr>
+            <tr><td>Performance monitoring</td><td>Yes (transactions)</td><td>Separate (Firebase Perf)</td></tr>
+            <tr><td>Session tracking</td><td>Yes</td><td>Yes</td></tr>
+            <tr><td>Release health</td><td>Crash-free rate, adoption</td><td>Crash-free rate</td></tr>
+            <tr><td>Cost</td><td>Paid (free tier available)</td><td>Free</td></tr>
+            <tr><td>Self-hosted option</td><td>Yes</td><td>No</td></tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="symbolication">5. Symbolication Pipeline</h2>
+
+    <div class="diagram">
+Symbolication Pipeline
+══════════════════════
+
+  Build Phase                    Upload Phase
+  ───────────                    ────────────
+  ┌──────────────┐              ┌──────────────────┐
+  │ Metro Bundle │              │ sentry-cli        │
+  │ → bundle.js  │              │ sourcemaps upload │
+  │ → bundle.map │──────────────│ --release X       │
+  └──────────────┘              │ --dist Y          │
+                                └──────────────────┘
+  ┌──────────────┐              ┌──────────────────┐
+  │ Hermes       │              │ sentry-cli        │
+  │ → bundle.hbc │              │ upload-dif        │
+  │ → hbc.map    │──────────────│ (compose maps)    │
+  └──────────────┘              └──────────────────┘
+
+  ┌──────────────┐              ┌──────────────────┐
+  │ Xcode Build  │              │ sentry-cli        │
+  │ → MyApp.dSYM │──────────────│ upload-dif        │
+  └──────────────┘              └──────────────────┘
+
+  ┌──────────────┐              ┌──────────────────┐
+  │ Gradle Build │              │ sentry-cli        │
+  │ → mapping.txt│──────────────│ upload-proguard   │
+  └──────────────┘              └──────────────────┘
+
+  At crash time:
+  Raw: "Error at bundle.hbc:12345:67"
+  Symbolicated: "TypeError at CartScreen.tsx:42:15"
+    </div>
+
+    <pre><code><span class="comment">// CI script for sourcemap upload</span>
+<span class="comment"># Generate bundle + sourcemap</span>
+npx react-native bundle \
+  --entry-file index.js \
+  --platform ios \
+  --dev <span class="keyword">false</span> \
+  --bundle-output ios/main.jsbundle \
+  --sourcemap-output ios/main.jsbundle.map
+
+<span class="comment"># Upload to Sentry</span>
+npx sentry-cli sourcemaps upload \
+  --release <span class="string">"com.myapp@1.0.0+42"</span> \
+  --dist <span class="string">"42"</span> \
+  ios/main.jsbundle ios/main.jsbundle.map
+
+<span class="comment"># Upload dSYM files</span>
+npx sentry-cli upload-dif \
+  ios/build/Build/Products/Release-iphoneos/MyApp.app.dSYM</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="breadcrumbs">6. Breadcrumbs &amp; Context</h2>
+
+    <pre><code><span class="comment">// Automatic breadcrumbs (Sentry captures these by default):</span>
+<span class="comment">// - Navigation events (screen changes)</span>
+<span class="comment">// - Network requests (URL, status, duration)</span>
+<span class="comment">// - Console logs (console.log, warn, error)</span>
+<span class="comment">// - Touch events (component, coordinates)</span>
+<span class="comment">// - App state changes (foreground/background)</span>
+
+<span class="comment">// Manual breadcrumbs for business context</span>
+Sentry.<span class="func">addBreadcrumb</span>({
+  category: <span class="string">'checkout'</span>,
+  message: <span class="string">'Added item to cart'</span>,
+  data: { productId: <span class="string">'abc'</span>, quantity: 2 },
+  level: <span class="string">'info'</span>,
+});
+
+<span class="comment">// User context</span>
+Sentry.<span class="func">setUser</span>({
+  id: <span class="string">'user-123'</span>,
+  email: <span class="string">'user@example.com'</span>,
+  subscription: <span class="string">'premium'</span>,
+});
+
+<span class="comment">// Tags for filtering</span>
+Sentry.<span class="func">setTag</span>(<span class="string">'feature'</span>, <span class="string">'checkout'</span>);
+Sentry.<span class="func">setTag</span>(<span class="string">'experiment'</span>, <span class="string">'new-flow-v2'</span>);</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="release-tracking">7. Release Tracking</h2>
+
+    <pre><code><span class="comment">// Release naming convention</span>
+<span class="comment">// Format: bundle-id@version+build</span>
+<span class="comment">// Example: com.myapp@2.1.0+142</span>
+
+<span class="comment">// Sentry release association</span>
+Sentry.<span class="func">init</span>({
+  release: <span class="string">`</span>${bundleId}<span class="string">@</span>${version}<span class="string">+</span>${buildNumber}<span class="string">`</span>,
+  dist: String(buildNumber),
+});
+
+<span class="comment">// Create release in CI</span>
+<span class="comment">// sentry-cli releases new "com.myapp@2.1.0+142"</span>
+<span class="comment">// sentry-cli releases set-commits "com.myapp@2.1.0+142" --auto</span>
+<span class="comment">// sentry-cli releases finalize "com.myapp@2.1.0+142"</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="crash-free">8. Crash-Free Rate Monitoring</h2>
+
+    <pre><code><span class="comment">// Crash-free rate = sessions without crashes / total sessions</span>
+<span class="comment">// Target: > 99.5% crash-free rate</span>
+
+<span class="comment">// Sentry session tracking</span>
+Sentry.<span class="func">init</span>({
+  enableAutoSessionTracking: <span class="keyword">true</span>,
+  sessionTrackingIntervalMillis: 30000,
+});
+
+<span class="comment">// Session states:</span>
+<span class="comment">// - ok: session completed without errors</span>
+<span class="comment">// - errored: session had non-fatal errors</span>
+<span class="comment">// - crashed: session ended with fatal error</span>
+<span class="comment">// - abnormal: session ended unexpectedly (ANR, OOM)</span>
+
+<span class="comment">// Alert thresholds:</span>
+<span class="comment">// Crash-free < 99% → P1 alert</span>
+<span class="comment">// Crash-free < 99.5% → P2 alert</span>
+<span class="comment">// New crash type with > 100 events → P2 alert</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="anr">9. ANR Detection</h2>
+
+    <pre><code><span class="comment">// ANR = Application Not Responding</span>
+<span class="comment">// Android: main thread blocked > 5 seconds</span>
+<span class="comment">// iOS: watchdog kills app if main thread blocked > ~10 seconds</span>
+
+<span class="comment">// Common ANR causes in React Native:</span>
+<span class="comment">// 1. Synchronous bridge calls blocking main thread</span>
+<span class="comment">// 2. Large JSON serialization on main thread</span>
+<span class="comment">// 3. Synchronous storage operations</span>
+<span class="comment">// 4. Heavy Yoga layout calculations</span>
+<span class="comment">// 5. Native module doing I/O on main thread</span>
+
+<span class="comment">// Sentry ANR detection</span>
+Sentry.<span class="func">init</span>({
+  enableAppHangTracking: <span class="keyword">true</span>,  <span class="comment">// iOS</span>
+  appHangTimeoutInterval: 2,    <span class="comment">// seconds</span>
+  enableAnrTracking: <span class="keyword">true</span>,      <span class="comment">// Android</span>
+  anrTimeout: 5000,             <span class="comment">// milliseconds</span>
+});</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">10. Architect Considerations</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>Crash reporting architecture for Staff engineers: (1) Use Sentry for comprehensive JS + native crash reporting with sourcemap support. (2) Implement granular error boundaries — per-screen, per-feature, with recovery options. (3) Automate sourcemap/dSYM upload in CI for every release. (4) Set up crash-free rate alerts with escalation policies. (5) Add business context via breadcrumbs and tags — a crash report without context is useless. (6) Track ANR rates alongside crash rates — ANRs are worse UX than crashes. (7) Never ship without symbolication artifacts — unsymbolicated crashes waste engineering time.</p>
+    </div>
+
+    <nav class="nav-footer">
+        <a href="05-profiling.html">← Performance Profiling</a>
+        <a href="07-ci-cd-mobile.html">Next: CI/CD for Mobile →</a>
+    </nav>
+</div>
+</body>
+</html>

@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bridgeless Mode — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">New Architecture</a><span class="sep">›</span>
+        Bridgeless Mode
+    </nav>
+
+    <h1>Bridgeless Mode</h1>
+    <p class="subtitle">Bridgeless mode is the culmination of the new architecture — the complete removal of the legacy bridge. Instead of JSON message passing, all communication flows through JSI, RuntimeExecutor, and CallInvoker. This document covers the internal mechanics, migration path, and what changes for app developers.</p>
+
+    <nav class="nav">
+        <a href="01-jsi-foundation.html">JSI Foundation</a>
+        <a href="02-fabric-renderer.html">Fabric Renderer</a>
+        <a href="03-turbo-modules.html">TurboModules</a>
+        <a href="04-codegen.html">Codegen</a>
+        <a href="05-bridgeless-mode.html" class="active">Bridgeless Mode</a>
+        <a href="06-concurrent-rendering.html">Concurrent Rendering</a>
+        <a href="07-migration-guide.html">Migration Guide</a>
+        <a href="08-interview-qa.html">Interview Q&amp;A</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#what-is-bridgeless">1. What Is Bridgeless Mode?</a></li>
+            <li><a href="#old-vs-new">2. Old Bridge vs Bridgeless Architecture</a></li>
+            <li><a href="#runtime-executor">3. RuntimeExecutor</a></li>
+            <li><a href="#call-invoker">4. CallInvoker</a></li>
+            <li><a href="#event-loop">5. Event Loop Integration</a></li>
+            <li><a href="#module-init">6. Module Initialization Without Bridge</a></li>
+            <li><a href="#error-handling">7. Error Handling</a></li>
+            <li><a href="#interop-mode">8. Interop Mode (Backward Compatibility)</a></li>
+            <li><a href="#migration-strategy">9. Migration Strategy</a></li>
+            <li><a href="#performance">10. Performance Improvements</a></li>
+            <li><a href="#developer-impact">11. What Changes for App Developers</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="what-is-bridgeless">1. What Is Bridgeless Mode?</h2>
+
+    <p>Bridgeless mode is React Native running without the <code>CxxBridge</code> (also called <code>RCTCxxBridge</code> on iOS or <code>CatalystInstance</code> on Android). In this mode, the legacy bridge infrastructure — the JSON message queue, the batched native call mechanism, and the <code>NativeModules</code> registry — is entirely removed from the runtime. All JS↔native communication happens through JSI-based primitives: <code>RuntimeExecutor</code> for scheduling work on the JS thread, <code>CallInvoker</code> for dispatching calls across threads, and direct JSI bindings for synchronous access.</p>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>Bridgeless mode is not just "the bridge but faster." It's a fundamentally different execution model. The bridge was a message queue with batching semantics — calls were enqueued, batched, serialized, and processed asynchronously. Bridgeless mode replaces this with direct function dispatch. This changes the concurrency model, error propagation, initialization order, and the entire mental model for how JS and native interact. Staff engineers must understand that this isn't a drop-in replacement — it's a new runtime contract.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="old-vs-new">2. Old Bridge vs Bridgeless Architecture</h2>
+
+    <div class="diagram">
+Old Architecture (Bridge)         New Architecture (Bridgeless)
+═════════════════════════         ═════════════════════════════
+
+  JS Thread     Native Thread     JS Thread     Native Thread
+  ┌────────┐    ┌────────┐       ┌────────┐    ┌────────┐
+  │ JS     │    │ Native │       │ JS     │    │ Native │
+  │ Code   │    │ Module │       │ Code   │    │ Module │
+  └───┬────┘    └───▲────┘       └───┬────┘    └───▲────┘
+      │             │                │             │
+      │ serialize   │ deserialize    │ Direct C++  │ CallInvoker
+      ▼             │                ▼             │
+  ┌──────────────────────┐       ┌──────────────────────┐
+  │  Bridge (msg queue)  │       │ JSI + RuntimeExecutor │
+  │  Batched, async,     │       │ No serialize, sync or │
+  │  JSON serialized     │       │ async, type-safe      │
+  └──────────────────────┘       └──────────────────────┘
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Bridge Mode</th>
+                <th>Bridgeless Mode</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Communication</strong></td>
+                <td>JSON message queue</td>
+                <td>Direct JSI calls</td>
+            </tr>
+            <tr>
+                <td><strong>Serialization</strong></td>
+                <td>JSON.stringify/parse every call</td>
+                <td>None — C++ types directly</td>
+            </tr>
+            <tr>
+                <td><strong>Batching</strong></td>
+                <td>Calls batched every ~5ms</td>
+                <td>Immediate dispatch</td>
+            </tr>
+            <tr>
+                <td><strong>Module registry</strong></td>
+                <td>Global NativeModules object</td>
+                <td>TurboModuleRegistry (lazy)</td>
+            </tr>
+            <tr>
+                <td><strong>Initialization</strong></td>
+                <td>All modules loaded at startup</td>
+                <td>Lazy — loaded on first access</td>
+            </tr>
+            <tr>
+                <td><strong>Threading</strong></td>
+                <td>Bridge manages thread dispatch</td>
+                <td>CallInvoker + RuntimeExecutor</td>
+            </tr>
+            <tr>
+                <td><strong>Error propagation</strong></td>
+                <td>Async error callbacks</td>
+                <td>Synchronous exceptions + async errors</td>
+            </tr>
+            <tr>
+                <td><strong>Binary data</strong></td>
+                <td>Base64 encoding</td>
+                <td>Direct ArrayBuffer sharing</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="runtime-executor">3. RuntimeExecutor</h2>
+
+    <p><code>RuntimeExecutor</code> is the primary mechanism for scheduling work on the JavaScript thread in bridgeless mode. It replaces the bridge's internal message dispatch. Any native code that needs to call into JavaScript must go through RuntimeExecutor to ensure thread safety — JS engines are single-threaded and all JS execution must happen on the JS thread.</p>
+
+    <pre><code><span class="comment">// RuntimeExecutor type definition</span>
+<span class="keyword">using</span> <span class="type">RuntimeExecutor</span> = std::function&lt;
+  <span class="keyword">void</span>(std::function&lt;<span class="keyword">void</span>(jsi::Runtime&amp; runtime)&gt;&amp;&amp; callback)
+&gt;;
+
+<span class="comment">// Usage: schedule work on the JS thread from any native thread</span>
+<span class="keyword">void</span> <span class="type">NativeTimerModule</span>::setTimeout(
+    jsi::Runtime&amp; rt,
+    jsi::Function callback,
+    <span class="keyword">double</span> delayMs) {
+
+  <span class="comment">// Capture the callback as a shared JSI value</span>
+  <span class="keyword">auto</span> sharedCallback = std::make_shared&lt;jsi::Function&gt;(
+    std::move(callback));
+
+  <span class="comment">// Schedule on a background timer thread</span>
+  timerThread_.postDelayed(delayMs, [
+    <span class="keyword">this</span>,
+    sharedCallback = std::move(sharedCallback)
+  ]() {
+    <span class="comment">// Use RuntimeExecutor to get back to JS thread</span>
+    runtimeExecutor_([sharedCallback](jsi::Runtime&amp; rt) {
+      sharedCallback-&gt;call(rt);
+    });
+  });
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Threading Contract</div>
+        <p>RuntimeExecutor guarantees that the callback runs on the JS thread with a valid <code>jsi::Runtime</code> reference. Never capture <code>jsi::Runtime&amp;</code> across thread boundaries — it is only valid on the JS thread. Always use RuntimeExecutor to re-enter the JS context. Violating this contract causes undefined behavior: crashes, memory corruption, or subtle data races that are extremely difficult to debug.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="call-invoker">4. CallInvoker</h2>
+
+    <p><code>CallInvoker</code> is the abstraction for dispatching function calls to a specific thread. In bridgeless mode, there are two primary CallInvokers: <code>jsCallInvoker</code> (dispatches to the JS thread) and <code>nativeCallInvoker</code> (dispatches to the native modules thread). TurboModules use CallInvoker to manage async method dispatch.</p>
+
+    <pre><code><span class="comment">// CallInvoker interface</span>
+<span class="keyword">class</span> <span class="type">CallInvoker</span> {
+<span class="keyword">public</span>:
+  <span class="keyword">virtual</span> ~CallInvoker() = <span class="keyword">default</span>;
+
+  <span class="comment">// Schedule a function to run on this invoker's thread</span>
+  <span class="keyword">virtual</span> <span class="keyword">void</span> invokeAsync(std::function&lt;<span class="keyword">void</span>()&gt;&amp;&amp; func) = 0;
+
+  <span class="comment">// Schedule with priority (for concurrent rendering)</span>
+  <span class="keyword">virtual</span> <span class="keyword">void</span> invokeAsync(
+    <span class="type">SchedulerPriority</span> priority,
+    std::function&lt;<span class="keyword">void</span>()&gt;&amp;&amp; func) = 0;
+
+  <span class="comment">// Synchronous invocation (blocks until complete)</span>
+  <span class="keyword">virtual</span> <span class="keyword">void</span> invokeSync(std::function&lt;<span class="keyword">void</span>()&gt;&amp;&amp; func) = 0;
+};
+
+<span class="comment">// How TurboModules use CallInvoker for async methods</span>
+<span class="keyword">class</span> <span class="type">TurboModule</span> {
+<span class="keyword">protected</span>:
+  std::shared_ptr&lt;<span class="type">CallInvoker</span>&gt; jsInvoker_;
+
+  <span class="comment">// Resolve a JS Promise from a native background thread</span>
+  <span class="keyword">void</span> resolvePromise(
+      std::shared_ptr&lt;jsi::Function&gt; resolve,
+      jsi::Value result) {
+    jsInvoker_-&gt;invokeAsync([resolve, result = std::move(result)]() {
+      resolve-&gt;call(*runtime_, result);
+    });
+  }
+};</code></pre>
+
+    <div class="diagram">
+CallInvoker Thread Dispatch
+═══════════════════════════
+
+  ┌─────────────────┐     invokeAsync()     ┌─────────────────┐
+  │  Native Thread   │ ──────────────────► │   JS Thread      │
+  │  (background     │     jsCallInvoker    │   (executes JS   │
+  │   computation)   │                      │    callbacks)    │
+  └─────────────────┘                      └─────────────────┘
+         ▲                                          │
+         │          nativeCallInvoker               │
+         └──────────────────────────────────────────┘
+                     invokeAsync()
+
+  RuntimeExecutor vs CallInvoker:
+  ┌──────────────────────────────────────────────────┐
+  │ RuntimeExecutor: gives you jsi::Runtime&amp; in the  │
+  │   callback — use when you need to touch JS values│
+  │                                                  │
+  │ CallInvoker: plain void() callback — use for     │
+  │   thread dispatch without direct JSI access      │
+  └──────────────────────────────────────────────────┘
+    </div>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Key Detail</div>
+        <p><code>RuntimeExecutor</code> and <code>jsCallInvoker</code> both dispatch to the JS thread, but they serve different purposes. RuntimeExecutor provides a <code>jsi::Runtime&amp;</code> reference in the callback — use it when you need to create or manipulate JS values. CallInvoker provides a plain <code>void()</code> callback — use it for scheduling work that doesn't need direct JSI access, or when you've already captured the necessary JS references. In practice, TurboModules use CallInvoker for Promise resolution (the resolve/reject functions are already captured), while RuntimeExecutor is used for event emission and global state updates.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="event-loop">5. Event Loop Integration</h2>
+
+    <p>In bridgeless mode, React Native integrates with the JS engine's event loop rather than implementing its own batching mechanism. With Hermes, this means native microtasks, <code>queueMicrotask()</code>, and proper Promise resolution ordering that matches web semantics.</p>
+
+    <pre><code><span class="comment">// Bridgeless event loop integration with Hermes</span>
+<span class="keyword">class</span> <span class="type">HermesInstance</span> : <span class="keyword">public</span> <span class="type">ReactInstance</span> {
+  <span class="keyword">void</span> initializeRuntime() {
+    <span class="comment">// Enable microtask queue (Hermes-specific)</span>
+    hermesRuntime_-&gt;enableMicrotasks();
+
+    <span class="comment">// Install native timer functions via JSI (not bridge)</span>
+    installTimerFunctions(*hermesRuntime_, runtimeExecutor_);
+
+    <span class="comment">// Install global error handler</span>
+    installGlobalErrorHandler(*hermesRuntime_);
+
+    <span class="comment">// Event loop: drain microtasks after each macrotask</span>
+    runtimeExecutor_([](jsi::Runtime&amp; rt) {
+      <span class="keyword">auto</span>&amp; hermesRt = <span class="keyword">static_cast</span>&lt;HermesRuntime&amp;&gt;(rt);
+      hermesRt.drainMicrotasks();
+    });
+  }
+};</code></pre>
+
+    <div class="diagram">
+Bridgeless Event Loop
+═════════════════════
+
+  ┌─────────────────────────────────────────────────┐
+  │                JS Thread Event Loop              │
+  │                                                  │
+  │  ┌──────────┐   ┌──────────┐   ┌──────────┐    │
+  │  │ Macrotask │──►│ Microtask│──►│ Macrotask │   │
+  │  │ (timer,   │   │ Queue    │   │ (next     │   │
+  │  │  event)   │   │ (Promise │   │  timer)   │   │
+  │  │           │   │  .then)  │   │           │   │
+  │  └──────────┘   └──────────┘   └──────────┘    │
+  │       ▲                                          │
+  │       │  RuntimeExecutor schedules here          │
+  │       │  (native events become macrotasks)       │
+  └───────┼──────────────────────────────────────────┘
+          │
+  ┌───────┴──────────┐
+  │  Native Events   │
+  │  (touch, timer,  │
+  │   network resp.) │
+  └──────────────────┘
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="module-init">6. Module Initialization Without Bridge</h2>
+
+    <p>In bridge mode, all native modules were registered at startup and initialized eagerly — the bridge needed a complete module registry to dispatch calls. In bridgeless mode, modules are registered with <code>TurboModuleRegistry</code> and initialized lazily on first access via JSI. This fundamentally changes the startup cost model.</p>
+
+    <pre><code><span class="comment">// Bridge mode: eager initialization of ALL modules at startup</span>
+<span class="comment">// (simplified from old RCTCxxBridge)</span>
+<span class="keyword">for</span> (<span class="keyword">auto</span>&amp; moduleData : moduleDataByName_) {
+  <span class="comment">// Every module is instantiated, even if never used</span>
+  moduleData.second-&gt;setUp();   <span class="comment">// ~2-5ms per module</span>
+}
+<span class="comment">// 80 modules × 3ms avg = ~240ms startup cost</span>
+
+<span class="comment">// Bridgeless mode: lazy initialization via TurboModuleRegistry</span>
+<span class="keyword">class</span> <span class="type">TurboModuleBinding</span> {
+  <span class="keyword">static</span> jsi::Value getModule(
+      jsi::Runtime&amp; rt,
+      <span class="keyword">const</span> jsi::Value&amp; name) {
+    <span class="keyword">auto</span> moduleName = name.asString(rt).utf8(rt);
+
+    <span class="comment">// Check cache first</span>
+    <span class="keyword">auto</span> it = moduleCache_.find(moduleName);
+    <span class="keyword">if</span> (it != moduleCache_.end()) {
+      <span class="keyword">return</span> jsi::Value(rt, it-&gt;second);
+    }
+
+    <span class="comment">// Create module on first access only</span>
+    <span class="keyword">auto</span> module = provider_-&gt;getModule(moduleName, jsInvoker_);
+    <span class="keyword">if</span> (module) {
+      moduleCache_[moduleName] = module;
+      <span class="keyword">return</span> module-&gt;getJSIValue(rt);
+    }
+    <span class="keyword">return</span> jsi::Value::undefined();
+  }
+};</code></pre>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Initialization Aspect</th>
+                <th>Bridge Mode</th>
+                <th>Bridgeless Mode</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>When modules load</strong></td>
+                <td>All at startup</td>
+                <td>On first access (lazy)</td>
+            </tr>
+            <tr>
+                <td><strong>Startup cost</strong></td>
+                <td>O(N) where N = total modules</td>
+                <td>O(1) — only used modules</td>
+            </tr>
+            <tr>
+                <td><strong>Registry</strong></td>
+                <td>Global NativeModules object</td>
+                <td>TurboModuleRegistry (JSI-backed)</td>
+            </tr>
+            <tr>
+                <td><strong>Module discovery</strong></td>
+                <td>Compile-time registration macros</td>
+                <td>Codegen + TurboModuleProvider</td>
+            </tr>
+            <tr>
+                <td><strong>First-call latency</strong></td>
+                <td>None (pre-initialized)</td>
+                <td>One-time init cost on first call</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="error-handling">7. Error Handling</h2>
+
+    <p>Error handling changes significantly in bridgeless mode. The bridge swallowed exceptions across the boundary — native errors became generic "bridge error" messages. In bridgeless mode, JSI enables synchronous exception propagation, and errors carry full stack traces across the JS↔native boundary.</p>
+
+    <pre><code><span class="comment">// Bridgeless error handling: synchronous exceptions propagate</span>
+<span class="keyword">try</span> {
+  <span class="comment">// Synchronous TurboModule call via JSI</span>
+  <span class="keyword">auto</span> result = turboModule-&gt;get(rt, propName);
+} <span class="keyword">catch</span> (<span class="keyword">const</span> jsi::JSError&amp; jsError) {
+  <span class="comment">// JS exceptions propagate as C++ exceptions</span>
+  LOG(ERROR) &lt;&lt; <span class="string">"JS Error: "</span> &lt;&lt; jsError.getMessage();
+  LOG(ERROR) &lt;&lt; <span class="string">"Stack: "</span> &lt;&lt; jsError.getStack();
+} <span class="keyword">catch</span> (<span class="keyword">const</span> std::exception&amp; nativeError) {
+  <span class="comment">// Native exceptions can be converted to JS errors</span>
+  <span class="keyword">throw</span> jsi::JSError(rt, nativeError.what());
+}
+
+<span class="comment">// Global error handler in bridgeless mode</span>
+<span class="keyword">void</span> <span class="type">ReactInstance</span>::handleJSError(
+    jsi::Runtime&amp; rt,
+    <span class="keyword">const</span> jsi::JSError&amp; error) {
+  <span class="comment">// Report to ErrorUtils (JS-side error boundary)</span>
+  <span class="keyword">auto</span> errorUtils = rt.global()
+    .getPropertyAsObject(rt, <span class="string">"ErrorUtils"</span>);
+  <span class="keyword">auto</span> reportFatalError = errorUtils
+    .getPropertyAsFunction(rt, <span class="string">"reportFatalError"</span>);
+  reportFatalError.call(rt, error.value());
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="interop-mode">8. Interop Mode (Backward Compatibility)</h2>
+
+    <p>Interop mode is the backward compatibility layer that allows legacy bridge-based native modules and Fabric components to work in bridgeless mode. It provides a shim that translates old-style bridge calls into JSI calls, enabling gradual migration without requiring all libraries to update simultaneously.</p>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>Interop mode is a critical architectural decision. Rather than requiring a big-bang migration (which would break the ecosystem), React Native provides a compatibility layer that wraps legacy modules in a TurboModule-compatible interface. This is a classic "strangler fig" pattern — the old system continues to work while being gradually replaced. The trade-off: interop modules don't get the full performance benefits (they still serialize arguments), but they don't block adoption of the new architecture for the rest of the app.</p>
+    </div>
+
+    <pre><code><span class="comment">// Interop layer: wrapping a legacy NativeModule as a TurboModule</span>
+<span class="comment">// (simplified from React Native's ObjCInteropTurboModule)</span>
+<span class="keyword">class</span> <span class="type">LegacyInteropModule</span> : <span class="keyword">public</span> <span class="type">TurboModule</span> {
+<span class="keyword">public</span>:
+  <span class="type">LegacyInteropModule</span>(
+    std::shared_ptr&lt;<span class="type">CallInvoker</span>&gt; jsInvoker,
+    id&lt;RCTBridgeModule&gt; legacyModule)
+    : TurboModule(<span class="string">"LegacyInterop"</span>, jsInvoker),
+      legacyModule_(legacyModule) {}
+
+  jsi::Value get(jsi::Runtime&amp; rt, <span class="keyword">const</span> jsi::PropNameID&amp; name) {
+    <span class="keyword">auto</span> methodName = name.utf8(rt);
+
+    <span class="comment">// Look up method in legacy module's method table</span>
+    <span class="keyword">auto</span> method = [legacyModule_ methodForSelector:
+      NSSelectorFromString(methodName)];
+
+    <span class="comment">// Return a JSI function that bridges to the legacy method</span>
+    <span class="keyword">return</span> jsi::Function::createFromHostFunction(rt, name, 0,
+      [<span class="keyword">this</span>, methodName](
+        jsi::Runtime&amp; rt,
+        <span class="keyword">const</span> jsi::Value&amp; thisVal,
+        <span class="keyword">const</span> jsi::Value* args,
+        size_t count) -&gt; jsi::Value {
+        <span class="comment">// Convert JSI args → NSDictionary (serialization still happens)</span>
+        <span class="keyword">auto</span> nsArgs = convertJSIToObjC(rt, args, count);
+        <span class="comment">// Invoke legacy method</span>
+        [legacyModule_ invokeMethod:methodName withArgs:nsArgs];
+        <span class="keyword">return</span> jsi::Value::undefined();
+      });
+  }
+};</code></pre>
+
+    <div class="diagram">
+Interop Mode Architecture
+═════════════════════════
+
+  JS Code
+  ┌──────────────────────────────────────────────┐
+  │  import { NativeModules } from 'react-native'│
+  │  NativeModules.LegacyModule.doSomething()    │
+  └──────────────────┬───────────────────────────┘
+                     │
+                     ▼
+  ┌──────────────────────────────────────────────┐
+  │  TurboModuleRegistry                         │
+  │  ┌─────────────────────────────────────────┐ │
+  │  │ Is this a TurboModule? → Use directly   │ │
+  │  │ Is this a legacy module? → Wrap in      │ │
+  │  │   LegacyInteropModule shim              │ │
+  │  └─────────────────────────────────────────┘ │
+  └──────────────────┬───────────────────────────┘
+                     │
+         ┌───────────┴───────────┐
+         ▼                       ▼
+  ┌──────────────┐      ┌──────────────────┐
+  │ TurboModule  │      │ InteropModule    │
+  │ (JSI direct) │      │ (wraps legacy    │
+  │ No serialize │      │  with serialize) │
+  └──────────────┘      └──────────────────┘
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="migration-strategy">9. Migration Strategy</h2>
+
+    <p>Enabling bridgeless mode is a per-app configuration change, but the real work is ensuring all native modules and components are compatible. The recommended strategy is incremental: enable the new architecture with interop mode first, then migrate individual modules to TurboModules over time.</p>
+
+    <pre><code><span class="comment">// Android: enable bridgeless mode in ReactNativeHost</span>
+<span class="comment">// gradle.properties</span>
+newArchEnabled=<span class="keyword">true</span>
+
+<span class="comment">// MainApplication.kt</span>
+<span class="keyword">class</span> <span class="type">MainApplication</span> : Application(), ReactApplication {
+  <span class="keyword">override val</span> reactNativeHost = <span class="keyword">object</span> : DefaultReactNativeHost(<span class="keyword">this</span>) {
+    <span class="keyword">override fun</span> getJSMainModuleName() = <span class="string">"index"</span>
+    <span class="keyword">override fun</span> getUseDeveloperSupport() = BuildConfig.DEBUG
+    <span class="keyword">override val</span> isNewArchEnabled = BuildConfig.IS_NEW_ARCHITECTURE_ENABLED
+    <span class="keyword">override val</span> isHermesEnabled = BuildConfig.IS_HERMES_ENABLED
+  }
+}
+
+<span class="comment">// iOS: enable bridgeless in AppDelegate</span>
+<span class="comment">// RCTAppDelegate automatically uses bridgeless when new arch is enabled</span>
+- (BOOL)bridgelessEnabled {
+  <span class="keyword">return</span> YES;
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Migration Risk</div>
+        <p>Enabling bridgeless mode changes the module initialization order. Some legacy modules depend on being initialized before others (implicit ordering via bridge registration). In bridgeless mode, modules initialize lazily on first access, which can expose hidden dependencies. Test thoroughly: if module A depends on module B being initialized first, you need explicit initialization ordering or dependency injection.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="performance">10. Performance Improvements</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Metric</th>
+                <th>Bridge Mode</th>
+                <th>Bridgeless Mode</th>
+                <th>Improvement</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>App startup (TTI)</strong></td>
+                <td>~1200ms</td>
+                <td>~800ms</td>
+                <td>~33% faster</td>
+            </tr>
+            <tr>
+                <td><strong>Native call latency</strong></td>
+                <td>5-10ms (async + serialize)</td>
+                <td>0.005-0.05ms (sync JSI)</td>
+                <td>100-1000× faster</td>
+            </tr>
+            <tr>
+                <td><strong>Memory (module overhead)</strong></td>
+                <td>All modules in memory</td>
+                <td>Only used modules</td>
+                <td>~40% reduction</td>
+            </tr>
+            <tr>
+                <td><strong>JS→Native event latency</strong></td>
+                <td>~16ms (next frame batch)</td>
+                <td>&lt;1ms (immediate dispatch)</td>
+                <td>16× faster</td>
+            </tr>
+            <tr>
+                <td><strong>Binary data transfer</strong></td>
+                <td>Base64 (33% overhead + encode/decode)</td>
+                <td>Direct ArrayBuffer (zero-copy)</td>
+                <td>No overhead</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Key Detail</div>
+        <p>The startup improvement comes primarily from lazy module initialization, not from the removal of bridge code itself. In a typical app with 60-100 native modules, only 10-20 are used during the initial render. Bridgeless mode defers the other 40-80 modules until they're actually needed, saving 200-400ms of startup time. The per-call latency improvement (100-1000×) matters most for high-frequency operations like gesture handling, animations, and real-time data processing.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="developer-impact">11. What Changes for App Developers</h2>
+
+    <p>For most app developers writing JavaScript/TypeScript, bridgeless mode is transparent — the React Native framework handles the transition. However, there are important behavioral differences that affect debugging, error handling, and module usage patterns.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Area</th>
+                <th>What Changes</th>
+                <th>Action Required</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>NativeModules import</strong></td>
+                <td><code>NativeModules.X</code> still works via interop</td>
+                <td>Migrate to <code>TurboModuleRegistry.get()</code> for full perf</td>
+            </tr>
+            <tr>
+                <td><strong>Module availability</strong></td>
+                <td>Modules may not exist at import time (lazy)</td>
+                <td>Handle null returns from TurboModuleRegistry</td>
+            </tr>
+            <tr>
+                <td><strong>Error messages</strong></td>
+                <td>More detailed native stack traces</td>
+                <td>Update error monitoring to parse new format</td>
+            </tr>
+            <tr>
+                <td><strong>Timing</strong></td>
+                <td>No more 5ms batching delay</td>
+                <td>Some race conditions may surface</td>
+            </tr>
+            <tr>
+                <td><strong>Promise behavior</strong></td>
+                <td>Proper microtask queue ordering</td>
+                <td>Code relying on bridge batching order may break</td>
+            </tr>
+            <tr>
+                <td><strong>requireNativeComponent</strong></td>
+                <td>Works via interop, but Fabric components preferred</td>
+                <td>Migrate to Fabric component specs over time</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="nav-footer">
+        <a href="04-codegen.html">← Codegen</a>
+        <a href="06-concurrent-rendering.html">Concurrent Rendering →</a>
+    </div>
+</div>
+</body>
+</html>

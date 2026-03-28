@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>View Flattening — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Rendering Pipeline</a><span class="sep">›</span>
+        View Flattening
+    </nav>
+
+    <h1>View Flattening</h1>
+    <p class="subtitle">View flattening is a critical optimization that removes unnecessary native views from the hierarchy, reducing memory usage, layout computation, and draw calls. Understanding when and why flattening applies — and when it breaks — is essential for Staff-level performance work.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#problem">1. The Problem: Deep View Hierarchies</a></li>
+            <li><a href="#layout-only">2. Layout-Only Views</a></li>
+            <li><a href="#flattening-algorithm">3. The Flattening Algorithm</a></li>
+            <li><a href="#when-applies">4. When Flattening Applies</a></li>
+            <li><a href="#when-breaks">5. When Flattening Breaks</a></li>
+            <li><a href="#collapsable">6. The collapsable Prop</a></li>
+            <li><a href="#fabric-flattening">7. Fabric's Improved Flattening</a></li>
+            <li><a href="#debugging">8. Debugging Flattened Hierarchies</a></li>
+            <li><a href="#performance">9. Performance Impact</a></li>
+            <li><a href="#architect">10. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="problem">1. The Problem: Deep View Hierarchies</h2>
+
+    <p>React component composition naturally produces deeply nested view trees. Each <code>&lt;View&gt;</code> in JSX creates a native platform view, and native view hierarchies have real performance costs.</p>
+
+    <div class="diagram">
+React Component Tree                    Without Flattening (Native)
+════════════════════                    ═══════════════════════════
+
+&lt;View&gt;              ← outer container    UIView (1)
+  &lt;View&gt;            ← padding wrapper      UIView (2) ← unnecessary!
+    &lt;View&gt;          ← flex row               UIView (3) ← unnecessary!
+      &lt;Text&gt;Hi&lt;/Text&gt;                          UILabel (4)
+    &lt;/View&gt;
+  &lt;/View&gt;
+&lt;/View&gt;
+
+With Flattening (Native):
+UIView (1)
+  UILabel (4)        ← Views 2 and 3 removed, layout absorbed by parent
+    </div>
+
+    <h3>1.1 Cost of Native Views</h3>
+
+    <table>
+        <thead>
+            <tr><th>Cost Category</th><th>iOS Impact</th><th>Android Impact</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Memory per view</td><td>~2-4 KB per UIView</td><td>~1-3 KB per android.view.View</td></tr>
+            <tr><td>Layout pass</td><td>layoutSubviews traversal</td><td>measure/layout traversal</td></tr>
+            <tr><td>Draw calls</td><td>CALayer rendering</td><td>Canvas draw commands</td></tr>
+            <tr><td>Hit testing</td><td>hitTest:withEvent: traversal</td><td>dispatchTouchEvent traversal</td></tr>
+            <tr><td>Accessibility</td><td>Accessibility tree nodes</td><td>AccessibilityNodeInfo objects</td></tr>
+            <tr><td>GPU overdraw</td><td>Compositing layers</td><td>GPU overdraw regions</td></tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>A typical React Native screen can have 200-500 React components but should ideally produce only 50-150 native views after flattening. The ratio of React components to native views is a key health metric. Tools like Flipper's Layout Inspector show the actual native hierarchy post-flattening.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="layout-only">2. Layout-Only Views</h2>
+
+    <p>A "layout-only" view is one that contributes only layout (flexbox positioning) to its children but has no visual properties of its own. These views are candidates for removal because their layout contribution can be absorbed by their parent.</p>
+
+    <h3>2.1 Identifying Layout-Only Views</h3>
+
+    <pre><code><span class="comment">// Layout-only: only has layout/flex properties</span>
+&lt;<span class="type">View</span> style={{ flex: <span class="number">1</span>, flexDirection: <span class="string">'row'</span>, padding: <span class="number">10</span> }}&gt;
+  &lt;<span class="type">Text</span>&gt;Hello&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+<span class="comment">// ↑ This View only does layout — no backgroundColor, border, shadow, etc.</span>
+<span class="comment">// It CAN be flattened: its layout is merged into the parent</span>
+
+<span class="comment">// NOT layout-only: has visual properties</span>
+&lt;<span class="type">View</span> style={{ flex: <span class="number">1</span>, backgroundColor: <span class="string">'red'</span> }}&gt;
+  &lt;<span class="type">Text</span>&gt;Hello&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+<span class="comment">// ↑ This View draws a red background — CANNOT be flattened</span>
+
+<span class="comment">// NOT layout-only: has event handlers</span>
+&lt;<span class="type">View</span> style={{ flex: <span class="number">1</span> }} onLayout={handleLayout}&gt;
+  &lt;<span class="type">Text</span>&gt;Hello&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+<span class="comment">// ↑ Needs native view to receive onLayout event</span></code></pre>
+
+    <h3>2.2 Properties That Prevent Flattening</h3>
+
+    <pre><code><span class="comment">// Any of these properties on a View prevent flattening:</span>
+
+<span class="comment">// Visual properties</span>
+backgroundColor      <span class="comment">// Draws color</span>
+borderWidth / borderColor / borderRadius  <span class="comment">// Draws borders</span>
+opacity              <span class="comment">// Requires compositing layer</span>
+shadowColor / shadowOffset / shadowRadius <span class="comment">// iOS shadows</span>
+elevation            <span class="comment">// Android shadows</span>
+
+<span class="comment">// Overflow</span>
+overflow: <span class="string">'hidden'</span>   <span class="comment">// Requires clipping bounds</span>
+
+<span class="comment">// Transforms</span>
+transform            <span class="comment">// Requires native layer</span>
+
+<span class="comment">// Event handlers</span>
+onLayout             <span class="comment">// Needs native view for measurement</span>
+onPress / onLongPress <span class="comment">// Needs native touch target</span>
+accessible / accessibilityLabel <span class="comment">// Accessibility tree node</span>
+
+<span class="comment">// Other</span>
+nativeID             <span class="comment">// Explicit native reference</span>
+testID               <span class="comment">// Testing reference</span>
+collapsable={<span class="keyword">false</span>}  <span class="comment">// Explicit opt-out</span>
+pointerEvents        <span class="comment">// Touch handling configuration</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="flattening-algorithm">3. The Flattening Algorithm</h2>
+
+    <p>The flattening algorithm runs during the shadow tree construction phase, before native views are created. It identifies layout-only nodes and merges their layout contributions into their parents.</p>
+
+    <h3>3.1 Algorithm Steps</h3>
+
+    <div class="diagram">
+Input Shadow Tree:                  After Flattening:
+═══════════════════                ═══════════════════
+
+ViewShadowNode (A)                 ViewShadowNode (A)
+  │ flex: 1                          │ flex: 1
+  │                                  │
+  ├─ ViewShadowNode (B)             ├─ TextShadowNode (D)
+  │    │ flexDirection: 'row'        │    [layout adjusted for B+C]
+  │    │ padding: 10                 │
+  │    │ ← LAYOUT ONLY              └─ ImageShadowNode (E)
+  │    │                                  [layout adjusted for B+C]
+  │    ├─ TextShadowNode (D)
+  │    │
+  │    └─ ViewShadowNode (C)
+  │         │ margin: 5
+  │         │ ← LAYOUT ONLY
+  │         │
+  │         └─ ImageShadowNode (E)
+
+Nodes B and C are removed.
+Their layout (padding, margin, flex) is absorbed
+into the positioning of D and E relative to A.
+    </div>
+
+    <h3>3.2 Implementation Detail</h3>
+
+    <pre><code><span class="comment">// Simplified flattening check (Old Architecture)</span>
+<span class="keyword">function</span> <span class="func">isLayoutOnly</span>(viewConfig, props) {
+  <span class="comment">// Check if component type supports flattening</span>
+  <span class="keyword">if</span> (viewConfig.uiViewClassName !== <span class="string">'RCTView'</span>) {
+    <span class="keyword">return false</span>; <span class="comment">// Only plain Views can be flattened</span>
+  }
+
+  <span class="comment">// Check for visual properties</span>
+  <span class="keyword">if</span> (props.backgroundColor) <span class="keyword">return false</span>;
+  <span class="keyword">if</span> (props.borderWidth || props.borderColor) <span class="keyword">return false</span>;
+  <span class="keyword">if</span> (props.opacity != <span class="keyword">null</span> &amp;&amp; props.opacity !== <span class="number">1</span>) <span class="keyword">return false</span>;
+  <span class="keyword">if</span> (props.shadowColor) <span class="keyword">return false</span>;
+  <span class="keyword">if</span> (props.elevation) <span class="keyword">return false</span>;
+  <span class="keyword">if</span> (props.overflow === <span class="string">'hidden'</span>) <span class="keyword">return false</span>;
+  <span class="keyword">if</span> (props.transform) <span class="keyword">return false</span>;
+
+  <span class="comment">// Check for event handlers</span>
+  <span class="keyword">if</span> (props.onLayout) <span class="keyword">return false</span>;
+  <span class="keyword">if</span> (props.accessible) <span class="keyword">return false</span>;
+  <span class="keyword">if</span> (props.collapsable === <span class="keyword">false</span>) <span class="keyword">return false</span>;
+  <span class="keyword">if</span> (props.nativeID) <span class="keyword">return false</span>;
+
+  <span class="keyword">return true</span>; <span class="comment">// Safe to flatten</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="when-applies">4. When Flattening Applies</h2>
+
+    <h3>4.1 Common Flattening Scenarios</h3>
+
+    <pre><code><span class="comment">// Scenario 1: Wrapper views for layout</span>
+<span class="keyword">const</span> <span class="func">Row</span> = ({ children }) =&gt; (
+  &lt;<span class="type">View</span> style={{ flexDirection: <span class="string">'row'</span> }}&gt;
+    {children}
+  &lt;/<span class="type">View</span>&gt;
+);
+<span class="comment">// ↑ This wrapper View is layout-only → will be flattened</span>
+
+<span class="comment">// Scenario 2: Spacing/padding wrappers</span>
+<span class="keyword">const</span> <span class="func">Padded</span> = ({ children }) =&gt; (
+  &lt;<span class="type">View</span> style={{ padding: <span class="number">16</span> }}&gt;
+    {children}
+  &lt;/<span class="type">View</span>&gt;
+);
+<span class="comment">// ↑ Layout-only → will be flattened</span>
+
+<span class="comment">// Scenario 3: Conditional rendering wrappers</span>
+<span class="keyword">const</span> <span class="func">ConditionalWrapper</span> = ({ wrap, children }) =&gt; (
+  wrap ? &lt;<span class="type">View</span> style={{ flex: <span class="number">1</span> }}&gt;{children}&lt;/<span class="type">View</span>&gt; : children
+);
+<span class="comment">// ↑ When wrap=true, the View is layout-only → flattened</span></code></pre>
+
+    <h3>4.2 Flattening with StyleSheet</h3>
+
+    <pre><code><span class="comment">// StyleSheet.create styles are analyzed at creation time</span>
+<span class="keyword">const</span> styles = StyleSheet.<span class="func">create</span>({
+  <span class="comment">// This style only has layout props → View using it can be flattened</span>
+  layoutOnly: {
+    flex: <span class="number">1</span>,
+    flexDirection: <span class="string">'row'</span>,
+    justifyContent: <span class="string">'center'</span>,
+    alignItems: <span class="string">'center'</span>,
+    padding: <span class="number">16</span>,
+    margin: <span class="number">8</span>,
+  },
+
+  <span class="comment">// This style has visual props → View using it CANNOT be flattened</span>
+  visual: {
+    flex: <span class="number">1</span>,
+    backgroundColor: <span class="string">'#f0f0f0'</span>,
+    borderRadius: <span class="number">8</span>,
+  },
+});</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="when-breaks">5. When Flattening Breaks</h2>
+
+    <p>Understanding when flattening cannot apply is crucial for debugging layout issues and unexpected native view counts.</p>
+
+    <h3>5.1 Border and Shadow Edge Cases</h3>
+
+    <pre><code><span class="comment">// Even borderWidth: 0 with borderColor prevents flattening!</span>
+&lt;<span class="type">View</span> style={{ borderWidth: <span class="number">0</span>, borderColor: <span class="string">'transparent'</span> }}&gt;
+  &lt;<span class="type">Text</span>&gt;Not flattened&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+<span class="comment">// ↑ borderColor is set → native view created</span>
+
+<span class="comment">// borderRadius alone prevents flattening</span>
+&lt;<span class="type">View</span> style={{ borderRadius: <span class="number">8</span> }}&gt;
+  &lt;<span class="type">Text</span>&gt;Not flattened&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+<span class="comment">// ↑ borderRadius implies visual rendering</span>
+
+<span class="comment">// overflow: 'hidden' prevents flattening</span>
+&lt;<span class="type">View</span> style={{ overflow: <span class="string">'hidden'</span> }}&gt;
+  &lt;<span class="type">Text</span>&gt;Not flattened&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+<span class="comment">// ↑ Clipping requires native view bounds</span></code></pre>
+
+    <h3>5.2 Accessibility Prevents Flattening</h3>
+
+    <pre><code><span class="comment">// Any accessibility prop prevents flattening</span>
+&lt;<span class="type">View</span> accessible={<span class="keyword">true</span>} accessibilityLabel=<span class="string">"container"</span>&gt;
+  &lt;<span class="type">Text</span>&gt;Not flattened&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+<span class="comment">// ↑ Must exist in native accessibility tree</span>
+
+<span class="comment">// accessibilityRole also prevents flattening</span>
+&lt;<span class="type">View</span> accessibilityRole=<span class="string">"button"</span>&gt;
+  &lt;<span class="type">Text</span>&gt;Not flattened&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Accessibility vs Performance Trade-off</div>
+        <p>Adding accessibility props prevents view flattening, which increases the native view count. This is an intentional trade-off — accessibility is more important than the marginal performance gain from flattening. However, be strategic: apply accessibility props at the right level of the hierarchy, not on every intermediate wrapper.</p>
+    </div>
+
+    <h3>5.3 Dynamic Styles That Break Flattening</h3>
+
+    <pre><code><span class="comment">// Inline styles are checked at render time</span>
+<span class="keyword">const</span> <span class="func">DynamicView</span> = ({ highlighted }) =&gt; (
+  &lt;<span class="type">View</span> style={{
+    flex: <span class="number">1</span>,
+    <span class="comment">// When highlighted=true, backgroundColor prevents flattening</span>
+    <span class="comment">// When highlighted=false, View can be flattened</span>
+    backgroundColor: highlighted ? <span class="string">'yellow'</span> : <span class="keyword">undefined</span>,
+  }}&gt;
+    &lt;<span class="type">Text</span>&gt;Content&lt;/<span class="type">Text</span>&gt;
+  &lt;/<span class="type">View</span>&gt;
+);
+<span class="comment">// ↑ Flattening status changes between renders!</span>
+<span class="comment">// This causes native view creation/deletion on state change</span>
+<span class="comment">// which is more expensive than a simple prop update</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="collapsable">6. The collapsable Prop</h2>
+
+    <p>The <code>collapsable</code> prop provides explicit control over view flattening. It's primarily used when you need to prevent flattening for measurement or native reference purposes.</p>
+
+    <pre><code><span class="comment">// Prevent flattening: collapsable={false}</span>
+&lt;<span class="type">View</span> collapsable={<span class="keyword">false</span>} style={{ flex: <span class="number">1</span> }}&gt;
+  &lt;<span class="type">Text</span>&gt;This View will always exist in native hierarchy&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+
+<span class="comment">// Common use case: findNodeHandle / measure</span>
+<span class="keyword">const</span> viewRef = <span class="func">useRef</span>(<span class="keyword">null</span>);
+
+<span class="comment">// Without collapsable={false}, this View might be flattened</span>
+<span class="comment">// and findNodeHandle would return null or the wrong node</span>
+&lt;<span class="type">View</span>
+  ref={viewRef}
+  collapsable={<span class="keyword">false</span>}
+  style={{ flex: <span class="number">1</span> }}
+  onLayout={(e) =&gt; {
+    <span class="comment">// onLayout already prevents flattening,</span>
+    <span class="comment">// but collapsable={false} makes intent explicit</span>
+    console.<span class="func">log</span>(e.nativeEvent.layout);
+  }}
+/&gt;
+
+<span class="comment">// Note: collapsable is Android-only in the old architecture</span>
+<span class="comment">// iOS never flattened views in Paper (old arch)</span>
+<span class="comment">// Fabric applies flattening on both platforms</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Platform Difference</div>
+        <p>In the old architecture (Paper), view flattening was Android-only. iOS did not flatten views. In Fabric (New Architecture), view flattening applies to both platforms, making <code>collapsable={false}</code> relevant on iOS as well.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="fabric-flattening">7. Fabric's Improved Flattening</h2>
+
+    <p>Fabric introduces a more sophisticated flattening mechanism that operates on the shadow tree diff rather than the initial tree construction.</p>
+
+    <h3>7.1 Diff-Based Flattening</h3>
+
+    <div class="diagram">
+Old Architecture (Paper):              Fabric:
+═════════════════════════              ═══════
+
+Shadow tree built                      Shadow tree built
+  ↓                                      ↓
+Flattening applied once                Flattening applied to DIFF
+during tree construction               between old and new trees
+  ↓                                      ↓
+Native views created                   Mutation instructions generated
+from flattened tree                    with flattening considered
+                                         ↓
+                                       Only changed views
+                                       created/removed
+    </div>
+
+    <h3>7.2 Fabric Flattening Implementation</h3>
+
+    <pre><code><span class="comment">// Fabric uses a "flattening" flag on ShadowNode</span>
+<span class="comment">// that determines if the node should be mounted as a native view</span>
+
+<span class="comment">// In C++ (simplified):</span>
+<span class="keyword">bool</span> <span class="func">ViewShadowNode::isLayoutOnly</span>() <span class="keyword">const</span> {
+  <span class="keyword">const auto</span> &amp;props = <span class="func">getConcreteProps</span>();
+
+  <span class="keyword">return</span>
+    props.backgroundColor == <span class="type">SharedColor</span>() &amp;&amp;
+    props.borderWidths == <span class="type">CascadedBorderWidths</span>() &amp;&amp;
+    props.borderColors == <span class="type">CascadedBorderColors</span>() &amp;&amp;
+    props.borderRadii == <span class="type">CascadedBorderRadii</span>() &amp;&amp;
+    props.shadowColor == <span class="type">SharedColor</span>() &amp;&amp;
+    props.transform == <span class="type">Transform::Identity</span>() &amp;&amp;
+    props.opacity == <span class="number">1.0</span> &amp;&amp;
+    props.overflow == <span class="type">Overflow::Visible</span> &amp;&amp;
+    !props.onLayout &amp;&amp;
+    !props.accessible &amp;&amp;
+    props.collapsable != <span class="keyword">false</span> &amp;&amp;
+    props.nativeId.empty();
+}
+
+<span class="comment">// Fabric tree diff algorithm considers flattening:</span>
+<span class="comment">// If a node transitions from layout-only to non-layout-only,</span>
+<span class="comment">// a Create mutation is generated.</span>
+<span class="comment">// If it transitions from non-layout-only to layout-only,</span>
+<span class="comment">// a Delete mutation is generated.</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="debugging">8. Debugging Flattened Hierarchies</h2>
+
+    <h3>8.1 Tools and Techniques</h3>
+
+    <pre><code><span class="comment">// 1. Flipper Layout Inspector</span>
+<span class="comment">// Shows actual native view hierarchy (post-flattening)</span>
+<span class="comment">// Compare React DevTools tree (pre-flattening) with Flipper (post)</span>
+
+<span class="comment">// 2. Xcode View Debugger (iOS)</span>
+<span class="comment">// Debug → View Debugging → Capture View Hierarchy</span>
+<span class="comment">// Shows 3D exploded view of native hierarchy</span>
+
+<span class="comment">// 3. Android Layout Inspector</span>
+<span class="comment">// Android Studio → Tools → Layout Inspector</span>
+<span class="comment">// Shows real-time native view tree</span>
+
+<span class="comment">// 4. Programmatic check</span>
+<span class="keyword">import</span> { findNodeHandle, UIManager } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="keyword">const</span> <span class="func">DebugView</span> = () =&gt; {
+  <span class="keyword">const</span> ref = <span class="func">useRef</span>(<span class="keyword">null</span>);
+
+  <span class="func">useEffect</span>(() =&gt; {
+    <span class="keyword">const</span> tag = <span class="func">findNodeHandle</span>(ref.current);
+    <span class="keyword">if</span> (tag === <span class="keyword">null</span>) {
+      console.<span class="func">log</span>(<span class="string">'View was flattened — no native node'</span>);
+    } <span class="keyword">else</span> {
+      console.<span class="func">log</span>(<span class="string">'Native view exists, tag:'</span>, tag);
+    }
+  }, []);
+
+  <span class="keyword">return</span> &lt;<span class="type">View</span> ref={ref} style={{ flex: <span class="number">1</span> }} /&gt;;
+};</code></pre>
+
+    <h3>8.2 Common Debugging Pitfalls</h3>
+
+    <pre><code><span class="comment">// Pitfall 1: ref on flattened view returns null</span>
+<span class="keyword">const</span> ref = <span class="func">useRef</span>(<span class="keyword">null</span>);
+&lt;<span class="type">View</span> ref={ref} style={{ flex: <span class="number">1</span> }}&gt;
+  &lt;<span class="type">Text</span>&gt;Content&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+<span class="comment">// ref.current.measure() may fail if View is flattened</span>
+<span class="comment">// Fix: add collapsable={false} or onLayout</span>
+
+<span class="comment">// Pitfall 2: nativeID on flattened view</span>
+&lt;<span class="type">View</span> nativeID=<span class="string">"my-view"</span> style={{ flex: <span class="number">1</span> }}&gt;
+  &lt;<span class="type">Text</span>&gt;Content&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+<span class="comment">// nativeID prevents flattening, so this always works</span>
+<span class="comment">// But adding nativeID "just in case" wastes a native view</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="performance">9. Performance Impact</h2>
+
+    <h3>9.1 Benchmarks</h3>
+
+    <table>
+        <thead>
+            <tr><th>Metric</th><th>Without Flattening</th><th>With Flattening</th><th>Improvement</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Native view count (typical screen)</td><td>~300 views</td><td>~120 views</td><td>60% reduction</td></tr>
+            <tr><td>Memory per screen</td><td>~1.2 MB</td><td>~0.5 MB</td><td>58% reduction</td></tr>
+            <tr><td>Layout pass time</td><td>~8ms</td><td>~3ms</td><td>62% faster</td></tr>
+            <tr><td>Initial mount time</td><td>~45ms</td><td>~28ms</td><td>38% faster</td></tr>
+            <tr><td>Hit testing depth</td><td>~12 levels</td><td>~5 levels</td><td>58% shallower</td></tr>
+        </tbody>
+    </table>
+
+    <h3>9.2 Optimization Strategies</h3>
+
+    <pre><code><span class="comment">// Strategy 1: Prefer layout-only wrapper components</span>
+<span class="keyword">const</span> <span class="func">Row</span> = ({ children }) =&gt; (
+  &lt;<span class="type">View</span> style={{ flexDirection: <span class="string">'row'</span> }}&gt;{children}&lt;/<span class="type">View</span>&gt;
+);
+<span class="comment">// ↑ Will be flattened — zero native cost</span>
+
+<span class="comment">// Strategy 2: Avoid unnecessary visual props</span>
+<span class="comment">// Bad: backgroundColor: 'transparent' prevents flattening!</span>
+&lt;<span class="type">View</span> style={{ flex: <span class="number">1</span>, backgroundColor: <span class="string">'transparent'</span> }}&gt;
+  &lt;<span class="type">Text</span>&gt;Content&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+
+<span class="comment">// Good: omit backgroundColor entirely</span>
+&lt;<span class="type">View</span> style={{ flex: <span class="number">1</span> }}&gt;
+  &lt;<span class="type">Text</span>&gt;Content&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+
+<span class="comment">// Strategy 3: Consolidate visual props at fewer levels</span>
+<span class="comment">// Bad: visual props at every level</span>
+&lt;<span class="type">View</span> style={{ backgroundColor: <span class="string">'white'</span> }}&gt;
+  &lt;<span class="type">View</span> style={{ borderWidth: <span class="number">1</span> }}&gt;
+    &lt;<span class="type">View</span> style={{ borderRadius: <span class="number">8</span> }}&gt;
+      &lt;<span class="type">Text</span>&gt;Content&lt;/<span class="type">Text</span>&gt;
+    &lt;/<span class="type">View</span>&gt;
+  &lt;/<span class="type">View</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+<span class="comment">// ↑ 3 native views — none can be flattened</span>
+
+<span class="comment">// Good: combine visual props on one view</span>
+&lt;<span class="type">View</span> style={{
+  backgroundColor: <span class="string">'white'</span>,
+  borderWidth: <span class="number">1</span>,
+  borderRadius: <span class="number">8</span>,
+}}&gt;
+  &lt;<span class="type">Text</span>&gt;Content&lt;/<span class="type">Text</span>&gt;
+&lt;/<span class="type">View</span>&gt;
+<span class="comment">// ↑ 1 native view</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">10. Architect Considerations</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>View flattening is an <strong>automatic optimization</strong> that rewards good component design. The key insight: <strong>React component boundaries should be driven by logic, not by visual boundaries</strong>. Create as many wrapper components as you need for code organization — the flattening algorithm will remove the unnecessary native views. The exception is when you need native-level features (events, accessibility, clipping) — then each View must exist natively. A Staff engineer's job is to ensure the team understands this distinction and designs component hierarchies accordingly.</p>
+    </div>
+
+    <h3>10.1 Design System Implications</h3>
+
+    <pre><code><span class="comment">// Design system components should be flattening-aware</span>
+
+<span class="comment">// Good: Spacer component that flattens away</span>
+<span class="keyword">const</span> <span class="func">Spacer</span> = ({ size }) =&gt; (
+  &lt;<span class="type">View</span> style={{ height: size, width: size }} /&gt;
+);
+<span class="comment">// ↑ Layout-only → flattened → zero native cost</span>
+
+<span class="comment">// Good: Stack component that flattens away</span>
+<span class="keyword">const</span> <span class="func">VStack</span> = ({ spacing, children }) =&gt; (
+  &lt;<span class="type">View</span> style={{ gap: spacing }}&gt;
+    {children}
+  &lt;/<span class="type">View</span>&gt;
+);
+<span class="comment">// ↑ Layout-only → flattened</span>
+
+<span class="comment">// Aware: Card component that cannot flatten</span>
+<span class="keyword">const</span> <span class="func">Card</span> = ({ children }) =&gt; (
+  &lt;<span class="type">View</span> style={styles.card}&gt;
+    {children}
+  &lt;/<span class="type">View</span>&gt;
+);
+<span class="keyword">const</span> styles = StyleSheet.<span class="func">create</span>({
+  card: {
+    backgroundColor: <span class="string">'white'</span>,
+    borderRadius: <span class="number">12</span>,
+    shadowColor: <span class="string">'#000'</span>,
+    shadowOffset: { width: <span class="number">0</span>, height: <span class="number">2</span> },
+    shadowOpacity: <span class="number">0.1</span>,
+    elevation: <span class="number">3</span>,
+    padding: <span class="number">16</span>,
+  },
+});
+<span class="comment">// ↑ Visual props → CANNOT flatten → 1 native view per Card</span>
+<span class="comment">// This is expected and correct</span></code></pre>
+
+    <div class="nav-footer">
+        <a href="01-reconciliation-to-native.html">← Reconciliation to Native</a>
+        <a href="03-list-rendering.html">Next: List Rendering →</a>
+    </div>
+</div>
+</body>
+</html>

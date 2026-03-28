@@ -1,0 +1,909 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Background Processing — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Engineering Problems</a><span class="sep">›</span>
+        Background Processing
+    </nav>
+
+    <h1>Background Processing in React Native</h1>
+    <p class="subtitle">Mobile operating systems aggressively restrict background execution to preserve battery. React Native apps must navigate Headless JS (Android), Background Fetch (iOS), WorkManager, BGTaskScheduler, and third-party libraries to perform work when the app isn't in the foreground — while respecting platform constraints and battery optimization policies.</p>
+
+    <nav class="nav">
+        <h3>Engineering Problems Series</h3>
+        <ul>
+            <li><a href="09-analytics-sdk.html">09 · Analytics SDK</a></li>
+            <li><a href="10-multi-app-platform.html">10 · Multi-App Platform</a></li>
+            <li><a href="11-accessibility-overhaul.html">11 · Accessibility Overhaul</a></li>
+            <li class="active"><a href="12-background-processing.html">12 · Background Processing</a></li>
+        </ul>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#platform-constraints">1. Platform Background Constraints</a></li>
+            <li><a href="#headless-js">2. Headless JS (Android)</a></li>
+            <li><a href="#background-fetch-ios">3. Background Fetch (iOS)</a></li>
+            <li><a href="#background-actions">4. react-native-background-actions</a></li>
+            <li><a href="#geolocation">5. Background Geolocation</a></li>
+            <li><a href="#audio">6. Background Audio</a></li>
+            <li><a href="#upload-download">7. Background Upload / Download</a></li>
+            <li><a href="#workmanager">8. WorkManager Integration (Android)</a></li>
+            <li><a href="#bgtaskscheduler">9. BGTaskScheduler Integration (iOS)</a></li>
+            <li><a href="#battery-optimization">10. Battery Optimization</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="platform-constraints">1. Platform Background Constraints</h2>
+
+    <p>iOS and Android have fundamentally different approaches to background execution. iOS is restrictive by default — apps get seconds, not minutes. Android is more permissive but has tightened restrictions with each API level since Android 8 (Oreo).</p>
+
+    <h3>1.1 Platform Comparison</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Constraint</th>
+                <th>iOS</th>
+                <th>Android</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Background execution time</td>
+                <td>~30 seconds after backgrounding</td>
+                <td>~10 minutes (foreground service), varies</td>
+            </tr>
+            <tr>
+                <td>Background fetch frequency</td>
+                <td>System-determined (adaptive)</td>
+                <td>Configurable via WorkManager</td>
+            </tr>
+            <tr>
+                <td>Long-running tasks</td>
+                <td>Requires specific capability (audio, location, VoIP)</td>
+                <td>Foreground service with notification</td>
+            </tr>
+            <tr>
+                <td>Periodic work</td>
+                <td>BGAppRefreshTask (minimum 15 min)</td>
+                <td>WorkManager (minimum 15 min)</td>
+            </tr>
+            <tr>
+                <td>Process termination</td>
+                <td>Aggressive — killed within minutes</td>
+                <td>Less aggressive, but Doze mode restricts</td>
+            </tr>
+            <tr>
+                <td>JS engine in background</td>
+                <td>Not guaranteed to be alive</td>
+                <td>Headless JS can start engine</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="diagram">
+App Lifecycle and Background Execution:
+
+  iOS:
+  ┌──────────┐    ┌───────────┐    ┌──────────────┐    ┌────────────┐
+  │  Active    │ →  │ Inactive   │ →  │  Background   │ →  │ Suspended   │
+  │ (running)  │    │ (brief)    │    │ (~30s window) │    │ (frozen)    │
+  └──────────┘    └───────────┘    └──────────────┘    └────────────┘
+                                          │                     │
+                                    beginBackgroundTask    OS may kill
+                                    (request more time)    at any time
+
+  Android:
+  ┌──────────┐    ┌───────────┐    ┌──────────────┐    ┌────────────┐
+  │ Foreground │ →  │  Visible   │ →  │  Background   │ →  │  Stopped    │
+  │ (running)  │    │ (partial)  │    │ (limited)     │    │ (cached)    │
+  └──────────┘    └───────────┘    └──────────────┘    └────────────┘
+                                          │                     │
+                                    Foreground Service     Doze mode
+                                    (persistent notif)     restricts all
+    </div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">The JS Engine Problem</div>
+        <p>When a React Native app is backgrounded, the JS engine may be suspended or terminated by the OS. On iOS, there is no way to keep the JS engine running indefinitely. On Android, Headless JS can start the JS engine without a UI, but this requires a native service. Any background processing strategy must account for the possibility that JavaScript is not running.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="headless-js">2. Headless JS (Android)</h2>
+
+    <p>Headless JS is React Native's built-in mechanism for running JavaScript tasks on Android when the app is not in the foreground. It starts the JS engine, executes a registered task, and shuts down when complete.</p>
+
+    <h3>2.1 Registering a Headless Task</h3>
+
+    <pre><code><span class="comment">// index.js — register at app entry point</span>
+<span class="keyword">import</span> { AppRegistry } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+AppRegistry.<span class="func">registerHeadlessTask</span>(
+  <span class="string">'SyncDataTask'</span>,
+  () =&gt; <span class="keyword">async</span> (taskData) =&gt; {
+    <span class="keyword">const</span> { lastSyncTimestamp } = taskData;
+
+    <span class="keyword">try</span> {
+      <span class="keyword">const</span> changes = <span class="keyword">await</span> <span class="func">fetchChangesSince</span>(lastSyncTimestamp);
+      <span class="keyword">await</span> <span class="func">applyChangesToLocalDB</span>(changes);
+      <span class="keyword">await</span> <span class="func">updateLastSyncTimestamp</span>(<span class="func">Date.now</span>());
+    } <span class="keyword">catch</span> (error) {
+      console.<span class="func">error</span>(<span class="string">'Background sync failed:'</span>, error);
+    }
+  }
+);</code></pre>
+
+    <h3>2.2 Starting from Native (Android Service)</h3>
+
+    <pre><code><span class="comment">// android/app/src/main/java/.../SyncService.java</span>
+<span class="keyword">public class</span> <span class="type">SyncService</span> <span class="keyword">extends</span> <span class="type">HeadlessJsTaskService</span> {
+
+  @Override
+  <span class="keyword">protected</span> @Nullable <span class="type">HeadlessJsTaskConfig</span> <span class="func">getTaskConfig</span>(
+      <span class="type">Intent</span> intent) {
+
+    <span class="type">Bundle</span> extras = intent.<span class="func">getExtras</span>();
+    <span class="type">WritableMap</span> data = <span class="type">Arguments</span>.<span class="func">fromBundle</span>(extras);
+
+    <span class="keyword">return new</span> <span class="type">HeadlessJsTaskConfig</span>(
+      <span class="string">"SyncDataTask"</span>,      <span class="comment">// must match JS registration</span>
+      data,                  <span class="comment">// taskData passed to JS</span>
+      <span class="number">30000</span>,                <span class="comment">// timeout in ms</span>
+      <span class="keyword">true</span>                  <span class="comment">// allow in foreground</span>
+    );
+  }
+}
+
+<span class="comment">// Triggered from a BroadcastReceiver, AlarmManager, or WorkManager</span>
+<span class="keyword">public class</span> <span class="type">SyncReceiver</span> <span class="keyword">extends</span> <span class="type">BroadcastReceiver</span> {
+  @Override
+  <span class="keyword">public void</span> <span class="func">onReceive</span>(<span class="type">Context</span> context, <span class="type">Intent</span> intent) {
+    <span class="keyword">if</span> (!<span class="type">HeadlessJsTaskService</span>.<span class="func">acquireWakeLockNow</span>(context)) {
+      <span class="keyword">return</span>;
+    }
+    <span class="type">Intent</span> serviceIntent = <span class="keyword">new</span> <span class="type">Intent</span>(context, <span class="type">SyncService</span>.class);
+    context.<span class="func">startService</span>(serviceIntent);
+  }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Headless JS Limitations</div>
+        <p>Headless JS is Android-only — there is no iOS equivalent in React Native core. The task runs with a timeout (default 5 minutes). If the task doesn't complete in time, the service is killed. The JS engine starts fresh each time — there is no shared state with the foreground app unless you use persistent storage (MMKV, SQLite).</p>
+    </div>
+
+    <h3>2.3 Headless JS Architecture</h3>
+
+    <div class="diagram">
+Headless JS Execution Flow:
+
+  Trigger (WorkManager / Alarm / Push)
+         │
+         ▼
+  ┌──────────────────┐
+  │  BroadcastReceiver │  acquireWakeLock
+  └──────┬───────────┘
+         ▼
+  ┌──────────────────┐
+  │  HeadlessJsTask   │  start JS engine (if not running)
+  │  Service          │
+  └──────┬───────────┘
+         ▼
+  ┌──────────────────┐
+  │  JS Runtime       │  execute registered task
+  │  (Hermes)         │  access storage, network
+  └──────┬───────────┘
+         ▼
+  Task completes → service stops → engine may shut down
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="background-fetch-ios">3. Background Fetch (iOS)</h2>
+
+    <p>iOS Background Fetch allows the system to wake your app periodically to fetch new content. The system decides when and how often based on user behavior patterns — apps the user opens frequently get more fetch opportunities.</p>
+
+    <h3>3.1 Enabling Background Fetch</h3>
+
+    <pre><code><span class="comment">// ios/AppDelegate.m — configure background fetch</span>
+- (<span class="type">BOOL</span>)<span class="func">application</span>:(<span class="type">UIApplication</span> *)application
+    <span class="func">didFinishLaunchingWithOptions</span>:(<span class="type">NSDictionary</span> *)launchOptions {
+
+  [application <span class="func">setMinimumBackgroundFetchInterval</span>:
+    UIApplicationBackgroundFetchIntervalMinimum];
+
+  <span class="comment">// ... React Native setup</span>
+  <span class="keyword">return</span> YES;
+}
+
+- (<span class="keyword">void</span>)<span class="func">application</span>:(<span class="type">UIApplication</span> *)application
+    <span class="func">performFetchWithCompletionHandler</span>:
+    (<span class="keyword">void</span> (^)(<span class="type">UIBackgroundFetchResult</span>))completionHandler {
+
+  <span class="comment">// Bridge to JS via event emitter or native module</span>
+  [<span class="keyword">self</span>.bridge.eventDispatcher
+    <span class="func">sendAppEventWithName</span>:@<span class="string">"backgroundFetch"</span>
+    body:@{}];
+
+  <span class="comment">// Must call completion handler within ~30 seconds</span>
+  dispatch_after(
+    dispatch_time(DISPATCH_TIME_NOW, <span class="number">25</span> * NSEC_PER_SEC),
+    dispatch_get_main_queue(),
+    ^{ <span class="func">completionHandler</span>(UIBackgroundFetchResultNewData); }
+  );
+}</code></pre>
+
+    <h3>3.2 react-native-background-fetch</h3>
+
+    <pre><code><span class="keyword">import</span> BackgroundFetch <span class="keyword">from</span> <span class="string">'react-native-background-fetch'</span>;
+
+<span class="keyword">async</span> <span class="keyword">function</span> <span class="func">configureBackgroundFetch</span>() {
+  <span class="keyword">await</span> BackgroundFetch.<span class="func">configure</span>(
+    {
+      minimumFetchInterval: <span class="number">15</span>,    <span class="comment">// minutes (iOS minimum)</span>
+      stopOnTerminate: <span class="keyword">false</span>,       <span class="comment">// Android: continue after app killed</span>
+      startOnBoot: <span class="keyword">true</span>,            <span class="comment">// Android: start after device reboot</span>
+      enableHeadless: <span class="keyword">true</span>,         <span class="comment">// Android: use Headless JS</span>
+      requiredNetworkType: BackgroundFetch.NETWORK_TYPE_ANY,
+    },
+    <span class="keyword">async</span> (taskId) =&gt; {
+      <span class="comment">// This runs when the OS wakes the app</span>
+      <span class="keyword">const</span> data = <span class="keyword">await</span> <span class="func">fetchNewContent</span>();
+      <span class="keyword">await</span> <span class="func">cacheLocally</span>(data);
+
+      BackgroundFetch.<span class="func">finish</span>(taskId);
+    },
+    (taskId) =&gt; {
+      <span class="comment">// Timeout callback — task took too long</span>
+      BackgroundFetch.<span class="func">finish</span>(taskId);
+    }
+  );
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="background-actions">4. react-native-background-actions</h2>
+
+    <p>For long-running tasks that need to survive backgrounding (data sync, file processing), <code>react-native-background-actions</code> uses a foreground service on Android and background task on iOS to keep JavaScript alive.</p>
+
+    <h3>4.1 Long-Running Background Task</h3>
+
+    <pre><code><span class="keyword">import</span> BackgroundService <span class="keyword">from</span> <span class="string">'react-native-background-actions'</span>;
+
+<span class="keyword">const</span> <span class="func">syncTask</span> = <span class="keyword">async</span> (taskData: <span class="type">any</span>) =&gt; {
+  <span class="keyword">const</span> { totalItems } = taskData;
+
+  <span class="keyword">for</span> (<span class="keyword">let</span> i = <span class="number">0</span>; i &lt; totalItems; i++) {
+    <span class="keyword">if</span> (!BackgroundService.isRunning()) <span class="keyword">break</span>;
+
+    <span class="keyword">await</span> <span class="func">syncItem</span>(i);
+    <span class="keyword">await</span> BackgroundService.<span class="func">updateNotification</span>({
+      progressBar: {
+        value: i + <span class="number">1</span>,
+        max: totalItems,
+      },
+      taskDesc: <span class="string">`Syncing item </span>${i + <span class="number">1</span>}<span class="string"> of </span>${totalItems}<span class="string">`</span>,
+    });
+
+    <span class="keyword">await</span> <span class="func">sleep</span>(<span class="number">100</span>);
+  }
+};
+
+<span class="keyword">async</span> <span class="keyword">function</span> <span class="func">startBackgroundSync</span>(totalItems: <span class="type">number</span>) {
+  <span class="keyword">await</span> BackgroundService.<span class="func">start</span>(syncTask, {
+    taskName: <span class="string">'DataSync'</span>,
+    taskTitle: <span class="string">'Syncing Data'</span>,
+    taskDesc: <span class="string">'Starting sync...'</span>,
+    taskIcon: { name: <span class="string">'ic_sync'</span>, type: <span class="string">'drawable'</span> },
+    color: <span class="string">'#1A73E8'</span>,
+    linkingURI: <span class="string">'myapp://sync'</span>,
+    parameters: { totalItems },
+  });
+}
+
+<span class="keyword">async</span> <span class="keyword">function</span> <span class="func">stopBackgroundSync</span>() {
+  <span class="keyword">await</span> BackgroundService.<span class="func">stop</span>();
+}</code></pre>
+
+    <h3>4.2 Platform Implementation Details</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Android</th>
+                <th>iOS</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Mechanism</td>
+                <td>Foreground Service</td>
+                <td>beginBackgroundTask + expiration handler</td>
+            </tr>
+            <tr>
+                <td>User visibility</td>
+                <td>Persistent notification (required)</td>
+                <td>No visible indicator</td>
+            </tr>
+            <tr>
+                <td>Max duration</td>
+                <td>Unlimited (with notification)</td>
+                <td>~3 minutes (iOS 13+)</td>
+            </tr>
+            <tr>
+                <td>JS engine</td>
+                <td>Kept alive by service</td>
+                <td>Kept alive by background task</td>
+            </tr>
+            <tr>
+                <td>Termination risk</td>
+                <td>Low (foreground service priority)</td>
+                <td>High (OS may kill after timeout)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">iOS Background Time is Severely Limited</div>
+        <p>On iOS 13+, <code>beginBackgroundTask</code> gives approximately 30 seconds (down from 3 minutes in earlier versions). For longer tasks, you must use specific background modes (audio, location, VoIP) or BGTaskScheduler. There is no general-purpose "run JS in background for 10 minutes" capability on iOS. Design your sync to be resumable — save progress so it can continue in the next background window.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="geolocation">5. Background Geolocation</h2>
+
+    <p>Background location tracking is one of the few capabilities both platforms allow for extended background execution. It requires the "location" background mode and careful configuration to balance accuracy with battery consumption.</p>
+
+    <h3>5.1 Configuration</h3>
+
+    <pre><code><span class="keyword">import</span> BackgroundGeolocation <span class="keyword">from</span> <span class="string">'react-native-background-geolocation'</span>;
+
+<span class="keyword">async</span> <span class="keyword">function</span> <span class="func">configureGeolocation</span>() {
+  <span class="keyword">await</span> BackgroundGeolocation.<span class="func">ready</span>({
+    desiredAccuracy: BackgroundGeolocation.DESIRED_ACCURACY_HIGH,
+    distanceFilter: <span class="number">50</span>,              <span class="comment">// meters between updates</span>
+    stopOnTerminate: <span class="keyword">false</span>,          <span class="comment">// continue after app killed</span>
+    startOnBoot: <span class="keyword">true</span>,               <span class="comment">// restart after device reboot</span>
+    stationaryRadius: <span class="number">25</span>,            <span class="comment">// meters — switch to stationary mode</span>
+    activityRecognitionInterval: <span class="number">10000</span>,
+
+    <span class="comment">// HTTP auto-sync to server</span>
+    url: <span class="string">'https://api.example.com/locations'</span>,
+    batchSync: <span class="keyword">true</span>,
+    autoSync: <span class="keyword">true</span>,
+    autoSyncThreshold: <span class="number">5</span>,           <span class="comment">// batch 5 locations before sending</span>
+    maxBatchSize: <span class="number">50</span>,
+
+    <span class="comment">// Battery optimization</span>
+    preventSuspend: <span class="keyword">true</span>,            <span class="comment">// iOS: prevent app suspension</span>
+    heartbeatInterval: <span class="number">60</span>,           <span class="comment">// seconds — keep-alive ping</span>
+
+    <span class="comment">// Android foreground service</span>
+    notification: {
+      title: <span class="string">'Tracking Location'</span>,
+      text: <span class="string">'Your location is being tracked for delivery'</span>,
+      channelName: <span class="string">'Location Tracking'</span>,
+    },
+  });
+
+  BackgroundGeolocation.<span class="func">onLocation</span>((location) =&gt; {
+    console.<span class="func">log</span>(<span class="string">'[location]'</span>, location.coords);
+  });
+
+  BackgroundGeolocation.<span class="func">onMotionChange</span>((event) =&gt; {
+    console.<span class="func">log</span>(<span class="string">'[motion]'</span>, event.isMoving);
+  });
+
+  <span class="keyword">await</span> BackgroundGeolocation.<span class="func">start</span>();
+}</code></pre>
+
+    <h3>5.2 Geofencing</h3>
+
+    <pre><code><span class="comment">// Add geofences for location-triggered actions</span>
+BackgroundGeolocation.<span class="func">addGeofences</span>([
+  {
+    identifier: <span class="string">'warehouse_a'</span>,
+    radius: <span class="number">200</span>,                    <span class="comment">// meters</span>
+    latitude: <span class="number">37.7749</span>,
+    longitude: -<span class="number">122.4194</span>,
+    notifyOnEntry: <span class="keyword">true</span>,
+    notifyOnExit: <span class="keyword">true</span>,
+    notifyOnDwell: <span class="keyword">true</span>,
+    loiteringDelay: <span class="number">30000</span>,           <span class="comment">// ms before dwell triggers</span>
+  },
+]);
+
+BackgroundGeolocation.<span class="func">onGeofence</span>((event) =&gt; {
+  <span class="keyword">const</span> { identifier, action } = event;
+  <span class="keyword">if</span> (action === <span class="string">'ENTER'</span>) {
+    <span class="func">notifyArrival</span>(identifier);
+  } <span class="keyword">else if</span> (action === <span class="string">'EXIT'</span>) {
+    <span class="func">notifyDeparture</span>(identifier);
+  }
+});</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="audio">6. Background Audio</h2>
+
+    <p>The "audio" background mode allows apps to play or record audio while backgrounded. This is the most reliable background execution mode on iOS because the system keeps the process alive as long as audio is active.</p>
+
+    <h3>6.1 Audio Session Configuration</h3>
+
+    <pre><code><span class="keyword">import</span> TrackPlayer <span class="keyword">from</span> <span class="string">'react-native-track-player'</span>;
+
+<span class="keyword">async</span> <span class="keyword">function</span> <span class="func">setupAudioPlayer</span>() {
+  <span class="keyword">await</span> TrackPlayer.<span class="func">setupPlayer</span>({
+    waitForBuffer: <span class="keyword">true</span>,
+    autoHandleInterruptions: <span class="keyword">true</span>,
+  });
+
+  <span class="keyword">await</span> TrackPlayer.<span class="func">updateOptions</span>({
+    capabilities: [
+      TrackPlayer.CAPABILITY_PLAY,
+      TrackPlayer.CAPABILITY_PAUSE,
+      TrackPlayer.CAPABILITY_SKIP_TO_NEXT,
+      TrackPlayer.CAPABILITY_SKIP_TO_PREVIOUS,
+      TrackPlayer.CAPABILITY_SEEK_TO,
+    ],
+    compactCapabilities: [
+      TrackPlayer.CAPABILITY_PLAY,
+      TrackPlayer.CAPABILITY_PAUSE,
+    ],
+    notificationCapabilities: [
+      TrackPlayer.CAPABILITY_PLAY,
+      TrackPlayer.CAPABILITY_PAUSE,
+      TrackPlayer.CAPABILITY_SKIP_TO_NEXT,
+    ],
+  });
+}
+
+<span class="comment">// Register playback service for background control</span>
+TrackPlayer.<span class="func">registerPlaybackService</span>(() =&gt;
+  <span class="keyword">async</span> <span class="keyword">function</span> <span class="func">playbackService</span>() {
+    TrackPlayer.<span class="func">addEventListener</span>(
+      <span class="string">'remote-play'</span>,
+      () =&gt; TrackPlayer.<span class="func">play</span>()
+    );
+    TrackPlayer.<span class="func">addEventListener</span>(
+      <span class="string">'remote-pause'</span>,
+      () =&gt; TrackPlayer.<span class="func">pause</span>()
+    );
+    TrackPlayer.<span class="func">addEventListener</span>(
+      <span class="string">'remote-next'</span>,
+      () =&gt; TrackPlayer.<span class="func">skipToNext</span>()
+    );
+  }
+);</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Audio Background Mode as a Side Channel</div>
+        <p>Some apps abuse the audio background mode by playing silent audio to keep the process alive for non-audio tasks. Apple explicitly rejects apps that do this during App Store review. The audio session must produce audible output or actively record audio. Apple's review team tests for this by monitoring the audio buffer.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="upload-download">7. Background Upload / Download</h2>
+
+    <p>Both platforms support background transfers that continue even after the app is terminated. These use native URL session (iOS) and DownloadManager (Android) — the OS handles the transfer, not your app process.</p>
+
+    <h3>7.1 iOS NSURLSession Background Transfer</h3>
+
+    <pre><code><span class="comment">// Native module wrapping NSURLSession background config</span>
+<span class="comment">// ios/BackgroundTransfer.m</span>
+- (<span class="type">NSURLSession</span> *)<span class="func">backgroundSession</span> {
+  <span class="keyword">static</span> <span class="type">NSURLSession</span> *session = <span class="keyword">nil</span>;
+  <span class="keyword">static</span> dispatch_once_t onceToken;
+  <span class="func">dispatch_once</span>(&amp;onceToken, ^{
+    <span class="type">NSURLSessionConfiguration</span> *config =
+      [<span class="type">NSURLSessionConfiguration</span>
+        <span class="func">backgroundSessionConfigurationWithIdentifier</span>:
+          @<span class="string">"com.app.background-upload"</span>];
+    config.sessionSendsLaunchEvents = YES;
+    config.discretionary = NO;
+    config.allowsCellularAccess = YES;
+    session = [<span class="type">NSURLSession</span>
+      <span class="func">sessionWithConfiguration</span>:config
+      delegate:<span class="keyword">self</span>
+      delegateQueue:<span class="keyword">nil</span>];
+  });
+  <span class="keyword">return</span> session;
+}</code></pre>
+
+    <h3>7.2 React Native Upload/Download</h3>
+
+    <pre><code><span class="keyword">import</span> RNFS <span class="keyword">from</span> <span class="string">'react-native-fs'</span>;
+<span class="keyword">import</span> RNBackgroundDownloader <span class="keyword">from</span> <span class="string">'react-native-background-downloader'</span>;
+
+<span class="comment">// Background download — survives app termination</span>
+<span class="keyword">const</span> task = RNBackgroundDownloader.<span class="func">download</span>({
+  id: <span class="string">'file_123'</span>,
+  url: <span class="string">'https://cdn.example.com/large-file.zip'</span>,
+  destination: <span class="string">`</span>${RNFS.DocumentDirectoryPath}<span class="string">/large-file.zip`</span>,
+  headers: { Authorization: <span class="string">`Bearer </span>${token}<span class="string">`</span> },
+});
+
+task.<span class="func">begin</span>((expectedBytes) =&gt; {
+  console.<span class="func">log</span>(<span class="string">`Download size: </span>${expectedBytes}<span class="string"> bytes`</span>);
+});
+
+task.<span class="func">progress</span>((percent) =&gt; {
+  <span class="func">updateProgressBar</span>(percent);
+});
+
+task.<span class="func">done</span>(() =&gt; {
+  console.<span class="func">log</span>(<span class="string">'Download complete'</span>);
+});
+
+task.<span class="func">error</span>((error) =&gt; {
+  console.<span class="func">error</span>(<span class="string">'Download failed:'</span>, error);
+});</code></pre>
+
+    <h3>7.3 Upload vs Download Comparison</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Background Download</th>
+                <th>Background Upload</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>iOS mechanism</td>
+                <td>NSURLSession downloadTask</td>
+                <td>NSURLSession uploadTask</td>
+            </tr>
+            <tr>
+                <td>Android mechanism</td>
+                <td>DownloadManager</td>
+                <td>WorkManager + OkHttp</td>
+            </tr>
+            <tr>
+                <td>Survives termination</td>
+                <td>Yes (both platforms)</td>
+                <td>Yes (iOS), depends (Android)</td>
+            </tr>
+            <tr>
+                <td>Progress tracking</td>
+                <td>Delegate callbacks</td>
+                <td>Delegate callbacks</td>
+            </tr>
+            <tr>
+                <td>Resume support</td>
+                <td>Automatic (Range headers)</td>
+                <td>Must implement chunked upload</td>
+            </tr>
+            <tr>
+                <td>Size limit</td>
+                <td>None (system managed)</td>
+                <td>None (but chunking recommended)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="workmanager">8. WorkManager Integration (Android)</h2>
+
+    <p>WorkManager is Android's recommended API for deferrable, guaranteed background work. It handles constraints (network, battery, charging), retry policies, chaining, and survives process death and device reboots.</p>
+
+    <h3>8.1 Native WorkManager Setup</h3>
+
+    <pre><code><span class="comment">// android/app/src/main/java/.../SyncWorker.kt</span>
+<span class="keyword">class</span> <span class="type">SyncWorker</span>(
+  context: <span class="type">Context</span>,
+  params: <span class="type">WorkerParameters</span>
+) : <span class="type">CoroutineWorker</span>(context, params) {
+
+  <span class="keyword">override suspend fun</span> <span class="func">doWork</span>(): <span class="type">Result</span> {
+    <span class="keyword">return try</span> {
+      <span class="comment">// Start Headless JS task</span>
+      <span class="keyword">val</span> intent = <span class="type">Intent</span>(applicationContext, <span class="type">SyncService</span>::<span class="keyword">class</span>.java)
+      intent.<span class="func">putExtra</span>(<span class="string">"taskType"</span>, <span class="string">"periodic_sync"</span>)
+
+      <span class="keyword">if</span> (<span class="type">Build</span>.VERSION.SDK_INT >= <span class="type">Build</span>.VERSION_CODES.O) {
+        applicationContext.<span class="func">startForegroundService</span>(intent)
+      } <span class="keyword">else</span> {
+        applicationContext.<span class="func">startService</span>(intent)
+      }
+
+      <span class="type">Result</span>.<span class="func">success</span>()
+    } <span class="keyword">catch</span> (e: <span class="type">Exception</span>) {
+      <span class="keyword">if</span> (runAttemptCount &lt; <span class="number">3</span>) <span class="type">Result</span>.<span class="func">retry</span>()
+      <span class="keyword">else</span> <span class="type">Result</span>.<span class="func">failure</span>()
+    }
+  }
+}
+
+<span class="comment">// Schedule periodic work</span>
+<span class="keyword">fun</span> <span class="func">scheduleSyncWork</span>(context: <span class="type">Context</span>) {
+  <span class="keyword">val</span> constraints = <span class="type">Constraints</span>.<span class="func">Builder</span>()
+    .<span class="func">setRequiredNetworkType</span>(<span class="type">NetworkType</span>.CONNECTED)
+    .<span class="func">setRequiresBatteryNotLow</span>(<span class="keyword">true</span>)
+    .<span class="func">build</span>()
+
+  <span class="keyword">val</span> syncRequest = <span class="type">PeriodicWorkRequestBuilder</span>&lt;<span class="type">SyncWorker</span>&gt;(
+    <span class="number">15</span>, <span class="type">TimeUnit</span>.MINUTES   <span class="comment">// minimum interval</span>
+  )
+    .<span class="func">setConstraints</span>(constraints)
+    .<span class="func">setBackoffCriteria</span>(
+      <span class="type">BackoffPolicy</span>.EXPONENTIAL,
+      <span class="number">30</span>, <span class="type">TimeUnit</span>.SECONDS
+    )
+    .<span class="func">addTag</span>(<span class="string">"periodic_sync"</span>)
+    .<span class="func">build</span>()
+
+  <span class="type">WorkManager</span>.<span class="func">getInstance</span>(context)
+    .<span class="func">enqueueUniquePeriodicWork</span>(
+      <span class="string">"sync"</span>,
+      <span class="type">ExistingPeriodicWorkPolicy</span>.KEEP,
+      syncRequest
+    )
+}</code></pre>
+
+    <h3>8.2 WorkManager Chaining</h3>
+
+    <div class="diagram">
+WorkManager Task Chain:
+
+  ┌────────────┐    ┌────────────┐    ┌────────────┐
+  │ Download    │ →  │ Process     │ →  │ Upload      │
+  │ Data        │    │ Data        │    │ Results     │
+  └────────────┘    └────────────┘    └────────────┘
+       │                                     │
+       │ constraint: CONNECTED               │ constraint: UNMETERED
+       │ retry: exponential                  │ retry: linear
+       ▼                                     ▼
+  If fails → retry 3x                 If fails → retry 5x
+  then → FAILURE (chain stops)        then → FAILURE
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="bgtaskscheduler">9. BGTaskScheduler Integration (iOS)</h2>
+
+    <p>BGTaskScheduler (iOS 13+) replaces the deprecated background fetch API. It supports two task types: BGAppRefreshTask (short, ~30 seconds) and BGProcessingTask (longer, minutes, runs during charging/idle).</p>
+
+    <h3>9.1 Registering Background Tasks</h3>
+
+    <pre><code><span class="comment">// ios/AppDelegate.m</span>
+<span class="keyword">@import</span> BackgroundTasks;
+
+- (<span class="type">BOOL</span>)<span class="func">application</span>:(<span class="type">UIApplication</span> *)application
+    <span class="func">didFinishLaunchingWithOptions</span>:(<span class="type">NSDictionary</span> *)launchOptions {
+
+  [<span class="type">BGTaskScheduler</span>.sharedScheduler
+    <span class="func">registerForTaskWithIdentifier</span>:@<span class="string">"com.app.refresh"</span>
+    usingQueue:<span class="keyword">nil</span>
+    launchHandler:^(<span class="type">BGTask</span> *task) {
+      [<span class="keyword">self</span> <span class="func">handleAppRefresh</span>:(<span class="type">BGAppRefreshTask</span> *)task];
+    }];
+
+  [<span class="type">BGTaskScheduler</span>.sharedScheduler
+    <span class="func">registerForTaskWithIdentifier</span>:@<span class="string">"com.app.db-cleanup"</span>
+    usingQueue:<span class="keyword">nil</span>
+    launchHandler:^(<span class="type">BGTask</span> *task) {
+      [<span class="keyword">self</span> <span class="func">handleDatabaseCleanup</span>:(<span class="type">BGProcessingTask</span> *)task];
+    }];
+
+  <span class="keyword">return</span> YES;
+}
+
+- (<span class="keyword">void</span>)<span class="func">handleAppRefresh</span>:(<span class="type">BGAppRefreshTask</span> *)task {
+  [<span class="keyword">self</span> <span class="func">scheduleAppRefresh</span>];
+
+  task.expirationHandler = ^{
+    <span class="comment">// Clean up — task is about to be killed</span>
+  };
+
+  <span class="comment">// Bridge to React Native JS</span>
+  [<span class="keyword">self</span>.bridge.eventDispatcher
+    <span class="func">sendAppEventWithName</span>:@<span class="string">"backgroundRefresh"</span>
+    body:@{}];
+
+  <span class="comment">// Mark complete when JS signals done</span>
+  [task <span class="func">setTaskCompletedWithSuccess</span>:YES];
+}
+
+- (<span class="keyword">void</span>)<span class="func">scheduleAppRefresh</span> {
+  <span class="type">BGAppRefreshTaskRequest</span> *request =
+    [[<span class="type">BGAppRefreshTaskRequest</span> alloc]
+      <span class="func">initWithIdentifier</span>:@<span class="string">"com.app.refresh"</span>];
+  request.earliestBeginDate =
+    [<span class="type">NSDate</span> <span class="func">dateWithTimeIntervalSinceNow</span>:<span class="number">15</span> * <span class="number">60</span>];
+
+  <span class="type">NSError</span> *error = <span class="keyword">nil</span>;
+  [<span class="type">BGTaskScheduler</span>.sharedScheduler
+    <span class="func">submitTaskRequest</span>:request error:&amp;error];
+}</code></pre>
+
+    <h3>9.2 BGTask Type Comparison</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>BGAppRefreshTask</th>
+                <th>BGProcessingTask</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Duration</td>
+                <td>~30 seconds</td>
+                <td>Several minutes</td>
+            </tr>
+            <tr>
+                <td>Frequency</td>
+                <td>System-adaptive</td>
+                <td>Infrequent (overnight)</td>
+            </tr>
+            <tr>
+                <td>Power state</td>
+                <td>Any</td>
+                <td>Preferably charging</td>
+            </tr>
+            <tr>
+                <td>Network</td>
+                <td>Optional</td>
+                <td>Can require connectivity</td>
+            </tr>
+            <tr>
+                <td>Use case</td>
+                <td>Content refresh, sync</td>
+                <td>DB maintenance, ML training</td>
+            </tr>
+            <tr>
+                <td>Info.plist key</td>
+                <td>BGTaskSchedulerPermittedIdentifiers</td>
+                <td>BGTaskSchedulerPermittedIdentifiers</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Testing BGTaskScheduler</div>
+        <p>BGTasks are difficult to test because the system controls scheduling. Use the Xcode debugger command <code>e -l objc -- (void)[[BGTaskScheduler sharedScheduler] _simulateLaunchForTaskWithIdentifier:@"com.app.refresh"]</code> to trigger a task immediately during development. In production, the system may delay tasks by hours or even days if the user rarely opens the app.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="battery-optimization">10. Battery Optimization</h2>
+
+    <p>Background processing is the primary cause of battery drain complaints. Every background strategy must be evaluated against its battery cost, and the app must adapt to low-battery conditions.</p>
+
+    <h3>10.1 Battery-Aware Processing</h3>
+
+    <pre><code><span class="keyword">import</span> { NativeModules, Platform } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+<span class="keyword">import</span> DeviceInfo <span class="keyword">from</span> <span class="string">'react-native-device-info'</span>;
+
+<span class="keyword">async</span> <span class="keyword">function</span> <span class="func">getBackgroundPolicy</span>(): <span class="type">Promise</span>&lt;<span class="type">BackgroundPolicy</span>&gt; {
+  <span class="keyword">const</span> batteryLevel = <span class="keyword">await</span> DeviceInfo.<span class="func">getBatteryLevel</span>();
+  <span class="keyword">const</span> isCharging = <span class="keyword">await</span> DeviceInfo.<span class="func">isBatteryCharging</span>();
+  <span class="keyword">const</span> isPowerSaver = <span class="keyword">await</span> DeviceInfo.<span class="func">getPowerState</span>()
+    .<span class="func">then</span>(s =&gt; s.lowPowerMode);
+
+  <span class="keyword">if</span> (isPowerSaver || batteryLevel &lt; <span class="number">0.15</span>) {
+    <span class="keyword">return</span> {
+      syncInterval: <span class="number">60</span> * <span class="number">60</span> * <span class="number">1000</span>,  <span class="comment">// 1 hour</span>
+      locationAccuracy: <span class="string">'low'</span>,
+      batchSize: <span class="number">100</span>,
+      enableAnalytics: <span class="keyword">false</span>,
+    };
+  }
+
+  <span class="keyword">if</span> (isCharging) {
+    <span class="keyword">return</span> {
+      syncInterval: <span class="number">5</span> * <span class="number">60</span> * <span class="number">1000</span>,    <span class="comment">// 5 minutes</span>
+      locationAccuracy: <span class="string">'high'</span>,
+      batchSize: <span class="number">20</span>,
+      enableAnalytics: <span class="keyword">true</span>,
+    };
+  }
+
+  <span class="keyword">return</span> {
+    syncInterval: <span class="number">15</span> * <span class="number">60</span> * <span class="number">1000</span>,   <span class="comment">// 15 minutes</span>
+    locationAccuracy: <span class="string">'balanced'</span>,
+    batchSize: <span class="number">50</span>,
+    enableAnalytics: <span class="keyword">true</span>,
+  };
+}</code></pre>
+
+    <h3>10.2 Android Doze Mode and App Standby</h3>
+
+    <div class="diagram">
+Android Doze Mode Restrictions:
+
+  Screen Off + Stationary + Battery
+         │
+         ▼
+  ┌──────────────────────────────────────────────┐
+  │  DOZE MODE                                    │
+  │                                               │
+  │  Restricted:                                  │
+  │  ✗ Network access                             │
+  │  ✗ Wake locks                                 │
+  │  ✗ AlarmManager (standard)                    │
+  │  ✗ JobScheduler / WorkManager (deferred)      │
+  │  ✗ Sync adapters                              │
+  │                                               │
+  │  Allowed:                                     │
+  │  ✓ AlarmManager.setAndAllowWhileIdle (limited)│
+  │  ✓ High-priority FCM (wakes device)           │
+  │  ✓ Foreground services (already running)      │
+  │                                               │
+  │  Maintenance Windows:                         │
+  │  Brief periods where deferred work executes   │
+  │  Intervals increase: 1min → 5min → 15min →    │
+  │  30min → 1hr → ... (exponential)              │
+  └──────────────────────────────────────────────┘
+    </div>
+
+    <h3>10.3 Battery Impact by Background Strategy</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Strategy</th>
+                <th>Battery Impact</th>
+                <th>Reliability</th>
+                <th>Use Case</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Periodic fetch (15 min)</td>
+                <td>Low</td>
+                <td>Medium (system-scheduled)</td>
+                <td>Content refresh</td>
+            </tr>
+            <tr>
+                <td>Foreground service</td>
+                <td>Medium-High</td>
+                <td>High</td>
+                <td>Active tracking, sync</td>
+            </tr>
+            <tr>
+                <td>Continuous GPS</td>
+                <td>Very High</td>
+                <td>High</td>
+                <td>Navigation, delivery</td>
+            </tr>
+            <tr>
+                <td>Significant location changes</td>
+                <td>Low</td>
+                <td>Medium</td>
+                <td>Geofencing</td>
+            </tr>
+            <tr>
+                <td>Push-triggered sync</td>
+                <td>Very Low</td>
+                <td>High</td>
+                <td>Chat, notifications</td>
+            </tr>
+            <tr>
+                <td>Background transfer (OS-managed)</td>
+                <td>Low</td>
+                <td>Very High</td>
+                <td>Large file upload/download</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>Background processing in mobile is a <strong>negotiation with the operating system</strong>, not a capability you control. Both iOS and Android are moving toward stricter background restrictions with each release. The architect's job is to <strong>minimize background work</strong> by using push notifications to trigger sync (server-initiated), OS-managed transfers for large files, and periodic tasks only for truly time-insensitive work. Design every background task to be <strong>idempotent</strong> (safe to run twice), <strong>resumable</strong> (can continue from where it stopped), and <strong>bounded</strong> (completes within the platform's time limit). The most battery-efficient background processing is the work you eliminate entirely by moving it to the server.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="11-accessibility-overhaul.html">← Prev: Accessibility Overhaul</a>
+        <a href="index.html">Series Index →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Error Tracking System — Engineering Problems</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Engineering Problems</a>
+  <span class="sep">›</span>
+  Error Tracking System
+</nav>
+
+<h1>Error Tracking System</h1>
+<p class="subtitle">Source maps, deterministic fingerprints, breadcrumb trails, session replay foundations, performance correlation, alert policy design, impact scoring, and incident tool integrations—built the way observability vendors do it internally.</p>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architecture lens</div>
+  <p>Ingestion must be <strong>idempotent</strong> and <strong>partitionable by project key + release</strong>. The hot path is <code>normalize → fingerprint → dedupe → enrich → store</code>; everything else (source map expansion, PII scrubbing) can be async workers.</p>
+</div>
+
+<h2 id="source-maps">Source maps: upload, association, and stack resolution</h2>
+
+<p>Production bundles reference <code>//# sourceMappingURL=...</code>—often hidden behind auth. SaaS trackers upload maps <strong>out-of-band</strong> during CI with the same <code>release</code> and <code>dist</code> artifact hashes. Resolution uses the <code>sourcesContent</code> embedded in the map when available to avoid fetching original files.</p>
+
+<div class="diagram">CI (Sentry CLI / @sentry/webpack-plugin)
+        │
+        ├── uploads bundle + .map + debug IDs
+        │
+        ▼
+Object storage (versioned by release)
+        │
+        ▼
+Error event arrives (minified stack)
+        │
+        ├── lookup release + frame.file + frame.lineno/colno
+        │
+        ▼
+Symbolication worker → original file:line:column</div>
+
+<table>
+<thead>
+<tr><th>Concern</th><th>Client</th><th>Server</th></tr>
+</thead>
+<tbody>
+<tr><td>Secret maps</td><td>Never expose map URL publicly</td><td>Authenticate uploads; TTL old releases</td></tr>
+<tr><td>Determinism</td><td>Send <code>release</code> + <code>dist</code> + commit SHA</td><td>Index by (projectId, release, abs_path)</td></tr>
+<tr><td>React stacks</td><td>Capture component stack from error boundary</td><td>Merge with symbolicated JS stack</td></tr>
+<tr><td>Wasm / workers</td><td>Separate contexts with <code>trace_id</code></td><td>Store thread metadata on frames</td></tr>
+</tbody>
+</table>
+
+<pre><code>// symbolicateFrame.ts — simplified; real impl uses map consumer + source-map library
+import { SourceMapConsumer } from 'source-map';
+
+export async function symbolicate(
+  rawFrame: { filename: string; lineno: number; colno: number },
+  mapJson: string
+): Promise&lt;{ file: string; line: number; column: number; name?: string }&gt; {
+  await SourceMapConsumer.initialize?.(); // browser build
+  const consumer = await new SourceMapConsumer(JSON.parse(mapJson));
+  const pos = consumer.originalPositionFor({
+    line: rawFrame.lineno,
+    column: rawFrame.colno,
+  });
+  consumer.destroy();
+  return {
+    file: pos.source ?? rawFrame.filename,
+    line: pos.line ?? rawFrame.lineno,
+    column: pos.column ?? rawFrame.colno,
+    name: pos.name ?? undefined,
+  };
+}</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">Debug IDs</div>
+  <p>Modern tooling injects a <strong>debug id</strong> into both bundle and map so the server can pair them even when filenames collide. Prefer that over fragile path matching across CDNs.</p>
+</div>
+
+<h2 id="fingerprinting">Error deduplication: fingerprinting</h2>
+
+<p>Fingerprint = hash of <strong>normalized</strong> exception identity: exception type, top in-app frames (after stripping library frames), and optionally transaction name. Two users hitting the same null deref should collapse to one <strong>issue</strong> with rising event count.</p>
+
+<pre><code>import { createHash } from 'crypto';
+
+type Frame = { filename: string; function?: string; lineno?: number };
+
+function normalizeFrame(f: Frame): string {
+  const file = f.filename.replace(/\?.*$/, ''); // strip query
+  const fn = (f.function ?? '').replace(/\s+/g, '');
+  return `${file}:${fn}:${f.lineno ?? 0}`;
+}
+
+export function fingerprint(
+  exceptionValue: string,
+  type: string,
+  frames: Frame[],
+  appRoot: RegExp
+): string {
+  const inApp = frames.filter((f) =&gt; appRoot.test(f.filename));
+  const top = inApp.slice(0, 5).map(normalizeFrame).join('|');
+  const payload = `${type}|${exceptionValue}|${top}`;
+  return createHash('sha256').update(payload).digest('hex').slice(0, 32);
+}</code></pre>
+
+<pre><code>// errorCollector.ts — browser SDK core
+type CapturedError = {
+  message: string;
+  name: string;
+  stack?: string;
+  frames?: Frame[];
+  breadcrumbs?: Breadcrumb[];
+  release?: string;
+};
+
+export function captureException(err: unknown, ctx?: Partial&lt;CapturedError&gt;) {
+  const normalized = normalizeError(err);
+  const frames = parseStack(normalized.stack);
+  const fp = fingerprint(
+    normalized.message,
+    normalized.name,
+    frames,
+    /https:\/\/(app\.example\.com\/static\/js)/
+  );
+
+  const body = {
+    fingerprint: fp,
+    exception: normalized,
+    breadcrumbs: breadcrumbBuffer.snapshot(),
+    ...ctx,
+  };
+
+  transport.enqueue(body);
+}</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Over-grouping</div>
+  <p>If you hash only <code>message</code>, dynamic strings (e.g., <code>Failed for id 123</code>) fragment issues. Strip numbers/UUIDs with caution—over-stripping merges unrelated bugs. Allow <strong>fingerprint overrides</strong> from catch blocks for known noisy sites.</p>
+</div>
+
+<h2 id="breadcrumbs">Breadcrumb trails: ordering and PII</h2>
+
+<p>Implement a fixed-size ring buffer (e.g., 100 items) with monotonic sequence numbers. Categories: <code>navigation</code>, <code>ui.click</code>, <code>fetch</code>, <code>console</code>, <code>custom</code>. Scrub URLs and headers at capture time.</p>
+
+<pre><code>export type Breadcrumb = {
+  ts: number;
+  seq: number;
+  category: string;
+  message: string;
+  data?: Record&lt;string, unknown&gt;;
+  level: 'debug' | 'info' | 'warning' | 'error';
+};
+
+class BreadcrumbBuffer {
+  private items: Breadcrumb[] = [];
+  private seq = 0;
+  constructor(private max = 100) {}
+
+  add(b: Omit&lt;Breadcrumb, 'ts' | 'seq'&gt;) {
+    const crumb: Breadcrumb = { ...b, ts: Date.now(), seq: ++this.seq };
+    this.items.push(crumb);
+    if (this.items.length &gt; this.max) this.items.shift();
+  }
+
+  snapshot() {
+    return [...this.items];
+  }
+}
+
+export const breadcrumbBuffer = new BreadcrumbBuffer();</code></pre>
+
+<div class="diagram">User flow (time →)
+[nav /checkout] → [click Pay] → [fetch POST /pay 500] → [exception]
+        │                │                │                    │
+        └─ breadcrumb ───┴── breadcrumb ──┴── breadcrumb ───────┘
+                              attached to single event payload</div>
+
+<h2 id="replay">Session replay: DOM mutations and events</h2>
+
+<p>Record a compressed <strong>mutation log</strong> (rrweb-style): initial snapshot + incremental DOM patches + input masks. Replay runs in a sandboxed iframe with the same viewport size. Staff concerns: payload size (deflate), sensitive fields (mask all <code>type=password</code> and configurable selectors), and CPU caps on the client recorder.</p>
+
+<table>
+<thead>
+<tr><th>Component</th><th>Captures</th><th>Risk</th></tr>
+</thead>
+<tbody>
+<tr><td>MutationObserver</td><td>DOM tree changes</td><td>High volume on SPAs</td></tr>
+<tr><td>Event listeners</td><td>Mouse, scroll, keys (filtered)</td><td>Keylogging perception</td></tr>
+<tr><td>Canvas / WebGL</td><td>Snapshots only (expensive)</td><td>Memory spikes</td></tr>
+<tr><td>Network</td><td>Metadata, not bodies (usually)</td><td>GDPR / PCI scope</td></tr>
+</tbody>
+</table>
+
+<pre><code>// replayRecorderSketch.ts — illustrative, not full rrweb
+export function startReplayRecording({ maskSelectors }: { maskSelectors: string[] }) {
+  const events: unknown[] = [];
+
+  const mo = new MutationObserver((muts) =&gt; {
+    for (const m of muts) {
+      events.push(serializeMutation(m));
+    }
+    maybeFlush(events);
+  });
+
+  mo.observe(document.documentElement, {
+    subtree: true,
+    childList: true,
+    attributes: true,
+    characterData: true,
+  });
+
+  document.addEventListener(
+    'input',
+    (e) =&gt; {
+      const t = e.target as HTMLElement;
+      if (matchesAny(t, maskSelectors)) return;
+      events.push({ type: 'input', target: cssPath(t), value: '***' });
+    },
+    true
+  );
+
+  return () =&gt; mo.disconnect();
+}</code></pre>
+
+<h2 id="perf-correlation">Performance correlation</h2>
+
+<p>Attach <code>trace_id</code> / <code>span_id</code> from OpenTelemetry to error events when the error surfaces inside a traced operation. On the backend, join issues to p95 latency regression windows. React: wrap router transitions and data loaders with spans; on rejection, call <code>captureException</code> with active span context.</p>
+
+<pre><code>// correlateErrorWithWebVitals.ts
+export function initPerfCorrelation() {
+  new PerformanceObserver((list) =&gt; {
+    for (const e of list.getEntries()) {
+      if (e.entryType === 'largest-contentful-paint') {
+        window.__LAST_LCP__ = e.startTime;
+      }
+    }
+  }).observe({ type: 'largest-contentful-paint', buffered: true });
+
+  window.addEventListener('error', () =&gt; {
+    captureMessage('window.error', {
+      extra: { lcp: window.__LAST_LCP__ },
+    });
+  });
+}</code></pre>
+
+<h2 id="alerts">Alert fatigue: grouping, rate limits, severity</h2>
+
+<ul>
+  <li><strong>Grouping:</strong> one issue = one fingerprint; notifications reference issue, not every event.</li>
+  <li><strong>Rate limiting:</strong> suppress duplicate alerts within a time window; escalate only on new releases or user growth spikes.</li>
+  <li><strong>Severity:</strong> map unhandled rejections in payment flow to P1; cosmetic UI to P4 via rules on tags and transaction names.</li>
+</ul>
+
+<table>
+<thead>
+<tr><th>Policy</th><th>Goal</th><th>Implementation sketch</th></tr>
+</thead>
+<tbody>
+<tr><td>Issue-level digest</td><td>Slack once per hour per issue</td><td>Scheduler aggregates counts</td></tr>
+<tr><td>Release regression</td><td>Compare error rate to prior release</td><td>Bayesian change point or simple % delta</td></tr>
+<tr><td>Ownership</td><td>Route to team</td><td>CODEOWNERS ↔ component stack frames</td></tr>
+<tr><td>Auto-resolve</td><td>Close stale issues</td><td>No events in N days + still deployed</td></tr>
+</tbody>
+</table>
+
+<div class="callout callout-architect">
+  <div class="callout-title">On-call ergonomics</div>
+  <p>Every alert should include <strong>release</strong>, <strong>first seen vs last seen</strong>, <strong>affected users estimate</strong>, and a <strong>deep link</strong> to replay (if enabled). If any of those are missing, pages get ignored.</p>
+</div>
+
+<h2 id="prioritization">Error prioritization: impact score</h2>
+
+<p>Define <code>impact = unique_users_affected × log(1 + event_count) × severity_weight × revenue_weight</code>. Cap <code>event_count</code> contribution so one bot loop does not dominate. Recompute hourly in a warehouse or stream processor.</p>
+
+<pre><code>export function impactScore(input: {
+  users: number;
+  events: number;
+  severity: 1 | 2 | 3 | 4 | 5;
+  inCheckout: boolean;
+}): number {
+  const sevW = input.severity ** 2;
+  const revW = input.inCheckout ? 3 : 1;
+  const freq = Math.log1p(input.events);
+  return input.users * freq * sevW * revW;
+}</code></pre>
+
+<h2 id="integrations">Incident management: PagerDuty and Slack</h2>
+
+<p>Use a single orchestration service that receives webhooks from the tracker, applies policies, then calls vendor APIs. Include <strong>dedupe keys</strong> (fingerprint + environment) so PagerDuty merges incidents.</p>
+
+<pre><code>// webhookToPagerDuty.ts
+export async function routeIssueToPagerDuty(issue: IssuePayload) {
+  await fetch('https://events.pagerduty.com/v2/enqueue', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      routing_key: process.env.PD_ROUTING_KEY,
+      event_action: 'trigger',
+      dedup_key: `${issue.fingerprint}:${issue.environment}`,
+      payload: {
+        summary: issue.title,
+        severity: issue.severity,
+        source: issue.project,
+        custom_details: {
+          users: issue.affectedUsers,
+          release: issue.release,
+          url: issue.permalink,
+        },
+      },
+    }),
+  });
+}</code></pre>
+
+<pre><code>// slackDigest.ts — rate-limited thread updates
+export async function postSlackDigest(channel: string, issues: IssuePayload[]) {
+  const text = issues
+    .map((i) =&gt; `*${i.title}* — ${i.affectedUsers} users — &lt;${i.permalink}|open&gt;`)
+    .join('\n');
+
+  await fetch('https://slack.com/api/chat.postMessage', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+      'Content-Type': 'application/json; charset=utf-8',
+    },
+    body: JSON.stringify({ channel, text }),
+  });
+}</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">React integration</div>
+  <p>Install a top-level <code>ErrorBoundary</code> that calls <code>captureException</code> in <code>componentDidCatch</code> with <code>componentStack</code>. For React 18+, capture recoverable errors from <code>onRecoverableError</code> in <code>createRoot</code> separately—they are often hydration noise vs fatal bugs.</p>
+</div>
+
+<h2 id="sdk-transport">SDK transport: batching, backoff, and offline queues</h2>
+
+<p>Browser SDKs should never block the main thread on the network path. Use an in-memory queue flushed on <code>visibilitychange</code>, <code>beforeunload</code> via <code>sendBeacon</code>, and exponential backoff with jitter on 429/503. Cap queue size and drop lowest-severity events first under memory pressure.</p>
+
+<pre><code>// transport.ts
+type Envelope = { event_id: string; body: unknown; attempts: number };
+
+export class EventTransport {
+  private q: Envelope[] = [];
+  private timer: ReturnType&lt;typeof setTimeout&gt; | null = null;
+
+  constructor(private endpoint: string, private maxBatch = 20) {
+    document.addEventListener('visibilitychange', () =&gt; {
+      if (document.visibilityState === 'hidden') this.flushBeacon();
+    });
+  }
+
+  enqueue(body: unknown) {
+    this.q.push({ event_id: crypto.randomUUID(), body, attempts: 0 });
+    this.schedule();
+  }
+
+  private schedule() {
+    if (this.timer) return;
+    this.timer = setTimeout(() =&gt; this.flushFetch(), 200);
+  }
+
+  private async flushFetch() {
+    this.timer = null;
+    if (!this.q.length) return;
+    const batch = this.q.splice(0, this.maxBatch);
+    try {
+      const res = await fetch(this.endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ events: batch }),
+        keepalive: true,
+      });
+      if (!res.ok) throw new Error(String(res.status));
+    } catch {
+      for (const e of batch) {
+        e.attempts += 1;
+        if (e.attempts &lt; 5) this.q.push(e);
+      }
+      setTimeout(() =&gt; this.schedule(), 2 ** batch[0].attempts * 200 + Math.random() * 100);
+    }
+  }
+
+  private flushBeacon() {
+    const batch = this.q.splice(0, this.maxBatch);
+    if (!batch.length) return;
+    navigator.sendBeacon(this.endpoint, JSON.stringify({ events: batch }));
+  }
+}</code></pre>
+
+<table>
+<thead>
+<tr><th>Mechanism</th><th>Use when</th><th>Caveat</th></tr>
+</thead>
+<tbody>
+<tr><td><code>fetch(..., { keepalive: true })</code></td><td>Small payloads on tab close</td><td>Size limits (~64KB) vary by browser</td></tr>
+<tr><td><code>sendBeacon</code></td><td>Fire-and-forget telemetry</td><td>No response handling</td></tr>
+<tr><td>retry with jitter</td><td>Thundering herd after outage</td><td>Cap max delay for UX of “fixed”</td></tr>
+</tbody>
+</table>
+
+<h2 id="sampling">Sampling, quotas, and cardinality control</h2>
+
+<p>High-traffic SPAs must sample benign errors (e.g., third-party ad block noise) while always capturing <code>$level:fatal</code> and payment flows. Implement <strong>dynamic sampling</strong> keyed by fingerprint so rare issues are not starved.</p>
+
+<div class="diagram">Ingress rate R
+     │
+     ├── fingerprint seen often? ──yes──▶ sample at 1%
+     │
+     └── novel fingerprint? ────────────▶ capture at 100%
+     │
+     └── override: user in allowlist ───▶ capture at 100%</div>
+
+<pre><code>export function shouldSample(
+  fingerprint: string,
+  counts: Map&lt;string, number&gt;,
+  baseRate: number
+): boolean {
+  const c = counts.get(fingerprint) ?? 0;
+  if (c &lt; 10) return false; // always keep early signal
+  const p = Math.min(0.99, baseRate * Math.log10(1 + c));
+  return Math.random() &lt; p;
+}</code></pre>
+
+<h2 id="react-root">React 18 root hooks: discriminating hydration noise</h2>
+
+<pre><code>import { createRoot } from 'react-dom/client';
+
+const container = document.getElementById('root')!;
+
+const root = createRoot(container, {
+  onRecoverableError(error, info) {
+    if (isHydrationMismatch(error)) {
+      captureMessage('hydration_recoverable', {
+        level: 'warning',
+        extra: { componentStack: info.componentStack },
+      });
+    } else {
+      captureException(error, { contexts: { react: info } });
+    }
+  },
+});
+
+root.render(&lt;App /&gt;);</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">CSP and third-party scripts</div>
+  <p>Inline stack frames from extensions and tag managers pollute fingerprints. Strip frames whose <code>filename</code> matches <code>chrome-extension:</code> or known tag hosts before hashing; optionally attach raw stack as a non-indexed attachment for support engineers.</p>
+</div>
+
+<h2 id="qa">Interview Q&amp;A</h2>
+<div class="qa-section">
+  <div class="qa-item">
+    <div class="qa-question">How do you avoid leaking PII in breadcrumbs? <span class="level tag tag-l6">L6</span></div>
+    <div class="qa-answer">
+      <p>Scrub at the edge: URL query keys, email regex in messages, and configurable deny-lists. Never log full GraphQL bodies by default. For replay, mask inputs and block entire subtrees (chat widgets, medical forms).</p>
+    </div>
+  </div>
+  <div class="qa-item">
+    <div class="qa-question">Why separate issue from event? <span class="level tag tag-senior">Senior</span></div>
+    <div class="qa-answer">
+      <p>Events are immutable facts; issues are aggregated, mutable workflow objects (assigned, resolved, muted). Storage and alerting efficiencies depend on that split—billions of events, thousands of issues.</p>
+    </div>
+  </div>
+</div>
+
+<nav class="nav-footer">
+  <a href="09-form-builder.html">← Dynamic Form Builder</a>
+  <a href="11-feature-flag-system.html">Feature Flag System →</a>
+</nav>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

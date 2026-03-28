@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SSR Fundamentals — Server-Side Rendering — React JS Deep Dive</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Server-Side Rendering</a>
+  <span class="sep">›</span>
+  SSR Fundamentals
+</nav>
+
+<h1>SSR Fundamentals</h1>
+<p class="subtitle">Understanding server-side rendering from first principles — rendering APIs, hydration mechanics, and the SSR/SSG/ISR spectrum that defines modern React architecture.</p>
+
+<nav class="toc">
+  <h3>Table of Contents</h3>
+  <ul>
+    <li><a href="#why-ssr">Why SSR Matters</a></li>
+    <li><a href="#rendering-apis">React Server Rendering APIs</a></li>
+    <li><a href="#ssr-ssg-isr">SSR vs SSG vs ISR</a></li>
+    <li><a href="#hydration">The Hydration Process</a></li>
+    <li><a href="#node-pipeline">Node.js Rendering Pipeline</a></li>
+    <li><a href="#universal-js">Universal / Isomorphic JavaScript</a></li>
+    <li><a href="#request-lifecycle">Request / Response Lifecycle</a></li>
+    <li><a href="#html-streaming">HTML Streaming</a></li>
+  </ul>
+</nav>
+
+<h2 id="why-ssr">Why SSR Matters</h2>
+
+<p>Client-side rendering (CSR) ships an empty HTML shell and relies on JavaScript to render content. This creates three fundamental problems at scale: search engines may not index JavaScript-rendered content reliably, users see a blank screen until the JS bundle downloads/parses/executes, and perceived performance suffers on slower devices and networks.</p>
+
+<p>Server-side rendering addresses all three by generating HTML on the server for each request. The browser receives fully-formed HTML, can display content immediately, and search engine crawlers see complete content without executing JavaScript.</p>
+
+<div class="diagram">
+CSR Timeline:
+┌──────────────────────────────────────────────────────────────────┐
+│ Request → Empty HTML → Download JS → Parse JS → Execute → Render│
+│ ├─── TTFB ───┤         ├──── Blank Screen ────┤  ├── FCP ──┤   │
+└──────────────────────────────────────────────────────────────────┘
+
+SSR Timeline:
+┌──────────────────────────────────────────────────────────────────┐
+│ Request → Server Render → Full HTML → FCP → Download JS → TTI  │
+│ ├─── TTFB (longer) ───┤  ├─ FCP ─┤        ├── Hydration ──┤   │
+└──────────────────────────────────────────────────────────────────┘
+</div>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p>SSR trades server compute cost for improved user experience. At L6, you must reason about this tradeoff quantitatively: SSR adds ~50-200ms of server rendering time to TTFB, but can reduce FCP by 1-3 seconds on typical connections. The ROI depends on your user demographics, caching strategy, and infrastructure costs.</p>
+</div>
+
+<h3>The Three Pillars of SSR Value</h3>
+
+<table>
+  <thead>
+    <tr><th>Pillar</th><th>Mechanism</th><th>Impact</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>SEO</td>
+      <td>Crawlers receive complete HTML without JS execution</td>
+      <td>Critical for content-heavy sites; Googlebot can execute JS but with delays and resource limits</td>
+    </tr>
+    <tr>
+      <td>Initial Load Performance</td>
+      <td>HTML is renderable before JS downloads</td>
+      <td>FCP improves 40-70% on 3G connections; LCP improves for text-heavy pages</td>
+    </tr>
+    <tr>
+      <td>Perceived Performance</td>
+      <td>Users see content immediately, even if not yet interactive</td>
+      <td>Reduces bounce rate; users perceive the app as faster even if TTI is similar</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="rendering-apis">React Server Rendering APIs</h2>
+
+<p>React provides three server rendering APIs, each designed for different runtime environments and streaming capabilities. Understanding when to use each is a core Staff-level competency.</p>
+
+<h3>renderToString (Legacy)</h3>
+
+<p>The original SSR API. Synchronously renders the entire React tree to an HTML string. Simple but fundamentally limited — it blocks the Node.js event loop during rendering and cannot stream partial content.</p>
+
+<pre><code>import { renderToString } from 'react-dom/server';
+import App from './App';
+
+function handleRequest(req, res) {
+  const html = renderToString(&lt;App url={req.url} /&gt;);
+
+  res.send(`
+    &lt;!DOCTYPE html&gt;
+    &lt;html&gt;
+      &lt;head&gt;&lt;title&gt;My App&lt;/title&gt;&lt;/head&gt;
+      &lt;body&gt;
+        &lt;div id="root"&gt;${html}&lt;/div&gt;
+        &lt;script src="/bundle.js"&gt;&lt;/script&gt;
+      &lt;/body&gt;
+    &lt;/html&gt;
+  `);
+}</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Critical Limitation</div>
+  <p><code>renderToString</code> does not support Suspense boundaries on the server. Any <code>&lt;Suspense&gt;</code> fallback is rendered synchronously, and the component tree must be fully resolved before any HTML is sent. This makes it incompatible with streaming and modern React patterns. It is considered legacy — use <code>renderToPipeableStream</code> for new projects.</p>
+</div>
+
+<h3>renderToPipeableStream (Node.js)</h3>
+
+<p>The modern SSR API for Node.js environments. Returns a pipeable Node.js stream that supports Suspense boundaries, streaming HTML, and out-of-order completion. This is the recommended API for production SSR.</p>
+
+<pre><code>import { renderToPipeableStream } from 'react-dom/server';
+import App from './App';
+
+function handleRequest(req, res) {
+  let didError = false;
+
+  const { pipe, abort } = renderToPipeableStream(
+    &lt;App url={req.url} /&gt;,
+    {
+      bootstrapScripts: ['/bundle.js'],
+
+      onShellReady() {
+        // The shell (content outside Suspense boundaries) is ready.
+        // Start streaming to the client.
+        res.statusCode = didError ? 500 : 200;
+        res.setHeader('Content-Type', 'text/html');
+        pipe(res);
+      },
+
+      onShellError(error) {
+        // Shell failed to render — send fallback HTML
+        res.statusCode = 500;
+        res.send('&lt;h1&gt;Server Error&lt;/h1&gt;');
+      },
+
+      onAllReady() {
+        // All Suspense boundaries resolved.
+        // Use this instead of onShellReady for crawlers/bots.
+      },
+
+      onError(error) {
+        didError = true;
+        console.error(error);
+      }
+    }
+  );
+
+  // Abort after timeout to prevent hanging requests
+  setTimeout(() => abort(), 10000);
+}</code></pre>
+
+<h3>renderToReadableStream (Web Streams)</h3>
+
+<p>The Web Streams API equivalent, designed for edge runtimes (Cloudflare Workers, Deno Deploy, Vercel Edge) that implement the WHATWG Streams standard rather than Node.js streams.</p>
+
+<pre><code>import { renderToReadableStream } from 'react-dom/server';
+import App from './App';
+
+async function handleRequest(req) {
+  const stream = await renderToReadableStream(
+    &lt;App url={req.url} /&gt;,
+    {
+      bootstrapScripts: ['/bundle.js'],
+      signal: AbortSignal.timeout(10000),
+    }
+  );
+
+  // For bots: wait for all content before responding
+  const isBot = /bot|crawler|spider/i.test(
+    req.headers.get('user-agent')
+  );
+  if (isBot) {
+    await stream.allReady;
+  }
+
+  return new Response(stream, {
+    headers: { 'Content-Type': 'text/html' },
+  });
+}</code></pre>
+
+<h3>API Comparison</h3>
+
+<table>
+  <thead>
+    <tr><th>Feature</th><th>renderToString</th><th>renderToPipeableStream</th><th>renderToReadableStream</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Streaming</td><td>No</td><td>Yes (Node.js streams)</td><td>Yes (Web Streams)</td></tr>
+    <tr><td>Suspense support</td><td>No (renders fallback)</td><td>Full</td><td>Full</td></tr>
+    <tr><td>Runtime</td><td>Node.js</td><td>Node.js</td><td>Edge / Deno / Bun</td></tr>
+    <tr><td>Blocking</td><td>Synchronous (blocks event loop)</td><td>Non-blocking</td><td>Non-blocking</td></tr>
+    <tr><td>Error handling</td><td>try/catch</td><td>onShellError, onError callbacks</td><td>Promise rejection + signal</td></tr>
+    <tr><td>Shell concept</td><td>N/A</td><td>onShellReady</td><td>Promise resolves on shell</td></tr>
+    <tr><td>Bot handling</td><td>Implicit (full HTML)</td><td>onAllReady</td><td>stream.allReady</td></tr>
+  </tbody>
+</table>
+
+<h2 id="ssr-ssg-isr">SSR vs SSG vs ISR</h2>
+
+<p>Modern React applications rarely use a single rendering strategy. Staff engineers must choose the right strategy per route based on data freshness requirements, traffic patterns, and infrastructure constraints.</p>
+
+<div class="diagram">
+Rendering Strategy Spectrum:
+
+Static ◄──────────────────────────────────────────────► Dynamic
+
+  SSG              ISR              SSR              CSR
+  │                │                │                │
+  Build-time       Build + Revalidate  Per-request     Client-only
+  No server        Periodic server     Always server   No server
+  Stale OK         Bounded staleness   Always fresh    Always fresh
+  Fastest TTFB     Fast TTFB          Slower TTFB     Slowest FCP
+  CDN-cacheable    CDN-cacheable      Edge-cacheable   CDN for assets
+</div>
+
+<h3>Static Site Generation (SSG)</h3>
+
+<p>Pages are rendered at build time and served as static files. Zero server compute at request time. Ideal for content that changes infrequently — marketing pages, documentation, blog posts.</p>
+
+<pre><code>// Next.js App Router — static by default
+// This page is rendered at build time
+export default async function BlogPost({ params }) {
+  const post = await getPost(params.slug);
+  return &lt;Article content={post} /&gt;;
+}
+
+// Generate all possible paths at build time
+export async function generateStaticParams() {
+  const posts = await getAllPosts();
+  return posts.map(post =&gt; ({ slug: post.slug }));
+}</code></pre>
+
+<h3>Incremental Static Regeneration (ISR)</h3>
+
+<p>A hybrid approach: pages are statically generated but revalidated in the background after a configurable time interval. Combines the performance of SSG with bounded data staleness.</p>
+
+<pre><code>// Next.js — ISR with time-based revalidation
+export const revalidate = 60; // Revalidate every 60 seconds
+
+export default async function ProductPage({ params }) {
+  const product = await getProduct(params.id);
+  return &lt;ProductDetail product={product} /&gt;;
+}
+
+// On-demand revalidation via API route
+// POST /api/revalidate?tag=products
+import { revalidateTag } from 'next/cache';
+
+export async function POST(request) {
+  const tag = request.nextUrl.searchParams.get('tag');
+  revalidateTag(tag);
+  return Response.json({ revalidated: true });
+}</code></pre>
+
+<h3>Server-Side Rendering (SSR)</h3>
+
+<p>Pages are rendered on every request. Guarantees fresh data but requires server compute for each page view. Necessary for personalized content, real-time data, or authenticated pages.</p>
+
+<pre><code>// Next.js — force dynamic rendering
+export const dynamic = 'force-dynamic';
+
+export default async function DashboardPage() {
+  const user = await getCurrentUser();
+  const data = await getDashboardData(user.id);
+  return &lt;Dashboard user={user} data={data} /&gt;;
+}</code></pre>
+
+<h2 id="hydration">The Hydration Process</h2>
+
+<p>Hydration is the process of attaching event handlers and React's internal state to server-rendered HTML. It's the bridge between static server output and an interactive client application.</p>
+
+<div class="diagram">
+Hydration Process:
+
+Server:  React Tree → renderToPipeableStream → HTML String
+                                                    │
+                                                    ▼
+Network: HTML transmitted to browser ──────────────────
+                                                    │
+                                                    ▼
+Client:  Parse HTML → Display (non-interactive) → Download JS
+                                                    │
+                                                    ▼
+         hydrateRoot() → Walk DOM + React Tree simultaneously
+                │
+                ├─ Match DOM nodes to fiber nodes
+                ├─ Attach event listeners
+                ├─ Initialize component state
+                ├─ Run effects (useEffect, useLayoutEffect)
+                └─ App becomes interactive (TTI)
+</div>
+
+<h3>hydrateRoot API</h3>
+
+<pre><code>import { hydrateRoot } from 'react-dom/client';
+import App from './App';
+
+// Hydrate server-rendered HTML
+// React expects the DOM to match what the server rendered
+const root = hydrateRoot(
+  document.getElementById('root'),
+  &lt;App /&gt;,
+  {
+    onRecoverableError(error, errorInfo) {
+      // Hydration mismatch — React recovered but log it
+      console.error('Hydration error:', error);
+      reportToMonitoring(error, errorInfo);
+    }
+  }
+);</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Hydration Mismatches</div>
+  <p>When server HTML doesn't match what React renders on the client, React must discard the server HTML and re-render from scratch — destroying the SSR performance benefit. Common causes: <code>Date.now()</code>, <code>Math.random()</code>, browser-only APIs (<code>window.innerWidth</code>), locale differences, and extension-injected DOM nodes. In React 18+, mismatches log warnings in development and attempt recovery in production.</p>
+</div>
+
+<h3>Hydration Internals</h3>
+
+<p>During hydration, React performs a concurrent traversal of both the existing DOM and the virtual React tree. For each fiber node, React:</p>
+
+<ol>
+  <li><strong>Finds the corresponding DOM node</strong> — uses depth-first traversal matching the render order</li>
+  <li><strong>Validates attributes</strong> — checks that text content, attributes, and structure match (development only for most checks)</li>
+  <li><strong>Attaches event listeners</strong> — uses event delegation on the root container, not individual DOM nodes</li>
+  <li><strong>Initializes state</strong> — hooks are initialized with their initial values (which should match server state)</li>
+  <li><strong>Schedules effects</strong> — useEffect callbacks are queued (they don't run on the server)</li>
+</ol>
+
+<pre><code>// Simplified hydration pseudocode
+function hydrateNode(fiber, domNode) {
+  if (fiber.tag === HostComponent) {
+    // Reuse existing DOM node instead of creating new one
+    fiber.stateNode = domNode;
+
+    // Validate props match (dev only for most checks)
+    if (__DEV__) {
+      validateHydration(fiber.pendingProps, domNode);
+    }
+
+    // Attach event listeners via delegation
+    listenToAllSupportedEvents(domNode);
+
+    // Recurse into children
+    hydrateChildren(fiber, domNode.firstChild);
+  } else if (fiber.tag === FunctionComponent) {
+    // Execute the component function
+    const children = renderWithHooks(fiber);
+    // Continue hydrating children against existing DOM
+    reconcileChildFibers(fiber, children);
+  }
+}</code></pre>
+
+<h2 id="node-pipeline">Node.js Rendering Pipeline</h2>
+
+<p>Understanding the full Node.js SSR pipeline is critical for debugging performance issues and designing scalable rendering infrastructure.</p>
+
+<div class="diagram">
+Node.js SSR Pipeline:
+
+Incoming Request
+      │
+      ▼
+┌─────────────────┐
+│  Parse URL/      │
+│  Match Route     │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐     ┌──────────────┐
+│  Data Fetching   │────▶│  API / DB    │
+│  (parallel)      │◀────│  Calls       │
+└────────┬────────┘     └──────────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Create React    │
+│  Element Tree    │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  renderTo        │
+│  PipeableStream  │──── Render Phase (CPU-bound)
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Stream HTML     │──── I/O Phase (non-blocking)
+│  to Response     │
+└────────┬────────┘
+         │
+         ▼
+   Client receives
+   progressive HTML
+</div>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p>The render phase is CPU-bound and blocks the Node.js thread. For complex component trees, this can take 50-200ms. At scale, this means a single Node.js process can only handle 5-20 SSR requests per second. Mitigation strategies: worker threads for rendering, horizontal scaling, aggressive caching, and streaming to reduce time-to-first-byte.</p>
+</div>
+
+<h2 id="universal-js">Universal / Isomorphic JavaScript</h2>
+
+<p>Universal JavaScript runs on both server and client. This sounds simple but introduces subtle challenges around environment-specific APIs, module resolution, and state management.</p>
+
+<h3>Environment Detection Patterns</h3>
+
+<pre><code>// Anti-pattern: checking typeof window everywhere
+if (typeof window !== 'undefined') {
+  window.addEventListener('resize', handler);
+}
+
+// Better: useEffect for client-only side effects
+// Effects don't run on the server
+function useWindowSize() {
+  const [size, setSize] = useState({ width: 0, height: 0 });
+
+  useEffect(() => {
+    function handleResize() {
+      setSize({
+        width: window.innerWidth,
+        height: window.innerHeight,
+      });
+    }
+    handleResize();
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  return size;
+}
+
+// Best: dynamic import for client-only modules
+const MapComponent = dynamic(() => import('./Map'), {
+  ssr: false,
+  loading: () => &lt;MapSkeleton /&gt;,
+});</code></pre>
+
+<h3>Common Universal JavaScript Pitfalls</h3>
+
+<table>
+  <thead>
+    <tr><th>Pitfall</th><th>Server Behavior</th><th>Solution</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>window</code> / <code>document</code> access</td><td>ReferenceError</td><td>Guard with useEffect or dynamic import with ssr: false</td></tr>
+    <tr><td><code>localStorage</code> / <code>sessionStorage</code></td><td>ReferenceError</td><td>Read in useEffect, provide server default</td></tr>
+    <tr><td>CSS-in-JS without SSR support</td><td>Flash of unstyled content</td><td>Use framework SSR extraction (styled-components ServerStyleSheet)</td></tr>
+    <tr><td>Singleton module state</td><td>Shared across requests (memory leak)</td><td>Use request-scoped context or AsyncLocalStorage</td></tr>
+    <tr><td>Date/timezone differences</td><td>Server timezone ≠ client</td><td>Use UTC or pass timezone from client</td></tr>
+  </tbody>
+</table>
+
+<h2 id="request-lifecycle">Request / Response Lifecycle</h2>
+
+<p>A complete SSR request involves multiple phases, each with distinct performance characteristics and failure modes.</p>
+
+<pre><code>// Complete SSR request lifecycle
+import { renderToPipeableStream } from 'react-dom/server';
+import { matchRoutes } from 'react-router-dom';
+import { createStaticHandler } from '@remix-run/router';
+
+async function handleSSRRequest(req, res) {
+  const startTime = performance.now();
+
+  // Phase 1: Route matching (~1ms)
+  const routes = matchRoutes(routeConfig, req.url);
+  if (!routes) {
+    res.status(404).send('Not Found');
+    return;
+  }
+
+  // Phase 2: Data fetching (~50-500ms, often the bottleneck)
+  const dataPromises = routes.map(route =>
+    route.route.loader?.({ params: route.params, request: req })
+  );
+  const loaderData = await Promise.all(dataPromises);
+
+  // Phase 3: Create React tree with data (~1ms)
+  const app = (
+    &lt;StaticRouter location={req.url}&gt;
+      &lt;DataContext.Provider value={loaderData}&gt;
+        &lt;App /&gt;
+      &lt;/DataContext.Provider&gt;
+    &lt;/StaticRouter&gt;
+  );
+
+  // Phase 4: Render to stream (~20-200ms for render, then streaming)
+  const { pipe, abort } = renderToPipeableStream(app, {
+    bootstrapScripts: ['/bundle.js'],
+    onShellReady() {
+      const renderTime = performance.now() - startTime;
+      res.setHeader('Server-Timing', `render;dur=${renderTime}`);
+      res.setHeader('Content-Type', 'text/html');
+      pipe(res);
+    },
+    onError(error) {
+      console.error('SSR Error:', error);
+    }
+  });
+
+  setTimeout(() => abort(), 10000);
+}</code></pre>
+
+<h2 id="html-streaming">HTML Streaming</h2>
+
+<p>HTML streaming sends HTML to the browser in chunks rather than waiting for the entire page to render. The browser can parse and display partial HTML while the server continues rendering.</p>
+
+<div class="diagram">
+Traditional SSR (Buffered):
+Server: [====== Render entire page ======]
+Client:                                    [Parse + Display]
+         ├──────── TTFB (slow) ──────────┤
+
+Streaming SSR:
+Server: [= Shell =][== Suspense 1 ==][== Suspense 2 ==]
+Client: [Parse]    [Parse + Inject]  [Parse + Inject]
+         ├ TTFB ─┤
+         (fast)
+</div>
+
+<p>Streaming works by sending the HTML shell first (everything outside Suspense boundaries), then injecting completed Suspense content using inline <code>&lt;script&gt;</code> tags that swap placeholder content with real content.</p>
+
+<pre><code>// What the browser receives during streaming:
+
+// 1. Initial shell (sent immediately)
+&lt;!DOCTYPE html&gt;
+&lt;html&gt;
+&lt;body&gt;
+  &lt;div id="root"&gt;
+    &lt;header&gt;My App&lt;/header&gt;
+    &lt;main&gt;
+      &lt;!-- Suspense fallback placeholder --&gt;
+      &lt;template id="B:0"&gt;&lt;/template&gt;
+      &lt;div&gt;Loading...&lt;/div&gt;
+      &lt;!--/$--&gt;
+    &lt;/main&gt;
+  &lt;/div&gt;
+
+// 2. When Suspense boundary resolves (sent later)
+  &lt;div hidden id="S:0"&gt;
+    &lt;article&gt;Actual content here...&lt;/article&gt;
+  &lt;/div&gt;
+  &lt;script&gt;
+    // React's inline script swaps the placeholder
+    $RC("B:0", "S:0");
+  &lt;/script&gt;
+
+// 3. Final closing tags
+&lt;/body&gt;
+&lt;/html&gt;</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">Deep Dive</div>
+  <p>The <code>$RC</code> function (completeBoundary) is a tiny inline script React injects. It finds the template marker, removes the fallback content, and inserts the resolved content — all before the main JS bundle loads. This means users see real content progressively, even on slow connections where the bundle hasn't downloaded yet.</p>
+</div>
+
+<h3>Streaming and SEO</h3>
+
+<p>Search engine crawlers handle streaming differently. Googlebot waits for the full response before indexing, so streaming doesn't affect SEO content. However, you can optimize for crawlers by using <code>onAllReady</code> (Node.js) or <code>stream.allReady</code> (Web Streams) to send the complete HTML at once for bot user agents, while streaming for real users.</p>
+
+<pre><code>const { pipe } = renderToPipeableStream(&lt;App /&gt;, {
+  bootstrapScripts: ['/bundle.js'],
+
+  onShellReady() {
+    if (!isBot(req)) {
+      // Stream for real users — faster TTFB
+      pipe(res);
+    }
+  },
+
+  onAllReady() {
+    if (isBot(req)) {
+      // Send complete HTML for crawlers — better indexing
+      pipe(res);
+    }
+  }
+});</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p>At L6, you should be able to articulate the full SSR decision matrix: when to use SSG (content sites, marketing pages), ISR (e-commerce catalogs, CMS-driven pages), SSR (dashboards, personalized content), and CSR (highly interactive tools, authenticated-only apps). The answer is almost always "it depends on the route" — a single application typically uses multiple strategies.</p>
+</div>
+
+<nav class="nav-footer">
+  <a href="index.html">← Series Index</a>
+  <a href="02-react-server-components.html">React Server Components →</a>
+</nav>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

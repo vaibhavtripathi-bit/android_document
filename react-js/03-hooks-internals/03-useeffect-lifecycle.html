@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>useEffect Lifecycle — React Hooks Internals</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Hooks Internals</a>
+  <span class="sep">›</span>
+  useEffect Lifecycle
+</nav>
+
+<h1>useEffect Lifecycle</h1>
+<p class="subtitle">Effect linked lists, HookFlags, cleanup timing, and the precise execution order of useEffect, useLayoutEffect, and useInsertionEffect.</p>
+
+<nav class="nav">
+  <a href="01-hooks-architecture.html">Hooks Architecture</a>
+  <a href="02-usestate-usereducer.html">useState &amp; useReducer</a>
+  <a href="04-usememo-usecallback.html">useMemo &amp; useCallback</a>
+  <a href="05-useref-imperative.html">useRef &amp; Imperative</a>
+  <a href="06-custom-hooks.html">Custom Hooks</a>
+  <a href="07-use-hook-react19.html">use() Hook</a>
+  <a href="08-concurrent-hooks.html">Concurrent Hooks</a>
+  <a href="09-interview-qa.html">Interview Q&amp;A</a>
+</nav>
+
+<h2 id="effect-linked-list">Effect Linked List (Separate from State)</h2>
+
+<p>Effects are stored in two places: on the hook's <code>memoizedState</code> (as part of the hooks linked list) and on the fiber's <code>updateQueue</code> (as a separate circular linked list of effects). The <code>updateQueue</code> list is what React iterates during commit.</p>
+
+<pre><code>type Effect = {
+  tag: HookFlags,          // Passive | Layout | Insertion
+  create: () =&gt; (() =&gt; void) | void,  // effect function
+  destroy: (() =&gt; void) | void,        // cleanup function
+  deps: Array&lt;mixed&gt; | null,           // dependency array
+  next: Effect,            // next effect (circular)
+};
+
+// On the hook node:
+hook.memoizedState = effect; // points to the Effect object
+
+// On the fiber:
+fiber.updateQueue = {
+  lastEffect: Effect | null,  // circular list of ALL effects
+};
+
+// The effect list contains ALL effects (useEffect, useLayoutEffect,
+// useInsertionEffect) for this fiber, distinguished by their tag.</code></pre>
+
+<div class="diagram">
+Fiber's Effect List (updateQueue.lastEffect):
+
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│ Effect #0       │    │ Effect #1        │    │ Effect #2       │
+│ tag: Passive    │───▶│ tag: Layout      │───▶│ tag: Passive    │──┐
+│ create: fn_a    │    │ create: fn_b     │    │ create: fn_c    │  │
+│ destroy: null   │    │ destroy: null    │    │ destroy: null   │  │
+│ deps: [a, b]    │    │ deps: [c]        │    │ deps: []        │  │
+└─────────────────┘    └──────────────────┘    └─────────────────┘  │
+▲                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+                    lastEffect points to Effect #2
+</div>
+
+<h2 id="hook-flags">HookFlags: Passive, Layout, Insertion</h2>
+
+<pre><code>// ReactHookEffectTags.js
+const Passive   = 0b1000;  // useEffect
+const Layout    = 0b0100;  // useLayoutEffect
+const Insertion = 0b0010;  // useInsertionEffect
+const HasEffect = 0b0001;  // effect needs to fire (deps changed)
+
+// Combined tags during mount:
+// useEffect:          HasEffect | Passive  = 0b1001
+// useLayoutEffect:    HasEffect | Layout   = 0b0101
+// useInsertionEffect: HasEffect | Insertion = 0b0011
+
+// During update, if deps haven't changed:
+// tag = Passive (without HasEffect) — effect is skipped</code></pre>
+
+<h3>Mount vs Update Effect Creation</h3>
+
+<pre><code>function mountEffect(create, deps) {
+  return mountEffectImpl(
+    PassiveEffect | PassiveStaticEffect, // fiber flags
+    HookPassive,                          // hook flags
+    create,
+    deps
+  );
+}
+
+function mountEffectImpl(fiberFlags, hookFlags, create, deps) {
+  const hook = mountWorkInProgressHook();
+  const nextDeps = deps === undefined ? null : deps;
+  currentlyRenderingFiber.flags |= fiberFlags;
+
+  hook.memoizedState = pushEffect(
+    HookHasEffect | hookFlags,  // always HasEffect on mount
+    create,
+    createEffectInstance(),
+    nextDeps
+  );
+}
+
+function updateEffect(create, deps) {
+  return updateEffectImpl(PassiveEffect, HookPassive, create, deps);
+}
+
+function updateEffectImpl(fiberFlags, hookFlags, create, deps) {
+  const hook = updateWorkInProgressHook();
+  const nextDeps = deps === undefined ? null : deps;
+  const prevEffect = currentHook.memoizedState;
+  const prevDeps = prevEffect.deps;
+
+  if (nextDeps !== null && areHookInputsEqual(nextDeps, prevDeps)) {
+    // Deps unchanged — push effect WITHOUT HasEffect flag
+    hook.memoizedState = pushEffect(hookFlags, create, prevEffect.inst, nextDeps);
+    return;
+  }
+
+  // Deps changed — push effect WITH HasEffect flag
+  currentlyRenderingFiber.flags |= fiberFlags;
+  hook.memoizedState = pushEffect(
+    HookHasEffect | hookFlags,
+    create,
+    prevEffect.inst,
+    nextDeps
+  );
+}</code></pre>
+
+<h2 id="dep-comparison">Dependency Array Comparison</h2>
+
+<pre><code>function areHookInputsEqual(nextDeps, prevDeps) {
+  if (prevDeps === null) {
+    return false; // always re-run if prev had no deps
+  }
+
+  for (let i = 0; i &lt; prevDeps.length && i &lt; nextDeps.length; i++) {
+    if (Object.is(nextDeps[i], prevDeps[i])) {
+      continue;
+    }
+    return false; // any element differs → re-run effect
+  }
+  return true;
+}
+
+// Key behaviors:
+// - null deps (no array): effect runs every render
+// - [] empty array: effect runs only on mount
+// - [a, b]: effect runs when a or b changes (Object.is per element)
+// - Object.is comparison means objects/arrays by reference only</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Common Pitfall: Object/Array Dependencies</div>
+  <p>Passing objects or arrays as dependencies causes the effect to re-run every render because a new reference is created each time. Use primitive values, or memoize the dependency with <code>useMemo</code>.</p>
+</div>
+
+<pre><code>// BUG: effect runs every render because config is a new object
+function MyComponent({ width, height }) {
+  const config = { width, height }; // new ref every render
+  useEffect(() => {
+    initCanvas(config);
+  }, [config]); // Object.is fails every time
+
+  // FIX 1: use primitives
+  useEffect(() => {
+    initCanvas({ width, height });
+  }, [width, height]);
+
+  // FIX 2: useMemo
+  const config = useMemo(() => ({ width, height }), [width, height]);
+  useEffect(() => {
+    initCanvas(config);
+  }, [config]);
+}</code></pre>
+
+<h2 id="execution-timing">Effect Execution Timing</h2>
+
+<div class="diagram">
+React Render + Commit Timeline:
+
+  Render Phase              Commit Phase                    After Paint
+  ──────────────           ─────────────────────           ──────────────
+  │                        │                               │
+  │ Component()            │ 1. useInsertionEffect         │ 4. useEffect
+  │ ├─ useState            │    cleanup (prev)             │    cleanup (prev)
+  │ ├─ useMemo             │    create (next)              │    create (next)
+  │ ├─ useEffect (queued)  │                               │
+  │ ├─ useLayoutEffect     │ 2. DOM mutations              │
+  │    (queued)            │    (appendChild, etc.)        │
+  │                        │                               │
+  │ Returns JSX            │ 3. useLayoutEffect            │
+  │                        │    cleanup (prev)             │
+                           │    create (next)              │
+                           │                               │
+                           │ Browser paints screen         │
+                           │ ──────────────────────────── │
+                                                           │
+                                                    useEffect fires
+                                                    (asynchronously)
+</div>
+
+<h3>Detailed Timing Comparison</h3>
+
+<table>
+<thead>
+<tr><th>Hook</th><th>Cleanup Timing</th><th>Create Timing</th><th>Blocks Paint?</th><th>Use Case</th></tr>
+</thead>
+<tbody>
+<tr><td><code>useInsertionEffect</code></td><td>Before DOM mutations</td><td>Before DOM mutations</td><td>Yes</td><td>CSS-in-JS style injection</td></tr>
+<tr><td><code>useLayoutEffect</code></td><td>After DOM mutations, before paint</td><td>After DOM mutations, before paint</td><td>Yes</td><td>DOM measurements, synchronous DOM updates</td></tr>
+<tr><td><code>useEffect</code></td><td>After paint (async)</td><td>After paint (async)</td><td>No</td><td>Data fetching, subscriptions, logging</td></tr>
+</tbody>
+</table>
+
+<h2 id="cleanup-timing">Cleanup Timing: Not Just Unmount</h2>
+
+<p>A common misconception is that cleanup only runs on unmount. In reality, cleanup runs <strong>before every re-execution</strong> of the effect:</p>
+
+<pre><code>function ChatRoom({ roomId }) {
+  useEffect(() => {
+    const connection = connectToRoom(roomId);
+    console.log(`Connected to ${roomId}`);
+
+    return () => {
+      connection.disconnect();
+      console.log(`Disconnected from ${roomId}`);
+    };
+  }, [roomId]);
+}
+
+// Timeline when roomId changes from "general" to "random":
+//
+// 1. Component re-renders with roomId="random"
+// 2. React sees deps changed: ["general"] → ["random"]
+// 3. After paint:
+//    a. Cleanup of PREVIOUS effect: "Disconnected from general"
+//    b. Create of NEW effect: "Connected to random"
+//
+// On unmount:
+// 4. Cleanup runs one final time: "Disconnected from random"</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight — Cleanup Ordering</div>
+  <p>In React 18+, cleanup functions for <code>useEffect</code> run asynchronously in a batch. All cleanups from the previous render run before any creates of the new render. For <code>useLayoutEffect</code>, cleanup and create are synchronous and interleaved per-component in tree order.</p>
+</div>
+
+<h2 id="stale-closures">Stale Closure Problem</h2>
+
+<pre><code>// The stale closure trap:
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      console.log(count); // always logs 0!
+      setCount(count + 1); // always sets to 1!
+    }, 1000);
+    return () => clearInterval(id);
+  }, []); // empty deps — effect captures count=0 forever
+
+  // The effect closure captured count=0 from the first render.
+  // Because deps=[], the effect never re-runs, so the closure
+  // never gets a fresh reference to count.
+}
+
+// Solution 1: Add count to deps (effect re-runs each time)
+useEffect(() => {
+  const id = setInterval(() => {
+    setCount(count + 1);
+  }, 1000);
+  return () => clearInterval(id);
+}, [count]); // re-creates interval on every count change
+
+// Solution 2: Functional update (preferred)
+useEffect(() => {
+  const id = setInterval(() => {
+    setCount(prev => prev + 1); // doesn't need count in closure
+  }, 1000);
+  return () => clearInterval(id);
+}, []); // safe — no dependency on count
+
+// Solution 3: useRef for mutable value
+const countRef = useRef(count);
+countRef.current = count; // update ref every render
+useEffect(() => {
+  const id = setInterval(() => {
+    console.log(countRef.current); // always current
+  }, 1000);
+  return () => clearInterval(id);
+}, []);</code></pre>
+
+<h2 id="strict-mode">Strict Mode Double-Invocation</h2>
+
+<p>In development with <code>&lt;StrictMode&gt;</code>, React intentionally double-invokes effects to help find bugs:</p>
+
+<pre><code>// In StrictMode (development only):
+// Mount:
+//   1. setup() runs
+//   2. cleanup() runs
+//   3. setup() runs again
+//
+// This simulates an unmount/remount cycle to verify:
+// - Cleanup properly undoes what setup did
+// - Effect is idempotent (safe to run twice)
+
+// This catches bugs like:
+useEffect(() => {
+  const ws = new WebSocket(url);
+  // BUG: no cleanup — StrictMode reveals the leak
+  // because two connections are opened
+}, [url]);
+
+// Fixed:
+useEffect(() => {
+  const ws = new WebSocket(url);
+  return () => ws.close(); // proper cleanup
+}, [url]);</code></pre>
+
+<h2 id="commit-phases">Effect Processing in Commit Phase</h2>
+
+<pre><code>// Simplified commit phase for effects:
+
+// Phase 1: Insertion Effects (synchronous, before DOM mutations)
+function commitInsertionEffects(fiber) {
+  const updateQueue = fiber.updateQueue;
+  if (updateQueue !== null) {
+    const lastEffect = updateQueue.lastEffect;
+    if (lastEffect !== null) {
+      let effect = lastEffect.next;
+      do {
+        if ((effect.tag & Insertion) !== 0 && (effect.tag & HasEffect) !== 0) {
+          // Run cleanup
+          const destroy = effect.inst.destroy;
+          if (destroy !== undefined) destroy();
+          // Run create
+          effect.inst.destroy = effect.create();
+        }
+        effect = effect.next;
+      } while (effect !== lastEffect.next);
+    }
+  }
+}
+
+// Phase 2: DOM Mutations (commitMutationEffects)
+// appendChild, removeChild, setAttribute, etc.
+
+// Phase 3: Layout Effects (synchronous, after DOM mutations)
+function commitLayoutEffects(fiber) {
+  // Similar loop but checks for Layout flag
+  // Runs synchronously before browser paint
+}
+
+// Phase 4: Passive Effects (asynchronous, after paint)
+// Scheduled via scheduler, runs in a microtask/setTimeout
+function flushPassiveEffects() {
+  // First pass: run all cleanups
+  commitPassiveUnmountEffects(root);
+  // Second pass: run all creates
+  commitPassiveMountEffects(root, root.current);
+}</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">Passive Effects Are Two-Pass</div>
+  <p>React runs ALL passive effect cleanups across the entire tree before running ANY passive effect creates. This ensures that a cleanup in component A doesn't interfere with a create in component B. Layout effects, by contrast, run cleanup-then-create per component in tree order.</p>
+</div>
+
+<h2 id="useinsertioneffect">useInsertionEffect: CSS-in-JS</h2>
+
+<pre><code>// useInsertionEffect runs BEFORE DOM mutations
+// Designed specifically for CSS-in-JS libraries to inject styles
+// before the browser calculates layout
+
+function useCSS(rule) {
+  useInsertionEffect(() => {
+    const sheet = getStyleSheet();
+    const index = sheet.insertRule(rule);
+    return () => sheet.deleteRule(index);
+  });
+}
+
+// Why not useLayoutEffect?
+// useLayoutEffect runs AFTER DOM mutations, so there's a flash
+// where the DOM is updated but styles aren't applied yet.
+// useInsertionEffect injects styles before any DOM changes.</code></pre>
+
+<h2 id="effect-unmount">Effect Cleanup on Unmount</h2>
+
+<pre><code>// When a component unmounts, React runs cleanup for ALL effects:
+// 1. Passive effect cleanups (async, batched)
+// 2. Layout effect cleanups (sync, during commit)
+// 3. Insertion effect cleanups (sync, during commit)
+
+// The fiber is marked with Deletion flag, and during commit:
+function commitDeletionEffects(fiber) {
+  // Walk the fiber subtree
+  // For each fiber with effects:
+  //   - Run layout effect cleanups (sync)
+  //   - Schedule passive effect cleanups (async)
+  //   - Detach refs
+}
+
+// Important: on unmount, the create function does NOT run.
+// Only the cleanup from the last execution runs.</code></pre>
+
+<div class="nav-footer">
+  <a href="02-usestate-usereducer.html">← useState &amp; useReducer</a>
+  <a href="04-usememo-usecallback.html">useMemo &amp; useCallback →</a>
+</div>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

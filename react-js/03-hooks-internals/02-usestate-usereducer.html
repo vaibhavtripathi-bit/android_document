@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>useState &amp; useReducer Internals — React Hooks Internals</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Hooks Internals</a>
+  <span class="sep">›</span>
+  useState &amp; useReducer
+</nav>
+
+<h1>useState &amp; useReducer Internals</h1>
+<p class="subtitle">How React implements state hooks via circular linked-list update queues, eager bail-outs, and batched processing.</p>
+
+<nav class="nav">
+  <a href="01-hooks-architecture.html">Hooks Architecture</a>
+  <a href="03-useeffect-lifecycle.html">useEffect Lifecycle</a>
+  <a href="04-usememo-usecallback.html">useMemo &amp; useCallback</a>
+  <a href="05-useref-imperative.html">useRef &amp; Imperative</a>
+  <a href="06-custom-hooks.html">Custom Hooks</a>
+  <a href="07-use-hook-react19.html">use() Hook</a>
+  <a href="08-concurrent-hooks.html">Concurrent Hooks</a>
+  <a href="09-interview-qa.html">Interview Q&amp;A</a>
+</nav>
+
+<h2 id="usestate-is-usereducer">useState Is useReducer Internally</h2>
+
+<p>In React's source code, <code>useState</code> is literally implemented as <code>useReducer</code> with a built-in reducer called <code>basicStateReducer</code>:</p>
+
+<pre><code>// ReactFiberHooks.js — simplified
+function basicStateReducer(state, action) {
+  return typeof action === 'function' ? action(state) : action;
+}
+
+function mountState(initialState) {
+  // Delegates to mountReducer with basicStateReducer
+  const hook = mountWorkInProgressHook();
+  if (typeof initialState === 'function') {
+    initialState = initialState();
+  }
+  hook.memoizedState = hook.baseState = initialState;
+
+  const queue = {
+    pending: null,
+    lanes: NoLanes,
+    dispatch: null,
+    lastRenderedReducer: basicStateReducer,
+    lastRenderedState: initialState,
+  };
+  hook.queue = queue;
+
+  const dispatch = queue.dispatch = dispatchSetState.bind(
+    null, currentlyRenderingFiber, queue
+  );
+  return [hook.memoizedState, dispatch];
+}
+
+function updateState(initialState) {
+  // Literally calls updateReducer
+  return updateReducer(basicStateReducer, initialState);
+}</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p><code>basicStateReducer</code> handles both direct values (<code>setState(5)</code>) and functional updates (<code>setState(prev =&gt; prev + 1)</code>). If the action is a function, it's called with the current state. Otherwise, the action itself becomes the new state. This is why <code>useState</code> and <code>useReducer</code> share identical update queue machinery.</p>
+</div>
+
+<h2 id="update-queue">The Update Queue: Circular Linked List</h2>
+
+<p>When you call <code>setState</code>, React doesn't immediately update state. Instead, it creates an <strong>update object</strong> and appends it to a <strong>circular linked list</strong> on the hook's queue:</p>
+
+<pre><code>type Update&lt;S, A&gt; = {
+  lane: Lane,              // priority lane
+  revertLane: Lane,        // for transitions
+  action: A,               // the value or function passed to setState
+  hasEagerState: boolean,  // was eager computation attempted?
+  eagerState: S | null,    // pre-computed state (if eager)
+  next: Update&lt;S, A&gt;,     // next update (circular)
+};
+
+type UpdateQueue&lt;S, A&gt; = {
+  pending: Update&lt;S, A&gt; | null,  // last update (circular list)
+  lanes: Lanes,
+  dispatch: ((A) =&gt; void) | null,
+  lastRenderedReducer: ((S, A) =&gt; S) | null,
+  lastRenderedState: S | null,
+};</code></pre>
+
+<h3>Why Circular?</h3>
+
+<p>The <code>pending</code> pointer points to the <strong>last</strong> update, and <code>pending.next</code> points to the <strong>first</strong>. This allows O(1) appending without traversing the list:</p>
+
+<div class="diagram">
+Circular Update Queue (pending points to last):
+
+After setState(1):
+  pending → [Update A: action=1] ──┐
+            ▲                       │
+            └───────────────────────┘
+
+After setState(2):
+  pending → [Update B: action=2] → [Update A: action=1] ──┐
+            ▲                                               │
+            └───────────────────────────────────────────────┘
+
+After setState(prev => prev + 1):
+  pending → [Update C: action=fn] → [Update A] → [Update B] ──┐
+            ▲                                                    │
+            └────────────────────────────────────────────────────┘
+
+Processing order: A → B → C (pending.next is first)
+</div>
+
+<pre><code>function dispatchSetState(fiber, queue, action) {
+  const lane = requestUpdateLane(fiber);
+
+  const update = {
+    lane,
+    revertLane: NoLane,
+    action,
+    hasEagerState: false,
+    eagerState: null,
+    next: null,
+  };
+
+  // Append to circular list
+  const pending = queue.pending;
+  if (pending === null) {
+    update.next = update; // circular: points to itself
+  } else {
+    update.next = pending.next; // new.next = first
+    pending.next = update;       // old_last.next = new
+  }
+  queue.pending = update; // pending = new (last)
+
+  // ... eager state check, then schedule re-render
+}</code></pre>
+
+<h2 id="eager-bailout">Eager State Bail-Out</h2>
+
+<p>Before scheduling a re-render, React attempts an <strong>eager state computation</strong>. If the new state is identical to the current state (via <code>Object.is</code>), React can skip the re-render entirely:</p>
+
+<pre><code>function dispatchSetState(fiber, queue, action) {
+  // ... create update, append to queue ...
+
+  const alternate = fiber.alternate;
+  if (
+    fiber.lanes === NoLanes &&
+    (alternate === null || alternate.lanes === NoLanes)
+  ) {
+    // The fiber has no pending work — safe to eagerly compute
+    const lastRenderedReducer = queue.lastRenderedReducer;
+    if (lastRenderedReducer !== null) {
+      const currentState = queue.lastRenderedState;
+      const eagerState = lastRenderedReducer(currentState, action);
+      update.hasEagerState = true;
+      update.eagerState = eagerState;
+
+      if (Object.is(eagerState, currentState)) {
+        // Bail out! Don't schedule a re-render.
+        enqueueConcurrentHookUpdateAndEagerlyBailout(
+          fiber, queue, update
+        );
+        return;
+      }
+    }
+  }
+
+  // State changed — schedule re-render
+  scheduleUpdateOnFiber(root, fiber, lane);
+}</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Bail-Out Conditions</div>
+  <p>Eager bail-out only works when the fiber has <strong>no pending updates</strong> (<code>fiber.lanes === NoLanes</code>). If there are already queued updates, React can't know the final state without processing the entire queue, so it must schedule a re-render. This is why sometimes <code>setState</code> with the same value still causes a render — there were pending updates from a previous <code>setState</code>.</p>
+</div>
+
+<h3>Object.is Comparison — Not Deep Equality</h3>
+
+<pre><code>// Object.is behavior:
+Object.is(1, 1)           // true — bail out
+Object.is('a', 'a')       // true — bail out
+Object.is(NaN, NaN)       // true — bail out (unlike ===)
+Object.is(0, -0)          // false — no bail out (unlike ===)
+
+// Reference types — NEVER bail out with new objects:
+Object.is({a: 1}, {a: 1}) // false — different references
+Object.is([1,2], [1,2])   // false — different references
+
+// Common mistake:
+const [user, setUser] = useState({ name: 'Alice', age: 30 });
+setUser({ ...user, age: 30 }); // WILL re-render (new object ref)
+setUser(user);                  // WON'T re-render (same ref)</code></pre>
+
+<table>
+<thead>
+<tr><th>Comparison</th><th><code>===</code></th><th><code>Object.is</code></th></tr>
+</thead>
+<tbody>
+<tr><td><code>NaN === NaN</code></td><td><code>false</code></td><td><code>true</code></td></tr>
+<tr><td><code>0 === -0</code></td><td><code>true</code></td><td><code>false</code></td></tr>
+<tr><td><code>'a' === 'a'</code></td><td><code>true</code></td><td><code>true</code></td></tr>
+<tr><td><code>{} === {}</code></td><td><code>false</code></td><td><code>false</code></td></tr>
+</tbody>
+</table>
+
+<h2 id="update-processing">Update Queue Processing</h2>
+
+<p>During render, React processes the entire update queue to compute the final state:</p>
+
+<pre><code>function updateReducer(reducer, initialArg, init) {
+  const hook = updateWorkInProgressHook();
+  const queue = hook.queue;
+  queue.lastRenderedReducer = reducer;
+
+  const current = currentHook;
+  let baseQueue = current.baseQueue;
+  const pendingQueue = queue.pending;
+
+  // Merge pending updates into base queue
+  if (pendingQueue !== null) {
+    if (baseQueue !== null) {
+      // Concatenate circular lists
+      const baseFirst = baseQueue.next;
+      const pendingFirst = pendingQueue.next;
+      baseQueue.next = pendingFirst;
+      pendingQueue.next = baseFirst;
+    }
+    current.baseQueue = baseQueue = pendingQueue;
+    queue.pending = null;
+  }
+
+  if (baseQueue !== null) {
+    const first = baseQueue.next;
+    let newState = current.baseState;
+    let newBaseState = null;
+    let newBaseQueueFirst = null;
+    let newBaseQueueLast = null;
+    let update = first;
+
+    do {
+      const updateLane = update.lane;
+      if (!isSubsetOfLanes(renderLanes, updateLane)) {
+        // Insufficient priority — skip and keep in base queue
+        // (for concurrent rendering priority handling)
+        const clone = { /* clone update */ };
+        if (newBaseQueueLast === null) {
+          newBaseQueueFirst = newBaseQueueLast = clone;
+          newBaseState = newState;
+        } else {
+          newBaseQueueLast = newBaseQueueLast.next = clone;
+        }
+      } else {
+        // Process this update
+        if (update.hasEagerState) {
+          newState = update.eagerState; // use pre-computed
+        } else {
+          newState = reducer(newState, update.action);
+        }
+      }
+      update = update.next;
+    } while (update !== null && update !== first);
+
+    if (!Object.is(newState, hook.memoizedState)) {
+      markWorkInProgressReceivedUpdate(); // signal that state changed
+    }
+
+    hook.memoizedState = newState;
+    hook.baseState = newBaseState ?? newState;
+    hook.baseQueue = newBaseQueueLast;
+    queue.lastRenderedState = newState;
+  }
+
+  return [hook.memoizedState, queue.dispatch];
+}</code></pre>
+
+<h2 id="batched-updates">Batched Updates</h2>
+
+<p>Since React 18, all state updates are automatically batched — even inside <code>setTimeout</code>, promises, and native event handlers:</p>
+
+<pre><code>function handleClick() {
+  setCount(c => c + 1);  // queued
+  setFlag(f => !f);       // queued
+  setName('Alice');        // queued
+  // React processes all three in a single re-render
+}
+
+// Pre-React 18: only batched inside React event handlers
+// React 18+: batched everywhere via automatic batching
+
+// To opt OUT of batching (rare):
+import { flushSync } from 'react-dom';
+
+function handleClick() {
+  flushSync(() => {
+    setCount(c => c + 1); // renders immediately
+  });
+  // DOM is updated here
+  flushSync(() => {
+    setFlag(f => !f);     // renders immediately
+  });
+  // DOM is updated here
+}</code></pre>
+
+<div class="diagram">
+Automatic Batching (React 18+):
+
+setState(A) ──┐
+setState(B) ──┤  All queued in same microtask
+setState(C) ──┘
+              │
+              ▼
+        scheduleUpdateOnFiber()
+              │
+              ▼
+        Single re-render processes A → B → C
+              │
+              ▼
+        Single DOM commit
+
+flushSync breaks batching:
+
+flushSync(() => setState(A)) → render → commit → DOM updated
+flushSync(() => setState(B)) → render → commit → DOM updated
+</div>
+
+<h2 id="lazy-init">Lazy Initialization Pattern</h2>
+
+<p>When <code>useState</code> receives a function, it calls it only on mount — not on every render:</p>
+
+<pre><code>// BAD: expensive computation runs every render
+const [data, setData] = useState(parseExpensiveJSON(rawData));
+
+// GOOD: lazy initializer — runs only on mount
+const [data, setData] = useState(() => parseExpensiveJSON(rawData));
+
+// Internal implementation:
+function mountState(initialState) {
+  const hook = mountWorkInProgressHook();
+  if (typeof initialState === 'function') {
+    initialState = initialState(); // called once during mount
+  }
+  hook.memoizedState = hook.baseState = initialState;
+  // ...
+}
+
+// On update, initialState is completely ignored:
+function updateState(initialState) {
+  return updateReducer(basicStateReducer, initialState);
+  // initialState param is never used in updateReducer
+}</code></pre>
+
+<h2 id="functional-updates">Functional Updates: prev =&gt; next</h2>
+
+<p>Functional updates are essential when the next state depends on the previous state, especially with batching:</p>
+
+<pre><code>// Problem: stale state with direct values
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  function incrementThree() {
+    setCount(count + 1); // all three read count=0
+    setCount(count + 1); // from the closure
+    setCount(count + 1); // result: count=1, not 3
+  }
+
+  // Solution: functional updates
+  function incrementThree() {
+    setCount(prev => prev + 1); // 0 → 1
+    setCount(prev => prev + 1); // 1 → 2
+    setCount(prev => prev + 1); // 2 → 3
+  }
+}
+
+// How it works internally (basicStateReducer):
+function basicStateReducer(state, action) {
+  return typeof action === 'function'
+    ? action(state)  // functional update: call with current state
+    : action;         // direct value: replace state
+}
+
+// Queue processing applies each update sequentially:
+// Update 1: basicStateReducer(0, prev => prev + 1) → 1
+// Update 2: basicStateReducer(1, prev => prev + 1) → 2
+// Update 3: basicStateReducer(2, prev => prev + 1) → 3</code></pre>
+
+<h2 id="usereducer-deep">useReducer Deep Dive</h2>
+
+<pre><code>// useReducer provides the same queue machinery with a custom reducer
+function mountReducer(reducer, initialArg, init) {
+  const hook = mountWorkInProgressHook();
+  const initialState = init !== undefined ? init(initialArg) : initialArg;
+  hook.memoizedState = hook.baseState = initialState;
+
+  const queue = {
+    pending: null,
+    lanes: NoLanes,
+    dispatch: null,
+    lastRenderedReducer: reducer,
+    lastRenderedState: initialState,
+  };
+  hook.queue = queue;
+
+  const dispatch = queue.dispatch = dispatchReducerAction.bind(
+    null, currentlyRenderingFiber, queue
+  );
+  return [hook.memoizedState, dispatch];
+}
+
+// Key difference: dispatchReducerAction does NOT attempt eager bail-out
+// because the reducer might have side effects or depend on external state.
+function dispatchReducerAction(fiber, queue, action) {
+  const lane = requestUpdateLane(fiber);
+  const update = {
+    lane,
+    revertLane: NoLane,
+    action,
+    hasEagerState: false,
+    eagerState: null,
+    next: null,
+  };
+  // Always schedules — no eager bail-out
+  enqueueConcurrentHookUpdate(fiber, queue, update, lane);
+  scheduleUpdateOnFiber(root, fiber, lane);
+}</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">useState vs useReducer Bail-Out</div>
+  <p><code>useState</code> (via <code>dispatchSetState</code>) attempts eager bail-out with <code>Object.is</code>. <code>useReducer</code> (via <code>dispatchReducerAction</code>) does <strong>not</strong> attempt eager bail-out — it always schedules a re-render. However, during the render phase, if the reducer produces the same state, React may still bail out of the child subtree via <code>Object.is</code> comparison.</p>
+</div>
+
+<table>
+<thead>
+<tr><th>Feature</th><th>useState</th><th>useReducer</th></tr>
+</thead>
+<tbody>
+<tr><td>Internal reducer</td><td><code>basicStateReducer</code></td><td>User-provided</td></tr>
+<tr><td>Eager bail-out</td><td>Yes (Object.is)</td><td>No</td></tr>
+<tr><td>Dispatch function</td><td><code>dispatchSetState</code></td><td><code>dispatchReducerAction</code></td></tr>
+<tr><td>Lazy init</td><td><code>useState(() =&gt; val)</code></td><td><code>useReducer(r, arg, init)</code></td></tr>
+<tr><td>Update shape</td><td>Value or function</td><td>Action object</td></tr>
+<tr><td>Best for</td><td>Simple, independent state</td><td>Complex state transitions</td></tr>
+</tbody>
+</table>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight — When to Choose useReducer</div>
+  <p>Use <code>useReducer</code> when: (1) next state depends on previous state in complex ways, (2) multiple sub-values are updated together, (3) you want to pass <code>dispatch</code> down instead of multiple callbacks, (4) you want to extract state logic for testing. The dispatch function is stable (like useState's setter), so it won't cause child re-renders when passed as a prop.</p>
+</div>
+
+<div class="nav-footer">
+  <a href="01-hooks-architecture.html">← Hooks Architecture</a>
+  <a href="03-useeffect-lifecycle.html">useEffect Lifecycle →</a>
+</div>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JS Thread Optimization — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Performance Optimization</a><span class="sep">›</span>
+        JS Thread Optimization
+    </nav>
+
+    <h1>JS Thread Optimization</h1>
+    <p class="subtitle">The JavaScript thread is the single most common bottleneck in React Native apps. It runs your React reconciliation, event handlers, state management, and business logic — all competing for a 16ms frame budget. This doc covers Hermes optimizations, computation offloading, and re-render reduction strategies.</p>
+
+    <nav class="nav">
+        <a href="01-performance-model.html">Performance Model</a>
+        <a href="03-rendering-optimization.html">Rendering Optimization</a>
+        <a href="04-memory-optimization.html">Memory Optimization</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#hermes">1. Hermes Engine Optimizations</a></li>
+            <li><a href="#expensive-ops">2. Avoiding Expensive JS Operations</a></li>
+            <li><a href="#interaction-manager">3. InteractionManager</a></li>
+            <li><a href="#memoization">4. useMemo/useCallback in RN Context</a></li>
+            <li><a href="#offloading">5. Heavy Computation Offloading</a></li>
+            <li><a href="#json">6. JSON Parsing Optimization</a></li>
+            <li><a href="#rerenders">7. Reducing Re-renders</a></li>
+            <li><a href="#profiling">8. JS Thread Profiling</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="hermes">1. Hermes Engine Optimizations</h2>
+
+    <div class="diagram">
+Hermes vs JavaScriptCore (JSC)
+══════════════════════════════
+
+                    Hermes              JSC
+                    ──────              ───
+Compilation:        AOT bytecode        JIT compilation
+Startup:            Fast (precompiled)  Slow (parse + compile)
+Peak perf:          Good                Better (JIT optimized)
+Memory:             Lower (~30% less)   Higher
+GC:                 GenGC (generational) Riptide (concurrent)
+Profiling:          Built-in sampling   Limited
+Bundle format:      .hbc (bytecode)     .jsbundle (source)
+Binary size:        Smaller             Larger
+
+Hermes Bytecode Pipeline:
+─────────────────────────
+  .js source → Hermes compiler → .hbc bytecode → Hermes VM
+                (build time)                      (runtime)
+
+  Key insight: Hermes moves compilation cost from runtime
+  to build time. This is why Hermes apps start faster but
+  may have slightly lower peak throughput than JIT engines.
+    </div>
+
+    <pre><code><span class="comment">// Verify Hermes is enabled</span>
+<span class="keyword">const</span> isHermes = () => !!global.HermesInternal;
+console.log(<span class="string">`Engine: ${isHermes() ? 'Hermes' : 'JSC'}`</span>);
+
+<span class="comment">// Hermes-specific optimizations:</span>
+<span class="comment">// 1. Use typed arrays instead of regular arrays for numeric data</span>
+<span class="keyword">const</span> buffer = <span class="keyword">new</span> Float64Array(1000); <span class="comment">// faster than Array(1000)</span>
+
+<span class="comment">// 2. Avoid eval() and new Function() — Hermes doesn't JIT</span>
+<span class="comment">// 3. Prefer for loops over forEach for hot paths</span>
+<span class="comment">// 4. Avoid arguments object — use rest params</span>
+<span class="comment">// 5. Use Map/Set instead of plain objects for dynamic keys</span>
+
+<span class="comment">// Hermes GC tuning (react-native.config.js)</span>
+<span class="comment">// hermesFlags: '--max-heap-size=512' // MB</span></code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Hermes GenGC</div>
+        <p>Hermes uses a generational garbage collector (GenGC) with young and old generations. Young gen collections are fast (~1-3ms) but old gen collections can take 10-50ms and cause frame drops. To minimize GC pressure: (1) reduce object allocation rate, (2) avoid creating short-lived objects in hot loops, (3) reuse objects where possible, (4) use typed arrays for numeric data.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="expensive-ops">2. Avoiding Expensive JS Operations</h2>
+
+    <pre><code><span class="comment">// EXPENSIVE: Creating new objects every render</span>
+<span class="keyword">function</span> <span class="func">BadComponent</span>({ items }) {
+  <span class="keyword">return</span> (
+    &lt;FlatList
+      data={items}
+      style={{ flex: 1 }}           <span class="comment">// new object every render!</span>
+      contentContainerStyle={{       <span class="comment">// new object every render!</span>
+        padding: 16
+      }}
+      renderItem={({ item }) => (   <span class="comment">// new function every render!</span>
+        &lt;ItemRow item={item} /&gt;
+      )}
+      keyExtractor={(item) =>       <span class="comment">// new function every render!</span>
+        item.id.toString()
+      }
+    /&gt;
+  );
+}
+
+<span class="comment">// OPTIMIZED: Stable references</span>
+<span class="keyword">const</span> styles = StyleSheet.create({
+  container: { flex: 1 },
+  content: { padding: 16 },
+});
+
+<span class="keyword">const</span> keyExtractor = (item) => item.id.toString();
+<span class="keyword">const</span> renderItem = ({ item }) => &lt;ItemRow item={item} /&gt;;
+
+<span class="keyword">function</span> <span class="func">GoodComponent</span>({ items }) {
+  <span class="keyword">return</span> (
+    &lt;FlatList
+      data={items}
+      style={styles.container}
+      contentContainerStyle={styles.content}
+      renderItem={renderItem}
+      keyExtractor={keyExtractor}
+    /&gt;
+  );
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="interaction-manager">3. InteractionManager</h2>
+
+    <p><code>InteractionManager</code> lets you defer work until after animations and interactions complete, preventing jank during transitions.</p>
+
+    <pre><code><span class="keyword">import</span> { InteractionManager } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="keyword">function</span> <span class="func">ScreenWithHeavyLoad</span>() {
+  <span class="keyword">const</span> [data, setData] = useState(<span class="keyword">null</span>);
+  <span class="keyword">const</span> [isReady, setIsReady] = useState(<span class="keyword">false</span>);
+
+  useEffect(() => {
+    <span class="comment">// Wait for navigation animation to complete</span>
+    <span class="keyword">const</span> handle = InteractionManager.runAfterInteractions(() => {
+      <span class="comment">// Now safe to do heavy work</span>
+      <span class="keyword">const</span> result = processLargeDataset();
+      setData(result);
+      setIsReady(<span class="keyword">true</span>);
+    });
+
+    <span class="keyword">return</span> () => handle.cancel();
+  }, []);
+
+  <span class="keyword">if</span> (!isReady) {
+    <span class="keyword">return</span> &lt;SkeletonLoader /&gt;;
+  }
+
+  <span class="keyword">return</span> &lt;DataView data={data} /&gt;;
+}
+
+<span class="comment">// Creating custom interaction handles</span>
+<span class="keyword">const</span> handle = InteractionManager.createInteractionHandle();
+<span class="comment">// ... animation running ...</span>
+InteractionManager.clearInteractionHandle(handle);
+<span class="comment">// Deferred work now runs</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="memoization">4. useMemo/useCallback in RN Context</h2>
+
+    <pre><code><span class="comment">// useMemo — cache expensive computations</span>
+<span class="keyword">function</span> <span class="func">FilteredList</span>({ items, filter, sortBy }) {
+  <span class="comment">// Without memo: runs every render (~50ms for 10K items)</span>
+  <span class="comment">// With memo: runs only when items, filter, or sortBy change</span>
+  <span class="keyword">const</span> processedItems = useMemo(() => {
+    <span class="keyword">return</span> items
+      .filter(item => matchesFilter(item, filter))
+      .sort((a, b) => compareBy(a, b, sortBy));
+  }, [items, filter, sortBy]);
+
+  <span class="keyword">return</span> &lt;FlatList data={processedItems} renderItem={renderItem} /&gt;;
+}
+
+<span class="comment">// useCallback — stabilize function references for child memoization</span>
+<span class="keyword">function</span> <span class="func">ParentScreen</span>() {
+  <span class="keyword">const</span> [count, setCount] = useState(0);
+
+  <span class="comment">// Without useCallback: new function ref every render</span>
+  <span class="comment">// → MemoizedChild re-renders even though its props didn't change</span>
+  <span class="keyword">const</span> handlePress = useCallback(() => {
+    setCount(c => c + 1);
+  }, []);
+
+  <span class="keyword">return</span> (
+    &lt;&gt;
+      &lt;Text&gt;{count}&lt;/Text&gt;
+      &lt;MemoizedChild onPress={handlePress} /&gt;
+    &lt;/&gt;
+  );
+}
+
+<span class="keyword">const</span> MemoizedChild = React.memo(({ onPress }) => {
+  console.log(<span class="string">'Child rendered'</span>); <span class="comment">// only when onPress changes</span>
+  <span class="keyword">return</span> &lt;Button onPress={onPress} title=<span class="string">"Press"</span> /&gt;;
+});</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Memoization Overhead</div>
+        <p>Memoization is not free — <code>useMemo</code> and <code>useCallback</code> have overhead for storing the cached value and comparing dependencies. Only memoize when: (1) the computation is expensive (&gt;1ms), (2) the component re-renders frequently with the same inputs, or (3) the result is passed to a memoized child. Memoizing cheap operations (string concatenation, simple math) can actually be slower than recomputing.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="offloading">5. Heavy Computation Offloading</h2>
+
+    <div class="diagram">
+Computation Offloading Strategies
+═════════════════════════════════
+
+Strategy 1: Native Module (recommended for &gt;10ms work)
+───────────────────────────────────────────────────────
+  JS Thread → TurboModule → Native Thread → Result back to JS
+  Pro: Full platform API access, best performance
+  Con: Platform-specific code, build complexity
+
+Strategy 2: Worklets (Reanimated)
+─────────────────────────────────
+  JS Thread → worklet → UI Thread (synchronous)
+  Pro: Access to UI thread, no bridge
+  Con: Limited API, only for UI-related computation
+
+Strategy 3: Web Workers (experimental)
+──────────────────────────────────────
+  JS Thread → Worker Thread → Message back to JS
+  Pro: Pure JS, familiar API
+  Con: Experimental in RN, data serialization overhead
+
+Strategy 4: Chunked Processing
+──────────────────────────────
+  JS Thread → process chunk → yield → process chunk → yield
+  Pro: No native code needed, works everywhere
+  Con: Total time increases, more complex logic
+    </div>
+
+    <pre><code><span class="comment">// Strategy 4: Chunked processing with requestAnimationFrame</span>
+<span class="keyword">async function</span> <span class="func">processInChunks</span>&lt;T&gt;(
+  items: T[],
+  processor: (item: T) => void,
+  chunkSize: number = 50
+): Promise&lt;void&gt; {
+  <span class="keyword">for</span> (<span class="keyword">let</span> i = 0; i &lt; items.length; i += chunkSize) {
+    <span class="keyword">const</span> chunk = items.slice(i, i + chunkSize);
+    chunk.forEach(processor);
+
+    <span class="keyword">if</span> (i + chunkSize &lt; items.length) {
+      <span class="comment">// Yield to allow frame rendering</span>
+      <span class="keyword">await new</span> Promise(resolve =>
+        requestAnimationFrame(resolve)
+      );
+    }
+  }
+}
+
+<span class="comment">// Usage</span>
+<span class="keyword">await</span> processInChunks(largeDataset, (item) => {
+  transformedItems.push(expensiveTransform(item));
+}, 100);</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="json">6. JSON Parsing Optimization</h2>
+
+    <pre><code><span class="comment">// Problem: JSON.parse blocks JS thread</span>
+<span class="comment">// 1MB JSON ≈ 20-50ms parse time on Hermes</span>
+
+<span class="comment">// Solution 1: Parse in native module</span>
+<span class="keyword">const</span> data = <span class="keyword">await</span> NativeModules.FastJSON.parse(jsonString);
+
+<span class="comment">// Solution 2: Streaming parse for large responses</span>
+<span class="keyword">async function</span> <span class="func">fetchLargeData</span>(url: string) {
+  <span class="keyword">const</span> response = <span class="keyword">await</span> fetch(url);
+  <span class="keyword">const</span> reader = response.body?.getReader();
+  <span class="keyword">const</span> decoder = <span class="keyword">new</span> TextDecoder();
+  <span class="keyword">let</span> buffer = <span class="string">''</span>;
+  <span class="keyword">const</span> items = [];
+
+  <span class="keyword">while</span> (<span class="keyword">true</span>) {
+    <span class="keyword">const</span> { done, value } = <span class="keyword">await</span> reader.read();
+    <span class="keyword">if</span> (done) <span class="keyword">break</span>;
+
+    buffer += decoder.decode(value, { stream: <span class="keyword">true</span> });
+    <span class="comment">// Parse complete JSON objects from buffer</span>
+    <span class="keyword">const</span> parsed = extractCompleteObjects(buffer);
+    items.push(...parsed.objects);
+    buffer = parsed.remaining;
+  }
+
+  <span class="keyword">return</span> items;
+}
+
+<span class="comment">// Solution 3: Use binary format instead of JSON</span>
+<span class="comment">// Protocol Buffers or FlatBuffers via C++ TurboModule</span>
+<span class="comment">// 5-10x faster than JSON for structured data</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="rerenders">7. Reducing Re-renders</h2>
+
+    <pre><code><span class="comment">// Anti-pattern: Context causing tree-wide re-renders</span>
+<span class="keyword">const</span> AppContext = createContext({ user: <span class="keyword">null</span>, theme: <span class="string">'light'</span>, cart: [] });
+
+<span class="comment">// Every consumer re-renders when ANY value changes</span>
+<span class="keyword">function</span> <span class="func">Header</span>() {
+  <span class="keyword">const</span> { user } = useContext(AppContext); <span class="comment">// re-renders on cart change!</span>
+  <span class="keyword">return</span> &lt;Text&gt;{user.name}&lt;/Text&gt;;
+}
+
+<span class="comment">// Fix: Split contexts by update frequency</span>
+<span class="keyword">const</span> UserContext = createContext(<span class="keyword">null</span>);
+<span class="keyword">const</span> ThemeContext = createContext(<span class="string">'light'</span>);
+<span class="keyword">const</span> CartContext = createContext([]);
+
+<span class="comment">// Fix: Use selectors with external stores (Zustand, Jotai)</span>
+<span class="keyword">import</span> { useStore } <span class="keyword">from</span> <span class="string">'zustand'</span>;
+
+<span class="keyword">const</span> useUserName = () => useStore(store => store.user.name);
+<span class="comment">// Only re-renders when user.name actually changes</span>
+
+<span class="comment">// Fix: Composition pattern — move state down</span>
+<span class="keyword">function</span> <span class="func">ParentWithCounter</span>() {
+  <span class="keyword">return</span> (
+    &lt;&gt;
+      &lt;ExpensiveTree /&gt;        <span class="comment">{/* doesn't re-render */}</span>
+      &lt;CounterSection /&gt;       <span class="comment">{/* state is local here */}</span>
+    &lt;/&gt;
+  );
+}
+
+<span class="keyword">function</span> <span class="func">CounterSection</span>() {
+  <span class="keyword">const</span> [count, setCount] = useState(0);
+  <span class="keyword">return</span> &lt;Button onPress={() => setCount(c => c + 1)} /&gt;;
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="profiling">8. JS Thread Profiling</h2>
+
+    <pre><code><span class="comment">// Hermes sampling profiler</span>
+<span class="comment">// 1. Start profiling</span>
+<span class="keyword">if</span> (global.HermesInternal) {
+  global.HermesInternal.enableSamplingProfiler();
+}
+
+<span class="comment">// 2. Perform the slow interaction</span>
+
+<span class="comment">// 3. Stop and save profile</span>
+<span class="keyword">if</span> (global.HermesInternal) {
+  global.HermesInternal.disableSamplingProfiler();
+  global.HermesInternal.dumpSampledTraceToFile(<span class="string">'/tmp/trace.cpuprofile'</span>);
+}
+
+<span class="comment">// 4. Open in Chrome DevTools → Performance tab</span>
+<span class="comment">// Or use: npx react-native profile-hermes</span>
+
+<span class="comment">// Custom performance marks</span>
+performance.mark(<span class="string">'filterStart'</span>);
+<span class="keyword">const</span> filtered = items.filter(expensiveFilter);
+performance.mark(<span class="string">'filterEnd'</span>);
+performance.measure(<span class="string">'filterDuration'</span>, <span class="string">'filterStart'</span>, <span class="string">'filterEnd'</span>);
+
+<span class="keyword">const</span> entries = performance.getEntriesByName(<span class="string">'filterDuration'</span>);
+console.log(<span class="string">`Filter took: ${entries[0].duration.toFixed(2)}ms`</span>);</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>JS thread optimization is about <strong>time budgeting</strong>. You have 16ms per frame. React reconciliation takes 2-5ms for a typical screen. That leaves 11-14ms for your code. Every re-render, every event handler, every computation competes for this budget. The Staff-level approach: (1) profile first to find the actual bottleneck, (2) reduce work (fewer re-renders, simpler computations), (3) defer work (InteractionManager, requestIdleCallback), (4) move work off the JS thread (native modules, worklets). Never optimize without measuring — intuition about performance is almost always wrong.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="01-performance-model.html">← Performance Model</a>
+        <a href="03-rendering-optimization.html">Next: Rendering Optimization →</a>
+    </div>
+</div>
+</body>
+</html>

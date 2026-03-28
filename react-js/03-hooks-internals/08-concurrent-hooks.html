@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Concurrent Hooks — React Hooks Internals</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Hooks Internals</a>
+  <span class="sep">›</span>
+  Concurrent Hooks
+</nav>
+
+<h1>Concurrent Hooks</h1>
+<p class="subtitle">useTransition, useDeferredValue, useId, useSyncExternalStore, useInsertionEffect — hooks designed for concurrent rendering and their interaction with the priority/lanes system.</p>
+
+<nav class="nav">
+  <a href="01-hooks-architecture.html">Hooks Architecture</a>
+  <a href="02-usestate-usereducer.html">useState &amp; useReducer</a>
+  <a href="03-useeffect-lifecycle.html">useEffect Lifecycle</a>
+  <a href="04-usememo-usecallback.html">useMemo &amp; useCallback</a>
+  <a href="05-useref-imperative.html">useRef &amp; Imperative</a>
+  <a href="06-custom-hooks.html">Custom Hooks</a>
+  <a href="07-use-hook-react19.html">use() Hook</a>
+  <a href="09-interview-qa.html">Interview Q&amp;A</a>
+</nav>
+
+<h2 id="usetransition">useTransition</h2>
+
+<p><code>useTransition</code> marks a state update as a <strong>transition</strong> — a low-priority update that can be interrupted by urgent updates (user input). It returns <code>[isPending, startTransition]</code>.</p>
+
+<pre><code>function SearchPage() {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+  const [isPending, startTransition] = useTransition();
+
+  function handleChange(e) {
+    const value = e.target.value;
+    setQuery(value);              // urgent: update input immediately
+
+    startTransition(() => {
+      setResults(search(value));  // transition: can be interrupted
+    });
+  }
+
+  return (
+    &lt;div&gt;
+      &lt;input value={query} onChange={handleChange} /&gt;
+      {isPending &amp;&amp; &lt;Spinner /&gt;}
+      &lt;ResultsList results={results} /&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<h3>Internal Mechanism</h3>
+
+<pre><code>// Simplified useTransition implementation:
+function mountTransition() {
+  const [isPending, setPending] = mountState(false);
+  const start = startTransition.bind(null, setPending);
+  const hook = mountWorkInProgressHook();
+  hook.memoizedState = start;
+  return [isPending, start];
+}
+
+function startTransition(setPending, callback) {
+  setPending(true); // urgent update: show pending state
+
+  const prevTransition = ReactCurrentBatchConfig.transition;
+  ReactCurrentBatchConfig.transition = {};
+
+  try {
+    setPending(false); // transition update: will be deferred
+    callback();        // state updates inside get transition lane
+  } finally {
+    ReactCurrentBatchConfig.transition = prevTransition;
+  }
+}
+
+// When ReactCurrentBatchConfig.transition is set,
+// requestUpdateLane() returns TransitionLane instead of SyncLane.
+// This means updates inside startTransition get lower priority.</code></pre>
+
+<div class="diagram">
+useTransition Priority Flow:
+
+User types "abc" rapidly:
+
+  Input: "a" ─── SyncLane (urgent) ──────────── renders immediately
+  Search: "a" ── TransitionLane (deferred) ──── starts rendering...
+  │
+  Input: "ab" ── SyncLane (urgent) ──────────── interrupts transition!
+  Search: "ab" ─ TransitionLane (deferred) ──── starts rendering...
+  │
+  Input: "abc" ─ SyncLane (urgent) ──────────── interrupts transition!
+  Search: "abc"─ TransitionLane (deferred) ──── renders to completion ✓
+
+  Result: input always responsive, search renders when idle
+</div>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight — Lanes and Priority</div>
+  <p>React's lane system assigns bit-flags to updates: <code>SyncLane</code> (0b0001) for urgent, <code>TransitionLane</code> (0b0001000000...) for transitions. During work loop, React checks if higher-priority lanes have pending work. If so, it abandons the current transition render and starts the urgent one. The abandoned work is discarded (no wasted DOM mutations).</p>
+</div>
+
+<h2 id="usedeferredvalue">useDeferredValue</h2>
+
+<p><code>useDeferredValue</code> returns a deferred copy of a value. During urgent updates, it returns the <em>previous</em> value, then re-renders with the new value at transition priority.</p>
+
+<pre><code>function SearchResults({ query }) {
+  const deferredQuery = useDeferredValue(query);
+  const isStale = query !== deferredQuery;
+
+  return (
+    &lt;div style={{ opacity: isStale ? 0.5 : 1 }}&gt;
+      &lt;ExpensiveList query={deferredQuery} /&gt;
+    &lt;/div&gt;
+  );
+}
+
+// Internal implementation (simplified):
+function mountDeferredValue(value) {
+  const hook = mountWorkInProgressHook();
+  hook.memoizedState = value;
+  return value;
+}
+
+function updateDeferredValue(value) {
+  const hook = updateWorkInProgressHook();
+  const prevValue = hook.memoizedState;
+
+  if (Object.is(value, prevValue)) {
+    return value; // no change
+  }
+
+  // Check if this is an urgent render
+  if (isCurrentTreeHiddenOrDetached()) {
+    hook.memoizedState = value;
+    return value;
+  }
+
+  // Return old value for this render, schedule transition for new value
+  const shouldDeferValue = !includesOnlyNonUrgentLanes(renderLanes);
+  if (shouldDeferValue) {
+    // Keep old value, schedule re-render at transition priority
+    markWorkInProgressReceivedUpdate();
+    return prevValue;
+  } else {
+    hook.memoizedState = value;
+    return value;
+  }
+}</code></pre>
+
+<h3>useTransition vs useDeferredValue</h3>
+
+<table>
+<thead>
+<tr><th>Aspect</th><th>useTransition</th><th>useDeferredValue</th></tr>
+</thead>
+<tbody>
+<tr><td>Controls</td><td>The state update itself</td><td>A value derived from state</td></tr>
+<tr><td>Use when</td><td>You own the state update</td><td>You receive a value as prop</td></tr>
+<tr><td>Returns</td><td><code>[isPending, startTransition]</code></td><td>Deferred value</td></tr>
+<tr><td>Wraps</td><td>setState calls</td><td>A value (any type)</td></tr>
+<tr><td>Pending indicator</td><td>Built-in <code>isPending</code></td><td>Compare <code>value !== deferredValue</code></td></tr>
+</tbody>
+</table>
+
+<h2 id="useid">useId</h2>
+
+<p><code>useId</code> generates a unique ID that is stable across server and client rendering. It solves the hydration mismatch problem with auto-generated IDs.</p>
+
+<pre><code>function FormField({ label }) {
+  const id = useId();
+  return (
+    &lt;div&gt;
+      &lt;label htmlFor={id}&gt;{label}&lt;/label&gt;
+      &lt;input id={id} /&gt;
+    &lt;/div&gt;
+  );
+}
+
+// Multiple IDs from one hook:
+function PasswordField() {
+  const id = useId();
+  return (
+    &lt;div&gt;
+      &lt;label htmlFor={`${id}-password`}&gt;Password&lt;/label&gt;
+      &lt;input id={`${id}-password`} type="password" /&gt;
+      &lt;p id={`${id}-hint`}&gt;Must be 8+ characters&lt;/p&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<h3>How useId Generates Stable IDs</h3>
+
+<pre><code>// useId generates IDs based on the component's position in the tree.
+// The algorithm uses the fiber tree path to create deterministic IDs:
+
+// Internal (simplified):
+function mountId() {
+  const hook = mountWorkInProgressHook();
+
+  const root = getWorkInProgressRoot();
+  let id = ':' + root.identifierPrefix;
+
+  // Build ID from tree path (position of this fiber in the tree)
+  const treeId = getTreeId();
+  id += 'r' + treeId + ':';
+
+  hook.memoizedState = id;
+  return id;
+}
+
+// The tree ID encodes the path through the fiber tree:
+// - Each level contributes bits based on sibling index
+// - This makes the ID deterministic regardless of render order
+// - Server and client traverse the tree in the same order
+//   → same IDs generated on both sides
+
+// Example IDs: ":r0:", ":r1:", ":r2:", ":r1a:", ":r1b:"</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Don't Use useId for List Keys</div>
+  <p><code>useId</code> generates IDs based on tree position, not data identity. Using it for list keys would produce unstable keys when items are reordered. Use data-derived keys (<code>item.id</code>) for lists.</p>
+</div>
+
+<h2 id="usesyncexternalstore">useSyncExternalStore</h2>
+
+<p><code>useSyncExternalStore</code> safely reads from external stores (Redux, Zustand, browser APIs) without <strong>tearing</strong> — a bug where different parts of the UI show inconsistent state during concurrent rendering.</p>
+
+<pre><code>// Signature:
+const snapshot = useSyncExternalStore(
+  subscribe,    // function to subscribe to store changes
+  getSnapshot,  // function to read current value
+  getServerSnapshot // optional: for SSR
+);
+
+// Example: subscribing to browser online status
+function useOnlineStatus() {
+  return useSyncExternalStore(
+    (callback) => {
+      window.addEventListener('online', callback);
+      window.addEventListener('offline', callback);
+      return () => {
+        window.removeEventListener('online', callback);
+        window.removeEventListener('offline', callback);
+      };
+    },
+    () => navigator.onLine,       // client snapshot
+    () => true                     // server snapshot (assume online)
+  );
+}
+
+// Example: subscribing to a Redux-like store
+function useStoreSelector(store, selector) {
+  return useSyncExternalStore(
+    store.subscribe,
+    () => selector(store.getState()),
+    () => selector(store.getInitialState())
+  );
+}</code></pre>
+
+<h3>The Tearing Problem</h3>
+
+<div class="diagram">
+Tearing in Concurrent Rendering (without useSyncExternalStore):
+
+External Store: value = "A"
+
+React starts rendering tree:
+  Component1 reads store → "A"
+  Component2 reads store → "A"
+  │
+  ├── React yields to browser (concurrent mode)
+  │   └── Store updates: value = "B"
+  │
+  Component3 reads store → "B"  ← TEARING! Inconsistent with 1 and 2
+  Component4 reads store → "B"
+
+With useSyncExternalStore:
+  React takes a SNAPSHOT before rendering
+  All components read from the same snapshot
+  If store updates mid-render, React re-renders from scratch
+</div>
+
+<pre><code>// Internal implementation (simplified):
+function mountSyncExternalStore(subscribe, getSnapshot, getServerSnapshot) {
+  const fiber = currentlyRenderingFiber;
+  const hook = mountWorkInProgressHook();
+
+  const nextSnapshot = getSnapshot();
+  hook.memoizedState = nextSnapshot;
+
+  const inst = { hasValue: true, value: nextSnapshot };
+  hook.queue = inst;
+
+  // Subscribe via effect
+  mountEffect(
+    subscribeToStore.bind(null, fiber, inst, subscribe),
+    [subscribe]
+  );
+
+  // Check for changes via layout effect (synchronous)
+  mountLayoutEffect(
+    updateStoreInstance.bind(null, fiber, inst, getSnapshot),
+    [getSnapshot]
+  );
+
+  return nextSnapshot;
+}
+
+// The key: it uses a LAYOUT effect to synchronously check
+// if the store changed during render. If it did, it forces
+// a synchronous re-render to prevent tearing.</code></pre>
+
+<h2 id="useinsertioneffect">useInsertionEffect</h2>
+
+<pre><code>// useInsertionEffect fires BEFORE DOM mutations.
+// Designed for CSS-in-JS libraries (styled-components, emotion).
+
+function useCSS(rule) {
+  useInsertionEffect(() => {
+    if (!isInserted(rule)) {
+      const sheet = getGlobalStyleSheet();
+      sheet.insertRule(rule);
+    }
+  }, [rule]);
+}
+
+// Timing comparison:
+// 1. useInsertionEffect → fires (inject styles)
+// 2. DOM mutations       → React updates DOM
+// 3. useLayoutEffect     → fires (read DOM measurements)
+// 4. Browser paint       → screen updates
+// 5. useEffect           → fires (side effects)
+
+// Restrictions:
+// - Cannot access refs (DOM not yet mutated)
+// - Cannot schedule state updates
+// - Intended ONLY for CSS-in-JS style injection</code></pre>
+
+<h2 id="priority-lanes">How Concurrent Hooks Interact with Lanes</h2>
+
+<pre><code>// React's lane system (simplified):
+const SyncLane           = 0b0000000000000000000000000000001;
+const InputContinuousLane = 0b0000000000000000000000000000100;
+const DefaultLane        = 0b0000000000000000000000000010000;
+const TransitionLane1    = 0b0000000000000000000001000000000;
+const TransitionLane2    = 0b0000000000000000000010000000000;
+// ... more transition lanes
+
+// How hooks map to lanes:
+// useState/useReducer:  SyncLane (urgent by default)
+// startTransition:      TransitionLane (deferred)
+// useDeferredValue:     creates TransitionLane re-render
+// useSyncExternalStore: SyncLane (forces synchronous)
+
+// The work loop processes lanes by priority:
+function performConcurrentWorkOnRoot(root) {
+  const lanes = getNextLanes(root);
+
+  if (includesSyncLane(lanes)) {
+    // Synchronous: cannot be interrupted
+    renderRootSync(root, lanes);
+  } else {
+    // Concurrent: can be interrupted by higher-priority work
+    renderRootConcurrent(root, lanes);
+  }
+}
+
+// shouldYield() checks if higher-priority work is pending:
+function workLoopConcurrent() {
+  while (workInProgress !== null && !shouldYield()) {
+    performUnitOfWork(workInProgress);
+  }
+  // If shouldYield() returns true, we pause and check for urgent work
+}</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight — Choosing the Right Concurrent Hook</div>
+  <p><strong>useTransition</strong>: You control the state update and want to mark it as non-urgent. <strong>useDeferredValue</strong>: You receive a value (prop) and want to defer expensive re-renders. <strong>useSyncExternalStore</strong>: You subscribe to a store outside React's state management. <strong>useId</strong>: You need SSR-safe unique IDs. <strong>useInsertionEffect</strong>: You're building a CSS-in-JS library (not for app code).</p>
+</div>
+
+<h2 id="patterns">Concurrent Patterns</h2>
+
+<pre><code>// Pattern: Transition + Suspense
+function TabContainer() {
+  const [tab, setTab] = useState('home');
+  const [isPending, startTransition] = useTransition();
+
+  function selectTab(nextTab) {
+    startTransition(() => {
+      setTab(nextTab); // if new tab suspends, show old tab with isPending
+    });
+  }
+
+  return (
+    &lt;div&gt;
+      &lt;TabBar
+        selectedTab={tab}
+        onSelect={selectTab}
+        isPending={isPending}
+      /&gt;
+      &lt;Suspense fallback={&lt;Spinner /&gt;}&gt;
+        &lt;TabContent tab={tab} /&gt;
+      &lt;/Suspense&gt;
+    &lt;/div&gt;
+  );
+}
+
+// Pattern: Deferred value for expensive rendering
+function TypeaheadSearch() {
+  const [text, setText] = useState('');
+  const deferredText = useDeferredValue(text);
+
+  return (
+    &lt;div&gt;
+      &lt;input value={text} onChange={e =&gt; setText(e.target.value)} /&gt;
+      &lt;Suspense fallback={&lt;Spinner /&gt;}&gt;
+        &lt;SearchResults query={deferredText} /&gt;
+      &lt;/Suspense&gt;
+    &lt;/div&gt;
+  );
+}
+
+// Pattern: External store with selector
+function useSelector(selector) {
+  const store = useContext(StoreContext);
+  return useSyncExternalStore(
+    store.subscribe,
+    () => selector(store.getState()),
+    () => selector(store.getInitialState())
+  );
+}
+
+function CartCount() {
+  const count = useSelector(state => state.cart.items.length);
+  return &lt;span&gt;{count}&lt;/span&gt;;
+}</code></pre>
+
+<div class="nav-footer">
+  <a href="07-use-hook-react19.html">← use() Hook (React 19)</a>
+  <a href="09-interview-qa.html">Interview Q&amp;A →</a>
+</div>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

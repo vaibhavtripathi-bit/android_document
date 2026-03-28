@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TurboModule Creation — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Native Modules</a><span class="sep">›</span>
+        TurboModule Creation
+    </nav>
+
+    <h1>TurboModule Creation</h1>
+    <p class="subtitle">TurboModules replace the legacy bridge-based NativeModules with direct JSI (JavaScript Interface) calls. They eliminate JSON serialization overhead, enable synchronous method invocation, support lazy initialization, and provide type-safe codegen from TypeScript/Flow specs.</p>
+
+    <nav class="nav">
+        <a href="01-native-module-basics.html">Native Module Basics</a>
+        <a href="03-native-ui-components.html">Native UI Components</a>
+        <a href="04-platform-apis.html">Platform APIs</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#architecture">1. TurboModule Architecture</a></li>
+            <li><a href="#spec-files">2. Spec Files (TypeScript/Flow)</a></li>
+            <li><a href="#codegen">3. Codegen Pipeline</a></li>
+            <li><a href="#ios-impl">4. iOS Implementation (ObjC++)</a></li>
+            <li><a href="#android-impl">5. Android Implementation (Java/Kotlin)</a></li>
+            <li><a href="#type-mapping">6. Type Mapping</a></li>
+            <li><a href="#sync-methods">7. Synchronous Methods</a></li>
+            <li><a href="#registration">8. Module Registration</a></li>
+            <li><a href="#lazy-init">9. Lazy Initialization</a></li>
+            <li><a href="#testing">10. Testing TurboModules</a></li>
+            <li><a href="#migration">11. Migration from NativeModules</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="architecture">1. TurboModule Architecture</h2>
+
+    <div class="diagram">
+Legacy NativeModules                    TurboModules (New Architecture)
+═══════════════════                    ════════════════════════════════
+
+JS ──► Bridge ──► Native               JS ──► JSI ──► C++ ──► Native
+       (JSON)                                 (direct call)
+
+┌──────────┐  serialize  ┌──────────┐  ┌──────────┐  JSI    ┌──────────┐
+│ JS Call   │───────────►│ Bridge   │  │ JS Call   │────────►│ C++ Host │
+│           │            │ Queue    │  │           │  (0     │ Object   │
+│ async     │  ≈1-5ms    │          │  │ sync or   │  copy)  │          │
+│ only      │  per call  │ JSON     │  │ async     │         │ ObjC++/  │
+│           │◄───────────│ deser.   │  │           │◄────────│ JNI      │
+└──────────┘  deserialize└──────────┘  └──────────┘         └──────────┘
+
+Overhead: ~1-5ms per call               Overhead: ~0.01ms per call
+Batched every 5ms                       Immediate invocation
+All modules loaded at startup           Lazy loaded on first access
+No type safety                          Codegen from TypeScript specs
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>TurboModules are backed by JSI <code>HostObject</code> instances. When JS accesses <code>global.__turboModuleProxy</code>, it triggers a C++ <code>get()</code> call that lazily instantiates the native module. Method calls go directly through C++ virtual dispatch — no serialization, no queuing, no batching. This is why TurboModules can support synchronous return values, which was impossible with the bridge.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="spec-files">2. Spec Files (TypeScript/Flow)</h2>
+
+    <p>Every TurboModule starts with a <strong>spec file</strong> — a TypeScript or Flow interface that defines the module's API contract. The codegen reads this spec to generate platform-specific boilerplate.</p>
+
+    <pre><code><span class="comment">// specs/NativeCalculator.ts</span>
+<span class="keyword">import type</span> { TurboModule } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+<span class="keyword">import</span> { TurboModuleRegistry } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="keyword">export interface</span> <span class="type">Spec</span> <span class="keyword">extends</span> TurboModule {
+  <span class="comment">// Synchronous method — returns value directly</span>
+  <span class="func">add</span>(a: number, b: number): number;
+
+  <span class="comment">// Asynchronous method — returns Promise</span>
+  <span class="func">computeAsync</span>(expression: string): Promise&lt;number&gt;;
+
+  <span class="comment">// Method with complex types</span>
+  <span class="func">processData</span>(input: {
+    values: number[];
+    operation: string;
+    precision?: number;
+  }): Promise&lt;{
+    result: number;
+    metadata: string;
+  }&gt;;
+
+  <span class="comment">// Constants</span>
+  <span class="func">getConstants</span>(): {
+    PI: number;
+    E: number;
+    MAX_PRECISION: number;
+  };
+
+  <span class="comment">// Callback-based method</span>
+  <span class="func">subscribe</span>(eventName: string, callback: (data: string) =&gt; void): void;
+}
+
+<span class="keyword">export default</span> TurboModuleRegistry.getEnforcing&lt;Spec&gt;(
+  <span class="string">'NativeCalculator'</span>
+);</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Spec File Naming Convention</div>
+        <p>The file must be named <code>Native&lt;ModuleName&gt;.ts</code> (or <code>.js</code> for Flow). The <code>Native</code> prefix is required by codegen. The module name passed to <code>TurboModuleRegistry.getEnforcing()</code> must match exactly. Using <code>getEnforcing</code> throws if the module isn't found; use <code>get()</code> for optional modules that return <code>null</code>.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="codegen">3. Codegen Pipeline</h2>
+
+    <div class="diagram">
+Codegen Pipeline
+════════════════
+
+  NativeCalculator.ts          react-native-codegen
+  (TypeScript Spec)     ──────────────────────────────►
+                               │
+                               ▼
+              ┌────────────────────────────────┐
+              │     Generated C++ Headers      │
+              │  NativeCalculatorSpecJSI.h      │
+              │  NativeCalculatorSpecJSI.cpp    │
+              └────────────┬───────────────────┘
+                           │
+              ┌────────────┴───────────────────┐
+              │                                │
+              ▼                                ▼
+  ┌──────────────────────┐    ┌──────────────────────────┐
+  │  iOS Generated       │    │  Android Generated        │
+  │  ObjC++ Protocol     │    │  Java Abstract Class      │
+  │  RCTNativeCalculator │    │  NativeCalculatorSpec     │
+  │  SpecJSI.h           │    │  .java                    │
+  └──────────────────────┘    └──────────────────────────┘
+              │                                │
+              ▼                                ▼
+  ┌──────────────────────┐    ┌──────────────────────────┐
+  │  Your Implementation │    │  Your Implementation      │
+  │  NativeCalculator.mm │    │  NativeCalculatorModule   │
+  │  (ObjC++)            │    │  .java/.kt                │
+  └──────────────────────┘    └──────────────────────────┘
+    </div>
+
+    <pre><code><span class="comment">// package.json — codegen configuration</span>
+{
+  <span class="string">"name"</span>: <span class="string">"my-turbo-module"</span>,
+  <span class="string">"codegenConfig"</span>: {
+    <span class="string">"name"</span>: <span class="string">"NativeCalculatorSpec"</span>,
+    <span class="string">"type"</span>: <span class="string">"modules"</span>,
+    <span class="string">"jsSrcsDir"</span>: <span class="string">"./specs"</span>,
+    <span class="string">"android"</span>: {
+      <span class="string">"javaPackageName"</span>: <span class="string">"com.myapp.calculator"</span>
+    }
+  }
+}
+
+<span class="comment">// Run codegen manually (usually runs during build)</span>
+<span class="comment">// npx react-native codegen --path ./specs</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="ios-impl">4. iOS Implementation (ObjC++)</h2>
+
+    <pre><code><span class="comment">// NativeCalculator.h</span>
+<span class="keyword">#import</span> <span class="string">&lt;NativeCalculatorSpecJSI.h&gt;</span>
+
+<span class="keyword">@interface</span> NativeCalculator : NSObject &lt;NativeCalculatorSpec&gt;
+<span class="keyword">@end</span>
+
+<span class="comment">// NativeCalculator.mm (ObjC++ — note the .mm extension)</span>
+<span class="keyword">#import</span> <span class="string">"NativeCalculator.h"</span>
+<span class="keyword">#import</span> <span class="string">&lt;React/RCTLog.h&gt;</span>
+
+<span class="keyword">@implementation</span> NativeCalculator
+
+RCT_EXPORT_MODULE()
+
+<span class="comment">// Synchronous — called directly from JS thread via JSI</span>
+- (NSNumber *)add:(double)a b:(double)b {
+  <span class="keyword">return</span> @(a + b);
+}
+
+<span class="comment">// Asynchronous — returns via promise</span>
+- (<span class="keyword">void</span>)computeAsync:(NSString *)expression
+               resolve:(RCTPromiseResolveBlock)resolve
+                reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    <span class="keyword">@try</span> {
+      NSExpression *expr = [NSExpression expressionWithFormat:expression];
+      NSNumber *result = [expr expressionValueWithObject:nil context:nil];
+      resolve(result);
+    } <span class="keyword">@catch</span> (NSException *e) {
+      reject(<span class="string">@"E_EVAL"</span>, e.reason, nil);
+    }
+  });
+}
+
+<span class="comment">// Complex types — codegen generates proper ObjC++ types</span>
+- (<span class="keyword">void</span>)processData:(JS::NativeCalculator::ProcessDataInput &)input
+             resolve:(RCTPromiseResolveBlock)resolve
+              reject:(RCTPromiseRejectBlock)reject {
+  NSArray *values = input.values();
+  NSString *operation = input.operation();
+  std::optional&lt;double&gt; precision = input.precision();
+  <span class="comment">// ... process and resolve</span>
+}
+
+- (facebook::react::ModuleConstants&lt;
+    JS::NativeCalculator::Constants::Builder&gt;)getConstants {
+  <span class="keyword">return</span> facebook::react::typedConstants&lt;
+    JS::NativeCalculator::Constants::Builder&gt;({
+    .PI = M_PI,
+    .E = M_E,
+    .MAX_PRECISION = 15
+  });
+}
+
+- (std::shared_ptr&lt;facebook::react::TurboModule&gt;)
+    getTurboModule:(const facebook::react::ObjCTurboModule::InitParams &)params {
+  <span class="keyword">return</span> std::make_shared&lt;
+    facebook::react::NativeCalculatorSpecJSI&gt;(params);
+}
+
+<span class="keyword">@end</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="android-impl">5. Android Implementation (Java/Kotlin)</h2>
+
+    <pre><code><span class="comment">// NativeCalculatorModule.kt</span>
+<span class="keyword">package</span> com.myapp.calculator
+
+<span class="keyword">import</span> com.facebook.react.bridge.*
+<span class="keyword">import</span> com.myapp.calculator.NativeCalculatorSpec
+
+<span class="keyword">class</span> <span class="type">NativeCalculatorModule</span>(
+  reactContext: ReactApplicationContext
+) : NativeCalculatorSpec(reactContext) {
+
+  <span class="keyword">override fun</span> getName(): String = <span class="string">"NativeCalculator"</span>
+
+  <span class="comment">// Synchronous — runs on JS thread via JNI</span>
+  <span class="keyword">override fun</span> add(a: Double, b: Double): Double = a + b
+
+  <span class="comment">// Asynchronous — runs on native modules thread</span>
+  <span class="keyword">override fun</span> computeAsync(expression: String, promise: Promise) {
+    <span class="keyword">try</span> {
+      <span class="keyword">val</span> result = evaluateExpression(expression)
+      promise.resolve(result)
+    } <span class="keyword">catch</span> (e: Exception) {
+      promise.reject(<span class="string">"E_EVAL"</span>, e.message, e)
+    }
+  }
+
+  <span class="comment">// Complex types — codegen generates ReadableMap/WritableMap handling</span>
+  <span class="keyword">override fun</span> processData(input: ReadableMap, promise: Promise) {
+    <span class="keyword">val</span> values = input.getArray(<span class="string">"values"</span>)
+    <span class="keyword">val</span> operation = input.getString(<span class="string">"operation"</span>)
+    <span class="keyword">val</span> precision = <span class="keyword">if</span> (input.hasKey(<span class="string">"precision"</span>))
+      input.getDouble(<span class="string">"precision"</span>).toInt() <span class="keyword">else</span> 10
+
+    <span class="keyword">val</span> result = Arguments.createMap().apply {
+      putDouble(<span class="string">"result"</span>, computedResult)
+      putString(<span class="string">"metadata"</span>, <span class="string">"computed"</span>)
+    }
+    promise.resolve(result)
+  }
+
+  <span class="keyword">override fun</span> getTypedExportedConstants(): Map&lt;String, Any&gt; = mapOf(
+    <span class="string">"PI"</span> to Math.PI,
+    <span class="string">"E"</span> to Math.E,
+    <span class="string">"MAX_PRECISION"</span> to 15
+  )
+}
+
+<span class="comment">// NativeCalculatorPackage.kt — registration</span>
+<span class="keyword">class</span> <span class="type">NativeCalculatorPackage</span> : TurboReactPackage() {
+  <span class="keyword">override fun</span> getModule(
+    name: String,
+    reactContext: ReactApplicationContext
+  ): NativeModule? {
+    <span class="keyword">return when</span> (name) {
+      NativeCalculatorModule.NAME -> NativeCalculatorModule(reactContext)
+      <span class="keyword">else</span> -> <span class="keyword">null</span>
+    }
+  }
+
+  <span class="keyword">override fun</span> getReactModuleInfoProvider() =
+    ReactModuleInfoProvider {
+      mapOf(
+        NativeCalculatorModule.NAME to ReactModuleInfo(
+          NativeCalculatorModule.NAME,
+          NativeCalculatorModule::class.java.name,
+          <span class="keyword">false</span>, <span class="comment">// canOverrideExistingModule</span>
+          <span class="keyword">false</span>, <span class="comment">// needsEagerInit</span>
+          <span class="keyword">true</span>,  <span class="comment">// hasConstants</span>
+          <span class="keyword">false</span>, <span class="comment">// isCxxModule</span>
+          <span class="keyword">true</span>   <span class="comment">// isTurboModule</span>
+        )
+      )
+    }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="type-mapping">6. Type Mapping</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>TypeScript Spec Type</th>
+                <th>iOS (ObjC++)</th>
+                <th>Android (Java/Kotlin)</th>
+                <th>C++ (JSI)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td><code>number</code></td><td><code>double</code></td><td><code>double</code></td><td><code>double</code></td></tr>
+            <tr><td><code>string</code></td><td><code>NSString *</code></td><td><code>String</code></td><td><code>jsi::String</code></td></tr>
+            <tr><td><code>boolean</code></td><td><code>BOOL</code></td><td><code>boolean</code></td><td><code>bool</code></td></tr>
+            <tr><td><code>number[]</code></td><td><code>NSArray&lt;NSNumber *&gt;</code></td><td><code>ReadableArray</code></td><td><code>jsi::Array</code></td></tr>
+            <tr><td><code>Object</code></td><td><code>NSDictionary</code></td><td><code>ReadableMap</code></td><td><code>jsi::Object</code></td></tr>
+            <tr><td><code>?T</code> (optional)</td><td><code>std::optional&lt;T&gt;</code></td><td><code>@Nullable T</code></td><td><code>std::optional&lt;T&gt;</code></td></tr>
+            <tr><td><code>Promise&lt;T&gt;</code></td><td>resolve/reject blocks</td><td><code>Promise</code></td><td><code>jsi::Function</code></td></tr>
+            <tr><td><code>() =&gt; void</code></td><td><code>RCTResponseSenderBlock</code></td><td><code>Callback</code></td><td><code>jsi::Function</code></td></tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="sync-methods">7. Synchronous Methods</h2>
+
+    <p>TurboModules can return values synchronously because JSI calls are direct C++ function invocations — no bridge, no serialization, no async dispatch.</p>
+
+    <pre><code><span class="comment">// Spec — synchronous method (no Promise return type)</span>
+<span class="keyword">export interface</span> <span class="type">Spec</span> <span class="keyword">extends</span> TurboModule {
+  <span class="func">getDeviceId</span>(): string;           <span class="comment">// sync — returns immediately</span>
+  <span class="func">isFeatureEnabled</span>(key: string): boolean;  <span class="comment">// sync</span>
+  <span class="func">fetchData</span>(): Promise&lt;string&gt;;    <span class="comment">// async — returns Promise</span>
+}
+
+<span class="comment">// JS usage — sync methods return directly, no await needed</span>
+<span class="keyword">const</span> deviceId = NativeCalculator.getDeviceId();  <span class="comment">// string, not Promise</span>
+<span class="keyword">const</span> enabled = NativeCalculator.isFeatureEnabled(<span class="string">'dark_mode'</span>);
+
+<span class="comment">// Async methods still need await</span>
+<span class="keyword">const</span> data = <span class="keyword">await</span> NativeCalculator.fetchData();</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Sync Method Performance</div>
+        <p>Synchronous TurboModule methods execute on the JS thread. The call overhead is ~10μs (vs ~1-5ms for bridge calls). However, the method body still runs on the JS thread, so expensive computation will block JavaScript. Use sync methods for: reading cached values, simple computations, and state checks. Use async methods for: I/O, heavy computation, and anything that might take &gt;1ms.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="registration">8. Module Registration</h2>
+
+    <pre><code><span class="comment">// iOS — AppDelegate.mm (New Architecture)</span>
+- (std::shared_ptr&lt;TurboModule&gt;)getTurboModule:(const std::string &)name
+                                      jsInvoker:(std::shared_ptr&lt;CallInvoker&gt;)jsInvoker {
+  <span class="keyword">if</span> (name == <span class="string">"NativeCalculator"</span>) {
+    <span class="keyword">return</span> std::make_shared&lt;NativeCalculatorSpecJSI&gt;(
+      [NativeCalculator new], jsInvoker
+    );
+  }
+  <span class="keyword">return</span> <span class="keyword">nullptr</span>;
+}
+
+<span class="comment">// Android — MainApplication.kt</span>
+<span class="keyword">override fun</span> getPackages(): List&lt;ReactPackage&gt; {
+  <span class="keyword">val</span> packages = PackageList(<span class="keyword">this</span>).packages.toMutableList()
+  packages.add(NativeCalculatorPackage())
+  <span class="keyword">return</span> packages
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="lazy-init">9. Lazy Initialization</h2>
+
+    <p>Unlike legacy NativeModules (all loaded at startup), TurboModules are instantiated on first access via <code>__turboModuleProxy</code>.</p>
+
+    <div class="diagram">
+Lazy Initialization Flow
+═════════════════════════
+
+App Start
+  │
+  ├── Legacy: ALL NativeModules instantiated ──► Slow startup
+  │
+  └── TurboModules: Only proxy installed
+        │
+        ├── JS accesses NativeCalculator
+        │     │
+        │     ▼
+        │   __turboModuleProxy("NativeCalculator")
+        │     │
+        │     ▼
+        │   C++ TurboModuleManager.getModule()
+        │     │
+        │     ▼
+        │   Platform module factory creates instance
+        │     │
+        │     ▼
+        │   Module cached for subsequent calls
+        │
+        └── Unused modules: NEVER instantiated ──► Fast startup
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="testing">10. Testing TurboModules</h2>
+
+    <pre><code><span class="comment">// __mocks__/NativeCalculator.ts — Jest mock</span>
+<span class="keyword">const</span> NativeCalculator = {
+  add: jest.fn((a: number, b: number) => a + b),
+  computeAsync: jest.fn((expr: string) =>
+    Promise.resolve(eval(expr))
+  ),
+  processData: jest.fn((input) =>
+    Promise.resolve({ result: 0, metadata: <span class="string">'mock'</span> })
+  ),
+  getConstants: jest.fn(() => ({
+    PI: 3.14159,
+    E: 2.71828,
+    MAX_PRECISION: 15,
+  })),
+};
+
+<span class="keyword">export default</span> NativeCalculator;
+
+<span class="comment">// __tests__/Calculator.test.ts</span>
+<span class="keyword">import</span> NativeCalculator <span class="keyword">from</span> <span class="string">'../specs/NativeCalculator'</span>;
+
+jest.mock(<span class="string">'../specs/NativeCalculator'</span>);
+
+describe(<span class="string">'Calculator integration'</span>, () => {
+  it(<span class="string">'calls native add method'</span>, () => {
+    <span class="keyword">const</span> result = NativeCalculator.add(2, 3);
+    expect(result).toBe(5);
+    expect(NativeCalculator.add).toHaveBeenCalledWith(2, 3);
+  });
+
+  it(<span class="string">'handles async computation'</span>, <span class="keyword">async</span> () => {
+    <span class="keyword">const</span> result = <span class="keyword">await</span> NativeCalculator.computeAsync(<span class="string">'2 + 3'</span>);
+    expect(result).toBe(5);
+  });
+});</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="migration">11. Migration from NativeModules</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Step</th>
+                <th>Legacy NativeModules</th>
+                <th>TurboModules</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>1. API Definition</td>
+                <td>Implicit (native code defines API)</td>
+                <td>Explicit spec file (<code>Native*.ts</code>)</td>
+            </tr>
+            <tr>
+                <td>2. JS Access</td>
+                <td><code>NativeModules.MyModule</code></td>
+                <td><code>TurboModuleRegistry.get('MyModule')</code></td>
+            </tr>
+            <tr>
+                <td>3. iOS Base Class</td>
+                <td><code>RCTBridgeModule</code></td>
+                <td>Codegen protocol + <code>getTurboModule</code></td>
+            </tr>
+            <tr>
+                <td>4. Android Base Class</td>
+                <td><code>ReactContextBaseJavaModule</code></td>
+                <td>Codegen abstract class</td>
+            </tr>
+            <tr>
+                <td>5. Android Package</td>
+                <td><code>ReactPackage</code></td>
+                <td><code>TurboReactPackage</code></td>
+            </tr>
+            <tr>
+                <td>6. Initialization</td>
+                <td>Eager (all at startup)</td>
+                <td>Lazy (on first access)</td>
+            </tr>
+            <tr>
+                <td>7. Sync Methods</td>
+                <td><code>isBlockingSynchronousMethod</code></td>
+                <td>Non-Promise return type in spec</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Migration Strategy</div>
+        <p>React Native supports <strong>interop mode</strong> where legacy NativeModules work alongside TurboModules. You don't need to migrate everything at once. Start with high-traffic modules (called frequently) to get the biggest performance wins. Modules called once at startup benefit less from the migration.</p>
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>TurboModules are fundamentally a transport optimization: replacing JSON-over-bridge with JSI-over-C++. The programming model (methods, promises, events, constants) stays the same. The key architectural wins are: (1) type safety via codegen, (2) lazy loading for startup performance, (3) synchronous methods for latency-sensitive paths, and (4) a foundation for future optimizations like shared memory and zero-copy data transfer.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="01-native-module-basics.html">← Native Module Basics</a>
+        <a href="03-native-ui-components.html">Next: Native UI Components →</a>
+    </div>
+</div>
+</body>
+</html>

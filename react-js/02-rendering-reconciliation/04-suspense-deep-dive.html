@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Suspense Deep Dive — React JS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Rendering &amp; Reconciliation</a><span class="sep">›</span>
+        Suspense Deep Dive
+    </nav>
+
+    <h1>Suspense Deep Dive</h1>
+    <p class="subtitle">Suspense boundaries and thrown promises, the use() hook for data fetching, streaming SSR with renderToPipeableStream, nested Suspense hierarchies, waterfall problems, and cache integration.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#mechanism">1. Suspense Boundary Mechanism</a></li>
+            <li><a href="#thrown-promises">2. Thrown Promises: How React Catches Them</a></li>
+            <li><a href="#use-hook">3. use() Hook for Data Fetching</a></li>
+            <li><a href="#streaming">4. Streaming SSR with renderToPipeableStream</a></li>
+            <li><a href="#nested">5. Nested Suspense and Fallback Hierarchy</a></li>
+            <li><a href="#waterfall">6. Waterfall Problem and Solutions</a></li>
+            <li><a href="#code-splitting">7. Suspense for Code Splitting vs Data Fetching</a></li>
+            <li><a href="#cache">8. Cache Integration</a></li>
+            <li><a href="#architect">9. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="mechanism">1. Suspense Boundary Mechanism</h2>
+
+    <p>A Suspense boundary is a component that catches "suspensions" (thrown promises) from its descendants and shows a fallback UI until the promise resolves.</p>
+
+    <div class="diagram">
+&lt;Suspense fallback={&lt;Spinner /&gt;}&gt;
+  &lt;UserProfile /&gt;     ← throws Promise (data loading)
+  &lt;UserPosts /&gt;       ← also throws Promise
+&lt;/Suspense&gt;
+
+Timeline:
+─────────
+t=0:  Render attempt
+      UserProfile throws Promise_A
+      UserPosts throws Promise_B
+      Suspense catches → shows &lt;Spinner /&gt;
+
+t=1:  Promise_A resolves
+      React re-renders Suspense boundary
+      UserProfile renders successfully
+      UserPosts still throws Promise_B
+      Suspense still shows &lt;Spinner /&gt;
+
+t=2:  Promise_B resolves
+      React re-renders Suspense boundary
+      Both render successfully
+      Suspense shows &lt;UserProfile /&gt; + &lt;UserPosts /&gt;
+    </div>
+
+    <pre><code><span class="comment">// Suspense fiber has special handling in beginWork:</span>
+<span class="keyword">function</span> <span class="func">updateSuspenseComponent</span>(current, workInProgress, renderLanes) {
+  <span class="keyword">const</span> nextProps = workInProgress.pendingProps;
+
+  <span class="keyword">let</span> showFallback = <span class="keyword">false</span>;
+  <span class="keyword">const</span> didSuspend = (workInProgress.flags & DidCapture) !== NoFlags;
+
+  <span class="keyword">if</span> (didSuspend) {
+    showFallback = <span class="keyword">true</span>;
+    workInProgress.flags &= ~DidCapture; <span class="comment">// Clear flag</span>
+  }
+
+  <span class="keyword">if</span> (showFallback) {
+    <span class="comment">// Render fallback as primary children</span>
+    <span class="keyword">const</span> fallbackChildren = nextProps.fallback;
+    <span class="keyword">return</span> <span class="func">mountSuspenseFallbackChildren</span>(
+      workInProgress, fallbackChildren, renderLanes
+    );
+  } <span class="keyword">else</span> {
+    <span class="comment">// Render primary children</span>
+    <span class="keyword">const</span> primaryChildren = nextProps.children;
+    <span class="keyword">return</span> <span class="func">mountSuspensePrimaryChildren</span>(
+      workInProgress, primaryChildren, renderLanes
+    );
+  }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="thrown-promises">2. Thrown Promises: How React Catches Them</h2>
+
+    <pre><code><span class="comment">// When a component throws a promise during render:</span>
+
+<span class="comment">// 1. React's work loop catches the thrown value</span>
+<span class="keyword">try</span> {
+  <span class="func">beginWork</span>(current, workInProgress, renderLanes);
+} <span class="keyword">catch</span> (thrownValue) {
+  <span class="keyword">if</span> (<span class="func">isThenable</span>(thrownValue)) {
+    <span class="comment">// It's a promise — this is a Suspense suspension</span>
+    <span class="func">handleSuspension</span>(workInProgress, thrownValue);
+  } <span class="keyword">else</span> {
+    <span class="comment">// It's a real error — propagate to error boundary</span>
+    <span class="func">handleError</span>(workInProgress, thrownValue);
+  }
+}
+
+<span class="comment">// 2. React walks up the fiber tree to find nearest Suspense</span>
+<span class="keyword">function</span> <span class="func">handleSuspension</span>(fiber, thenable) {
+  <span class="keyword">let</span> node = fiber.<span class="keyword">return</span>;
+  <span class="keyword">while</span> (node !== <span class="keyword">null</span>) {
+    <span class="keyword">if</span> (node.tag === SuspenseComponent) {
+      <span class="comment">// Found Suspense boundary</span>
+      node.flags |= DidCapture;
+      <span class="comment">// Attach listener to re-render when promise resolves</span>
+      thenable.<span class="func">then</span>(
+        () =&gt; <span class="func">retryTimedOutBoundary</span>(node),
+        () =&gt; <span class="func">retryTimedOutBoundary</span>(node)
+      );
+      <span class="keyword">return</span>;
+    }
+    node = node.<span class="keyword">return</span>;
+  }
+  <span class="comment">// No Suspense boundary found — this is an error</span>
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Thrown Promises Are Not Errors</div>
+        <p>React uses JavaScript's <code>throw</code> mechanism for Suspense, but thrown promises are not errors. They're a control flow mechanism — a way for a component to say "I'm not ready yet, here's a promise that resolves when I will be." This is why error boundaries don't catch Suspense suspensions, and Suspense boundaries don't catch errors. They're separate propagation paths through the fiber tree.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="use-hook">3. use() Hook for Data Fetching</h2>
+
+    <pre><code><span class="keyword">import</span> { use, Suspense } <span class="keyword">from</span> <span class="string">'react'</span>;
+
+<span class="comment">// use() reads the value of a Promise (suspending if pending)</span>
+<span class="keyword">function</span> <span class="func">UserProfile</span>({ userPromise }) {
+  <span class="keyword">const</span> user = <span class="func">use</span>(userPromise);
+  <span class="keyword">return</span> &lt;<span class="type">h1</span>&gt;{user.name}&lt;/<span class="type">h1</span>&gt;;
+}
+
+<span class="comment">// Parent creates the promise OUTSIDE of render</span>
+<span class="keyword">function</span> <span class="func">App</span>() {
+  <span class="keyword">const</span> [userId, setUserId] = <span class="func">useState</span>(<span class="number">1</span>);
+  <span class="keyword">const</span> userPromise = <span class="func">useMemo</span>(
+    () =&gt; <span class="func">fetchUser</span>(userId),
+    [userId]
+  );
+
+  <span class="keyword">return</span> (
+    &lt;<span class="type">Suspense</span> <span class="attr">fallback</span>={&lt;<span class="type">Spinner</span> /&gt;}&gt;
+      &lt;<span class="type">UserProfile</span> <span class="attr">userPromise</span>={userPromise} /&gt;
+    &lt;/<span class="type">Suspense</span>&gt;
+  );
+}
+
+<span class="comment">// use() behavior:</span>
+<span class="comment">// - Promise pending → throws promise (Suspense shows fallback)</span>
+<span class="comment">// - Promise resolved → returns the value</span>
+<span class="comment">// - Promise rejected → throws the error (error boundary catches)</span>
+
+<span class="comment">// Unlike useEffect-based fetching:</span>
+<span class="comment">// - No loading state management (Suspense handles it)</span>
+<span class="comment">// - No race conditions (React manages promise lifecycle)</span>
+<span class="comment">// - Works with streaming SSR</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="streaming">4. Streaming SSR with renderToPipeableStream</h2>
+
+    <pre><code><span class="comment">// Server-side: stream HTML with Suspense boundaries</span>
+<span class="keyword">import</span> { renderToPipeableStream } <span class="keyword">from</span> <span class="string">'react-dom/server'</span>;
+
+<span class="keyword">const</span> { pipe } = <span class="func">renderToPipeableStream</span>(
+  &lt;<span class="type">App</span> /&gt;,
+  {
+    <span class="func">onShellReady</span>() {
+      <span class="comment">// Shell (everything outside Suspense) is ready</span>
+      response.statusCode = <span class="number">200</span>;
+      response.<span class="func">setHeader</span>(<span class="string">'Content-Type'</span>, <span class="string">'text/html'</span>);
+      <span class="func">pipe</span>(response); <span class="comment">// Start streaming</span>
+    },
+    <span class="func">onShellError</span>(error) {
+      response.statusCode = <span class="number">500</span>;
+      response.<span class="func">send</span>(<span class="string">'&lt;h1&gt;Error&lt;/h1&gt;'</span>);
+    },
+    <span class="func">onAllReady</span>() {
+      <span class="comment">// All Suspense boundaries resolved (for crawlers)</span>
+    }
+  }
+);</code></pre>
+
+    <div class="diagram">
+Streaming SSR timeline:
+
+Server:
+t=0: Start rendering &lt;App&gt;
+t=1: Shell ready (header, nav, layout) → STREAM to client
+     Suspense boundaries send fallback HTML
+t=2: Comments data ready → STREAM replacement HTML + script
+t=3: Sidebar data ready → STREAM replacement HTML + script
+
+Client receives:
+─────────────────────────────────────────────────────────
+│ &lt;header&gt;...&lt;/header&gt;                                  │ ← immediate
+│ &lt;div id="comments"&gt;&lt;spinner/&gt;&lt;/div&gt;                   │ ← fallback
+│ &lt;div id="sidebar"&gt;&lt;spinner/&gt;&lt;/div&gt;                    │ ← fallback
+│ ... later ...                                          │
+│ &lt;script&gt;replaceContent("comments", "&lt;div&gt;...")&lt;/script&gt;│ ← streamed
+│ &lt;script&gt;replaceContent("sidebar", "&lt;div&gt;...")&lt;/script&gt; │ ← streamed
+─────────────────────────────────────────────────────────
+
+User sees content progressively, not all-or-nothing!
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="nested">5. Nested Suspense and Fallback Hierarchy</h2>
+
+    <pre><code><span class="comment">// Nested Suspense creates a fallback hierarchy</span>
+&lt;<span class="type">Suspense</span> <span class="attr">fallback</span>={&lt;<span class="type">PageSkeleton</span> /&gt;}&gt;
+  &lt;<span class="type">Header</span> /&gt;
+  &lt;<span class="type">Suspense</span> <span class="attr">fallback</span>={&lt;<span class="type">ContentSkeleton</span> /&gt;}&gt;
+    &lt;<span class="type">MainContent</span> /&gt;
+    &lt;<span class="type">Suspense</span> <span class="attr">fallback</span>={&lt;<span class="type">CommentsSkeleton</span> /&gt;}&gt;
+      &lt;<span class="type">Comments</span> /&gt;
+    &lt;/<span class="type">Suspense</span>&gt;
+  &lt;/<span class="type">Suspense</span>&gt;
+  &lt;<span class="type">Sidebar</span> /&gt;
+&lt;/<span class="type">Suspense</span>&gt;
+
+<span class="comment">// Loading sequence:</span>
+<span class="comment">// 1. If Header suspends → outer boundary → PageSkeleton</span>
+<span class="comment">// 2. If MainContent suspends → middle boundary → ContentSkeleton</span>
+<span class="comment">//    (Header + Sidebar still visible)</span>
+<span class="comment">// 3. If only Comments suspends → inner boundary → CommentsSkeleton</span>
+<span class="comment">//    (Header + MainContent + Sidebar visible)</span>
+
+<span class="comment">// Each boundary is independent — the nearest one catches</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="waterfall">6. Waterfall Problem and Solutions</h2>
+
+    <pre><code><span class="comment">// PROBLEM: Sequential data fetching (waterfall)</span>
+<span class="keyword">function</span> <span class="func">UserPage</span>({ userId }) {
+  <span class="keyword">const</span> user = <span class="func">use</span>(<span class="func">fetchUser</span>(userId));     <span class="comment">// Fetch 1: 200ms</span>
+  <span class="keyword">const</span> posts = <span class="func">use</span>(<span class="func">fetchPosts</span>(user.id));  <span class="comment">// Fetch 2: 300ms (waits for 1)</span>
+  <span class="comment">// Total: 500ms (sequential)</span>
+}
+
+<span class="comment">// SOLUTION 1: Parallel fetching at parent level</span>
+<span class="keyword">function</span> <span class="func">UserPage</span>({ userId }) {
+  <span class="keyword">const</span> userPromise = <span class="func">useMemo</span>(() =&gt; <span class="func">fetchUser</span>(userId), [userId]);
+  <span class="keyword">const</span> postsPromise = <span class="func">useMemo</span>(() =&gt; <span class="func">fetchPosts</span>(userId), [userId]);
+
+  <span class="keyword">return</span> (
+    &lt;&gt;
+      &lt;<span class="type">Suspense</span> <span class="attr">fallback</span>={&lt;<span class="type">UserSkeleton</span> /&gt;}&gt;
+        &lt;<span class="type">UserInfo</span> <span class="attr">userPromise</span>={userPromise} /&gt;
+      &lt;/<span class="type">Suspense</span>&gt;
+      &lt;<span class="type">Suspense</span> <span class="attr">fallback</span>={&lt;<span class="type">PostsSkeleton</span> /&gt;}&gt;
+        &lt;<span class="type">UserPosts</span> <span class="attr">postsPromise</span>={postsPromise} /&gt;
+      &lt;/<span class="type">Suspense</span>&gt;
+    &lt;/&gt;
+  );
+  <span class="comment">// Both fetch in parallel! Total: max(200, 300) = 300ms</span>
+}
+
+<span class="comment">// SOLUTION 2: Preload / prefetch at route level</span>
+<span class="keyword">function</span> <span class="func">loader</span>({ params }) {
+  <span class="comment">// Start fetching before component renders</span>
+  <span class="keyword">return</span> {
+    user: <span class="func">fetchUser</span>(params.userId),
+    posts: <span class="func">fetchPosts</span>(params.userId)
+  };
+}</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Waterfall Prevention Architecture</div>
+        <p>At L6, design data fetching to avoid waterfalls: (1) Start all fetches as early as possible (route loaders, not component effects). (2) Use parallel Suspense boundaries so independent data shows independently. (3) Prefetch data on hover/focus before navigation. (4) Use a data layer (React Query, Relay) that manages caching and deduplication. The goal: every network request starts at the earliest possible moment, and UI sections appear as their data arrives.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="code-splitting">7. Suspense for Code Splitting vs Data Fetching</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Code Splitting</th>
+                <th>Data Fetching</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>API</td>
+                <td><code>React.lazy(() => import(...))</code></td>
+                <td><code>use(promise)</code> or framework integration</td>
+            </tr>
+            <tr>
+                <td>What's loaded</td>
+                <td>JavaScript module (component code)</td>
+                <td>Data from API/database</td>
+            </tr>
+            <tr>
+                <td>Caching</td>
+                <td>Module cache (loaded once)</td>
+                <td>Needs explicit cache strategy</td>
+            </tr>
+            <tr>
+                <td>Retry</td>
+                <td>Reload the chunk</td>
+                <td>Re-fetch the data</td>
+            </tr>
+            <tr>
+                <td>SSR</td>
+                <td>Renders on server (no lazy needed)</td>
+                <td>Streaming with renderToPipeableStream</td>
+            </tr>
+            <tr>
+                <td>Stability</td>
+                <td>Stable since React 16.6</td>
+                <td>Stable in React 19 (use() hook)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="cache">8. Cache Integration</h2>
+
+    <pre><code><span class="comment">// React's cache() function (React 19) memoizes async functions</span>
+<span class="keyword">import</span> { cache } <span class="keyword">from</span> <span class="string">'react'</span>;
+
+<span class="keyword">const</span> fetchUser = <span class="func">cache</span>(<span class="keyword">async</span> (id) =&gt; {
+  <span class="keyword">const</span> res = <span class="keyword">await</span> <span class="func">fetch</span>(<span class="string">`/api/users/</span>${id}<span class="string">`</span>);
+  <span class="keyword">return</span> res.<span class="func">json</span>();
+});
+
+<span class="comment">// Multiple components can call fetchUser(1)</span>
+<span class="comment">// Only ONE network request is made per render pass</span>
+<span class="comment">// The cache is scoped to the current server request (RSC)</span>
+<span class="comment">// or the current render tree (client)</span>
+
+<span class="keyword">function</span> <span class="func">UserName</span>({ id }) {
+  <span class="keyword">const</span> user = <span class="func">use</span>(<span class="func">fetchUser</span>(id)); <span class="comment">// Deduped!</span>
+  <span class="keyword">return</span> &lt;<span class="type">span</span>&gt;{user.name}&lt;/<span class="type">span</span>&gt;;
+}
+
+<span class="keyword">function</span> <span class="func">UserAvatar</span>({ id }) {
+  <span class="keyword">const</span> user = <span class="func">use</span>(<span class="func">fetchUser</span>(id)); <span class="comment">// Same cache entry!</span>
+  <span class="keyword">return</span> &lt;<span class="type">img</span> <span class="attr">src</span>={user.avatar} /&gt;;
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">9. Architect Considerations</h2>
+
+    <pre><code><span class="comment">// Suspense boundary placement strategy:</span>
+
+<span class="comment">// 1. Route-level: each page has its own Suspense</span>
+<span class="comment">//    → Shows page skeleton during navigation</span>
+
+<span class="comment">// 2. Section-level: independent content sections</span>
+<span class="comment">//    → Header loads instantly, content streams in</span>
+
+<span class="comment">// 3. Component-level: individual data-dependent components</span>
+<span class="comment">//    → Most granular, but many loading states</span>
+
+<span class="comment">// Balance: too few boundaries = large loading states</span>
+<span class="comment">//          too many boundaries = flickering skeleton soup</span>
+
+<span class="comment">// Rule of thumb: one boundary per independent data dependency</span></code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Suspense Architecture</div>
+        <p>Suspense is not just a loading state mechanism — it's a <strong>rendering coordination primitive</strong>. It unifies code splitting, data fetching, streaming SSR, and selective hydration under one model. At L6, design your Suspense boundaries to match your data dependencies: each boundary should correspond to an independently-fetchable unit of data. Use nested boundaries for progressive disclosure (show what you have, load the rest). Combine with transitions to prevent existing content from being replaced by fallbacks during navigation.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="03-concurrent-features.html">← Prev: Concurrent Features</a>
+        <a href="05-batching-updates.html">Next: Batching Updates →</a>
+    </div>
+</div>
+</body>
+</html>

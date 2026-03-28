@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>use() Hook (React 19) — React Hooks Internals</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Hooks Internals</a>
+  <span class="sep">›</span>
+  use() Hook (React 19)
+</nav>
+
+<h1>The use() Hook — React 19</h1>
+<p class="subtitle">Reading promises with Suspense, replacing useContext, conditional calling, promise caching, and the transition from useEffect-based data fetching.</p>
+
+<nav class="nav">
+  <a href="01-hooks-architecture.html">Hooks Architecture</a>
+  <a href="02-usestate-usereducer.html">useState &amp; useReducer</a>
+  <a href="03-useeffect-lifecycle.html">useEffect Lifecycle</a>
+  <a href="04-usememo-usecallback.html">useMemo &amp; useCallback</a>
+  <a href="05-useref-imperative.html">useRef &amp; Imperative</a>
+  <a href="06-custom-hooks.html">Custom Hooks</a>
+  <a href="08-concurrent-hooks.html">Concurrent Hooks</a>
+  <a href="09-interview-qa.html">Interview Q&amp;A</a>
+</nav>
+
+<h2 id="what-is-use">What is use()?</h2>
+
+<p><code>use()</code> is a new React 19 API that can read the value of a resource — either a <strong>Promise</strong> or a <strong>Context</strong>. Unlike other hooks, <code>use()</code> can be called conditionally and inside loops.</p>
+
+<pre><code>import { use } from 'react';
+
+// Reading a promise (integrates with Suspense):
+function UserProfile({ userPromise }) {
+  const user = use(userPromise); // suspends until resolved
+  return &lt;h1&gt;{user.name}&lt;/h1&gt;;
+}
+
+// Reading context (replaces useContext):
+function ThemeButton() {
+  const theme = use(ThemeContext);
+  return &lt;button className={theme}&gt;Click&lt;/button&gt;;
+}
+
+// Conditional calling (unique to use()):
+function StatusMessage({ shouldLoad, messagePromise }) {
+  if (shouldLoad) {
+    const message = use(messagePromise); // OK inside if!
+    return &lt;p&gt;{message}&lt;/p&gt;;
+  }
+  return &lt;p&gt;Not loaded&lt;/p&gt;;
+}</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight — Why use() Breaks the Rules</div>
+  <p><code>use()</code> is technically not a hook — it doesn't create a hook node on the fiber's linked list. It's a special API that reads from external resources. Because it doesn't rely on positional identity in a linked list, it can be called conditionally. The <code>use</code> prefix is a naming convention for consistency, not a structural requirement.</p>
+</div>
+
+<h2 id="reading-promises">Reading Promises with Suspense</h2>
+
+<pre><code>// use() with promises integrates with React's Suspense mechanism:
+
+async function fetchUser(id) {
+  const res = await fetch(`/api/users/${id}`);
+  return res.json();
+}
+
+function UserPage({ userId }) {
+  // Create the promise OUTSIDE the component that reads it
+  const userPromise = fetchUser(userId);
+
+  return (
+    &lt;Suspense fallback={&lt;Spinner /&gt;}&gt;
+      &lt;UserProfile userPromise={userPromise} /&gt;
+    &lt;/Suspense&gt;
+  );
+}
+
+function UserProfile({ userPromise }) {
+  const user = use(userPromise);
+  // This line only executes AFTER the promise resolves.
+  // While pending, React suspends and shows the Suspense fallback.
+  return &lt;div&gt;{user.name}&lt;/div&gt;;
+}</code></pre>
+
+<h3>How use() Suspends</h3>
+
+<div class="diagram">
+use(promise) execution flow:
+
+Component renders → use(promise) called
+│
+├─ Promise status: PENDING
+│   └─ React throws the promise (Suspense protocol)
+│       └─ Nearest &lt;Suspense&gt; catches it
+│           └─ Shows fallback UI
+│               └─ When promise resolves:
+│                   └─ React re-renders the suspended component
+│                       └─ use(promise) returns the resolved value
+│
+├─ Promise status: FULFILLED
+│   └─ Returns resolved value immediately (no suspension)
+│
+└─ Promise status: REJECTED
+    └─ Throws the rejection reason
+        └─ Nearest ErrorBoundary catches it
+</div>
+
+<pre><code>// Simplified internal implementation:
+function use(usable) {
+  if (usable !== null && typeof usable === 'object') {
+    if (typeof usable.then === 'function') {
+      // It's a thenable/promise
+      return useThenable(usable);
+    }
+    if (usable.$$typeof === REACT_CONTEXT_TYPE) {
+      // It's a context
+      return readContext(usable);
+    }
+  }
+  throw new Error('use() requires a promise or context');
+}
+
+function useThenable(thenable) {
+  const status = thenable.status;
+
+  switch (status) {
+    case 'fulfilled':
+      return thenable.value;
+    case 'rejected':
+      throw thenable.reason;
+    default:
+      // Pending — suspend
+      if (typeof status !== 'string') {
+        // Track the promise
+        thenable.status = 'pending';
+        thenable.then(
+          value => {
+            thenable.status = 'fulfilled';
+            thenable.value = value;
+          },
+          reason => {
+            thenable.status = 'rejected';
+            thenable.reason = reason;
+          }
+        );
+      }
+      // Throw the promise to trigger Suspense
+      throw thenable;
+  }
+}</code></pre>
+
+<h2 id="promise-caching">Promise Caching Requirements</h2>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Critical: Promise Identity Matters</div>
+  <p><code>use()</code> tracks promises by reference. If you create a new promise on every render, React will suspend infinitely because each render sees a new, pending promise. The promise must be created outside the rendering component or cached.</p>
+</div>
+
+<pre><code>// BUG: infinite suspension loop
+function UserProfile({ userId }) {
+  // Creates a NEW promise every render → suspends → re-renders → new promise → ...
+  const user = use(fetch(`/api/users/${userId}`).then(r => r.json()));
+  return &lt;div&gt;{user.name}&lt;/div&gt;;
+}
+
+// FIX 1: Create promise in parent, pass as prop
+function UserPage({ userId }) {
+  const [userPromise] = useState(() => fetchUser(userId));
+  return (
+    &lt;Suspense fallback={&lt;Spinner /&gt;}&gt;
+      &lt;UserProfile userPromise={userPromise} /&gt;
+    &lt;/Suspense&gt;
+  );
+}
+
+// FIX 2: Use a caching layer
+const cache = new Map();
+function fetchUserCached(userId) {
+  if (!cache.has(userId)) {
+    cache.set(userId, fetchUser(userId));
+  }
+  return cache.get(userId);
+}
+
+function UserProfile({ userId }) {
+  const user = use(fetchUserCached(userId)); // same promise ref
+  return &lt;div&gt;{user.name}&lt;/div&gt;;
+}
+
+// FIX 3: Use React.cache (for Server Components)
+const fetchUser = cache(async (id) => {
+  const res = await fetch(`/api/users/${id}`);
+  return res.json();
+});
+
+// FIX 4: Use a data fetching library (TanStack Query, SWR)
+// These handle promise caching internally</code></pre>
+
+<h2 id="reading-context">Reading Context (Replacing useContext)</h2>
+
+<pre><code>// use() can read context, replacing useContext:
+
+// Before (useContext):
+function ThemedButton() {
+  const theme = useContext(ThemeContext);
+  return &lt;button style={{ background: theme.primary }}&gt;Click&lt;/button&gt;;
+}
+
+// After (use):
+function ThemedButton() {
+  const theme = use(ThemeContext);
+  return &lt;button style={{ background: theme.primary }}&gt;Click&lt;/button&gt;;
+}
+
+// Key advantage: use() can be called conditionally
+function StatusDisplay({ showTheme }) {
+  if (showTheme) {
+    const theme = use(ThemeContext); // OK — use() allows this
+    return &lt;div style={{ color: theme.text }}&gt;Themed&lt;/div&gt;;
+  }
+  return &lt;div&gt;Default&lt;/div&gt;;
+}
+
+// With useContext, this would violate rules of hooks:
+function StatusDisplay({ showTheme }) {
+  if (showTheme) {
+    const theme = useContext(ThemeContext); // ERROR: conditional hook
+  }
+  // ...
+}</code></pre>
+
+<h2 id="conditional-calling">Conditional Calling: Breaking Rules of Hooks</h2>
+
+<pre><code>// use() can be called:
+// - Inside if/else blocks
+// - Inside loops
+// - Inside try/catch
+// - After early returns
+
+// This is valid:
+function DataDisplay({ condition, promise1, promise2 }) {
+  if (condition) {
+    const data1 = use(promise1);
+    return &lt;div&gt;{data1.value}&lt;/div&gt;;
+  } else {
+    const data2 = use(promise2);
+    return &lt;div&gt;{data2.value}&lt;/div&gt;;
+  }
+}
+
+// Inside a loop:
+function MultiDataDisplay({ promises }) {
+  const results = [];
+  for (const promise of promises) {
+    results.push(use(promise)); // each may suspend independently
+  }
+  return &lt;ul&gt;{results.map((r, i) => &lt;li key={i}&gt;{r.name}&lt;/li&gt;)}&lt;/ul&gt;;
+}
+
+// After early return:
+function ConditionalFetch({ shouldFetch, dataPromise }) {
+  if (!shouldFetch) {
+    return &lt;div&gt;Not fetching&lt;/div&gt;;
+  }
+  const data = use(dataPromise); // only called when shouldFetch is true
+  return &lt;div&gt;{data.value}&lt;/div&gt;;
+}
+
+// STILL NOT ALLOWED: use() inside try/catch in the same component
+// (because thrown promises would be caught by your try/catch
+//  instead of propagating to Suspense)
+function Broken({ promise }) {
+  try {
+    const data = use(promise); // DON'T: catches the thrown promise
+    return &lt;div&gt;{data}&lt;/div&gt;;
+  } catch (e) {
+    return &lt;div&gt;Error&lt;/div&gt;; // catches Suspense throw, not errors
+  }
+}</code></pre>
+
+<h2 id="use-vs-useeffect">use() vs useEffect for Data Fetching</h2>
+
+<table>
+<thead>
+<tr><th>Aspect</th><th>useEffect Pattern</th><th>use() Pattern</th></tr>
+</thead>
+<tbody>
+<tr><td>Fetch timing</td><td>After render + paint (waterfall)</td><td>During render (parallel with Suspense)</td></tr>
+<tr><td>Loading state</td><td>Manual (<code>useState</code> for loading)</td><td>Automatic (Suspense fallback)</td></tr>
+<tr><td>Error handling</td><td>Manual (<code>useState</code> for error)</td><td>ErrorBoundary</td></tr>
+<tr><td>Race conditions</td><td>Manual (cleanup flag / AbortController)</td><td>Handled by React (promise identity)</td></tr>
+<tr><td>Server rendering</td><td>Client-only (effect doesn't run on server)</td><td>Works with SSR + streaming</td></tr>
+<tr><td>Concurrent features</td><td>Limited</td><td>Full integration (transitions, etc.)</td></tr>
+</tbody>
+</table>
+
+<pre><code>// BEFORE: useEffect waterfall pattern
+function UserPosts({ userId }) {
+  const [user, setUser] = useState(null);
+  const [posts, setPosts] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+
+    fetchUser(userId).then(user => {
+      if (cancelled) return;
+      setUser(user);
+      return fetchPosts(user.id); // waterfall: waits for user
+    }).then(posts => {
+      if (cancelled) return;
+      setPosts(posts);
+      setLoading(false);
+    });
+
+    return () => { cancelled = true; };
+  }, [userId]);
+
+  if (loading) return &lt;Spinner /&gt;;
+  return &lt;div&gt;{user.name}: {posts.length} posts&lt;/div&gt;;
+}
+
+// AFTER: use() with parallel fetching
+function UserPosts({ userId }) {
+  const userPromise = fetchUserCached(userId);
+  const postsPromise = fetchPostsCached(userId);
+
+  return (
+    &lt;Suspense fallback={&lt;Spinner /&gt;}&gt;
+      &lt;UserPostsContent
+        userPromise={userPromise}
+        postsPromise={postsPromise}
+      /&gt;
+    &lt;/Suspense&gt;
+  );
+}
+
+function UserPostsContent({ userPromise, postsPromise }) {
+  const user = use(userPromise);   // both fetched in parallel
+  const posts = use(postsPromise); // no waterfall
+  return &lt;div&gt;{user.name}: {posts.length} posts&lt;/div&gt;;
+}</code></pre>
+
+<h2 id="error-handling">Error Handling with use()</h2>
+
+<pre><code>// When a promise rejects, use() throws the error.
+// Catch it with an ErrorBoundary:
+
+function App() {
+  return (
+    &lt;ErrorBoundary fallback={&lt;ErrorMessage /&gt;}&gt;
+      &lt;Suspense fallback={&lt;Spinner /&gt;}&gt;
+        &lt;UserProfile userPromise={fetchUser(1)} /&gt;
+      &lt;/Suspense&gt;
+    &lt;/ErrorBoundary&gt;
+  );
+}
+
+// ErrorBoundary implementation:
+class ErrorBoundary extends React.Component {
+  state = { hasError: false, error: null };
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return this.props.fallback;
+    }
+    return this.props.children;
+  }
+}
+
+// Nested boundaries for granular error handling:
+function Dashboard() {
+  return (
+    &lt;div&gt;
+      &lt;ErrorBoundary fallback={&lt;p&gt;User failed&lt;/p&gt;}&gt;
+        &lt;Suspense fallback={&lt;Spinner /&gt;}&gt;
+          &lt;UserWidget /&gt;
+        &lt;/Suspense&gt;
+      &lt;/ErrorBoundary&gt;
+
+      &lt;ErrorBoundary fallback={&lt;p&gt;Stats failed&lt;/p&gt;}&gt;
+        &lt;Suspense fallback={&lt;Spinner /&gt;}&gt;
+          &lt;StatsWidget /&gt;
+        &lt;/Suspense&gt;
+      &lt;/ErrorBoundary&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<h2 id="server-components">use() with Server Components</h2>
+
+<pre><code>// In Server Components, you can use async/await directly:
+async function UserProfile({ userId }) {
+  const user = await fetchUser(userId); // server-side fetch
+  return &lt;div&gt;{user.name}&lt;/div&gt;;
+}
+
+// In Client Components, use use() with promises from the server:
+'use client';
+function UserProfile({ userPromise }) {
+  const user = use(userPromise);
+  return &lt;div&gt;{user.name}&lt;/div&gt;;
+}
+
+// Server Component passes promise to Client Component:
+async function UserPage({ userId }) {
+  const userPromise = fetchUser(userId); // starts fetch on server
+  return (
+    &lt;Suspense fallback={&lt;Spinner /&gt;}&gt;
+      &lt;UserProfile userPromise={userPromise} /&gt;
+    &lt;/Suspense&gt;
+  );
+}</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">use() Adoption Strategy</div>
+  <p>For existing apps: (1) Keep useEffect-based fetching for now if it works. (2) Adopt use() for new features that benefit from Suspense integration. (3) Use a data fetching library (TanStack Query) that handles caching — it works with both patterns. (4) For Server Components, prefer async/await over use().</p>
+</div>
+
+<div class="nav-footer">
+  <a href="06-custom-hooks.html">← Custom Hooks</a>
+  <a href="08-concurrent-hooks.html">Concurrent Hooks →</a>
+</div>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

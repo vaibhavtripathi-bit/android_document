@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat App Architecture — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Engineering Problems</a><span class="sep">›</span>
+        Chat App Architecture
+    </nav>
+
+    <h1>Chat App Architecture</h1>
+    <p class="subtitle">Designing a production-grade real-time chat system in React Native — from WebSocket lifecycle management and message delivery guarantees through offline queuing, read receipts, typing indicators, push notifications, and media sharing. This is the most frequently asked Staff-level mobile system design problem.</p>
+
+    <nav class="nav">
+        <a href="01-chat-app-architecture.html" class="active">Chat App</a>
+        <a href="02-offline-first-mobile.html">Offline-First</a>
+        <a href="03-app-performance-audit.html">Performance Audit</a>
+        <a href="04-migration-native-to-rn.html">Native → RN Migration</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#high-level">1. High-Level Architecture</a></li>
+            <li><a href="#websocket">2. WebSocket Management</a></li>
+            <li><a href="#delivery">3. Message Delivery Guarantees</a></li>
+            <li><a href="#offline-queue">4. Offline Message Queue</a></li>
+            <li><a href="#persistence">5. Message Persistence</a></li>
+            <li><a href="#read-receipts">6. Read Receipts</a></li>
+            <li><a href="#typing">7. Typing Indicators</a></li>
+            <li><a href="#push">8. Push Notification Integration</a></li>
+            <li><a href="#media">9. Image and File Sharing</a></li>
+            <li><a href="#search-pagination">10. Search and Pagination</a></li>
+            <li><a href="#architect">11. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="high-level">1. High-Level Architecture</h2>
+
+    <p>A chat app is a <strong>distributed real-time system</strong> with strict ordering, delivery, and consistency requirements. The mobile client must handle unreliable networks, background/foreground transitions, and multi-device synchronization — all while maintaining a responsive 60fps UI.</p>
+
+    <div class="diagram">
+┌─────────────────────────────────────────────────────────────────────┐
+│                         CHAT SYSTEM ARCHITECTURE                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────┐    WebSocket     ┌──────────────────────────┐     │
+│  │  RN Client   │◄───────────────►│  WebSocket Gateway        │     │
+│  │              │    (wss://)      │  (Connection Manager)     │     │
+│  │  ┌────────┐  │                  └──────────┬───────────────┘     │
+│  │  │ SQLite │  │                             │                      │
+│  │  │ Cache  │  │                  ┌──────────▼───────────────┐     │
+│  │  └────────┘  │                  │  Message Router           │     │
+│  │              │    REST/HTTP     │  (Pub/Sub + Routing)      │     │
+│  │  ┌────────┐  │◄───────────────►└──────────┬───────────────┘     │
+│  │  │Offline │  │                             │                      │
+│  │  │ Queue  │  │                  ┌──────────▼───────────────┐     │
+│  │  └────────┘  │                  │  Message Store            │     │
+│  └──────────────┘                  │  (Cassandra / DynamoDB)   │     │
+│                                    └──────────────────────────┘     │
+│                                                                      │
+│  ┌──────────────┐                  ┌──────────────────────────┐     │
+│  │  APNs / FCM  │◄────────────────│  Push Service             │     │
+│  │  (Platform)  │                  │  (Offline Delivery)       │     │
+│  └──────────────┘                  └──────────────────────────┘     │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>The most critical design decision is the <strong>source of truth boundary</strong>. The server is the authoritative source for message ordering (via server-assigned timestamps and sequence numbers), but the client must maintain a local cache that allows instant UI updates. This dual-write model — optimistic local writes with server reconciliation — is the foundation of every production chat system.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="websocket">2. WebSocket Management</h2>
+
+    <p>WebSockets provide full-duplex, persistent connections essential for real-time messaging. In React Native, managing the WebSocket lifecycle across app states, network changes, and reconnection scenarios is the first major engineering challenge.</p>
+
+    <h3>2.1 Connection Lifecycle</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">ChatSocketManager</span> {
+  <span class="keyword">private</span> ws: WebSocket | <span class="keyword">null</span> = <span class="keyword">null</span>;
+  <span class="keyword">private</span> reconnectAttempts = <span class="number">0</span>;
+  <span class="keyword">private</span> maxReconnectDelay = <span class="number">30000</span>;
+  <span class="keyword">private</span> heartbeatInterval: NodeJS.Timer | <span class="keyword">null</span> = <span class="keyword">null</span>;
+  <span class="keyword">private</span> pendingAcks = <span class="keyword">new</span> <span class="type">Map</span>&lt;<span class="type">string</span>, PendingMessage&gt;();
+
+  <span class="func">connect</span>(token: <span class="type">string</span>): <span class="type">void</span> {
+    <span class="keyword">this</span>.ws = <span class="keyword">new</span> <span class="type">WebSocket</span>(<span class="string">`wss://chat.api.com/ws?token=${token}`</span>);
+
+    <span class="keyword">this</span>.ws.onopen = () =&gt; {
+      <span class="keyword">this</span>.reconnectAttempts = <span class="number">0</span>;
+      <span class="keyword">this</span>.<span class="func">startHeartbeat</span>();
+      <span class="keyword">this</span>.<span class="func">flushOfflineQueue</span>();
+      <span class="keyword">this</span>.<span class="func">requestMissedMessages</span>();
+    };
+
+    <span class="keyword">this</span>.ws.onclose = (event) =&gt; {
+      <span class="keyword">this</span>.<span class="func">stopHeartbeat</span>();
+      <span class="keyword">if</span> (!event.wasClean) {
+        <span class="keyword">this</span>.<span class="func">scheduleReconnect</span>();
+      }
+    };
+
+    <span class="keyword">this</span>.ws.onerror = () =&gt; {
+      <span class="keyword">this</span>.ws?.<span class="func">close</span>();
+    };
+
+    <span class="keyword">this</span>.ws.onmessage = (event) =&gt; {
+      <span class="keyword">this</span>.<span class="func">handleMessage</span>(JSON.<span class="func">parse</span>(event.data));
+    };
+  }
+
+  <span class="keyword">private</span> <span class="func">scheduleReconnect</span>(): <span class="type">void</span> {
+    <span class="keyword">const</span> delay = Math.<span class="func">min</span>(
+      <span class="number">1000</span> * Math.<span class="func">pow</span>(<span class="number">2</span>, <span class="keyword">this</span>.reconnectAttempts) + Math.<span class="func">random</span>() * <span class="number">1000</span>,
+      <span class="keyword">this</span>.maxReconnectDelay
+    );
+    <span class="keyword">this</span>.reconnectAttempts++;
+    <span class="func">setTimeout</span>(() =&gt; <span class="keyword">this</span>.<span class="func">connect</span>(<span class="keyword">this</span>.token), delay);
+  }
+}</code></pre>
+
+    <h3>2.2 Reconnection Strategy</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Strategy</th>
+                <th>Formula</th>
+                <th>Pros</th>
+                <th>Cons</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Fixed interval</td>
+                <td><code>delay = 5000ms</code></td>
+                <td>Simple, predictable</td>
+                <td>Thundering herd on server recovery</td>
+            </tr>
+            <tr>
+                <td>Exponential backoff</td>
+                <td><code>delay = min(base * 2^n, max)</code></td>
+                <td>Reduces server load</td>
+                <td>Slow recovery for individual clients</td>
+            </tr>
+            <tr>
+                <td>Exponential + jitter</td>
+                <td><code>delay = random(0, min(base * 2^n, max))</code></td>
+                <td>Spreads reconnection load</td>
+                <td>Less predictable for users</td>
+            </tr>
+            <tr>
+                <td>Network-aware</td>
+                <td>Backoff + NetInfo listener</td>
+                <td>Only reconnects when network available</td>
+                <td>Depends on OS network detection</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>2.3 Heartbeat / Keep-Alive</h3>
+
+    <pre><code><span class="keyword">private</span> <span class="func">startHeartbeat</span>(): <span class="type">void</span> {
+  <span class="keyword">this</span>.heartbeatInterval = <span class="func">setInterval</span>(() =&gt; {
+    <span class="keyword">if</span> (<span class="keyword">this</span>.ws?.readyState === WebSocket.OPEN) {
+      <span class="keyword">this</span>.ws.<span class="func">send</span>(JSON.<span class="func">stringify</span>({ type: <span class="string">'ping'</span>, ts: Date.<span class="func">now</span>() }));
+      <span class="keyword">this</span>.pongTimeout = <span class="func">setTimeout</span>(() =&gt; {
+        <span class="keyword">this</span>.ws?.<span class="func">close</span>(<span class="number">4000</span>, <span class="string">'Pong timeout'</span>);
+      }, <span class="number">5000</span>);
+    }
+  }, <span class="number">25000</span>);
+}
+
+<span class="keyword">private</span> <span class="func">handlePong</span>(): <span class="type">void</span> {
+  <span class="keyword">if</span> (<span class="keyword">this</span>.pongTimeout) {
+    <span class="func">clearTimeout</span>(<span class="keyword">this</span>.pongTimeout);
+    <span class="keyword">this</span>.pongTimeout = <span class="keyword">null</span>;
+  }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Critical: App State Transitions</div>
+        <p>On iOS, WebSocket connections are suspended when the app enters background. On Android, they may persist briefly but are killed by Doze mode. You <strong>must</strong> listen to <code>AppState</code> changes: disconnect gracefully on background, reconnect on foreground, and rely on push notifications for background delivery. Never assume the WebSocket is alive after a background period.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="delivery">3. Message Delivery Guarantees</h2>
+
+    <p>Chat systems require <strong>at-least-once delivery</strong> with client-side deduplication to achieve <strong>effectively-exactly-once</strong> semantics. This is implemented through a three-phase acknowledgment protocol.</p>
+
+    <h3>3.1 Three-Phase Delivery Protocol</h3>
+
+    <div class="diagram">
+Sender                    Server                    Receiver
+  │                         │                         │
+  │── MSG (clientId: abc) ─►│                         │
+  │                         │── STORE + ASSIGN seqId ─│
+  │◄── ACK (seqId: 42) ────│                         │
+  │                         │── DELIVER (seqId: 42) ─►│
+  │                         │◄── DELIVERED ACK ───────│
+  │◄── DELIVERED (seqId:42)─│                         │
+  │                         │                         │
+
+  Phase 1: Sent      (client → server ACK)
+  Phase 2: Delivered  (server → recipient ACK)
+  Phase 3: Read       (recipient opens conversation)
+    </div>
+
+    <h3>3.2 Client-Side Message States</h3>
+
+    <pre><code><span class="keyword">enum</span> <span class="type">MessageStatus</span> {
+  QUEUED    = <span class="string">'queued'</span>,     <span class="comment">// in offline queue, not yet sent</span>
+  SENDING   = <span class="string">'sending'</span>,    <span class="comment">// WebSocket send() called</span>
+  SENT      = <span class="string">'sent'</span>,       <span class="comment">// server ACK received (seqId assigned)</span>
+  DELIVERED = <span class="string">'delivered'</span>,  <span class="comment">// recipient device confirmed receipt</span>
+  READ      = <span class="string">'read'</span>,       <span class="comment">// recipient opened the conversation</span>
+  FAILED    = <span class="string">'failed'</span>,     <span class="comment">// max retries exceeded</span>
+}
+
+<span class="keyword">interface</span> <span class="type">ChatMessage</span> {
+  clientId: <span class="type">string</span>;        <span class="comment">// UUID generated on client (dedup key)</span>
+  serverId?: <span class="type">number</span>;       <span class="comment">// server-assigned sequence number</span>
+  conversationId: <span class="type">string</span>;
+  senderId: <span class="type">string</span>;
+  body: <span class="type">string</span>;
+  status: <span class="type">MessageStatus</span>;
+  createdAt: <span class="type">number</span>;       <span class="comment">// client timestamp</span>
+  serverTs?: <span class="type">number</span>;       <span class="comment">// server-assigned timestamp (ordering)</span>
+}</code></pre>
+
+    <h3>3.3 Idempotency and Deduplication</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">MessageDeduplicator</span> {
+  <span class="keyword">private</span> seen = <span class="keyword">new</span> <span class="type">Set</span>&lt;<span class="type">string</span>&gt;();
+
+  <span class="func">isDuplicate</span>(msg: <span class="type">ChatMessage</span>): <span class="type">boolean</span> {
+    <span class="keyword">const</span> key = msg.serverId
+      ? <span class="string">`server:${msg.serverId}`</span>
+      : <span class="string">`client:${msg.clientId}`</span>;
+    <span class="keyword">if</span> (<span class="keyword">this</span>.seen.<span class="func">has</span>(key)) <span class="keyword">return true</span>;
+    <span class="keyword">this</span>.seen.<span class="func">add</span>(key);
+    <span class="keyword">if</span> (<span class="keyword">this</span>.seen.size &gt; <span class="number">10000</span>) {
+      <span class="keyword">const</span> first = <span class="keyword">this</span>.seen.<span class="func">values</span>().<span class="func">next</span>().value;
+      <span class="keyword">this</span>.seen.<span class="func">delete</span>(first);
+    }
+    <span class="keyword">return false</span>;
+  }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Why Client-Generated UUIDs</div>
+        <p>The <code>clientId</code> is generated before any network call, allowing the message to appear in the UI instantly (optimistic update). The server uses this <code>clientId</code> for idempotency — if the same message is sent twice (e.g., after a reconnection), the server returns the existing <code>serverId</code> rather than creating a duplicate. This is the same pattern used by WhatsApp, Signal, and Slack.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="offline-queue">4. Offline Message Queue</h2>
+
+    <p>When the device is offline, messages must be queued locally and flushed in order when connectivity returns. The queue must survive app restarts, handle partial flushes, and maintain conversation ordering.</p>
+
+    <h3>4.1 Persistent Queue Implementation</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">OfflineMessageQueue</span> {
+  <span class="keyword">private</span> db: <span class="type">SQLiteDatabase</span>;
+
+  <span class="keyword">async</span> <span class="func">enqueue</span>(msg: <span class="type">ChatMessage</span>): <span class="type">Promise</span>&lt;<span class="type">void</span>&gt; {
+    <span class="keyword">await</span> <span class="keyword">this</span>.db.<span class="func">executeSql</span>(
+      <span class="string">`INSERT INTO outbox (client_id, conversation_id, body, created_at, retry_count)
+       VALUES (?, ?, ?, ?, 0)`</span>,
+      [msg.clientId, msg.conversationId, msg.body, msg.createdAt]
+    );
+  }
+
+  <span class="keyword">async</span> <span class="func">flush</span>(socket: <span class="type">ChatSocketManager</span>): <span class="type">Promise</span>&lt;<span class="type">void</span>&gt; {
+    <span class="keyword">const</span> pending = <span class="keyword">await</span> <span class="keyword">this</span>.db.<span class="func">executeSql</span>(
+      <span class="string">`SELECT * FROM outbox ORDER BY created_at ASC LIMIT 50`</span>
+    );
+
+    <span class="keyword">for</span> (<span class="keyword">const</span> row <span class="keyword">of</span> pending.rows) {
+      <span class="keyword">try</span> {
+        <span class="keyword">await</span> socket.<span class="func">sendWithAck</span>(row);
+        <span class="keyword">await</span> <span class="keyword">this</span>.db.<span class="func">executeSql</span>(
+          <span class="string">`DELETE FROM outbox WHERE client_id = ?`</span>,
+          [row.client_id]
+        );
+      } <span class="keyword">catch</span> (err) {
+        <span class="keyword">await</span> <span class="keyword">this</span>.db.<span class="func">executeSql</span>(
+          <span class="string">`UPDATE outbox SET retry_count = retry_count + 1 WHERE client_id = ?`</span>,
+          [row.client_id]
+        );
+        <span class="keyword">if</span> (row.retry_count &gt;= <span class="number">5</span>) {
+          <span class="keyword">await</span> <span class="keyword">this</span>.<span class="func">markFailed</span>(row.client_id);
+        }
+        <span class="keyword">break</span>; <span class="comment">// preserve ordering — don't skip failed messages</span>
+      }
+    }
+  }
+}</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight — Queue Ordering</div>
+        <p>The <code>break</code> on failure is deliberate: messages within a conversation must be delivered in order. If message N fails, messages N+1, N+2... must wait. An alternative is per-conversation queues that allow independent progress, but this adds complexity. WhatsApp uses per-conversation queues; simpler apps use a single ordered queue.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="persistence">5. Message Persistence</h2>
+
+    <p>Local message storage enables instant conversation loading, offline access, and search. The schema must handle millions of messages across thousands of conversations efficiently.</p>
+
+    <h3>5.1 SQLite Schema Design</h3>
+
+    <pre><code><span class="comment">-- Core messages table with covering indexes</span>
+<span class="keyword">CREATE TABLE</span> messages (
+  client_id    <span class="type">TEXT</span> <span class="keyword">PRIMARY KEY</span>,
+  server_id    <span class="type">INTEGER</span> <span class="keyword">UNIQUE</span>,
+  conv_id      <span class="type">TEXT NOT NULL</span>,
+  sender_id    <span class="type">TEXT NOT NULL</span>,
+  body         <span class="type">TEXT</span>,
+  media_url    <span class="type">TEXT</span>,
+  media_type   <span class="type">TEXT</span>,
+  status       <span class="type">TEXT NOT NULL DEFAULT</span> <span class="string">'queued'</span>,
+  created_at   <span class="type">INTEGER NOT NULL</span>,
+  server_ts    <span class="type">INTEGER</span>,
+  is_deleted   <span class="type">INTEGER DEFAULT</span> <span class="number">0</span>
+);
+
+<span class="keyword">CREATE INDEX</span> idx_messages_conv_ts
+  <span class="keyword">ON</span> messages(conv_id, server_ts <span class="keyword">DESC</span>);
+
+<span class="keyword">CREATE INDEX</span> idx_messages_status
+  <span class="keyword">ON</span> messages(status) <span class="keyword">WHERE</span> status <span class="keyword">IN</span> (<span class="string">'queued'</span>, <span class="string">'sending'</span>);
+
+<span class="comment">-- FTS5 for full-text search</span>
+<span class="keyword">CREATE VIRTUAL TABLE</span> messages_fts <span class="keyword">USING</span> <span class="func">fts5</span>(
+  body, content=messages, content_rowid=rowid
+);</code></pre>
+
+    <h3>5.2 Conversation Summary Table</h3>
+
+    <pre><code><span class="keyword">CREATE TABLE</span> conversations (
+  conv_id        <span class="type">TEXT PRIMARY KEY</span>,
+  title          <span class="type">TEXT</span>,
+  last_msg_body  <span class="type">TEXT</span>,
+  last_msg_ts    <span class="type">INTEGER</span>,
+  unread_count   <span class="type">INTEGER DEFAULT</span> <span class="number">0</span>,
+  is_muted       <span class="type">INTEGER DEFAULT</span> <span class="number">0</span>,
+  is_pinned      <span class="type">INTEGER DEFAULT</span> <span class="number">0</span>,
+  updated_at     <span class="type">INTEGER</span>
+);
+
+<span class="keyword">CREATE INDEX</span> idx_conv_sort
+  <span class="keyword">ON</span> conversations(is_pinned <span class="keyword">DESC</span>, last_msg_ts <span class="keyword">DESC</span>);</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Storage Budget</div>
+        <p>On mobile, SQLite databases over 50MB cause noticeable performance degradation. Implement a retention policy: keep the last N messages per conversation locally, archive older messages to server-only storage. Use <code>PRAGMA auto_vacuum = INCREMENTAL</code> and periodically run <code>PRAGMA incremental_vacuum</code> to reclaim space without blocking the UI thread.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="read-receipts">6. Read Receipts</h2>
+
+    <p>Read receipts tell senders when their messages have been seen. The challenge is batching these signals efficiently — sending a read receipt for every individual message would overwhelm the network.</p>
+
+    <h3>6.1 Batched Read Receipt Protocol</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">ReadReceiptManager</span> {
+  <span class="keyword">private</span> pendingReceipts = <span class="keyword">new</span> <span class="type">Map</span>&lt;<span class="type">string</span>, <span class="type">number</span>&gt;();
+  <span class="keyword">private</span> flushTimer: NodeJS.Timer | <span class="keyword">null</span> = <span class="keyword">null</span>;
+
+  <span class="func">markRead</span>(conversationId: <span class="type">string</span>, lastSeqId: <span class="type">number</span>): <span class="type">void</span> {
+    <span class="keyword">const</span> current = <span class="keyword">this</span>.pendingReceipts.<span class="func">get</span>(conversationId) ?? <span class="number">0</span>;
+    <span class="keyword">if</span> (lastSeqId &gt; current) {
+      <span class="keyword">this</span>.pendingReceipts.<span class="func">set</span>(conversationId, lastSeqId);
+    }
+    <span class="keyword">this</span>.<span class="func">scheduleFlush</span>();
+  }
+
+  <span class="keyword">private</span> <span class="func">scheduleFlush</span>(): <span class="type">void</span> {
+    <span class="keyword">if</span> (<span class="keyword">this</span>.flushTimer) <span class="keyword">return</span>;
+    <span class="keyword">this</span>.flushTimer = <span class="func">setTimeout</span>(() =&gt; {
+      <span class="keyword">this</span>.<span class="func">flush</span>();
+      <span class="keyword">this</span>.flushTimer = <span class="keyword">null</span>;
+    }, <span class="number">2000</span>); <span class="comment">// batch window: 2 seconds</span>
+  }
+
+  <span class="keyword">private</span> <span class="func">flush</span>(): <span class="type">void</span> {
+    <span class="keyword">const</span> batch = Array.<span class="func">from</span>(<span class="keyword">this</span>.pendingReceipts.<span class="func">entries</span>())
+      .<span class="func">map</span>(([convId, seqId]) =&gt; ({ convId, lastReadSeqId: seqId }));
+    <span class="keyword">this</span>.socket.<span class="func">send</span>({ type: <span class="string">'read_receipts'</span>, receipts: batch });
+    <span class="keyword">this</span>.pendingReceipts.<span class="func">clear</span>();
+  }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">High-Water Mark Pattern</div>
+        <p>Read receipts use a <strong>high-water mark</strong>: "I've read up to sequence ID 42" implicitly marks all messages 1-42 as read. This is far more efficient than tracking individual message read states. The server stores one integer per user per conversation, not one boolean per message.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="typing">7. Typing Indicators</h2>
+
+    <p>Typing indicators are ephemeral signals — they don't need persistence, delivery guarantees, or ordering. They're fire-and-forget with client-side timeout.</p>
+
+    <h3>7.1 Throttled Typing Events</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">TypingIndicator</span> {
+  <span class="keyword">private</span> lastSent = <span class="number">0</span>;
+  <span class="keyword">private</span> stopTimer: NodeJS.Timer | <span class="keyword">null</span> = <span class="keyword">null</span>;
+  <span class="keyword">private static</span> THROTTLE_MS = <span class="number">3000</span>;
+  <span class="keyword">private static</span> STOP_DELAY_MS = <span class="number">5000</span>;
+
+  <span class="func">onTextChange</span>(conversationId: <span class="type">string</span>): <span class="type">void</span> {
+    <span class="keyword">const</span> now = Date.<span class="func">now</span>();
+    <span class="keyword">if</span> (now - <span class="keyword">this</span>.lastSent &gt; <span class="type">TypingIndicator</span>.THROTTLE_MS) {
+      <span class="keyword">this</span>.socket.<span class="func">send</span>({
+        type: <span class="string">'typing'</span>, conversationId, isTyping: <span class="keyword">true</span>
+      });
+      <span class="keyword">this</span>.lastSent = now;
+    }
+    <span class="keyword">if</span> (<span class="keyword">this</span>.stopTimer) <span class="func">clearTimeout</span>(<span class="keyword">this</span>.stopTimer);
+    <span class="keyword">this</span>.stopTimer = <span class="func">setTimeout</span>(() =&gt; {
+      <span class="keyword">this</span>.socket.<span class="func">send</span>({
+        type: <span class="string">'typing'</span>, conversationId, isTyping: <span class="keyword">false</span>
+      });
+    }, <span class="type">TypingIndicator</span>.STOP_DELAY_MS);
+  }
+}
+
+<span class="comment">// Receiver side: auto-expire typing indicators</span>
+<span class="keyword">const</span> <span class="func">useTypingIndicators</span> = (conversationId: <span class="type">string</span>) =&gt; {
+  <span class="keyword">const</span> [typingUsers, setTypingUsers] = <span class="func">useState</span>&lt;<span class="type">Map</span>&lt;<span class="type">string</span>, <span class="type">number</span>&gt;&gt;(<span class="keyword">new</span> <span class="type">Map</span>());
+
+  <span class="func">useEffect</span>(() =&gt; {
+    <span class="keyword">const</span> interval = <span class="func">setInterval</span>(() =&gt; {
+      <span class="keyword">const</span> now = Date.<span class="func">now</span>();
+      <span class="func">setTypingUsers</span>(prev =&gt; {
+        <span class="keyword">const</span> next = <span class="keyword">new</span> <span class="type">Map</span>(prev);
+        <span class="keyword">for</span> (<span class="keyword">const</span> [uid, ts] <span class="keyword">of</span> next) {
+          <span class="keyword">if</span> (now - ts &gt; <span class="number">6000</span>) next.<span class="func">delete</span>(uid);
+        }
+        <span class="keyword">return</span> next;
+      });
+    }, <span class="number">1000</span>);
+    <span class="keyword">return</span> () =&gt; <span class="func">clearInterval</span>(interval);
+  }, []);
+};</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="push">8. Push Notification Integration</h2>
+
+    <p>Push notifications are the <strong>only reliable delivery channel</strong> when the app is backgrounded or killed. The server must detect when a recipient's WebSocket is disconnected and fall back to push.</p>
+
+    <h3>8.1 Delivery Decision Flow</h3>
+
+    <div class="diagram">
+Server receives message for User B:
+
+  Is User B's WebSocket connected?
+  ├── YES → Deliver via WebSocket
+  │         Wait 5s for DELIVERED ACK
+  │         ├── ACK received → Done
+  │         └── No ACK → Fall back to push
+  │
+  └── NO  → Send push notification immediately
+            Store message for later WebSocket delivery
+            (User B fetches on next connect)
+    </div>
+
+    <h3>8.2 Push Payload Design</h3>
+
+    <pre><code><span class="comment">// Minimal push payload (APNs limit: 4KB, FCM: 4KB)</span>
+{
+  <span class="string">"notification"</span>: {
+    <span class="string">"title"</span>: <span class="string">"Alice"</span>,
+    <span class="string">"body"</span>: <span class="string">"Hey, are you free for lunch?"</span>,
+    <span class="string">"badge"</span>: <span class="number">3</span>,
+    <span class="string">"thread-id"</span>: <span class="string">"conv_abc123"</span>
+  },
+  <span class="string">"data"</span>: {
+    <span class="string">"type"</span>: <span class="string">"new_message"</span>,
+    <span class="string">"conv_id"</span>: <span class="string">"conv_abc123"</span>,
+    <span class="string">"msg_server_id"</span>: <span class="number">42</span>,
+    <span class="string">"sender_id"</span>: <span class="string">"user_alice"</span>
+  }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Push Notification Privacy</div>
+        <p>Never include the full message body in push payloads for sensitive apps. Use <strong>notification service extensions</strong> (iOS) or <strong>FirebaseMessagingService</strong> (Android) to fetch and decrypt the message content on-device after the push arrives. Signal uses this pattern — the push only contains a "you have a new message" signal, and the app fetches the encrypted content.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="media">9. Image and File Sharing</h2>
+
+    <p>Media messages require a separate upload pipeline — you never send binary data over the WebSocket. The pattern is: upload to object storage, get a URL, send the URL as a message.</p>
+
+    <h3>9.1 Upload Pipeline</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">MediaUploader</span> {
+  <span class="keyword">async</span> <span class="func">uploadAndSend</span>(
+    file: <span class="type">Asset</span>,
+    conversationId: <span class="type">string</span>
+  ): <span class="type">Promise</span>&lt;<span class="type">void</span>&gt; {
+    <span class="keyword">const</span> clientId = <span class="func">uuid</span>();
+    <span class="keyword">const</span> thumbnail = <span class="keyword">await</span> <span class="func">generateThumbnail</span>(file, { width: <span class="number">200</span> });
+
+    <span class="comment">// 1. Show optimistic message with local URI</span>
+    <span class="func">dispatch</span>(<span class="func">addOptimisticMessage</span>({
+      clientId, conversationId,
+      mediaLocalUri: file.uri,
+      thumbnailUri: thumbnail.uri,
+      uploadProgress: <span class="number">0</span>,
+      status: <span class="string">'uploading'</span>,
+    }));
+
+    <span class="comment">// 2. Upload with progress tracking</span>
+    <span class="keyword">const</span> { url } = <span class="keyword">await</span> <span class="func">uploadToS3</span>(file, {
+      onProgress: (pct) =&gt; <span class="func">dispatch</span>(<span class="func">updateProgress</span>(clientId, pct)),
+      contentType: file.type,
+    });
+
+    <span class="comment">// 3. Send message with media URL</span>
+    <span class="keyword">await</span> socket.<span class="func">sendWithAck</span>({
+      clientId, conversationId,
+      body: <span class="keyword">null</span>,
+      mediaUrl: url,
+      mediaType: file.type,
+      thumbnailUrl: thumbnail.remoteUrl,
+    });
+  }
+}</code></pre>
+
+    <h3>9.2 Image Optimization</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Optimization</th>
+                <th>Implementation</th>
+                <th>Impact</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Client-side resize</td>
+                <td>Max 1920px, JPEG quality 80%</td>
+                <td>70-90% size reduction</td>
+            </tr>
+            <tr>
+                <td>Thumbnail generation</td>
+                <td>200px blurhash or JPEG</td>
+                <td>Instant preview before full load</td>
+            </tr>
+            <tr>
+                <td>Progressive loading</td>
+                <td>Blurhash → thumbnail → full</td>
+                <td>Perceived instant loading</td>
+            </tr>
+            <tr>
+                <td>CDN with transforms</td>
+                <td>Cloudinary/Imgix URL params</td>
+                <td>Device-appropriate sizes</td>
+            </tr>
+            <tr>
+                <td>Disk cache</td>
+                <td>react-native-fast-image</td>
+                <td>Offline access, no re-downloads</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="search-pagination">10. Search and Pagination</h2>
+
+    <h3>10.1 Cursor-Based Pagination</h3>
+
+    <pre><code><span class="keyword">async function</span> <span class="func">loadMessages</span>(
+  conversationId: <span class="type">string</span>,
+  cursor?: <span class="type">number</span>,
+  limit = <span class="number">30</span>
+): <span class="type">Promise</span>&lt;<span class="type">MessagePage</span>&gt; {
+  <span class="comment">// Try local first</span>
+  <span class="keyword">const</span> local = <span class="keyword">await</span> db.<span class="func">executeSql</span>(
+    <span class="string">`SELECT * FROM messages
+     WHERE conv_id = ? AND (? IS NULL OR server_ts &lt; ?)
+     ORDER BY server_ts DESC LIMIT ?`</span>,
+    [conversationId, cursor, cursor, limit + <span class="number">1</span>]
+  );
+
+  <span class="keyword">const</span> hasMore = local.rows.length &gt; limit;
+  <span class="keyword">const</span> messages = local.rows.<span class="func">slice</span>(<span class="number">0</span>, limit);
+
+  <span class="keyword">if</span> (messages.length &lt; limit) {
+    <span class="comment">// Local cache exhausted — fetch from server</span>
+    <span class="keyword">const</span> remote = <span class="keyword">await</span> api.<span class="func">getMessages</span>(conversationId, cursor, limit);
+    <span class="keyword">await</span> <span class="func">insertMessages</span>(remote.messages);
+    <span class="keyword">return</span> remote;
+  }
+
+  <span class="keyword">return</span> {
+    messages,
+    nextCursor: hasMore ? messages[messages.length - <span class="number">1</span>].server_ts : <span class="keyword">null</span>,
+  };
+}</code></pre>
+
+    <h3>10.2 Full-Text Search</h3>
+
+    <pre><code><span class="keyword">async function</span> <span class="func">searchMessages</span>(query: <span class="type">string</span>): <span class="type">Promise</span>&lt;<span class="type">SearchResult</span>[]&gt; {
+  <span class="keyword">const</span> results = <span class="keyword">await</span> db.<span class="func">executeSql</span>(
+    <span class="string">`SELECT m.*, snippet(messages_fts, 0, '&lt;b&gt;', '&lt;/b&gt;', '...', 32) as snippet
+     FROM messages_fts
+     JOIN messages m ON m.rowid = messages_fts.rowid
+     WHERE messages_fts MATCH ?
+     ORDER BY rank
+     LIMIT 50`</span>,
+    [<span class="string">`"${query}"`</span>]
+  );
+  <span class="keyword">return</span> results.rows;
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">11. Architect Considerations</h2>
+
+    <h3>11.1 End-to-End Encryption</h3>
+
+    <p>For privacy-sensitive chat, implement the <strong>Signal Protocol</strong> (Double Ratchet): each message is encrypted with a unique key derived from a ratcheting key exchange. The server never sees plaintext. This affects every layer: push payloads must be opaque, search must be client-side only, and key management adds significant complexity.</p>
+
+    <h3>11.2 Multi-Device Sync</h3>
+
+    <div class="diagram">
+Device A (Phone)          Server              Device B (Tablet)
+     │                      │                      │
+     │── Send msg ─────────►│                      │
+     │                      │── Deliver to B ─────►│
+     │                      │── Deliver to A' ────►│ (echo back to
+     │◄── Echo (self-sent) ─│                      │  sender's other
+     │                      │                      │  devices)
+     │                      │                      │
+     │  All devices share the same conversation    │
+     │  state via server-assigned sequence IDs     │
+    </div>
+
+    <h3>11.3 Performance Budget</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Metric</th>
+                <th>Target</th>
+                <th>Measurement</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Message send latency</td>
+                <td>&lt; 200ms (optimistic UI)</td>
+                <td>Time from tap to message appearing in list</td>
+            </tr>
+            <tr>
+                <td>Conversation load</td>
+                <td>&lt; 100ms (cached)</td>
+                <td>SQLite query + FlatList initial render</td>
+            </tr>
+            <tr>
+                <td>Scroll frame rate</td>
+                <td>60fps</td>
+                <td>No dropped frames during message list scroll</td>
+            </tr>
+            <tr>
+                <td>Reconnection time</td>
+                <td>&lt; 3s (good network)</td>
+                <td>WebSocket close → new connection established</td>
+            </tr>
+            <tr>
+                <td>Offline queue flush</td>
+                <td>&lt; 1s per message</td>
+                <td>Time to send + receive ACK per queued message</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Summary</div>
+        <p>A production chat system is a <strong>distributed state machine</strong> with the client as an eventually-consistent replica. The key architectural decisions are: (1) optimistic local writes with server reconciliation, (2) sequence-number-based ordering rather than timestamps, (3) at-least-once delivery with client dedup, (4) push notification fallback for offline delivery, and (5) cursor-based pagination with local-first reads. Every decision trades latency against consistency — and in chat, users always prefer latency.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="index.html">← Series Index</a>
+        <a href="02-offline-first-mobile.html">Next: Offline-First Mobile →</a>
+    </div>
+</div>
+</body>
+</html>

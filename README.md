@@ -1,6 +1,6 @@
-# Android & iOS Interview Preparation
+# Android, iOS, React JS & React Native Interview Preparation
 
-A comprehensive collection of deep-dive documentation covering Android and iOS internals for senior-level (L5/L6) interview preparation.
+A comprehensive collection of deep-dive documentation covering Android, iOS, React JS, and React Native internals for senior-level (L5/L6) interview preparation.
 
 ---
 
@@ -37,6 +37,36 @@ android_document/
 │   ├── 11-architecture-patterns/
 │   ├── 12-build-toolchain/
 │   └── 13-api-evolution-history/
+│
+├── react-js/                     # React JS web deep-dive documentation
+│   ├── 01-react-fundamentals/
+│   ├── 02-rendering-reconciliation/
+│   ├── 03-hooks-internals/
+│   ├── 04-state-management/
+│   ├── 05-routing-navigation/
+│   ├── 06-performance-optimization/
+│   ├── 07-server-side-rendering/
+│   ├── 08-testing-patterns/
+│   ├── 09-build-toolchain/
+│   ├── 10-security-web/
+│   ├── 11-architecture-patterns/
+│   ├── 12-browser-internals/
+│   └── engineering-problems/
+│
+├── react-native/                 # React Native mobile deep-dive documentation
+│   ├── 01-architecture-bridge/
+│   ├── 02-new-architecture/
+│   ├── 03-rendering-pipeline/
+│   ├── 04-navigation-deep-dive/
+│   ├── 05-native-modules/
+│   ├── 06-performance-optimization/
+│   ├── 07-state-management/
+│   ├── 08-animations-gestures/
+│   ├── 09-platform-specific/
+│   ├── 10-testing-debugging/
+│   ├── 11-security-storage/
+│   ├── 12-build-deployment/
+│   └── engineering-problems/
 │
 ├── code-samples/                 # Runnable sample projects
 │   ├── ipc-binder/
@@ -112,6 +142,46 @@ Real-world production problems with deep-dive solutions — designed for L5/L6 s
 | 11 | Architecture Patterns | MVC, MVVM, TCA, Coordinator |
 | 12 | Build Toolchain | Xcode build system, Swift Package Manager, Instruments |
 | 13 | API Evolution & History | Swift evolution, deprecation strategies, backward compatibility |
+
+---
+
+## React JS Topics
+
+| # | Topic | Focus Areas |
+|---|-------|-------------|
+| 01 | React Fundamentals | JSX transformation, Fiber architecture, virtual DOM, reconciliation |
+| 02 | Rendering & Reconciliation | Render phases, Scheduler lanes, concurrent features, Suspense, hydration |
+| 03 | Hooks Internals | Hooks linked list, useState/useReducer, useEffect lifecycle, React 19 use() |
+| 04 | State Management | Redux internals, Zustand/Jotai/Signals, TanStack Query, state machines |
+| 05 | Routing & Navigation | History API, React Router v6, data loading, code splitting, Next.js App Router |
+| 06 | Performance Optimization | Rendering perf, memoization, virtualization, Web Vitals, memory management |
+| 07 | Server-Side Rendering | SSR/SSG/ISR, React Server Components, streaming, Next.js, edge rendering |
+| 08 | Testing Patterns | RTL, MSW, Playwright/Cypress, mocking, performance testing, CI infrastructure |
+| 09 | Build Toolchain | Module systems, Webpack/Vite/Turbopack, transpilation, TypeScript, CSS solutions |
+| 10 | Security & Web | XSS, CSRF, authentication, authorization, dependency security, browser security |
+| 11 | Architecture Patterns | Component architecture, design systems, micro-frontends, accessibility |
+| 12 | Browser Internals | Rendering engine, V8 internals, event loop, DOM APIs, Web Workers |
+| — | **Engineering Problems** | Real-time collaboration, infinite scroll, offline-first, design systems at scale, performance monitoring, micro-frontend migration, search typeahead, image gallery, form builder, error tracking, feature flags, cross-tab state sync |
+
+---
+
+## React Native Topics
+
+| # | Topic | Focus Areas |
+|---|-------|-------------|
+| 01 | Architecture & Bridge | Bridge architecture, Hermes/JSC, native modules, shadow tree, Yoga, Metro |
+| 02 | New Architecture | JSI, Fabric renderer, TurboModules, Codegen, bridgeless mode, concurrent rendering |
+| 03 | Rendering Pipeline | Reconciliation to native, view flattening, FlatList/FlashList, image handling |
+| 04 | Navigation Deep Dive | React Navigation internals, native stack, deep linking, navigation performance |
+| 05 | Native Modules | Native module creation, TurboModules, native UI, platform APIs, Expo Modules |
+| 06 | Performance Optimization | JS thread, rendering, memory, startup, animation, network, bundle size |
+| 07 | State Management | Redux/Zustand/MobX in RN, persistent storage (MMKV/SQLite/Realm), state sync |
+| 08 | Animations & Gestures | Animated API, Reanimated v3, Gesture Handler, Skia graphics, shared elements |
+| 09 | Platform-Specific | iOS/Android specifics, responsive design, accessibility, i18n, RN for Web |
+| 10 | Testing & Debugging | Jest, Detox E2E, Flipper, profiling, crash reporting, CI/CD mobile |
+| 11 | Security & Storage | Keychain/Keystore, certificate pinning, code protection, biometric auth |
+| 12 | Build & Deployment | Metro config, native builds, Expo, OTA updates, app signing, monorepo |
+| — | **Engineering Problems** | Chat app, offline-first, performance audit, native-to-RN migration, push notifications, image-heavy apps, payments, biometric auth, analytics SDK, multi-app platform, accessibility overhaul, background processing |
 
 ---
 

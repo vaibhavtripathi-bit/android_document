@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dynamic Form Builder — Engineering Problems</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Engineering Problems</a>
+  <span class="sep">›</span>
+  Dynamic Form Builder
+</nav>
+
+<h1>Dynamic Form Builder</h1>
+<p class="subtitle">Schema-driven rendering, conditional visibility graphs, layered validation (sync/async, field vs form), wizard state machines, DnD Kit ordering, analytics instrumentation, server error mapping, and accessibility contracts at staff level.</p>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architecture lens</div>
+  <p>Treat the form as a <strong>directed acyclic graph of fields</strong> with validation as a <strong>monoidal layer</strong> (field errors compose to form errors). Persist wizard state as <strong>versioned snapshots</strong> so migrations do not corrupt in-flight user sessions.</p>
+</div>
+
+<h2 id="schema-driven">Schema-driven forms: JSON Schema to React</h2>
+
+<p>At L6 depth, the renderer is not a giant <code>switch</code> on <code>type</code>; you register <strong>widget resolvers</strong> keyed by <code>format</code>, <code>x-widget</code>, or capability flags. Resolution order: explicit widget override → format mapping → type default → fallback text input.</p>
+
+<div class="diagram">┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  JSON Schema    │────▶│  Normalizer      │────▶│  Field DAG      │
+│  (+ extensions) │     │  (defaults, $ref)│     │  (nodes + edges)│
+└─────────────────┘     └──────────────────┘     └────────┬────────┘
+                                                          │
+                        ┌─────────────────────────────────┘
+                        ▼
+              ┌─────────────────────┐
+              │ SchemaFieldRenderer │
+              │ (React.memo per id) │
+              └─────────────────────┘</div>
+
+<pre><code>// types.ts — minimal schema surface for a builder
+export type FieldSchema = {
+  id: string;
+  type: 'string' | 'number' | 'boolean' | 'enum' | 'object' | 'array';
+  title?: string;
+  description?: string;
+  enum?: string[];
+  'x-widget'?: 'textarea' | 'select' | 'date' | 'file';
+  'x-dependsOn'?: DependencyRule[];
+  properties?: Record&lt;string, FieldSchema&gt;;
+};
+
+export type DependencyRule = {
+  when: string; // JSON Pointer or dot path to watched field
+  op: 'eq' | 'neq' | 'in' | 'truthy';
+  value?: unknown;
+};
+
+// registry.ts — pluggable widget map (OCP-friendly)
+type WidgetProps = {
+  schema: FieldSchema;
+  value: unknown;
+  onChange: (v: unknown) =&gt; void;
+  error?: string;
+  disabled?: boolean;
+};
+
+const widgets: Record&lt;string, React.FC&lt;WidgetProps&gt;&gt; = {
+  string: TextInput,
+  textarea: Textarea,
+  enum: Select,
+  boolean: Checkbox,
+};
+
+export function resolveWidget(schema: FieldSchema) {
+  if (schema['x-widget'] &amp;&amp; widgets[schema['x-widget']]) {
+    return widgets[schema['x-widget']];
+  }
+  if (schema.enum) return widgets.enum;
+  return widgets[schema.type] ?? widgets.string;
+}</code></pre>
+
+<pre><code>// SchemaFieldRenderer.tsx — isolate subscriptions to avoid full-form re-renders
+import { memo, useCallback } from 'react';
+import { useFormContext, Controller } from 'react-hook-form';
+
+export const SchemaFieldRenderer = memo(function SchemaFieldRenderer({
+  schema,
+  namePrefix = '',
+}: {
+  schema: FieldSchema;
+  namePrefix?: string;
+}) {
+  const path = `${namePrefix}${schema.id}`;
+  const { control, formState } = useFormContext();
+  const Widget = resolveWidget(schema);
+  const visible = useVisibility(schema, namePrefix);
+
+  const err = formState.errors[path]?.message as string | undefined;
+
+  if (!visible) return null;
+
+  if (schema.type === 'object' &amp;&amp; schema.properties) {
+    return (
+      &lt;fieldset aria-labelledby={`${path}-legend`}&gt;
+        &lt;legend id={`${path}-legend`}&gt;{schema.title}&lt;/legend&gt;
+        {Object.values(schema.properties).map((child) =&gt; (
+          &lt;SchemaFieldRenderer key={child.id} schema={child} namePrefix={`${path}.`} /&gt;
+        ))}
+      &lt;/fieldset&gt;
+    );
+  }
+
+  return (
+    &lt;Controller
+      name={path}
+      control={control}
+      render={({ field }) =&gt; (
+        &lt;Widget
+          schema={schema}
+          value={field.value}
+          onChange={field.onChange}
+          error={err}
+          disabled={formState.isSubmitting}
+        /&gt;
+      )}
+    /&gt;
+  );
+});</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">Performance note</div>
+  <p>Memoize per <code>schema.id</code> and pass stable <code>onChange</code> wrappers from context. For 200+ fields, consider splitting into <strong>micro-forms</strong> with a coordinator reducer or <code>useFormState({ control, name: subset })</code> subscriptions.</p>
+</div>
+
+<h2 id="conditional">Conditional fields: visibility as a pure function</h2>
+
+<p>Evaluate dependencies from a <strong>frozen snapshot</strong> of values (or RHF <code>watch()</code> with debounce for expensive rules). Cycle detection: build adjacency list from <code>x-dependsOn</code> and run DFS; staff systems fail CI if a cycle exists.</p>
+
+<pre><code>// visibilityEngine.ts
+import get from 'lodash/get';
+
+export function evaluateVisibility(
+  schema: FieldSchema,
+  values: Record&lt;string, unknown&gt;,
+  namePrefix: string
+): boolean {
+  const rules = schema['x-dependsOn'];
+  if (!rules?.length) return true;
+
+  return rules.every((rule) =&gt; {
+    const fullPath = `${namePrefix}${rule.when}`;
+    const actual = get(values, fullPath.replace(/\./g, '.')); // or json-pointer lib
+    switch (rule.op) {
+      case 'eq':
+        return actual === rule.value;
+      case 'neq':
+        return actual !== rule.value;
+      case 'in':
+        return Array.isArray(rule.value) &amp;&amp; rule.value.includes(actual as never);
+      case 'truthy':
+        return Boolean(actual);
+      default:
+        return true;
+    }
+  });
+}
+
+// useVisibility.ts — subscribe only to dependency paths
+import { useWatch, useFormContext } from 'react-hook-form';
+
+export function useVisibility(schema: FieldSchema, namePrefix: string) {
+  const { control } = useFormContext();
+  const deps = schema['x-dependsOn']?.map((r) =&gt; `${namePrefix}${r.when}`) ?? [];
+  const slice = useWatch({ control, name: deps as any }); // RHF supports array of names
+  const all = useWatch({ control }); // fallback if deps empty
+  const values = deps.length ? Object.fromEntries(deps.map((d, i) =&gt; [d, slice?.[i]])) : all;
+  return evaluateVisibility(schema, values as Record&lt;string, unknown&gt;, namePrefix);
+}</code></pre>
+
+<div class="diagram">values.accountType === "business"
+        │
+        ├── true  ──▶ show [taxId, companyName]
+        │
+        └── false ──▶ hide  [taxId, companyName]
+                      (unregister + strip from submit payload)</div>
+
+<h2 id="validation">Validation: sync, async, field, and form layers</h2>
+
+<table>
+<thead>
+<tr><th>Layer</th><th>When</th><th>Typical mechanism</th><th>Failure mode</th></tr>
+</thead>
+<tbody>
+<tr><td>Field sync</td><td>onBlur / onChange</td><td>Zod <code>.superRefine</code>, Yup, AJV</td><td>Thrashing UX if on every keystroke</td></tr>
+<tr><td>Field async</td><td>debounced onChange</td><td>AbortController per request</td><td>Race: stale response overwrites newer</td></tr>
+<tr><td>Form sync</td><td>onSubmit</td><td>Super-schema with <code>refine</code> across fields</td><td>Errors not attributable to single widget</td></tr>
+<tr><td>Form async</td><td>submit pipeline</td><td>Server round-trip</td><td>Mapping 422 body to fields</td></tr>
+</tbody>
+</table>
+
+<pre><code>// validationEngine.ts — composable validators with async cancellation
+export type FieldValidator = (value: unknown, ctx: FormCtx) =&gt;
+  | string | undefined | Promise&lt;string | undefined&gt;;
+
+export type FormCtx = {
+  getValues: () =&gt; Record&lt;string, unknown&gt;;
+  signal: AbortSignal;
+};
+
+export async function runFieldAsync(
+  validators: FieldValidator[],
+  value: unknown,
+  ctx: FormCtx
+): Promise&lt;string | undefined&gt; {
+  for (const v of validators) {
+    const msg = await v(value, ctx);
+    if (msg) return msg;
+  }
+  return undefined;
+}
+
+// usage with react-hook-form — resolver stays thin, heavy logic in engine
+import { zodResolver } from '@hookform/resolvers/zod';
+import { z } from 'zod';
+
+const schema = z
+  .object({
+    start: z.coerce.date(),
+    end: z.coerce.date(),
+  })
+  .refine((d) =&gt; d.end &gt;= d.start, { path: ['end'], message: 'End must be after start' });
+
+// Form-level cross-field = super-schema; field-level = .superRefine on individual keys</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Async races</div>
+  <p>Always key async validation by <code>fieldId + valueVersion</code>. If the user changes input before the prior request resolves, <strong>discard</strong> the stale result. Expose <code>isValidating</code> per field for loading indicators without blocking submit globally.</p>
+</div>
+
+<h2 id="wizard">Multi-step forms: state machine and persistence</h2>
+
+<p>Model steps as explicit states with events <code>NEXT</code>, <code>BACK</code>, <code>SAVE_DRAFT</code>, <code>SUBMIT</code>. Persist to <code>IndexedDB</code> or encrypted <code>sessionStorage</code> with a <strong>schema version</strong> header; on load, run a migrator. Hydrate RHF with <code>reset(migrated)</code> once.</p>
+
+<pre><code>// wizardMachine.ts — XState-style reducer (no lib required)
+type WizardState = {
+  step: number;
+  data: Record&lt;string, unknown&gt;;
+  lastSavedAt?: number;
+};
+
+type WizardEvt =
+  | { type: 'NEXT'; payload?: Record&lt;string, unknown&gt; }
+  | { type: 'BACK' }
+  | { type: 'HYDRATE'; snapshot: WizardState };
+
+export function wizardReducer(s: WizardState, e: WizardEvt): WizardState {
+  switch (e.type) {
+    case 'NEXT':
+      return {
+        ...s,
+        step: s.step + 1,
+        data: { ...s.data, ...e.payload },
+        lastSavedAt: Date.now(),
+      };
+    case 'BACK':
+      return { ...s, step: Math.max(0, s.step - 1) };
+    case 'HYDRATE':
+      return e.snapshot;
+    default:
+      return s;
+  }
+}
+
+// persist.ts
+const KEY = 'wizard:checkout:v3';
+
+export async function saveWizard(snapshot: WizardState) {
+  const enc = await compressAndSeal(snapshot, KEY); // app-specific crypto
+  await idbPut(KEY, enc);
+}</code></pre>
+
+<div class="diagram">Step0 (Identity) ──NEXT──▶ Step1 (Address) ──NEXT──▶ Step2 (Payment)
+     ▲                         │                         │
+     └──────── BACK ───────────┘                         SUBMIT
+                                                         │
+                                                         ▼
+                                                   API + clear draft</div>
+
+<h2 id="dnd">Drag-and-drop ordering with DnD Kit</h2>
+
+<p>Use <code>@dnd-kit/core</code> with <strong>collision detection</strong> tuned for nested lists (<code>closestCenter</code> vs <code>pointerWithin</code>). For accessibility, implement <code>KeyboardSensor</code> and announce moves via <code>aria-live</code>. Store order as an array of stable IDs, not array indices in the DOM.</p>
+
+<pre><code>import {
+  DndContext,
+  PointerSensor,
+  KeyboardSensor,
+  useSensor,
+  useSensors,
+  closestCenter,
+} from '@dnd-kit/core';
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+  arrayMove,
+} from '@dnd-kit/sortable';
+
+function FieldOrderEditor({
+  ids,
+  onReorder,
+}: {
+  ids: string[];
+  onReorder: (next: string[]) =&gt; void;
+}) {
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor)
+  );
+
+  return (
+    &lt;DndContext
+      sensors={sensors}
+      collisionDetection={closestCenter}
+      onDragEnd={({ active, over }) =&gt; {
+        if (!over || active.id === over.id) return;
+        const oldIndex = ids.indexOf(String(active.id));
+        const newIndex = ids.indexOf(String(over.id));
+        onReorder(arrayMove(ids, oldIndex, newIndex));
+      }}
+    &gt;
+      &lt;SortableContext items={ids} strategy={verticalListSortingStrategy}&gt;
+        {ids.map((id) =&gt; (
+          &lt;SortableFieldRow key={id} id={id} /&gt;
+        ))}
+      &lt;/SortableContext&gt;
+    &lt;/DndContext&gt;
+  );
+}</code></pre>
+
+<h2 id="analytics">Form analytics: interaction and drop-off</h2>
+
+<table>
+<thead>
+<tr><th>Signal</th><th>Implementation</th><th>Privacy</th></tr>
+</thead>
+<tbody>
+<tr><td>Field focus time</td><td><code>onFocus</code>/<code>onBlur</code> timestamps</td><td>Aggregate; avoid logging PII values</td></tr>
+<tr><td>Error rate per field</td><td>Hook into validation resolver</td><td>Hash field keys if sensitive</td></tr>
+<tr><td>Step abandonment</td><td><code>visibilitychange</code> + step index</td><td>Session ID rotation</td></tr>
+<tr><td>Correction loops</td><td>Count transitions invalid→valid per field</td><td>Opt-in consent banner</td></tr>
+</tbody>
+</table>
+
+<pre><code>// formAnalytics.ts — batch + sendBeacon on page hide
+const queue: AnalyticsEvent[] = [];
+
+export function trackFieldBlur(fieldId: string, dwellMs: number) {
+  queue.push({ type: 'field_blur', fieldId, dwellMs, ts: Date.now() });
+  if (queue.length &gt;= 20) flush();
+}
+
+export function flush() {
+  if (!queue.length) return;
+  const body = JSON.stringify(queue.splice(0, queue.length));
+  navigator.sendBeacon('/api/form-telemetry', body);
+}</code></pre>
+
+<h2 id="server-errors">Server-side validation: mapping errors to fields</h2>
+
+<p>Standardize on RFC 7807 <code>Problem+JSON</code> or a custom envelope <code>{ errors: { path: message[] } }</code>. Normalize paths to RHF names with a single <code>serverPathToClient</code> function shared by web and API teams.</p>
+
+<pre><code>type ServerErrorBody = {
+  errors: Record&lt;string, string[]&gt;;
+};
+
+export function applyServerErrors(
+  setError: UseFormSetError&lt;FieldValues&gt;,
+  body: ServerErrorBody
+) {
+  for (const [path, messages] of Object.entries(body.errors)) {
+    const name = path.replace(/^\//, '').replace(/\//g, '.'); // JSON Pointer → RHF
+    setError(name as FieldPath&lt;FieldValues&gt;, {
+      type: 'server',
+      message: messages[0] ?? 'Invalid',
+    });
+  }
+}</code></pre>
+
+<h2 id="a11y">Accessibility: labels, live regions, focus</h2>
+
+<ul>
+  <li>Associate every input with <code>&lt;label htmlFor&gt;</code> or <code>aria-labelledby</code>.</li>
+  <li>On submit failure, move focus to the first error with <code>role="alert"</code> container or <code>aria-live="assertive"</code> for screen readers.</li>
+  <li>When conditional fields mount, use <code>useLayoutEffect</code> to focus the first newly visible control if the user triggered the dependency change via keyboard.</li>
+</ul>
+
+<pre><code>function FormErrorSummary({ errors }: { errors: FieldErrors }) {
+  const first = Object.keys(errors)[0];
+  const ref = useRef&lt;HTMLDivElement&gt;(null);
+
+  useEffect(() =&gt; {
+    if (first) ref.current?.focus();
+  }, [first]);
+
+  if (!first) return null;
+
+  return (
+    &lt;div
+      ref={ref}
+      tabIndex={-1}
+      role="alert"
+      aria-live="assertive"
+      className="error-summary"
+    &gt;
+      &lt;h2&gt;There are errors in the form&lt;/h2&gt;
+      &lt;ul&gt;
+        {Object.entries(errors).map(([name, e]) =&gt; (
+          &lt;li key={name}&gt;
+            &lt;a href={`#${name}`}&gt;{e?.message as string}&lt;/a&gt;
+          &lt;/li&gt;
+        ))}
+      &lt;/ul&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Staff takeaway</div>
+  <p>Invest in a <strong>schema IR</strong> shared with the backend (OpenAPI/JSON Schema codegen) so validation, visibility, and analytics keys stay aligned across services. The alternative is endless stringly-typed path drift.</p>
+</div>
+
+<h2 id="qa">Interview Q&amp;A</h2>
+<div class="qa-section">
+  <div class="qa-item">
+    <div class="qa-question">How do you unregister hidden conditional fields? <span class="level tag tag-l6">L6</span></div>
+    <div class="qa-answer">
+      <p>Use RHF <code>unregister</code> when visibility flips false, or keep values but strip at submit with a <code>transform</code> layer. Unregister avoids sending stale data; keeping values preserves UX if the user toggles back. Document the product decision explicitly.</p>
+    </div>
+  </div>
+  <div class="qa-item">
+    <div class="qa-question">Where does Zod outperform AJV for React forms? <span class="level tag tag-senior">Senior</span></div>
+    <div class="qa-answer">
+      <p>Zod integrates ergonomically with TypeScript inference and <code>zodResolver</code>. AJJ shines when the canonical schema <em>is</em> JSON Schema and must be identical on server and client—then use <code>@hookform/resolvers/ajv</code> or convert schemas carefully.</p>
+    </div>
+  </div>
+</div>
+
+<nav class="nav-footer">
+  <a href="08-image-gallery-optimization.html">← Image Gallery Optimization</a>
+  <a href="10-error-tracking-system.html">Error Tracking System →</a>
+</nav>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

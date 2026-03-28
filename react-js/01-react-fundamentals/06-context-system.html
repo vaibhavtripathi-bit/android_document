@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Context System — React JS L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">React Fundamentals</a><span class="sep">›</span>
+        Context System
+    </nav>
+
+    <h1>Context System</h1>
+    <p class="subtitle">createContext internals, Provider/Consumer propagation through the fiber tree, bail-out optimization, why context triggers re-renders in all consumers, and techniques to avoid unnecessary re-renders at scale.</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#internals">1. createContext Internals</a></li>
+            <li><a href="#provider-consumer">2. Provider/Consumer Model</a></li>
+            <li><a href="#propagation">3. Value Propagation Through Fiber Tree</a></li>
+            <li><a href="#finding-provider">4. How React Finds the Nearest Provider</a></li>
+            <li><a href="#bailout">5. Bail-Out Optimization</a></li>
+            <li><a href="#re-render-problem">6. Why Context Triggers Re-Renders</a></li>
+            <li><a href="#optimization">7. Techniques to Avoid Unnecessary Re-Renders</a></li>
+            <li><a href="#react19">8. use(Context) in React 19</a></li>
+            <li><a href="#module-patterns">9. Module-Level Context Patterns</a></li>
+            <li><a href="#architect">10. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="internals">1. createContext Internals</h2>
+
+    <pre><code><span class="comment">// React.createContext returns an object with Provider and Consumer</span>
+<span class="keyword">const</span> ThemeContext = React.<span class="func">createContext</span>(<span class="string">'light'</span>);
+
+<span class="comment">// Internally, this creates:</span>
+{
+  $$typeof: <span class="type">Symbol</span>.<span class="func">for</span>(<span class="string">'react.context'</span>),
+  _currentValue: <span class="string">'light'</span>,     <span class="comment">// Current value (primary renderer)</span>
+  _currentValue2: <span class="string">'light'</span>,    <span class="comment">// Current value (secondary renderer)</span>
+  _threadCount: <span class="number">0</span>,             <span class="comment">// For concurrent rendering</span>
+  Provider: {
+    $$typeof: <span class="type">Symbol</span>.<span class="func">for</span>(<span class="string">'react.provider'</span>),
+    _context: <span class="comment">/* circular ref to context object */</span>
+  },
+  Consumer: {
+    $$typeof: <span class="type">Symbol</span>.<span class="func">for</span>(<span class="string">'react.context'</span>),
+    _context: <span class="comment">/* circular ref to context object */</span>
+  },
+  _defaultValue: <span class="string">'light'</span>,     <span class="comment">// The default passed to createContext</span>
+  _globalName: <span class="keyword">null</span>            <span class="comment">// For DevTools</span>
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Two Current Values</div>
+        <p><code>_currentValue</code> and <code>_currentValue2</code> exist because React supports multiple renderers simultaneously (e.g., react-dom and react-art in the same app). Each renderer reads from its own slot. In practice, most apps only use one renderer, so <code>_currentValue2</code> is unused.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="provider-consumer">2. Provider/Consumer Model</h2>
+
+    <pre><code><span class="comment">// Provider: sets the context value for its subtree</span>
+&lt;<span class="type">ThemeContext.Provider</span> <span class="attr">value</span>=<span class="string">"dark"</span>&gt;
+  &lt;<span class="type">App</span> /&gt;
+&lt;/<span class="type">ThemeContext.Provider</span>&gt;
+
+<span class="comment">// Consumer (3 ways to read context):</span>
+
+<span class="comment">// 1. useContext hook (recommended)</span>
+<span class="keyword">function</span> <span class="func">Button</span>() {
+  <span class="keyword">const</span> theme = <span class="func">useContext</span>(ThemeContext);
+  <span class="keyword">return</span> &lt;<span class="type">button</span> <span class="attr">className</span>={theme}&gt;Click&lt;/<span class="type">button</span>&gt;;
+}
+
+<span class="comment">// 2. Consumer component (legacy, still works)</span>
+&lt;<span class="type">ThemeContext.Consumer</span>&gt;
+  {theme =&gt; &lt;<span class="type">button</span> <span class="attr">className</span>={theme}&gt;Click&lt;/<span class="type">button</span>&gt;}
+&lt;/<span class="type">ThemeContext.Consumer</span>&gt;
+
+<span class="comment">// 3. Class component contextType (legacy)</span>
+<span class="keyword">class</span> <span class="type">Button</span> <span class="keyword">extends</span> <span class="type">React.Component</span> {
+  <span class="keyword">static</span> contextType = ThemeContext;
+  <span class="func">render</span>() {
+    <span class="keyword">return</span> &lt;<span class="type">button</span> <span class="attr">className</span>={<span class="keyword">this</span>.context}&gt;Click&lt;/<span class="type">button</span>&gt;;
+  }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="propagation">3. Value Propagation Through Fiber Tree</h2>
+
+    <div class="diagram">
+Context value propagation:
+
+ThemeContext.Provider (value="dark")
+  │
+  ├── Header ──── Logo
+  │                └── uses ThemeContext ← reads "dark"
+  │
+  ├── ThemeContext.Provider (value="light")  ← nested override
+  │     │
+  │     └── Sidebar
+  │           └── uses ThemeContext ← reads "light" (nearest)
+  │
+  └── Footer
+        └── uses ThemeContext ← reads "dark" (outer provider)
+    </div>
+
+    <pre><code><span class="comment">// During the render phase, when React encounters a Provider:</span>
+<span class="comment">// 1. It pushes the new value onto an internal context stack</span>
+<span class="comment">// 2. All descendants read from the top of the stack</span>
+<span class="comment">// 3. When leaving the Provider subtree, it pops the value</span>
+
+<span class="comment">// This is a stack-based approach:</span>
+<span class="comment">// push(ThemeContext, "dark")    ← enter outer Provider</span>
+<span class="comment">//   read → "dark"</span>
+<span class="comment">//   push(ThemeContext, "light") ← enter inner Provider</span>
+<span class="comment">//     read → "light"</span>
+<span class="comment">//   pop(ThemeContext)           ← leave inner Provider</span>
+<span class="comment">//   read → "dark"</span>
+<span class="comment">// pop(ThemeContext)             ← leave outer Provider</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="finding-provider">4. How React Finds the Nearest Provider</h2>
+
+    <pre><code><span class="comment">// When useContext(ThemeContext) is called during render:</span>
+<span class="comment">// React does NOT walk up the fiber tree looking for a Provider.</span>
+<span class="comment">// Instead, it reads context._currentValue directly.</span>
+
+<span class="comment">// The Provider's beginWork sets context._currentValue</span>
+<span class="comment">// before processing children. Since rendering is depth-first,</span>
+<span class="comment">// children always see the correct value.</span>
+
+<span class="comment">// Simplified Provider beginWork:</span>
+<span class="keyword">function</span> <span class="func">updateContextProvider</span>(fiber) {
+  <span class="keyword">const</span> context = fiber.type._context;
+  <span class="keyword">const</span> newValue = fiber.pendingProps.value;
+
+  <span class="comment">// Push new value</span>
+  <span class="func">pushProvider</span>(fiber, context, newValue);
+  context._currentValue = newValue;
+
+  <span class="comment">// Process children (they'll read the new value)</span>
+  <span class="func">reconcileChildren</span>(fiber, fiber.pendingProps.children);
+}
+
+<span class="comment">// Simplified useContext:</span>
+<span class="keyword">function</span> <span class="func">useContext</span>(context) {
+  <span class="comment">// Mark this fiber as a consumer (for change propagation)</span>
+  <span class="func">readContext</span>(context);
+  <span class="keyword">return</span> context._currentValue; <span class="comment">// Direct read!</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="bailout">5. Bail-Out Optimization</h2>
+
+    <p>When a Provider re-renders with the <strong>same value</strong> (by reference), React can bail out and skip re-rendering consumers.</p>
+
+    <pre><code><span class="comment">// React compares old and new values with Object.is()</span>
+<span class="keyword">function</span> <span class="func">updateContextProvider</span>(fiber) {
+  <span class="keyword">const</span> oldValue = fiber.memoizedProps.value;
+  <span class="keyword">const</span> newValue = fiber.pendingProps.value;
+
+  <span class="keyword">if</span> (<span class="type">Object</span>.<span class="func">is</span>(oldValue, newValue)) {
+    <span class="comment">// Same value → bail out</span>
+    <span class="comment">// Children won't re-render due to context change</span>
+    <span class="comment">// (they might still re-render for other reasons)</span>
+    <span class="keyword">return</span>;
+  }
+
+  <span class="comment">// Different value → propagate change to all consumers</span>
+  <span class="func">propagateContextChange</span>(fiber, context, newValue);
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">The Object Identity Trap</div>
+        <p>If the Provider's value is an object literal created during render, it will be a <strong>new reference every render</strong>, defeating the bail-out optimization. This is one of the most common context performance mistakes.</p>
+    </div>
+
+    <pre><code><span class="comment">// BAD: New object every render → all consumers re-render</span>
+<span class="keyword">function</span> <span class="func">App</span>() {
+  <span class="keyword">const</span> [user, setUser] = <span class="func">useState</span>(<span class="keyword">null</span>);
+  <span class="keyword">return</span> (
+    &lt;<span class="type">UserContext.Provider</span> <span class="attr">value</span>={{ user, setUser }}&gt;
+      <span class="comment">{/* { user, setUser } is a NEW object every render */}</span>
+      &lt;<span class="type">App</span> /&gt;
+    &lt;/<span class="type">UserContext.Provider</span>&gt;
+  );
+}
+
+<span class="comment">// GOOD: Memoize the value object</span>
+<span class="keyword">function</span> <span class="func">App</span>() {
+  <span class="keyword">const</span> [user, setUser] = <span class="func">useState</span>(<span class="keyword">null</span>);
+  <span class="keyword">const</span> value = <span class="func">useMemo</span>(() =&gt; ({ user, setUser }), [user]);
+  <span class="keyword">return</span> (
+    &lt;<span class="type">UserContext.Provider</span> <span class="attr">value</span>={value}&gt;
+      &lt;<span class="type">App</span> /&gt;
+    &lt;/<span class="type">UserContext.Provider</span>&gt;
+  );
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="re-render-problem">6. Why Context Triggers Re-Renders in All Consumers</h2>
+
+    <p>When a context value changes, <strong>every component that calls useContext for that context will re-render</strong>, regardless of whether it uses the specific part of the value that changed.</p>
+
+    <pre><code><span class="comment">// Context with multiple values</span>
+<span class="keyword">const</span> AppContext = React.<span class="func">createContext</span>({
+  theme: <span class="string">'light'</span>,
+  locale: <span class="string">'en'</span>,
+  user: <span class="keyword">null</span>
+});
+
+<span class="comment">// Component that only uses theme</span>
+<span class="keyword">function</span> <span class="func">ThemeButton</span>() {
+  <span class="keyword">const</span> { theme } = <span class="func">useContext</span>(AppContext);
+  <span class="keyword">return</span> &lt;<span class="type">button</span> <span class="attr">className</span>={theme}&gt;Click&lt;/<span class="type">button</span>&gt;;
+}
+
+<span class="comment">// When user changes (but theme doesn't):</span>
+<span class="comment">// ThemeButton STILL re-renders because the context VALUE</span>
+<span class="comment">// (the entire object) changed reference.</span>
+<span class="comment">// React cannot know that ThemeButton only uses .theme</span></code></pre>
+
+    <h3>6.1 The Propagation Mechanism</h3>
+
+    <pre><code><span class="comment">// When a Provider's value changes, React calls propagateContextChange.</span>
+<span class="comment">// This walks the ENTIRE subtree of the Provider, looking for consumers.</span>
+
+<span class="comment">// For each consumer found:</span>
+<span class="comment">// 1. Mark the consumer fiber with a lane (schedule re-render)</span>
+<span class="comment">// 2. Mark all ancestors up to the Provider with childLanes</span>
+<span class="comment">// 3. This ensures the consumer is visited during the next render</span>
+
+<span class="comment">// Key insight: this propagation CANNOT be stopped by React.memo</span>
+<span class="comment">// or shouldComponentUpdate. Context changes bypass memoization.</span>
+<span class="comment">// The consumer will re-render even if its parent is memoized.</span></code></pre>
+
+    <div class="diagram">
+Provider (value changed)
+  │
+  ├── MemoizedParent (React.memo) ← would normally skip
+  │     │
+  │     └── Consumer (useContext) ← STILL re-renders!
+  │           Context change bypasses memo.
+  │           React marks this fiber directly.
+  │
+  └── AnotherConsumer ← also re-renders
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="optimization">7. Techniques to Avoid Unnecessary Re-Renders</h2>
+
+    <h3>7.1 Split Contexts</h3>
+
+    <pre><code><span class="comment">// Instead of one large context:</span>
+<span class="keyword">const</span> AppContext = <span class="func">createContext</span>({ theme, locale, user });
+
+<span class="comment">// Split into focused contexts:</span>
+<span class="keyword">const</span> ThemeContext = <span class="func">createContext</span>(<span class="string">'light'</span>);
+<span class="keyword">const</span> LocaleContext = <span class="func">createContext</span>(<span class="string">'en'</span>);
+<span class="keyword">const</span> UserContext = <span class="func">createContext</span>(<span class="keyword">null</span>);
+
+<span class="comment">// Now ThemeButton only subscribes to ThemeContext</span>
+<span class="comment">// Changes to user/locale don't trigger ThemeButton re-render</span></code></pre>
+
+    <h3>7.2 Separate State from Dispatch</h3>
+
+    <pre><code><span class="comment">// Common pattern: separate read-heavy and write-heavy contexts</span>
+<span class="keyword">const</span> StateContext = <span class="func">createContext</span>(<span class="keyword">null</span>);
+<span class="keyword">const</span> DispatchContext = <span class="func">createContext</span>(<span class="keyword">null</span>);
+
+<span class="keyword">function</span> <span class="func">AppProvider</span>({ children }) {
+  <span class="keyword">const</span> [state, dispatch] = <span class="func">useReducer</span>(reducer, initialState);
+
+  <span class="keyword">return</span> (
+    &lt;<span class="type">DispatchContext.Provider</span> <span class="attr">value</span>={dispatch}&gt;
+      &lt;<span class="type">StateContext.Provider</span> <span class="attr">value</span>={state}&gt;
+        {children}
+      &lt;/<span class="type">StateContext.Provider</span>&gt;
+    &lt;/<span class="type">DispatchContext.Provider</span>&gt;
+  );
+}
+
+<span class="comment">// dispatch is a stable reference (from useReducer)</span>
+<span class="comment">// Components that only dispatch actions never re-render</span>
+<span class="comment">// from state changes</span></code></pre>
+
+    <h3>7.3 Memoize Children</h3>
+
+    <pre><code><span class="comment">// The children pattern prevents re-rendering the subtree</span>
+<span class="comment">// when only the Provider's own state changes</span>
+
+<span class="keyword">function</span> <span class="func">ThemeProvider</span>({ children }) {
+  <span class="keyword">const</span> [theme, setTheme] = <span class="func">useState</span>(<span class="string">'light'</span>);
+  <span class="keyword">const</span> value = <span class="func">useMemo</span>(() =&gt; ({ theme, setTheme }), [theme]);
+
+  <span class="keyword">return</span> (
+    &lt;<span class="type">ThemeContext.Provider</span> <span class="attr">value</span>={value}&gt;
+      {children}  <span class="comment">{/* children is the SAME reference (from props) */}</span>
+    &lt;/<span class="type">ThemeContext.Provider</span>&gt;
+  );
+}
+
+<span class="comment">// Usage:</span>
+&lt;<span class="type">ThemeProvider</span>&gt;
+  &lt;<span class="type">App</span> /&gt;  <span class="comment">{/* This element is created by ThemeProvider's parent */}</span>
+&lt;/<span class="type">ThemeProvider</span>&gt;
+
+<span class="comment">// When ThemeProvider re-renders (theme changes):</span>
+<span class="comment">// - children prop is the same reference → subtree bails out</span>
+<span class="comment">// - Only actual context consumers re-render</span></code></pre>
+
+    <h3>7.4 Selector Pattern (External Libraries)</h3>
+
+    <pre><code><span class="comment">// React doesn't natively support context selectors.</span>
+<span class="comment">// Libraries like use-context-selector provide this:</span>
+
+<span class="keyword">import</span> { createContext, useContextSelector } <span class="keyword">from</span> <span class="string">'use-context-selector'</span>;
+
+<span class="keyword">const</span> AppContext = <span class="func">createContext</span>({ theme: <span class="string">'light'</span>, count: <span class="number">0</span> });
+
+<span class="keyword">function</span> <span class="func">ThemeButton</span>() {
+  <span class="comment">// Only re-renders when theme changes, not count</span>
+  <span class="keyword">const</span> theme = <span class="func">useContextSelector</span>(AppContext, ctx =&gt; ctx.theme);
+  <span class="keyword">return</span> &lt;<span class="type">button</span> <span class="attr">className</span>={theme}&gt;Click&lt;/<span class="type">button</span>&gt;;
+}
+
+<span class="comment">// How it works internally:</span>
+<span class="comment">// 1. Subscribes to context changes (like normal useContext)</span>
+<span class="comment">// 2. When context changes, runs selector on new value</span>
+<span class="comment">// 3. Compares selector result with previous</span>
+<span class="comment">// 4. Only triggers re-render if selector result changed</span>
+<span class="comment">// Uses useSyncExternalStore under the hood</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="react19">8. use(Context) in React 19</h2>
+
+    <pre><code><span class="comment">// React 19 introduces the use() hook for reading context</span>
+<span class="keyword">import</span> { use } <span class="keyword">from</span> <span class="string">'react'</span>;
+
+<span class="keyword">function</span> <span class="func">Button</span>() {
+  <span class="keyword">const</span> theme = <span class="func">use</span>(ThemeContext);
+  <span class="keyword">return</span> &lt;<span class="type">button</span> <span class="attr">className</span>={theme}&gt;Click&lt;/<span class="type">button</span>&gt;;
+}
+
+<span class="comment">// Key difference from useContext:</span>
+<span class="comment">// use() can be called CONDITIONALLY and in loops!</span>
+
+<span class="keyword">function</span> <span class="func">ConditionalTheme</span>({ useTheme }) {
+  <span class="keyword">if</span> (useTheme) {
+    <span class="keyword">const</span> theme = <span class="func">use</span>(ThemeContext); <span class="comment">// Valid in React 19!</span>
+    <span class="keyword">return</span> &lt;<span class="type">div</span> <span class="attr">className</span>={theme} /&gt;;
+  }
+  <span class="keyword">return</span> &lt;<span class="type">div</span> /&gt;;
+}
+
+<span class="comment">// use() also works with Promises:</span>
+<span class="keyword">function</span> <span class="func">UserProfile</span>({ userPromise }) {
+  <span class="keyword">const</span> user = <span class="func">use</span>(userPromise); <span class="comment">// Suspends until resolved</span>
+  <span class="keyword">return</span> &lt;<span class="type">h1</span>&gt;{user.name}&lt;/<span class="type">h1</span>&gt;;
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="module-patterns">9. Module-Level Context Patterns</h2>
+
+    <pre><code><span class="comment">// Pattern: Context module with custom hook and provider</span>
+
+<span class="comment">// auth-context.tsx</span>
+<span class="keyword">const</span> AuthContext = <span class="func">createContext</span>&lt;<span class="type">AuthState</span> | <span class="keyword">null</span>&gt;(<span class="keyword">null</span>);
+
+<span class="keyword">export function</span> <span class="func">AuthProvider</span>({ children }: { children: <span class="type">ReactNode</span> }) {
+  <span class="keyword">const</span> [user, setUser] = <span class="func">useState</span>&lt;<span class="type">User</span> | <span class="keyword">null</span>&gt;(<span class="keyword">null</span>);
+  <span class="keyword">const</span> [loading, setLoading] = <span class="func">useState</span>(<span class="keyword">true</span>);
+
+  <span class="keyword">const</span> value = <span class="func">useMemo</span>(
+    () =&gt; ({ user, loading, login, logout }),
+    [user, loading]
+  );
+
+  <span class="keyword">return</span> (
+    &lt;<span class="type">AuthContext.Provider</span> <span class="attr">value</span>={value}&gt;
+      {children}
+    &lt;/<span class="type">AuthContext.Provider</span>&gt;
+  );
+}
+
+<span class="keyword">export function</span> <span class="func">useAuth</span>(): <span class="type">AuthState</span> {
+  <span class="keyword">const</span> ctx = <span class="func">useContext</span>(AuthContext);
+  <span class="keyword">if</span> (ctx === <span class="keyword">null</span>) {
+    <span class="keyword">throw new</span> <span class="type">Error</span>(<span class="string">'useAuth must be used within AuthProvider'</span>);
+  }
+  <span class="keyword">return</span> ctx;
+}
+
+<span class="comment">// The null default + runtime check pattern ensures:</span>
+<span class="comment">// 1. TypeScript knows the value is non-null after useAuth()</span>
+<span class="comment">// 2. Missing Provider is caught immediately with clear error</span>
+<span class="comment">// 3. No accidental use of stale default values</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">10. Architect Considerations</h2>
+
+    <h3>10.1 Context vs External State</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Concern</th>
+                <th>React Context</th>
+                <th>External Store (Zustand, Redux)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Selector support</td>
+                <td>No (all consumers re-render)</td>
+                <td>Yes (fine-grained subscriptions)</td>
+            </tr>
+            <tr>
+                <td>Middleware</td>
+                <td>Manual (wrap dispatch)</td>
+                <td>Built-in (logging, persistence)</td>
+            </tr>
+            <tr>
+                <td>DevTools</td>
+                <td>React DevTools only</td>
+                <td>Dedicated DevTools</td>
+            </tr>
+            <tr>
+                <td>SSR</td>
+                <td>Built-in (per-request isolation)</td>
+                <td>Requires careful setup</td>
+            </tr>
+            <tr>
+                <td>Bundle size</td>
+                <td>0 KB (built-in)</td>
+                <td>1-10 KB</td>
+            </tr>
+            <tr>
+                <td>Best for</td>
+                <td>Low-frequency, scoped state (theme, auth, locale)</td>
+                <td>High-frequency, global state (UI state, cache)</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Architecture Decision</div>
+        <p>At L6, the question isn't "context vs Redux" — it's "what's the right state management architecture for this app's scale and team?" Context is ideal for <strong>dependency injection</strong> (providing services, configuration, auth) where values change infrequently. For <strong>application state</strong> that changes frequently and is consumed by many components, an external store with selectors prevents the cascading re-render problem. Many large apps use both: context for DI, external store for UI state.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="05-element-component-instance.html">← Prev: Element vs Component vs Instance</a>
+        <a href="07-error-boundaries.html">Next: Error Boundaries →</a>
+    </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Persistent Storage — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">State Management</a><span class="sep">›</span>
+        Persistent Storage
+    </nav>
+
+    <h1>Persistent Storage in React Native</h1>
+    <p class="subtitle">Choosing the right storage engine — AsyncStorage, MMKV, SQLite, or Realm — is an architectural decision that impacts cold start time, query capability, encryption, and scalability. This document dissects each option at the internals level expected for Staff-level interviews.</p>
+
+    <nav class="nav">
+        <a href="01-state-in-rn.html">State in RN</a>
+        <a href="02-redux-in-rn.html">Redux in RN</a>
+        <a href="03-zustand-mobx.html">Zustand &amp; MobX</a>
+        <a href="04-server-state-rn.html">Server State</a>
+        <a href="06-state-synchronization.html">State Sync</a>
+        <a href="07-interview-qa.html">Interview Q&amp;A</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#asyncstorage">1. AsyncStorage: Legacy &amp; Limitations</a></li>
+            <li><a href="#mmkv">2. MMKV: JSI-Based Synchronous Storage</a></li>
+            <li><a href="#sqlite">3. SQLite: Relational Power</a></li>
+            <li><a href="#realm">4. Realm: Object Database</a></li>
+            <li><a href="#encrypted">5. Encrypted Storage</a></li>
+            <li><a href="#keychain">6. Keychain &amp; Keystore Integration</a></li>
+            <li><a href="#migration">7. Storage Migration Strategies</a></li>
+            <li><a href="#large-datasets">8. Large Dataset Handling</a></li>
+            <li><a href="#architect">9. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="asyncstorage">1. AsyncStorage: Legacy &amp; Limitations</h2>
+
+    <p>AsyncStorage was React Native's original persistence API — a simple async key-value store backed by SQLite on Android and serialized dictionaries on iOS. It's now community-maintained and has significant limitations.</p>
+
+    <div class="diagram">
+AsyncStorage Architecture
+════════════════════════════════════════════════════
+
+  JS Thread                Bridge              Native Thread
+  ─────────               ──────              ─────────────
+  AsyncStorage.getItem()
+       │
+       ├── Serialize key ──→ JSON message ──→ Native module
+       │                                         │
+       │   (async wait)                          ├── Android: SQLite query
+       │                                         │   SELECT value FROM
+       │                                         │   catalystLocalStorage
+       │                                         │   WHERE key = ?
+       │                                         │
+       │                                         ├── iOS: Read from
+       │                                         │   RCTAsyncLocalStorage
+       │                                         │   (NSUserDefaults or files)
+       │                                         │
+       ◄── JSON response ◄── Bridge message ◄───┘
+       │
+       └── Promise resolves with string value
+
+  Problems:
+  • Every read/write crosses the bridge (async, ~5-10ms)
+  • Android: 6MB default limit (RCT_ASYNC_STORAGE_MAX_SIZE)
+  • String-only values (JSON.stringify/parse overhead)
+  • No encryption
+  • No batch transaction guarantees
+    </div>
+
+    <pre><code><span class="comment">// AsyncStorage API — simple but slow</span>
+<span class="keyword">import</span> AsyncStorage <span class="keyword">from</span> <span class="string">'@react-native-async-storage/async-storage'</span>;
+
+<span class="comment">// Every operation is async and crosses the bridge</span>
+<span class="keyword">await</span> AsyncStorage.<span class="func">setItem</span>(<span class="string">'user'</span>, JSON.<span class="func">stringify</span>(user));
+<span class="keyword">const</span> raw = <span class="keyword">await</span> AsyncStorage.<span class="func">getItem</span>(<span class="string">'user'</span>);
+<span class="keyword">const</span> user = raw ? JSON.<span class="func">parse</span>(raw) : <span class="keyword">null</span>;
+
+<span class="comment">// Multi-get for batch reads (still async)</span>
+<span class="keyword">const</span> pairs = <span class="keyword">await</span> AsyncStorage.<span class="func">multiGet</span>([<span class="string">'key1'</span>, <span class="string">'key2'</span>, <span class="string">'key3'</span>]);
+<span class="comment">// pairs = [['key1', 'val1'], ['key2', 'val2'], ['key3', 'val3']]</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Warning</div>
+        <p>AsyncStorage is <strong>not deprecated</strong> in the official sense, but it is widely considered legacy for new projects. Its bridge-based architecture means every read blocks on an async round-trip — making it unsuitable for synchronous state rehydration, high-frequency writes, or any performance-sensitive path. New projects should default to MMKV.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="mmkv">2. MMKV: JSI-Based Synchronous Storage</h2>
+
+    <p>MMKV (Memory-Mapped Key-Value) is Tencent's high-performance storage engine, adapted for React Native via JSI. It uses memory-mapped files for near-instant reads and writes without crossing the bridge.</p>
+
+    <div class="diagram">
+MMKV Architecture
+════════════════════════════════════════════════════
+
+  JS Thread (Hermes/JSC)
+       │
+       ├── JSI binding (C++ → JS, no bridge)
+       │
+       ▼
+  ┌─────────────────────────────────────────┐
+  │           MMKV C++ Core                  │
+  │                                         │
+  │  ┌───────────────────────────────────┐  │
+  │  │  Memory-Mapped File (mmap)        │  │
+  │  │  ┌─────────────────────────────┐  │  │
+  │  │  │  Protobuf-encoded KV pairs  │  │  │
+  │  │  │  key1=val1|key2=val2|...    │  │  │
+  │  │  └─────────────────────────────┘  │  │
+  │  └───────────────────────────────────┘  │
+  │                                         │
+  │  • Reads: Direct memory access (~0.01ms)│
+  │  • Writes: Append to mmap, OS flushes   │
+  │  • Encryption: AES-CFB (optional)       │
+  │  • CRC32 checksum for integrity         │
+  │  • Auto-trim on file size threshold     │
+  └─────────────────────────────────────────┘
+       │
+       ▼
+  File System (persisted by OS page cache)
+    </div>
+
+    <h3>2.1 MMKV Internals</h3>
+
+    <pre><code><span class="keyword">import</span> { MMKV } <span class="keyword">from</span> <span class="string">'react-native-mmkv'</span>;
+
+<span class="comment">// Multiple isolated instances for different data domains</span>
+<span class="keyword">const</span> appStorage = <span class="keyword">new</span> <span class="type">MMKV</span>({ id: <span class="string">'app'</span> });
+<span class="keyword">const</span> cacheStorage = <span class="keyword">new</span> <span class="type">MMKV</span>({ id: <span class="string">'cache'</span> });
+<span class="keyword">const</span> secureStorage = <span class="keyword">new</span> <span class="type">MMKV</span>({
+  id: <span class="string">'secure'</span>,
+  encryptionKey: <span class="string">'my-encryption-key'</span>,
+});
+
+<span class="comment">// Typed getters — no JSON.parse for primitives</span>
+appStorage.<span class="func">set</span>(<span class="string">'count'</span>, <span class="number">42</span>);
+appStorage.<span class="func">set</span>(<span class="string">'enabled'</span>, <span class="keyword">true</span>);
+appStorage.<span class="func">set</span>(<span class="string">'name'</span>, <span class="string">'Alice'</span>);
+appStorage.<span class="func">set</span>(<span class="string">'data'</span>, <span class="keyword">new</span> <span class="type">Uint8Array</span>([<span class="number">1</span>, <span class="number">2</span>, <span class="number">3</span>]));
+
+<span class="keyword">const</span> count = appStorage.<span class="func">getNumber</span>(<span class="string">'count'</span>);     <span class="comment">// 42</span>
+<span class="keyword">const</span> enabled = appStorage.<span class="func">getBoolean</span>(<span class="string">'enabled'</span>); <span class="comment">// true</span>
+<span class="keyword">const</span> name = appStorage.<span class="func">getString</span>(<span class="string">'name'</span>);       <span class="comment">// 'Alice'</span>
+<span class="keyword">const</span> data = appStorage.<span class="func">getBuffer</span>(<span class="string">'data'</span>);       <span class="comment">// Uint8Array</span>
+
+<span class="comment">// Listener for value changes</span>
+appStorage.<span class="func">addOnValueChangedListener</span>((key) =&gt; {
+  console.<span class="func">log</span>(<span class="string">`Key changed: </span>${key}<span class="string">`</span>);
+});
+
+<span class="comment">// Enumerate all keys</span>
+<span class="keyword">const</span> allKeys = appStorage.<span class="func">getAllKeys</span>(); <span class="comment">// string[]</span>
+
+<span class="comment">// Check existence without reading value</span>
+<span class="keyword">const</span> exists = appStorage.<span class="func">contains</span>(<span class="string">'name'</span>); <span class="comment">// boolean</span></code></pre>
+
+    <h3>2.2 MMKV React Hook</h3>
+
+    <pre><code><span class="keyword">import</span> { useMMKVString, useMMKVBoolean, useMMKVNumber } <span class="keyword">from</span> <span class="string">'react-native-mmkv'</span>;
+
+<span class="keyword">function</span> <span class="func">SettingsScreen</span>() {
+  <span class="keyword">const</span> [theme, setTheme] = <span class="func">useMMKVString</span>(<span class="string">'settings.theme'</span>, appStorage);
+  <span class="keyword">const</span> [darkMode, setDarkMode] = <span class="func">useMMKVBoolean</span>(<span class="string">'settings.dark'</span>, appStorage);
+  <span class="keyword">const</span> [fontSize, setFontSize] = <span class="func">useMMKVNumber</span>(<span class="string">'settings.fontSize'</span>, appStorage);
+
+  <span class="keyword">return</span> (
+    &lt;<span class="type">View</span>&gt;
+      &lt;<span class="type">Switch</span> value={darkMode} onValueChange={setDarkMode} /&gt;
+      &lt;<span class="type">Slider</span> value={fontSize ?? <span class="number">16</span>} onValueChange={setFontSize} /&gt;
+    &lt;/<span class="type">View</span>&gt;
+  );
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="sqlite">3. SQLite: Relational Power</h2>
+
+    <p>SQLite provides full relational database capabilities. Modern RN SQLite libraries use JSI for synchronous access, eliminating the bridge overhead that plagued older implementations.</p>
+
+    <h3>3.1 react-native-quick-sqlite</h3>
+
+    <pre><code><span class="keyword">import</span> { open } <span class="keyword">from</span> <span class="string">'@op-engineering/op-sqlite'</span>;
+
+<span class="keyword">const</span> db = <span class="func">open</span>({ name: <span class="string">'app.db'</span> });
+
+<span class="comment">// Synchronous via JSI — no await needed</span>
+db.<span class="func">execute</span>(<span class="string">`
+  CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    is_read INTEGER DEFAULT 0
+  )
+`</span>);
+
+db.<span class="func">execute</span>(<span class="string">`CREATE INDEX IF NOT EXISTS idx_messages_thread
+  ON messages(thread_id, created_at DESC)`</span>);
+
+<span class="comment">// Parameterized queries prevent SQL injection</span>
+db.<span class="func">execute</span>(
+  <span class="string">'INSERT INTO messages (id, thread_id, sender_id, content, created_at) VALUES (?, ?, ?, ?, ?)'</span>,
+  [msg.id, msg.threadId, msg.senderId, msg.content, Date.<span class="func">now</span>()]
+);
+
+<span class="comment">// Query with results</span>
+<span class="keyword">const</span> result = db.<span class="func">execute</span>(
+  <span class="string">'SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at DESC LIMIT ?'</span>,
+  [threadId, <span class="number">50</span>]
+);
+
+<span class="comment">// result.rows is an array of objects</span>
+<span class="keyword">const</span> messages: Message[] = result.rows;</code></pre>
+
+    <h3>3.2 Transaction Support</h3>
+
+    <pre><code><span class="comment">// Batch operations in a transaction for atomicity and performance</span>
+db.<span class="func">execute</span>(<span class="string">'BEGIN TRANSACTION'</span>);
+<span class="keyword">try</span> {
+  <span class="keyword">for</span> (<span class="keyword">const</span> msg <span class="keyword">of</span> messages) {
+    db.<span class="func">execute</span>(
+      <span class="string">'INSERT OR REPLACE INTO messages VALUES (?, ?, ?, ?, ?)'</span>,
+      [msg.id, msg.threadId, msg.senderId, msg.content, msg.createdAt]
+    );
+  }
+  db.<span class="func">execute</span>(<span class="string">'COMMIT'</span>);
+} <span class="keyword">catch</span> (error) {
+  db.<span class="func">execute</span>(<span class="string">'ROLLBACK'</span>);
+  <span class="keyword">throw</span> error;
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="realm">4. Realm: Object Database</h2>
+
+    <p>Realm is an object database that stores data as native objects rather than rows in tables. It uses a zero-copy architecture — objects are memory-mapped directly from disk, eliminating serialization overhead.</p>
+
+    <pre><code><span class="keyword">import</span> Realm <span class="keyword">from</span> <span class="string">'realm'</span>;
+
+<span class="keyword">class</span> <span class="type">Message</span> <span class="keyword">extends</span> Realm.Object {
+  <span class="keyword">static</span> schema = {
+    name: <span class="string">'Message'</span>,
+    primaryKey: <span class="string">'id'</span>,
+    properties: {
+      id: <span class="string">'string'</span>,
+      threadId: { type: <span class="string">'string'</span>, indexed: <span class="keyword">true</span> },
+      senderId: <span class="string">'string'</span>,
+      content: <span class="string">'string'</span>,
+      createdAt: <span class="string">'date'</span>,
+      isRead: { type: <span class="string">'bool'</span>, <span class="keyword">default</span>: <span class="keyword">false</span> },
+      attachments: <span class="string">'Attachment[]'</span>,
+    },
+  };
+}
+
+<span class="keyword">const</span> realm = <span class="keyword">await</span> Realm.<span class="func">open</span>({
+  schema: [Message, Attachment, Thread],
+  schemaVersion: <span class="number">3</span>,
+  migration: (oldRealm, newRealm) =&gt; {
+    <span class="keyword">if</span> (oldRealm.schemaVersion &lt; <span class="number">2</span>) {
+      <span class="keyword">const</span> messages = newRealm.<span class="func">objects</span>(<span class="string">'Message'</span>);
+      <span class="keyword">for</span> (<span class="keyword">const</span> msg <span class="keyword">of</span> messages) {
+        msg.isRead = <span class="keyword">false</span>;
+      }
+    }
+  },
+});
+
+<span class="comment">// Live queries — results update automatically</span>
+<span class="keyword">const</span> unreadMessages = realm
+  .<span class="func">objects</span>(<span class="string">'Message'</span>)
+  .<span class="func">filtered</span>(<span class="string">'threadId == $0 AND isRead == false'</span>, threadId)
+  .<span class="func">sorted</span>(<span class="string">'createdAt'</span>, <span class="keyword">true</span>);
+
+<span class="comment">// Write transactions</span>
+realm.<span class="func">write</span>(() =&gt; {
+  realm.<span class="func">create</span>(<span class="string">'Message'</span>, {
+    id: <span class="func">uuid</span>(),
+    threadId,
+    senderId: currentUser.id,
+    content: <span class="string">'Hello!'</span>,
+    createdAt: <span class="keyword">new</span> <span class="type">Date</span>(),
+  });
+});</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Key Insight</div>
+        <p>Realm's live objects are fundamentally different from SQLite rows. When you hold a reference to a Realm object, it's a <strong>live proxy</strong> to the underlying data — reads always return the latest value without re-querying. This makes Realm ideal for real-time UIs like chat, but it also means objects can't be used after the Realm is closed or from a different thread without explicit handling.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="encrypted">5. Encrypted Storage</h2>
+
+    <pre><code><span class="comment">// MMKV with encryption</span>
+<span class="keyword">const</span> secureMMKV = <span class="keyword">new</span> <span class="type">MMKV</span>({
+  id: <span class="string">'secure-storage'</span>,
+  encryptionKey: <span class="string">'derived-from-keychain'</span>,
+});
+
+<span class="comment">// SQLite with SQLCipher</span>
+<span class="keyword">const</span> encryptedDb = <span class="func">open</span>({
+  name: <span class="string">'secure.db'</span>,
+  encryptionKey: <span class="string">'database-encryption-key'</span>,
+});
+
+<span class="comment">// Realm with encryption</span>
+<span class="keyword">const</span> encryptedRealm = <span class="keyword">await</span> Realm.<span class="func">open</span>({
+  schema: [Message],
+  encryptionKey: encryptionKeyBuffer, <span class="comment">// 64-byte ArrayBuffer</span>
+});</code></pre>
+
+    <table>
+        <thead>
+        <tr>
+            <th>Storage</th>
+            <th>Encryption Method</th>
+            <th>Key Management</th>
+            <th>Performance Impact</th>
+        </tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td><strong>MMKV</strong></td>
+            <td>AES-CFB</td>
+            <td>String key in constructor</td>
+            <td>~10-20% overhead</td>
+        </tr>
+        <tr>
+            <td><strong>SQLite</strong></td>
+            <td>SQLCipher (AES-256-CBC)</td>
+            <td>PRAGMA key</td>
+            <td>~15-25% overhead</td>
+        </tr>
+        <tr>
+            <td><strong>Realm</strong></td>
+            <td>AES-256</td>
+            <td>64-byte ArrayBuffer</td>
+            <td>~10% overhead</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="keychain">6. Keychain &amp; Keystore Integration</h2>
+
+    <p>Sensitive credentials (auth tokens, encryption keys, biometric data) should never be stored in general-purpose storage. iOS Keychain and Android Keystore provide hardware-backed secure storage.</p>
+
+    <pre><code><span class="keyword">import</span> * <span class="keyword">as</span> Keychain <span class="keyword">from</span> <span class="string">'react-native-keychain'</span>;
+
+<span class="comment">// Store credentials with biometric protection</span>
+<span class="keyword">await</span> Keychain.<span class="func">setGenericPassword</span>(<span class="string">'auth'</span>, authToken, {
+  accessControl: Keychain.ACCESS_CONTROL.BIOMETRY_CURRENT_SET,
+  accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+  securityLevel: Keychain.SECURITY_LEVEL.SECURE_HARDWARE,
+  storage: Keychain.STORAGE_TYPE.AES,
+});
+
+<span class="comment">// Retrieve with biometric prompt</span>
+<span class="keyword">const</span> credentials = <span class="keyword">await</span> Keychain.<span class="func">getGenericPassword</span>({
+  authenticationPrompt: {
+    title: <span class="string">'Authenticate to access your account'</span>,
+  },
+});
+
+<span class="keyword">if</span> (credentials) {
+  <span class="keyword">const</span> token = credentials.password;
+}
+
+<span class="comment">// Pattern: Store encryption key in Keychain, use it for MMKV</span>
+<span class="keyword">async</span> <span class="keyword">function</span> <span class="func">getOrCreateEncryptionKey</span>(): Promise&lt;<span class="type">string</span>&gt; {
+  <span class="keyword">const</span> existing = <span class="keyword">await</span> Keychain.<span class="func">getGenericPassword</span>({ service: <span class="string">'mmkv-key'</span> });
+  <span class="keyword">if</span> (existing) <span class="keyword">return</span> existing.password;
+
+  <span class="keyword">const</span> key = <span class="func">generateSecureRandomKey</span>();
+  <span class="keyword">await</span> Keychain.<span class="func">setGenericPassword</span>(<span class="string">'mmkv'</span>, key, { service: <span class="string">'mmkv-key'</span> });
+  <span class="keyword">return</span> key;
+}</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>The secure storage pattern for production apps: store the <strong>encryption key</strong> in Keychain/Keystore (hardware-backed), then use that key to encrypt MMKV or SQLite. This gives you both the performance of MMKV and the security of hardware-backed key storage. Never hardcode encryption keys or store them in the app bundle.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="migration">7. Storage Migration Strategies</h2>
+
+    <pre><code><span class="comment">// Migrating from AsyncStorage to MMKV</span>
+<span class="keyword">async</span> <span class="keyword">function</span> <span class="func">migrateFromAsyncStorage</span>(mmkv: MMKV) {
+  <span class="keyword">const</span> migrated = mmkv.<span class="func">getBoolean</span>(<span class="string">'__migrated_from_async_storage'</span>);
+  <span class="keyword">if</span> (migrated) <span class="keyword">return</span>;
+
+  <span class="keyword">const</span> keys = <span class="keyword">await</span> AsyncStorage.<span class="func">getAllKeys</span>();
+  <span class="keyword">const</span> pairs = <span class="keyword">await</span> AsyncStorage.<span class="func">multiGet</span>(keys);
+
+  <span class="keyword">for</span> (<span class="keyword">const</span> [key, value] <span class="keyword">of</span> pairs) {
+    <span class="keyword">if</span> (value !== <span class="keyword">null</span>) {
+      mmkv.<span class="func">set</span>(key, value);
+    }
+  }
+
+  mmkv.<span class="func">set</span>(<span class="string">'__migrated_from_async_storage'</span>, <span class="keyword">true</span>);
+
+  <span class="comment">// Optionally clear AsyncStorage after successful migration</span>
+  <span class="keyword">await</span> AsyncStorage.<span class="func">clear</span>();
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="large-datasets">8. Large Dataset Handling</h2>
+
+    <div class="diagram">
+Storage Selection by Data Size
+════════════════════════════════════════════════════
+
+  Data Size        Recommended Storage     Reason
+  ─────────       ───────────────────     ──────
+  &lt; 1KB           MMKV                    Fastest for small KV
+  1KB - 1MB       MMKV                    Still efficient
+  1MB - 10MB      SQLite                  Queryable, indexed
+  10MB - 100MB    SQLite + pagination     Avoid loading all in memory
+  100MB+          Realm or SQLite         Need careful memory management
+                  with cursor-based
+                  pagination
+
+  Rule of thumb:
+  • Key-value data → MMKV
+  • Relational/queryable data → SQLite
+  • Object graph with live queries → Realm
+  • Never store large blobs in any DB — use file system
+    </div>
+
+    <pre><code><span class="comment">// Cursor-based pagination for large SQLite datasets</span>
+<span class="keyword">function</span> <span class="func">fetchMessagePage</span>(
+  db: Database,
+  threadId: <span class="type">string</span>,
+  cursor?: <span class="type">number</span>,
+  limit = <span class="number">50</span>
+): Message[] {
+  <span class="keyword">const</span> query = cursor
+    ? <span class="string">'SELECT * FROM messages WHERE thread_id = ? AND created_at &lt; ? ORDER BY created_at DESC LIMIT ?'</span>
+    : <span class="string">'SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at DESC LIMIT ?'</span>;
+
+  <span class="keyword">const</span> params = cursor
+    ? [threadId, cursor, limit]
+    : [threadId, limit];
+
+  <span class="keyword">return</span> db.<span class="func">execute</span>(query, params).rows;
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">9. Architect Considerations</h2>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>Storage architecture in React Native follows a <strong>tiered model</strong>: (1) MMKV for hot data — preferences, tokens, small state snapshots that need synchronous access; (2) SQLite for warm data — queryable collections, offline caches, message history; (3) Keychain/Keystore for secrets — auth tokens, encryption keys, biometric data; (4) File system for cold data — images, documents, large blobs. A Staff engineer never stores everything in one tier. The storage tier determines read latency, query capability, encryption model, and memory footprint — each must be chosen deliberately based on the data's access pattern and sensitivity.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="04-server-state-rn.html">← Server State in RN</a>
+        <a href="06-state-synchronization.html">Next: State Synchronization →</a>
+    </div>
+</div>
+</body>
+</html>

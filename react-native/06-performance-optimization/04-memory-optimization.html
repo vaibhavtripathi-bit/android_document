@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Memory Optimization — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Performance Optimization</a><span class="sep">›</span>
+        Memory Optimization
+    </nav>
+
+    <h1>Memory Optimization</h1>
+    <p class="subtitle">Memory management in React Native spans two worlds — the JavaScript heap (managed by Hermes/JSC GC) and native memory (images, views, caches). Memory leaks, excessive allocation, and poor image management are the top causes of OOM crashes and degraded performance on mobile.</p>
+
+    <nav class="nav">
+        <a href="03-rendering-optimization.html">Rendering Optimization</a>
+        <a href="05-startup-optimization.html">Startup Optimization</a>
+        <a href="06-animation-performance.html">Animation Performance</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#memory-model">1. React Native Memory Model</a></li>
+            <li><a href="#js-heap">2. JavaScript Heap (Hermes vs JSC)</a></li>
+            <li><a href="#native-memory">3. Native Memory</a></li>
+            <li><a href="#leaks">4. Memory Leak Patterns</a></li>
+            <li><a href="#profiling">5. Memory Profiling Tools</a></li>
+            <li><a href="#images">6. Image Memory Management</a></li>
+            <li><a href="#lists">7. Large List Memory</a></li>
+            <li><a href="#low-memory">8. Low-Memory Handling</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="memory-model">1. React Native Memory Model</h2>
+
+    <div class="diagram">
+React Native Memory Layout
+═══════════════════════════
+
+  Total App Memory (reported by OS)
+  ┌─────────────────────────────────────────────────────┐
+  │                                                      │
+  │  JS Heap (Hermes/JSC)           ~30-150MB            │
+  │  ┌──────────────────────────────────────────────┐   │
+  │  │ React component tree (fiber nodes)            │   │
+  │  │ State objects, props, closures                │   │
+  │  │ Module cache (require() results)              │   │
+  │  │ String pool, ArrayBuffers                     │   │
+  │  └──────────────────────────────────────────────┘   │
+  │                                                      │
+  │  Native Heap                     ~50-300MB           │
+  │  ┌──────────────────────────────────────────────┐   │
+  │  │ Image bitmaps (decoded pixels)                │   │
+  │  │ Native view hierarchy                         │   │
+  │  │ Native module instances                       │   │
+  │  │ Platform caches (URL cache, font cache)       │   │
+  │  │ Video/audio buffers                           │   │
+  │  └──────────────────────────────────────────────┘   │
+  │                                                      │
+  │  Shared/Mapped Memory                                │
+  │  ┌──────────────────────────────────────────────┐   │
+  │  │ JS bundle (mmap'd .hbc file)                  │   │
+  │  │ MMKV storage (mmap'd)                         │   │
+  │  │ Shared libraries (.so / .dylib)               │   │
+  │  └──────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────┘
+
+  iOS memory limit: ~1-2GB (varies by device, no hard limit)
+  Android memory limit: 256-512MB typical (varies by device)
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="js-heap">2. JavaScript Heap (Hermes vs JSC)</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Aspect</th>
+                <th>Hermes</th>
+                <th>JavaScriptCore</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td>GC Algorithm</td><td>GenGC (generational, mark-compact)</td><td>Riptide (concurrent, generational)</td></tr>
+            <tr><td>Young Gen Collection</td><td>~1-3ms</td><td>~0.5-2ms</td></tr>
+            <tr><td>Old Gen Collection</td><td>~10-50ms (stop-the-world)</td><td>~5-20ms (mostly concurrent)</td></tr>
+            <tr><td>Heap Size (typical)</td><td>30-100MB</td><td>50-150MB</td></tr>
+            <tr><td>Memory Overhead</td><td>Lower (bytecode, no JIT)</td><td>Higher (source + JIT code)</td></tr>
+            <tr><td>Profiling</td><td>Built-in heap snapshot</td><td>Safari Web Inspector</td></tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Monitoring Hermes heap usage</span>
+<span class="keyword">if</span> (global.HermesInternal) {
+  <span class="keyword">const</span> heapInfo = global.HermesInternal.getInstrumentedStats();
+  console.log(<span class="string">`JS Heap Used: ${(heapInfo.js_heapSize / 1024 / 1024).toFixed(1)}MB`</span>);
+  console.log(<span class="string">`Allocated: ${heapInfo.js_totalAllocatedBytes}`</span>);
+  console.log(<span class="string">`GC count: ${heapInfo.js_numGCs}`</span>);
+}
+
+<span class="comment">// Taking a Hermes heap snapshot</span>
+<span class="comment">// Dev menu → "Capture Heap Profile"</span>
+<span class="comment">// Or programmatically:</span>
+<span class="keyword">if</span> (global.HermesInternal?.createHeapSnapshot) {
+  <span class="keyword">const</span> path = <span class="string">`${RNFS.CachesDirectoryPath}/heap.heapsnapshot`</span>;
+  global.HermesInternal.createHeapSnapshot(path);
+  <span class="comment">// Open in Chrome DevTools → Memory tab</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="native-memory">3. Native Memory</h2>
+
+    <pre><code><span class="comment">// Native memory consumers in React Native</span>
+
+<span class="comment">// 1. Image bitmaps — LARGEST consumer</span>
+<span class="comment">// A 1080x1920 image = 1080 × 1920 × 4 bytes = ~8MB decoded</span>
+<span class="comment">// 10 such images = 80MB of native memory</span>
+
+<span class="comment">// 2. View hierarchy</span>
+<span class="comment">// Each native view: ~1-5KB (Android) / ~2-8KB (iOS)</span>
+<span class="comment">// 500 views on screen = 0.5-4MB</span>
+
+<span class="comment">// 3. WebView</span>
+<span class="comment">// Each WebView instance: ~30-50MB</span>
+<span class="comment">// Multiple WebViews can quickly exhaust memory</span>
+
+<span class="comment">// 4. Video buffers</span>
+<span class="comment">// 1080p frame = ~6MB decoded</span>
+<span class="comment">// Video player buffers multiple frames</span>
+
+<span class="comment">// Monitoring native memory (Android)</span>
+<span class="comment">// adb shell dumpsys meminfo com.myapp</span>
+<span class="comment">// Key sections: Native Heap, Graphics, Views</span>
+
+<span class="comment">// Monitoring native memory (iOS)</span>
+<span class="comment">// Xcode → Debug Navigator → Memory</span>
+<span class="comment">// Or: Instruments → Allocations</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="leaks">4. Memory Leak Patterns</h2>
+
+    <pre><code><span class="comment">// Leak 1: Event listeners not cleaned up</span>
+<span class="keyword">function</span> <span class="func">LeakyComponent</span>() {
+  useEffect(() => {
+    <span class="keyword">const</span> handler = (data) => processData(data);
+    DeviceEventEmitter.addListener(<span class="string">'dataUpdate'</span>, handler);
+    <span class="comment">// MISSING: return () => subscription.remove();</span>
+  }, []);
+}
+
+<span class="comment">// Leak 2: Timers not cleared</span>
+<span class="keyword">function</span> <span class="func">LeakyTimer</span>() {
+  useEffect(() => {
+    <span class="keyword">const</span> interval = setInterval(() => {
+      fetchNewData(); <span class="comment">// keeps running after unmount</span>
+    }, 5000);
+    <span class="comment">// MISSING: return () => clearInterval(interval);</span>
+  }, []);
+}
+
+<span class="comment">// Leak 3: Closures capturing stale references</span>
+<span class="keyword">function</span> <span class="func">LeakyClosure</span>() {
+  <span class="keyword">const</span> [data, setData] = useState(largeDataset);
+
+  useEffect(() => {
+    <span class="keyword">const</span> ws = <span class="keyword">new</span> WebSocket(<span class="string">'wss://...'</span>);
+    ws.onmessage = (msg) => {
+      <span class="comment">// This closure captures 'data' — prevents GC of largeDataset</span>
+      <span class="comment">// even after component unmounts if ws isn't closed</span>
+      setData([...data, msg.data]);
+    };
+    <span class="keyword">return</span> () => ws.close();
+  }, [data]); <span class="comment">// Re-creates ws on every data change!</span>
+}
+
+<span class="comment">// Leak 4: Navigation stack retaining screens</span>
+<span class="comment">// React Navigation keeps unmounted screens in memory</span>
+<span class="comment">// for back navigation. Deep stacks accumulate memory.</span>
+<span class="comment">// Fix: Use unmountOnBlur: true for heavy screens</span>
+&lt;Stack.Screen
+  name=<span class="string">"HeavyScreen"</span>
+  component={HeavyScreen}
+  options={{ unmountOnBlur: <span class="keyword">true</span> }}
+/&gt;
+
+<span class="comment">// Leak 5: Animated values not cleaned up</span>
+<span class="keyword">function</span> <span class="func">LeakyAnimation</span>() {
+  <span class="keyword">const</span> anim = useRef(<span class="keyword">new</span> Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.loop(
+      Animated.timing(anim, { toValue: 1, duration: 1000, useNativeDriver: <span class="keyword">true</span> })
+    ).start();
+    <span class="comment">// MISSING: return () => anim.stopAnimation();</span>
+  }, []);
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">The Navigation Stack Leak</div>
+        <p>React Navigation's stack navigator keeps all screens in memory by default (for instant back navigation). A user navigating through 20 screens accumulates 20 screen components, their state, images, and native views. For memory-heavy screens, use <code>unmountOnBlur: true</code> or switch to a tab/drawer navigator that naturally limits the screen count.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="profiling">5. Memory Profiling Tools</h2>
+
+    <pre><code><span class="comment">// Tool 1: Hermes Heap Snapshot</span>
+<span class="comment">// Captures: JS objects, closures, strings, arrays</span>
+<span class="comment">// Open in Chrome DevTools → Memory tab</span>
+<span class="comment">// Compare snapshots to find growing objects</span>
+
+<span class="comment">// Tool 2: Xcode Memory Graph Debugger</span>
+<span class="comment">// Debug → Debug Memory Graph</span>
+<span class="comment">// Shows: retain cycles, leaked objects, ownership graph</span>
+
+<span class="comment">// Tool 3: Android Studio Memory Profiler</span>
+<span class="comment">// View → Tool Windows → Profiler → Memory</span>
+<span class="comment">// Shows: heap allocations, GC events, native memory</span>
+
+<span class="comment">// Tool 4: Flipper Leak Canary plugin (Android)</span>
+<span class="comment">// Automatically detects Activity/Fragment leaks</span>
+
+<span class="comment">// Programmatic memory monitoring</span>
+<span class="keyword">function</span> <span class="func">useMemoryMonitor</span>(intervalMs = 10000) {
+  useEffect(() => {
+    <span class="keyword">const</span> timer = setInterval(() => {
+      <span class="keyword">if</span> (global.HermesInternal) {
+        <span class="keyword">const</span> stats = global.HermesInternal.getInstrumentedStats();
+        <span class="keyword">const</span> heapMB = stats.js_heapSize / 1024 / 1024;
+
+        <span class="keyword">if</span> (heapMB > 200) {
+          console.warn(<span class="string">`High memory: ${heapMB.toFixed(0)}MB`</span>);
+          analytics.track(<span class="string">'high_memory_warning'</span>, { heapMB });
+        }
+      }
+    }, intervalMs);
+
+    <span class="keyword">return</span> () => clearInterval(timer);
+  }, [intervalMs]);
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="images">6. Image Memory Management</h2>
+
+    <pre><code><span class="comment">// Image memory formula:</span>
+<span class="comment">// Memory = width × height × 4 bytes (RGBA)</span>
+<span class="comment">// 4K photo (3840×2160) = 33MB decoded!</span>
+
+<span class="comment">// Solution 1: Resize before display</span>
+<span class="keyword">import</span> FastImage <span class="keyword">from</span> <span class="string">'react-native-fast-image'</span>;
+
+&lt;FastImage
+  source={{
+    uri: <span class="string">'https://example.com/photo.jpg'</span>,
+    priority: FastImage.priority.normal,
+    cache: FastImage.cacheControl.immutable,
+  }}
+  style={{ width: 200, height: 200 }}
+  resizeMode={FastImage.resizeMode.cover}
+/&gt;
+
+<span class="comment">// Solution 2: Use thumbnail URLs from CDN</span>
+<span class="keyword">function</span> <span class="func">getImageUrl</span>(baseUrl, width, height) {
+  <span class="keyword">return</span> <span class="string">`${baseUrl}?w=${width}&h=${height}&fit=crop&auto=format`</span>;
+}
+
+<span class="comment">// Solution 3: Clear image cache when memory is low</span>
+<span class="keyword">import</span> { Image } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="keyword">function</span> <span class="func">clearImageCache</span>() {
+  <span class="comment">// iOS only — clears decoded image cache</span>
+  Image.queryCache([]).then(() => {
+    console.log(<span class="string">'Image cache cleared'</span>);
+  });
+}
+
+<span class="comment">// Solution 4: Limit concurrent image loads</span>
+<span class="comment">// FastImage handles this automatically</span>
+<span class="comment">// For Image component, manage loading state manually</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="lists">7. Large List Memory</h2>
+
+    <pre><code><span class="comment">// FlatList memory optimization</span>
+&lt;FlatList
+  data={items}
+  renderItem={renderItem}
+
+  <span class="comment">// Key memory props:</span>
+  windowSize={5}             <span class="comment">// Only render 5 screens of content</span>
+  removeClippedSubviews={<span class="keyword">true</span>} <span class="comment">// Detach off-screen views (Android)</span>
+  maxToRenderPerBatch={5}    <span class="comment">// Fewer items per batch</span>
+
+  <span class="comment">// For very long lists (1000+ items):</span>
+  initialNumToRender={10}    <span class="comment">// Don't render all at once</span>
+  getItemLayout={getItemLayout} <span class="comment">// Skip measurement</span>
+/&gt;
+
+<span class="comment">// Pagination — don't load everything into memory</span>
+<span class="keyword">function</span> <span class="func">usePaginatedList</span>(fetchPage) {
+  <span class="keyword">const</span> [items, setItems] = useState([]);
+  <span class="keyword">const</span> [page, setPage] = useState(0);
+
+  <span class="keyword">const</span> loadMore = useCallback(<span class="keyword">async</span> () => {
+    <span class="keyword">const</span> newItems = <span class="keyword">await</span> fetchPage(page);
+    setItems(prev => [...prev, ...newItems]);
+    setPage(p => p + 1);
+  }, [page, fetchPage]);
+
+  <span class="comment">// Memory-conscious: trim old items if list gets too long</span>
+  useEffect(() => {
+    <span class="keyword">if</span> (items.length > 500) {
+      setItems(prev => prev.slice(-300));
+    }
+  }, [items.length]);
+
+  <span class="keyword">return</span> { items, loadMore };
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="low-memory">8. Low-Memory Handling</h2>
+
+    <pre><code><span class="comment">// iOS — respond to memory warnings</span>
+<span class="comment">// In AppDelegate.swift:</span>
+<span class="comment">// override func applicationDidReceiveMemoryWarning(_ application: UIApplication) {</span>
+<span class="comment">//   URLCache.shared.removeAllCachedResponses()</span>
+<span class="comment">//   SDImageCache.shared.clearMemory()</span>
+<span class="comment">// }</span>
+
+<span class="comment">// Android — respond to trim memory</span>
+<span class="comment">// In Application class:</span>
+<span class="comment">// override fun onTrimMemory(level: Int) {</span>
+<span class="comment">//   if (level >= TRIM_MEMORY_MODERATE) {</span>
+<span class="comment">//     Glide.get(this).clearMemory()</span>
+<span class="comment">//   }</span>
+<span class="comment">// }</span>
+
+<span class="comment">// JS side — listen for memory warnings</span>
+<span class="keyword">import</span> { AppState } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+useEffect(() => {
+  <span class="keyword">const</span> sub = AppState.addEventListener(<span class="string">'memoryWarning'</span>, () => {
+    <span class="comment">// Aggressive cleanup</span>
+    clearImageCaches();
+    clearNavigationHistory();
+    dispatchReducedMemoryMode();
+  });
+  <span class="keyword">return</span> () => sub.remove();
+}, []);</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>Memory optimization in React Native requires thinking in two domains simultaneously: JS heap (managed by GC, leaks via closures/listeners/timers) and native memory (images, views, caches — managed manually). The most impactful optimization is almost always <strong>image memory</strong> — a single unoptimized image can consume more memory than your entire React component tree. At Staff level, implement: (1) a memory monitoring system that tracks both JS and native memory in production, (2) automatic image resizing based on display size, (3) aggressive cache eviction under memory pressure, and (4) navigation stack management to prevent unbounded screen accumulation.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="03-rendering-optimization.html">← Rendering Optimization</a>
+        <a href="05-startup-optimization.html">Next: Startup Optimization →</a>
+    </div>
+</div>
+</body>
+</html>

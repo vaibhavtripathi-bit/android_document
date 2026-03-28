@@ -1,0 +1,819 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Building an Analytics SDK — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Engineering Problems</a><span class="sep">›</span>
+        Building an Analytics SDK
+    </nav>
+
+    <h1>Building an Analytics SDK for React Native</h1>
+    <p class="subtitle">A production-grade analytics SDK must handle event batching, offline persistence, network-aware delivery, session lifecycle, user identity resolution, screen tracking via navigation integration, performance metrics collection, privacy compliance, and A/B testing — all without impacting the host app's performance or UX.</p>
+
+    <nav class="nav">
+        <h3>Engineering Problems Series</h3>
+        <ul>
+            <li class="active"><a href="09-analytics-sdk.html">09 · Analytics SDK</a></li>
+            <li><a href="10-multi-app-platform.html">10 · Multi-App Platform</a></li>
+            <li><a href="11-accessibility-overhaul.html">11 · Accessibility Overhaul</a></li>
+            <li><a href="12-background-processing.html">12 · Background Processing</a></li>
+        </ul>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#event-architecture">1. Event Tracking Architecture</a></li>
+            <li><a href="#batching-persistence">2. Batching and Persistence</a></li>
+            <li><a href="#network-aware">3. Network-Aware Sending</a></li>
+            <li><a href="#session-management">4. Session Management</a></li>
+            <li><a href="#user-identification">5. User Identification</a></li>
+            <li><a href="#screen-tracking">6. Screen Tracking with Navigation</a></li>
+            <li><a href="#performance-metrics">7. Performance Metrics Collection</a></li>
+            <li><a href="#privacy-compliance">8. Privacy Compliance</a></li>
+            <li><a href="#ab-testing">9. A/B Testing Integration</a></li>
+            <li><a href="#architect">10. Architect Considerations</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="event-architecture">1. Event Tracking Architecture</h2>
+
+    <p>The SDK's core responsibility is capturing structured events with minimal overhead. Every event flows through a pipeline: capture → enrich → validate → queue → persist → batch → send.</p>
+
+    <div class="diagram">
+Event Lifecycle Pipeline:
+
+  User Action          SDK Core              Queue            Network
+  ──────────     ──────────────────     ──────────────     ────────────
+                 │                  │
+  tap/screen  →  │  enrich(event)   │ →  in-memory    →   batch &amp; send
+  navigate    →  │  validate(event) │    ring buffer       to endpoint
+  error       →  │  timestamp       │        │
+                 │  sessionId       │        ▼
+                 │  userId          │    SQLite / MMKV
+                 └──────────────────┘    (persistence)
+                                             │
+                                             ▼
+                                     retry on failure
+                                     exponential backoff
+    </div>
+
+    <h3>1.1 Event Schema Design</h3>
+
+    <pre><code><span class="keyword">interface</span> <span class="type">AnalyticsEvent</span> {
+  id: <span class="type">string</span>;                <span class="comment">// UUID v4 — deduplication key</span>
+  name: <span class="type">string</span>;              <span class="comment">// e.g., "product_viewed"</span>
+  category: <span class="type">string</span>;          <span class="comment">// e.g., "commerce", "navigation"</span>
+  properties: <span class="type">Record</span>&lt;<span class="type">string</span>, <span class="type">unknown</span>&gt;;
+  timestamp: <span class="type">number</span>;         <span class="comment">// Unix ms — captured at event time</span>
+  sessionId: <span class="type">string</span>;
+  userId: <span class="type">string</span> | <span class="keyword">null</span>;
+  anonymousId: <span class="type">string</span>;
+  context: <span class="type">EventContext</span>;
+}
+
+<span class="keyword">interface</span> <span class="type">EventContext</span> {
+  app: { version: <span class="type">string</span>; build: <span class="type">string</span> };
+  device: { model: <span class="type">string</span>; os: <span class="type">string</span>; osVersion: <span class="type">string</span> };
+  screen: { width: <span class="type">number</span>; height: <span class="type">number</span>; density: <span class="type">number</span> };
+  network: { type: <span class="type">string</span>; effectiveType: <span class="type">string</span> };
+  locale: <span class="type">string</span>;
+  timezone: <span class="type">string</span>;
+}</code></pre>
+
+    <h3>1.2 SDK Initialization</h3>
+
+    <pre><code><span class="keyword">import</span> { Analytics } <span class="keyword">from</span> <span class="string">'@app/analytics'</span>;
+
+<span class="keyword">const</span> analytics = <span class="keyword">new</span> <span class="func">Analytics</span>({
+  writeKey: <span class="string">'prod_abc123'</span>,
+  endpoint: <span class="string">'https://ingest.example.com/v1/batch'</span>,
+  flushInterval: <span class="number">30000</span>,       <span class="comment">// 30 seconds</span>
+  flushAt: <span class="number">20</span>,                 <span class="comment">// batch size threshold</span>
+  maxQueueSize: <span class="number">1000</span>,          <span class="comment">// drop oldest if exceeded</span>
+  retryLimit: <span class="number">3</span>,
+  debug: __DEV__,
+  middleware: [
+    <span class="func">enrichWithDeviceInfo</span>,
+    <span class="func">filterSensitiveData</span>,
+    <span class="func">addExperimentContext</span>,
+  ],
+});</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>The middleware pattern is critical for extensibility. Each middleware receives the event, can transform it, and passes it downstream. This allows teams to inject enrichment (device info, experiment assignments), filtering (PII scrubbing), and routing (send to multiple backends) without modifying the core SDK.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="batching-persistence">2. Batching and Persistence</h2>
+
+    <p>Sending every event individually is wasteful. Batching amortizes HTTP overhead, reduces battery drain, and enables server-side deduplication. Persistence ensures events survive app crashes and cold restarts.</p>
+
+    <h3>2.1 In-Memory Ring Buffer</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">EventQueue</span> {
+  <span class="keyword">private</span> buffer: <span class="type">AnalyticsEvent</span>[] = [];
+  <span class="keyword">private</span> maxSize: <span class="type">number</span>;
+  <span class="keyword">private</span> flushAt: <span class="type">number</span>;
+  <span class="keyword">private</span> flushTimer: <span class="type">ReturnType</span>&lt;<span class="keyword">typeof</span> setTimeout&gt; | <span class="keyword">null</span> = <span class="keyword">null</span>;
+
+  <span class="func">enqueue</span>(event: <span class="type">AnalyticsEvent</span>): <span class="keyword">void</span> {
+    <span class="keyword">if</span> (<span class="keyword">this</span>.buffer.length >= <span class="keyword">this</span>.maxSize) {
+      <span class="keyword">this</span>.buffer.<span class="func">shift</span>();  <span class="comment">// drop oldest — bounded memory</span>
+    }
+    <span class="keyword">this</span>.buffer.<span class="func">push</span>(event);
+    <span class="keyword">this</span>.<span class="func">persistToDisk</span>(event);
+
+    <span class="keyword">if</span> (<span class="keyword">this</span>.buffer.length >= <span class="keyword">this</span>.flushAt) {
+      <span class="keyword">this</span>.<span class="func">flush</span>();
+    } <span class="keyword">else</span> {
+      <span class="keyword">this</span>.<span class="func">scheduleFlush</span>();
+    }
+  }
+
+  <span class="keyword">private</span> <span class="keyword">async</span> <span class="func">persistToDisk</span>(event: <span class="type">AnalyticsEvent</span>): <span class="type">Promise</span>&lt;<span class="keyword">void</span>&gt; {
+    <span class="keyword">await</span> db.<span class="func">execute</span>(
+      <span class="string">`INSERT INTO events (id, payload, created_at, status)
+       VALUES (?, ?, ?, 'pending')`</span>,
+      [event.id, <span class="func">JSON.stringify</span>(event), event.timestamp]
+    );
+  }
+}</code></pre>
+
+    <h3>2.2 Persistence Layer Comparison</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Storage</th>
+                <th>Write Speed</th>
+                <th>Crash Safety</th>
+                <th>Query Support</th>
+                <th>Best For</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>AsyncStorage</td>
+                <td>Slow (JSON serialize)</td>
+                <td>Moderate</td>
+                <td>None (key-value)</td>
+                <td>Simple apps</td>
+            </tr>
+            <tr>
+                <td>MMKV</td>
+                <td>Very fast (mmap)</td>
+                <td>High (CRC checksum)</td>
+                <td>None (key-value)</td>
+                <td>High-throughput events</td>
+            </tr>
+            <tr>
+                <td>SQLite (op-sqlite)</td>
+                <td>Fast (WAL mode)</td>
+                <td>Very high (ACID)</td>
+                <td>Full SQL</td>
+                <td>Complex querying, retry</td>
+            </tr>
+            <tr>
+                <td>WatermelonDB</td>
+                <td>Fast (lazy loading)</td>
+                <td>Very high</td>
+                <td>Query builder</td>
+                <td>Reactive sync scenarios</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Critical: Persistence Must Be Synchronous-Feeling</div>
+        <p>If <code>track()</code> awaits disk I/O, it blocks the calling code and risks dropping events during rapid-fire scenarios (scroll tracking, gesture events). Use a write-ahead approach: enqueue in memory immediately, persist asynchronously, and reconcile on startup by replaying un-sent events from disk.</p>
+    </div>
+
+    <h3>2.3 Startup Reconciliation</h3>
+
+    <pre><code><span class="keyword">async</span> <span class="keyword">function</span> <span class="func">reconcileOnStartup</span>(): <span class="type">Promise</span>&lt;<span class="keyword">void</span>&gt; {
+  <span class="keyword">const</span> pending = <span class="keyword">await</span> db.<span class="func">query</span>(
+    <span class="string">`SELECT * FROM events WHERE status = 'pending'
+     ORDER BY created_at ASC LIMIT 500`</span>
+  );
+
+  <span class="keyword">if</span> (pending.length > <span class="number">0</span>) {
+    <span class="keyword">await</span> <span class="func">sendBatch</span>(pending);
+    <span class="keyword">await</span> db.<span class="func">execute</span>(
+      <span class="string">`DELETE FROM events WHERE id IN (?)`</span>,
+      [pending.<span class="func">map</span>(e =&gt; e.id)]
+    );
+  }
+
+  <span class="comment">// Prune events older than 7 days to prevent unbounded growth</span>
+  <span class="keyword">await</span> db.<span class="func">execute</span>(
+    <span class="string">`DELETE FROM events WHERE created_at &lt; ?`</span>,
+    [<span class="func">Date.now</span>() - <span class="number">7</span> * <span class="number">24</span> * <span class="number">60</span> * <span class="number">60</span> * <span class="number">1000</span>]
+  );
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="network-aware">3. Network-Aware Sending</h2>
+
+    <p>A production SDK must adapt its behavior to network conditions. Sending batches over a metered cellular connection wastes user data; sending over no connection wastes battery on retries.</p>
+
+    <h3>3.1 Network State Machine</h3>
+
+    <div class="diagram">
+Network-Aware Flush Strategy:
+
+  ┌──────────┐    wifi     ┌───────────────┐
+  │  OFFLINE  │ ─────────→ │  FLUSH_EAGER   │  flush every 15s, batch 10
+  └──────────┘             └───────────────┘
+       │                          │
+       │ cellular                 │ wifi lost
+       ▼                          ▼
+  ┌──────────────┐         ┌──────────┐
+  │ FLUSH_LAZY    │ ←────── │  OFFLINE  │
+  │ flush 60s,    │         └──────────┘
+  │ batch 50      │
+  └──────────────┘
+
+  OFFLINE:      queue only, no sends, persist everything
+  FLUSH_LAZY:   larger batches, longer intervals (save data)
+  FLUSH_EAGER:  smaller batches, shorter intervals (low latency)
+    </div>
+
+    <h3>3.2 NetInfo Integration</h3>
+
+    <pre><code><span class="keyword">import</span> NetInfo <span class="keyword">from</span> <span class="string">'@react-native-community/netinfo'</span>;
+
+<span class="keyword">class</span> <span class="type">NetworkAwareTransport</span> {
+  <span class="keyword">private</span> state: <span class="string">'offline'</span> | <span class="string">'cellular'</span> | <span class="string">'wifi'</span> = <span class="string">'wifi'</span>;
+
+  <span class="func">constructor</span>() {
+    NetInfo.<span class="func">addEventListener</span>(netState =&gt; {
+      <span class="keyword">if</span> (!netState.isConnected) {
+        <span class="keyword">this</span>.state = <span class="string">'offline'</span>;
+        <span class="keyword">this</span>.<span class="func">pauseFlushing</span>();
+      } <span class="keyword">else if</span> (netState.type === <span class="string">'wifi'</span>) {
+        <span class="keyword">this</span>.state = <span class="string">'wifi'</span>;
+        <span class="keyword">this</span>.<span class="func">setFlushConfig</span>({ interval: <span class="number">15000</span>, batchSize: <span class="number">10</span> });
+        <span class="keyword">this</span>.<span class="func">drainQueue</span>();
+      } <span class="keyword">else</span> {
+        <span class="keyword">this</span>.state = <span class="string">'cellular'</span>;
+        <span class="keyword">this</span>.<span class="func">setFlushConfig</span>({ interval: <span class="number">60000</span>, batchSize: <span class="number">50</span> });
+      }
+    });
+  }
+
+  <span class="keyword">async</span> <span class="func">send</span>(batch: <span class="type">AnalyticsEvent</span>[]): <span class="type">Promise</span>&lt;<span class="keyword">void</span>&gt; {
+    <span class="keyword">try</span> {
+      <span class="keyword">const</span> response = <span class="keyword">await</span> <span class="func">fetch</span>(<span class="keyword">this</span>.endpoint, {
+        method: <span class="string">'POST'</span>,
+        headers: { <span class="string">'Content-Encoding'</span>: <span class="string">'gzip'</span> },
+        body: <span class="func">gzip</span>(<span class="func">JSON.stringify</span>({ batch })),
+      });
+      <span class="keyword">if</span> (!response.ok) <span class="keyword">throw new</span> <span class="type">Error</span>(response.status);
+    } <span class="keyword">catch</span> (err) {
+      <span class="keyword">this</span>.<span class="func">scheduleRetry</span>(batch);
+    }
+  }
+}</code></pre>
+
+    <h3>3.3 Retry with Exponential Backoff</h3>
+
+    <pre><code><span class="keyword">async</span> <span class="keyword">function</span> <span class="func">retryWithBackoff</span>(
+  fn: () =&gt; <span class="type">Promise</span>&lt;<span class="keyword">void</span>&gt;,
+  maxRetries: <span class="type">number</span> = <span class="number">3</span>,
+  baseDelay: <span class="type">number</span> = <span class="number">1000</span>
+): <span class="type">Promise</span>&lt;<span class="keyword">void</span>&gt; {
+  <span class="keyword">for</span> (<span class="keyword">let</span> attempt = <span class="number">0</span>; attempt &lt; maxRetries; attempt++) {
+    <span class="keyword">try</span> {
+      <span class="keyword">await</span> <span class="func">fn</span>();
+      <span class="keyword">return</span>;
+    } <span class="keyword">catch</span> (err) {
+      <span class="keyword">const</span> jitter = Math.<span class="func">random</span>() * <span class="number">1000</span>;
+      <span class="keyword">const</span> delay = baseDelay * Math.<span class="func">pow</span>(<span class="number">2</span>, attempt) + jitter;
+      <span class="keyword">await</span> <span class="keyword">new</span> <span class="type">Promise</span>(r =&gt; <span class="func">setTimeout</span>(r, delay));
+    }
+  }
+  <span class="comment">// After max retries, events remain in SQLite for next startup</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="session-management">4. Session Management</h2>
+
+    <p>Sessions group user activity into logical visits. A session starts when the app foregrounds and expires after a configurable inactivity timeout (typically 30 minutes).</p>
+
+    <h3>4.1 Session State Machine</h3>
+
+    <div class="diagram">
+Session Lifecycle:
+
+  App Launch / Foreground
+         │
+         ▼
+  ┌─────────────┐
+  │  NEW_SESSION  │ ── generate sessionId, emit session_start
+  └──────┬──────┘
+         ▼
+  ┌─────────────┐    user activity     ┌─────────────┐
+  │   ACTIVE     │ ←─────────────────── │   ACTIVE     │
+  └──────┬──────┘    reset timer       └─────────────┘
+         │
+         │ 30 min inactivity OR app background
+         ▼
+  ┌─────────────┐
+  │   EXPIRED    │ ── emit session_end, persist duration
+  └─────────────┘
+         │
+         │ foreground again
+         ▼
+  ┌─────────────┐
+  │  NEW_SESSION  │ ── new sessionId
+  └─────────────┘
+    </div>
+
+    <h3>4.2 AppState-Driven Session Tracking</h3>
+
+    <pre><code><span class="keyword">import</span> { AppState } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+<span class="keyword">import</span> { v4 <span class="keyword">as</span> uuid } <span class="keyword">from</span> <span class="string">'uuid'</span>;
+
+<span class="keyword">class</span> <span class="type">SessionManager</span> {
+  <span class="keyword">private</span> sessionId: <span class="type">string</span> = <span class="func">uuid</span>();
+  <span class="keyword">private</span> sessionStart: <span class="type">number</span> = <span class="func">Date.now</span>();
+  <span class="keyword">private</span> lastActivity: <span class="type">number</span> = <span class="func">Date.now</span>();
+  <span class="keyword">private</span> timeout: <span class="type">number</span> = <span class="number">30</span> * <span class="number">60</span> * <span class="number">1000</span>; <span class="comment">// 30 min</span>
+
+  <span class="func">constructor</span>(<span class="keyword">private</span> analytics: <span class="type">Analytics</span>) {
+    AppState.<span class="func">addEventListener</span>(<span class="string">'change'</span>, <span class="keyword">this</span>.<span class="func">handleAppState</span>);
+  }
+
+  <span class="func">handleAppState</span> = (state: <span class="type">string</span>) =&gt; {
+    <span class="keyword">if</span> (state === <span class="string">'active'</span>) {
+      <span class="keyword">const</span> elapsed = <span class="func">Date.now</span>() - <span class="keyword">this</span>.lastActivity;
+      <span class="keyword">if</span> (elapsed > <span class="keyword">this</span>.timeout) {
+        <span class="keyword">this</span>.<span class="func">endSession</span>();
+        <span class="keyword">this</span>.<span class="func">startSession</span>();
+      }
+    } <span class="keyword">else if</span> (state === <span class="string">'background'</span>) {
+      <span class="keyword">this</span>.lastActivity = <span class="func">Date.now</span>();
+      <span class="keyword">this</span>.analytics.<span class="func">track</span>(<span class="string">'app_backgrounded'</span>);
+    }
+  };
+
+  <span class="func">touch</span>(): <span class="keyword">void</span> {
+    <span class="keyword">this</span>.lastActivity = <span class="func">Date.now</span>();
+  }
+
+  <span class="keyword">private</span> <span class="func">startSession</span>(): <span class="keyword">void</span> {
+    <span class="keyword">this</span>.sessionId = <span class="func">uuid</span>();
+    <span class="keyword">this</span>.sessionStart = <span class="func">Date.now</span>();
+    <span class="keyword">this</span>.analytics.<span class="func">track</span>(<span class="string">'session_start'</span>, {
+      sessionId: <span class="keyword">this</span>.sessionId,
+    });
+  }
+
+  <span class="keyword">private</span> <span class="func">endSession</span>(): <span class="keyword">void</span> {
+    <span class="keyword">this</span>.analytics.<span class="func">track</span>(<span class="string">'session_end'</span>, {
+      sessionId: <span class="keyword">this</span>.sessionId,
+      duration: <span class="func">Date.now</span>() - <span class="keyword">this</span>.sessionStart,
+    });
+  }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="user-identification">5. User Identification</h2>
+
+    <p>Identity resolution maps anonymous device activity to known user profiles. The SDK must handle the transition from anonymous to identified state and merge event histories.</p>
+
+    <h3>5.1 Identity Resolution Flow</h3>
+
+    <div class="diagram">
+Identity Resolution:
+
+  First Launch                Login                    Logout
+  ────────────           ──────────────           ──────────────
+  anonymousId: "abc"     identify("user_42")      reset()
+  userId: null           userId: "user_42"        anonymousId: "xyz" (new)
+                         anonymousId: "abc"       userId: null
+                              │
+                              ▼
+                    Server merges "abc" → "user_42"
+                    All prior anonymous events
+                    attributed to user_42
+    </div>
+
+    <h3>5.2 Identify and Reset API</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">IdentityManager</span> {
+  <span class="keyword">private</span> anonymousId: <span class="type">string</span>;
+  <span class="keyword">private</span> userId: <span class="type">string</span> | <span class="keyword">null</span> = <span class="keyword">null</span>;
+  <span class="keyword">private</span> traits: <span class="type">Record</span>&lt;<span class="type">string</span>, <span class="type">unknown</span>&gt; = {};
+
+  <span class="func">constructor</span>() {
+    <span class="keyword">this</span>.anonymousId = <span class="keyword">this</span>.<span class="func">loadOrCreateAnonymousId</span>();
+  }
+
+  <span class="func">identify</span>(userId: <span class="type">string</span>, traits?: <span class="type">Record</span>&lt;<span class="type">string</span>, <span class="type">unknown</span>&gt;): <span class="keyword">void</span> {
+    <span class="keyword">const</span> previousId = <span class="keyword">this</span>.userId;
+    <span class="keyword">this</span>.userId = userId;
+    <span class="keyword">this</span>.traits = { ...<span class="keyword">this</span>.traits, ...traits };
+
+    <span class="keyword">this</span>.<span class="func">persistIdentity</span>();
+    <span class="keyword">this</span>.analytics.<span class="func">enqueue</span>({
+      type: <span class="string">'identify'</span>,
+      userId,
+      anonymousId: <span class="keyword">this</span>.anonymousId,
+      traits: <span class="keyword">this</span>.traits,
+      previousId,
+    });
+  }
+
+  <span class="func">reset</span>(): <span class="keyword">void</span> {
+    <span class="keyword">this</span>.userId = <span class="keyword">null</span>;
+    <span class="keyword">this</span>.traits = {};
+    <span class="keyword">this</span>.anonymousId = <span class="func">uuid</span>();
+    <span class="keyword">this</span>.<span class="func">persistIdentity</span>();
+  }
+
+  <span class="keyword">private</span> <span class="func">loadOrCreateAnonymousId</span>(): <span class="type">string</span> {
+    <span class="keyword">const</span> stored = MMKV.<span class="func">getString</span>(<span class="string">'analytics_anonymous_id'</span>);
+    <span class="keyword">if</span> (stored) <span class="keyword">return</span> stored;
+    <span class="keyword">const</span> id = <span class="func">uuid</span>();
+    MMKV.<span class="func">set</span>(<span class="string">'analytics_anonymous_id'</span>, id);
+    <span class="keyword">return</span> id;
+  }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Anonymous ID Persistence</div>
+        <p>The anonymous ID must persist across app restarts but reset on <code>reset()</code> (logout). Store it in MMKV or Keychain — not AsyncStorage, which is slower and can be cleared by OS storage pressure. On iOS, consider using the Keychain so the ID survives app reinstalls (useful for attribution).</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="screen-tracking">6. Screen Tracking with Navigation</h2>
+
+    <p>Automatic screen tracking requires deep integration with React Navigation. The SDK must capture screen views without requiring manual instrumentation on every screen.</p>
+
+    <h3>6.1 Navigation Listener Integration</h3>
+
+    <pre><code><span class="keyword">import</span> { useNavigationContainerRef } <span class="keyword">from</span> <span class="string">'@react-navigation/native'</span>;
+
+<span class="keyword">function</span> <span class="func">useAnalyticsScreenTracking</span>() {
+  <span class="keyword">const</span> navigationRef = <span class="func">useNavigationContainerRef</span>();
+  <span class="keyword">const</span> routeNameRef = <span class="func">useRef</span>&lt;<span class="type">string</span>&gt;();
+
+  <span class="keyword">const</span> onReady = <span class="func">useCallback</span>(() =&gt; {
+    routeNameRef.current = navigationRef.<span class="func">getCurrentRoute</span>()?.name;
+  }, []);
+
+  <span class="keyword">const</span> onStateChange = <span class="func">useCallback</span>(() =&gt; {
+    <span class="keyword">const</span> previousRoute = routeNameRef.current;
+    <span class="keyword">const</span> currentRoute = navigationRef.<span class="func">getCurrentRoute</span>();
+
+    <span class="keyword">if</span> (currentRoute &amp;&amp; previousRoute !== currentRoute.name) {
+      analytics.<span class="func">screen</span>(currentRoute.name, {
+        params: currentRoute.params,
+        previousScreen: previousRoute,
+      });
+    }
+
+    routeNameRef.current = currentRoute?.name;
+  }, []);
+
+  <span class="keyword">return</span> { navigationRef, onReady, onStateChange };
+}
+
+<span class="comment">// Usage in App.tsx</span>
+<span class="keyword">function</span> <span class="func">App</span>() {
+  <span class="keyword">const</span> { navigationRef, onReady, onStateChange } =
+    <span class="func">useAnalyticsScreenTracking</span>();
+
+  <span class="keyword">return</span> (
+    &lt;<span class="type">NavigationContainer</span>
+      <span class="attr">ref</span>={navigationRef}
+      <span class="attr">onReady</span>={onReady}
+      <span class="attr">onStateChange</span>={onStateChange}
+    &gt;
+      {<span class="comment">/* navigators */</span>}
+    &lt;/<span class="type">NavigationContainer</span>&gt;
+  );
+}</code></pre>
+
+    <h3>6.2 Screen Time Tracking</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">ScreenTimeTracker</span> {
+  <span class="keyword">private</span> screenEntryTime: <span class="type">Map</span>&lt;<span class="type">string</span>, <span class="type">number</span>&gt; = <span class="keyword">new</span> <span class="type">Map</span>();
+
+  <span class="func">onScreenEnter</span>(screenName: <span class="type">string</span>): <span class="keyword">void</span> {
+    <span class="keyword">this</span>.screenEntryTime.<span class="func">set</span>(screenName, <span class="func">Date.now</span>());
+  }
+
+  <span class="func">onScreenLeave</span>(screenName: <span class="type">string</span>): <span class="keyword">void</span> {
+    <span class="keyword">const</span> entry = <span class="keyword">this</span>.screenEntryTime.<span class="func">get</span>(screenName);
+    <span class="keyword">if</span> (entry) {
+      analytics.<span class="func">track</span>(<span class="string">'screen_time'</span>, {
+        screen: screenName,
+        duration: <span class="func">Date.now</span>() - entry,
+      });
+      <span class="keyword">this</span>.screenEntryTime.<span class="func">delete</span>(screenName);
+    }
+  }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="performance-metrics">7. Performance Metrics Collection</h2>
+
+    <p>The analytics SDK is uniquely positioned to collect performance telemetry because it already has the batching and transport infrastructure. Key metrics include app startup time, screen render time, JS thread frame drops, and API latency.</p>
+
+    <h3>7.1 Startup Time Measurement</h3>
+
+    <pre><code><span class="comment">// Native module exposes process start timestamp</span>
+<span class="keyword">import</span> { NativeModules } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="keyword">const</span> nativeStartTime = NativeModules.StartupTiming.startTime;
+
+<span class="keyword">function</span> <span class="func">measureStartup</span>() {
+  <span class="keyword">const</span> jsReady = <span class="func">Date.now</span>();
+  <span class="keyword">const</span> coldStartMs = jsReady - nativeStartTime;
+
+  analytics.<span class="func">track</span>(<span class="string">'app_startup'</span>, {
+    coldStartMs,
+    jsLoadMs: jsReady - global.__jsLoadStart,
+    bundleSize: global.__bundleSize,
+  });
+}</code></pre>
+
+    <h3>7.2 Performance Metrics Table</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Metric</th>
+                <th>Collection Method</th>
+                <th>Threshold</th>
+                <th>Impact</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Cold start time</td>
+                <td>Native timestamp → JS ready</td>
+                <td>&lt; 2s</td>
+                <td>User retention</td>
+            </tr>
+            <tr>
+                <td>TTI (Time to Interactive)</td>
+                <td>First meaningful paint + idle</td>
+                <td>&lt; 3s</td>
+                <td>Perceived performance</td>
+            </tr>
+            <tr>
+                <td>JS frame drops</td>
+                <td>Performance observer / frame callback</td>
+                <td>&lt; 1% dropped</td>
+                <td>Scroll jank</td>
+            </tr>
+            <tr>
+                <td>API latency (p50/p95)</td>
+                <td>Fetch interceptor timestamps</td>
+                <td>p95 &lt; 500ms</td>
+                <td>Feature usability</td>
+            </tr>
+            <tr>
+                <td>JS heap size</td>
+                <td>Performance.memory (Hermes)</td>
+                <td>&lt; 150MB</td>
+                <td>OOM crashes</td>
+            </tr>
+            <tr>
+                <td>Native module init</td>
+                <td>TurboModule timing hooks</td>
+                <td>&lt; 50ms each</td>
+                <td>Startup time</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Don't Measure What You Can't Act On</div>
+        <p>Every metric you collect has a cost: storage, bandwidth, and engineering time to analyze. Define actionable thresholds and alerts before adding a metric. If a metric degrades and nobody investigates, it's wasted infrastructure.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="privacy-compliance">8. Privacy Compliance</h2>
+
+    <p>GDPR, CCPA, and App Tracking Transparency (ATT) impose strict requirements on what data you collect, how you store it, and whether you can send it. The SDK must support consent management as a first-class concern.</p>
+
+    <h3>8.1 Consent State Machine</h3>
+
+    <div class="diagram">
+Consent Flow:
+
+  App Launch
+      │
+      ▼
+  ┌──────────────┐     user grants      ┌───────────────┐
+  │  UNKNOWN      │ ──────────────────→  │  GRANTED       │
+  │  (queue only) │                      │  (send events) │
+  └──────┬───────┘                      └───────────────┘
+         │                                      │
+         │ user denies                          │ user revokes
+         ▼                                      ▼
+  ┌──────────────┐                      ┌───────────────┐
+  │  DENIED       │                      │  REVOKED       │
+  │  (purge queue)│                      │  (stop + purge)│
+  └──────────────┘                      └───────────────┘
+    </div>
+
+    <h3>8.2 Consent-Aware Event Pipeline</h3>
+
+    <pre><code><span class="keyword">type</span> <span class="type">ConsentStatus</span> = <span class="string">'unknown'</span> | <span class="string">'granted'</span> | <span class="string">'denied'</span> | <span class="string">'revoked'</span>;
+
+<span class="keyword">class</span> <span class="type">ConsentManager</span> {
+  <span class="keyword">private</span> status: <span class="type">ConsentStatus</span> = <span class="string">'unknown'</span>;
+  <span class="keyword">private</span> pendingQueue: <span class="type">AnalyticsEvent</span>[] = [];
+
+  <span class="func">setConsent</span>(status: <span class="type">ConsentStatus</span>): <span class="keyword">void</span> {
+    <span class="keyword">this</span>.status = status;
+
+    <span class="keyword">switch</span> (status) {
+      <span class="keyword">case</span> <span class="string">'granted'</span>:
+        <span class="keyword">this</span>.<span class="func">flushPending</span>();
+        <span class="keyword">break</span>;
+      <span class="keyword">case</span> <span class="string">'denied'</span>:
+      <span class="keyword">case</span> <span class="string">'revoked'</span>:
+        <span class="keyword">this</span>.<span class="func">purgeAllData</span>();
+        <span class="keyword">break</span>;
+    }
+  }
+
+  <span class="func">shouldTrack</span>(event: <span class="type">AnalyticsEvent</span>): <span class="type">boolean</span> {
+    <span class="keyword">if</span> (<span class="keyword">this</span>.status === <span class="string">'denied'</span> || <span class="keyword">this</span>.status === <span class="string">'revoked'</span>) {
+      <span class="keyword">return</span> <span class="keyword">false</span>;
+    }
+    <span class="keyword">if</span> (<span class="keyword">this</span>.status === <span class="string">'unknown'</span>) {
+      <span class="keyword">this</span>.pendingQueue.<span class="func">push</span>(event);
+      <span class="keyword">return</span> <span class="keyword">false</span>;
+    }
+    <span class="keyword">return</span> <span class="keyword">true</span>;
+  }
+
+  <span class="keyword">private</span> <span class="keyword">async</span> <span class="func">purgeAllData</span>(): <span class="type">Promise</span>&lt;<span class="keyword">void</span>&gt; {
+    <span class="keyword">this</span>.pendingQueue = [];
+    <span class="keyword">await</span> db.<span class="func">execute</span>(<span class="string">'DELETE FROM events'</span>);
+    <span class="keyword">await</span> MMKV.<span class="func">delete</span>(<span class="string">'analytics_anonymous_id'</span>);
+  }
+}</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight — ATT on iOS</div>
+        <p>iOS 14.5+ requires App Tracking Transparency permission before accessing the IDFA. If your analytics SDK uses IDFA for cross-app attribution, you must request ATT permission and handle denial gracefully. Many teams now avoid IDFA entirely and rely on first-party anonymous IDs, which don't require ATT but limit cross-app attribution capabilities.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="ab-testing">9. A/B Testing Integration</h2>
+
+    <p>The analytics SDK and experimentation platform share infrastructure: both need user identification, event tracking, and property enrichment. Integrating them avoids duplicate SDKs and ensures experiment assignments are automatically attached to all analytics events.</p>
+
+    <h3>9.1 Experiment Assignment Flow</h3>
+
+    <pre><code><span class="keyword">interface</span> <span class="type">Experiment</span> {
+  key: <span class="type">string</span>;           <span class="comment">// "checkout_redesign"</span>
+  variant: <span class="type">string</span>;       <span class="comment">// "control" | "treatment_a" | "treatment_b"</span>
+  payload: <span class="type">unknown</span>;      <span class="comment">// feature flags, config values</span>
+}
+
+<span class="keyword">class</span> <span class="type">ExperimentManager</span> {
+  <span class="keyword">private</span> assignments: <span class="type">Map</span>&lt;<span class="type">string</span>, <span class="type">Experiment</span>&gt; = <span class="keyword">new</span> <span class="type">Map</span>();
+
+  <span class="keyword">async</span> <span class="func">fetchAssignments</span>(userId: <span class="type">string</span>): <span class="type">Promise</span>&lt;<span class="keyword">void</span>&gt; {
+    <span class="keyword">const</span> response = <span class="keyword">await</span> <span class="func">fetch</span>(
+      <span class="string">`/api/experiments?user=</span>${userId}<span class="string">`</span>
+    );
+    <span class="keyword">const</span> experiments: <span class="type">Experiment</span>[] = <span class="keyword">await</span> response.<span class="func">json</span>();
+
+    experiments.<span class="func">forEach</span>(exp =&gt; {
+      <span class="keyword">this</span>.assignments.<span class="func">set</span>(exp.key, exp);
+    });
+  }
+
+  <span class="func">getExperimentContext</span>(): <span class="type">Record</span>&lt;<span class="type">string</span>, <span class="type">string</span>&gt; {
+    <span class="keyword">const</span> context: <span class="type">Record</span>&lt;<span class="type">string</span>, <span class="type">string</span>&gt; = {};
+    <span class="keyword">this</span>.assignments.<span class="func">forEach</span>((exp, key) =&gt; {
+      context[<span class="string">`experiment_</span>${key}<span class="string">`</span>] = exp.variant;
+    });
+    <span class="keyword">return</span> context;
+  }
+}
+
+<span class="comment">// Middleware that enriches every event with experiment context</span>
+<span class="keyword">function</span> <span class="func">addExperimentContext</span>(event: <span class="type">AnalyticsEvent</span>): <span class="type">AnalyticsEvent</span> {
+  <span class="keyword">return</span> {
+    ...event,
+    properties: {
+      ...event.properties,
+      ...experimentManager.<span class="func">getExperimentContext</span>(),
+    },
+  };
+}</code></pre>
+
+    <h3>9.2 Exposure Tracking</h3>
+
+    <pre><code><span class="comment">// Track when a user actually sees the experiment variant</span>
+<span class="keyword">function</span> <span class="func">useExperiment</span>(experimentKey: <span class="type">string</span>) {
+  <span class="keyword">const</span> experiment = experimentManager.<span class="func">get</span>(experimentKey);
+  <span class="keyword">const</span> exposureTracked = <span class="func">useRef</span>(<span class="keyword">false</span>);
+
+  <span class="func">useEffect</span>(() =&gt; {
+    <span class="keyword">if</span> (experiment &amp;&amp; !exposureTracked.current) {
+      analytics.<span class="func">track</span>(<span class="string">'experiment_exposure'</span>, {
+        experimentKey,
+        variant: experiment.variant,
+      });
+      exposureTracked.current = <span class="keyword">true</span>;
+    }
+  }, [experiment]);
+
+  <span class="keyword">return</span> experiment;
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="architect">10. Architect Considerations</h2>
+
+    <h3>10.1 SDK Size Budget</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Component</th>
+                <th>Estimated Size (gzipped)</th>
+                <th>Optimization</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Core (track, identify, screen)</td>
+                <td>~8 KB</td>
+                <td>Tree-shake unused methods</td>
+            </tr>
+            <tr>
+                <td>Persistence (SQLite)</td>
+                <td>~15 KB (JS) + native</td>
+                <td>Optional — fallback to MMKV</td>
+            </tr>
+            <tr>
+                <td>Network transport</td>
+                <td>~3 KB</td>
+                <td>Use platform fetch</td>
+            </tr>
+            <tr>
+                <td>Experiment engine</td>
+                <td>~5 KB</td>
+                <td>Lazy load if not used</td>
+            </tr>
+            <tr>
+                <td>Total JS overhead</td>
+                <td>~31 KB</td>
+                <td>Target: &lt; 50 KB gzipped</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h3>10.2 Testing Strategy</h3>
+
+    <pre><code><span class="comment">// Mock analytics for unit tests</span>
+<span class="keyword">class</span> <span class="type">MockAnalytics</span> <span class="keyword">implements</span> <span class="type">AnalyticsInterface</span> {
+  events: <span class="type">AnalyticsEvent</span>[] = [];
+
+  <span class="func">track</span>(name: <span class="type">string</span>, props?: <span class="type">Record</span>&lt;<span class="type">string</span>, <span class="type">unknown</span>&gt;): <span class="keyword">void</span> {
+    <span class="keyword">this</span>.events.<span class="func">push</span>({ name, properties: props ?? {} } <span class="keyword">as</span> <span class="type">AnalyticsEvent</span>);
+  }
+
+  <span class="func">assertTracked</span>(name: <span class="type">string</span>, props?: <span class="type">Partial</span>&lt;<span class="type">Record</span>&lt;<span class="type">string</span>, <span class="type">unknown</span>&gt;&gt;): <span class="keyword">void</span> {
+    <span class="keyword">const</span> match = <span class="keyword">this</span>.events.<span class="func">find</span>(e =&gt;
+      e.name === name &amp;&amp;
+      (!props || <span class="func">objectContains</span>(e.properties, props))
+    );
+    <span class="keyword">if</span> (!match) <span class="keyword">throw new</span> <span class="type">Error</span>(<span class="string">`Event "</span>${name}<span class="string">" not tracked`</span>);
+  }
+}</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>An analytics SDK is a <strong>distributed systems problem disguised as a client library</strong>. It must handle unreliable networks, app crashes, storage limits, identity resolution across devices, privacy regulations across jurisdictions, and real-time experiment assignment — all while adding zero perceptible latency to the host app. The key architectural principle is <strong>eventual delivery with bounded resource usage</strong>: events will arrive at the server eventually, but the SDK must never consume unbounded memory, storage, or battery to achieve this.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="08-offline-first-sync.html">← Prev: Offline-First Sync</a>
+        <a href="10-multi-app-platform.html">Next: Multi-App Platform →</a>
+    </div>
+</div>
+</body>
+</html>

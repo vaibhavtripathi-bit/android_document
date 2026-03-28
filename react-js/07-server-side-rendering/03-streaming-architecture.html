@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Streaming Architecture — Server-Side Rendering — React JS Deep Dive</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Server-Side Rendering</a>
+  <span class="sep">›</span>
+  Streaming Architecture
+</nav>
+
+<h1>Streaming Architecture</h1>
+<p class="subtitle">Deep dive into React's streaming SSR — renderToPipeableStream internals, Suspense as streaming units, out-of-order completion, selective hydration, backpressure, and the streams API landscape.</p>
+
+<nav class="toc">
+  <h3>Table of Contents</h3>
+  <ul>
+    <li><a href="#streaming-model">The Streaming Model</a></li>
+    <li><a href="#pipeable-stream">renderToPipeableStream Internals</a></li>
+    <li><a href="#suspense-streaming">Suspense Boundaries as Streaming Units</a></li>
+    <li><a href="#shell-concept">The Shell Concept</a></li>
+    <li><a href="#out-of-order">Out-of-Order Streaming</a></li>
+    <li><a href="#selective-hydration">Selective Hydration</a></li>
+    <li><a href="#backpressure">Backpressure Handling</a></li>
+    <li><a href="#streams-api">Node.js Streams vs Web Streams</a></li>
+  </ul>
+</nav>
+
+<h2 id="streaming-model">The Streaming Model</h2>
+
+<p>Traditional SSR buffers the entire HTML response before sending anything to the client. Streaming SSR sends HTML in chunks as components render, allowing the browser to start parsing and displaying content before the server finishes rendering the entire page.</p>
+
+<div class="diagram">
+Buffered SSR (renderToString):
+
+Server:  [======= Render ALL components =======]──▶ Send
+Client:                                              [== Parse + Display ==]
+Time:    ├────── 200ms render ──────────────────┤    ├──── 50ms ────┤
+         TTFB = 200ms                                FCP = 250ms
+
+Streaming SSR (renderToPipeableStream):
+
+Server:  [= Shell 30ms =][== Chunk 1 80ms ==][== Chunk 2 150ms ==]
+Client:  [Parse Shell]   [Parse + Inject]     [Parse + Inject]
+Time:    ├── 30ms ──┤
+         TTFB = 30ms     FCP = 30ms (shell visible immediately)
+</div>
+
+<p>The key insight: streaming decouples TTFB from total render time. Users see content in ~30ms (shell) instead of waiting ~200ms for the entire page. For pages with slow data dependencies, the difference can be seconds.</p>
+
+<h2 id="pipeable-stream">renderToPipeableStream Internals</h2>
+
+<p>Under the hood, <code>renderToPipeableStream</code> creates a Fizz renderer — React's streaming server renderer. Fizz traverses the React tree depth-first, writing HTML to an internal buffer that gets flushed to the Node.js writable stream.</p>
+
+<pre><code>// Simplified Fizz renderer internals
+class FizzRenderer {
+  constructor(rootElement, options) {
+    this.destination = null;  // Node.js writable stream
+    this.completedRootSegment = null;
+    this.pendingBoundaries = new Set();
+    this.completedBoundaries = [];
+
+    // Start rendering the tree
+    this.performWork(rootElement);
+  }
+
+  performWork(element) {
+    // Depth-first traversal of React tree
+    const segment = this.createSegment();
+
+    try {
+      this.renderNode(element, segment);
+    } catch (thrownValue) {
+      if (isPromise(thrownValue)) {
+        // Hit a Suspense boundary — render fallback
+        // and track the promise
+        const boundary = this.createBoundary(segment);
+        this.renderFallback(boundary);
+        this.pendingBoundaries.add(boundary);
+
+        thrownValue.then(() => {
+          // Promise resolved — render the real content
+          this.completeBoundary(boundary);
+        });
+      } else {
+        throw thrownValue; // Real error
+      }
+    }
+  }
+
+  completeBoundary(boundary) {
+    // Render the resolved content into a hidden div
+    // Generate inline script to swap fallback with content
+    this.completedBoundaries.push(boundary);
+    this.pendingBoundaries.delete(boundary);
+    this.flushCompletedBoundaries();
+  }
+
+  flushCompletedBoundaries() {
+    if (!this.destination) return;
+
+    for (const boundary of this.completedBoundaries) {
+      // Write: <div hidden id="S:N">...resolved content...</div>
+      // Write: <script>$RC("B:N", "S:N")</script>
+      writeChunk(this.destination, boundary.completedHTML);
+    }
+    this.completedBoundaries = [];
+  }
+}</code></pre>
+
+<h3>Fizz Rendering Phases</h3>
+
+<div class="diagram">
+Fizz Rendering Phases:
+
+Phase 1: Shell Rendering (synchronous)
+├─ Traverse tree depth-first
+├─ Write HTML for non-suspended components
+├─ Hit Suspense → write fallback, track promise
+├─ Complete → fire onShellReady()
+└─ pipe(res) starts streaming shell to client
+
+Phase 2: Boundary Completion (async, incremental)
+├─ Promises resolve (data fetching completes)
+├─ Render resolved content into hidden segments
+├─ Write inline &lt;script&gt; to swap fallback → content
+├─ Flush completed boundaries to stream
+└─ Repeat until all boundaries complete
+
+Phase 3: Finalization
+├─ All boundaries resolved → fire onAllReady()
+├─ Write closing HTML tags
+└─ End the stream
+</div>
+
+<h2 id="suspense-streaming">Suspense Boundaries as Streaming Units</h2>
+
+<p>Each <code>&lt;Suspense&gt;</code> boundary in your component tree becomes a streaming unit. The fallback renders immediately as part of the shell, and the resolved content streams in later. This means your Suspense boundary placement directly controls the streaming granularity.</p>
+
+<pre><code>// Each Suspense boundary = one streaming unit
+function ProductPage({ productId }) {
+  return (
+    &lt;div&gt;
+      {/* Shell: renders immediately */}
+      &lt;Header /&gt;
+      &lt;Navigation /&gt;
+
+      {/* Streaming unit 1: product details */}
+      &lt;Suspense fallback={&lt;ProductSkeleton /&gt;}&gt;
+        &lt;ProductDetails id={productId} /&gt;
+      &lt;/Suspense&gt;
+
+      {/* Streaming unit 2: reviews (independent) */}
+      &lt;Suspense fallback={&lt;ReviewsSkeleton /&gt;}&gt;
+        &lt;Reviews productId={productId} /&gt;
+      &lt;/Suspense&gt;
+
+      {/* Streaming unit 3: recommendations */}
+      &lt;Suspense fallback={&lt;RecommendationsSkeleton /&gt;}&gt;
+        &lt;Recommendations productId={productId} /&gt;
+      &lt;/Suspense&gt;
+
+      {/* Shell: renders immediately */}
+      &lt;Footer /&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p>Suspense boundary placement is an architectural decision with significant UX impact. Too few boundaries: the entire page waits for the slowest data source. Too many boundaries: excessive skeleton flashing and layout shifts. The sweet spot is typically 2-4 boundaries per page, aligned with independent data dependencies and visual sections.</p>
+</div>
+
+<h3>Nested Suspense Boundaries</h3>
+
+<p>Suspense boundaries can be nested. The outer boundary's fallback shows until its direct content resolves. Inner boundaries then show their own fallbacks independently.</p>
+
+<pre><code>// Nested Suspense — progressive disclosure
+&lt;Suspense fallback={&lt;PageSkeleton /&gt;}&gt;
+  {/* Outer boundary: page layout + product data */}
+  &lt;ProductLayout product={product}&gt;
+
+    &lt;Suspense fallback={&lt;PriceSkeleton /&gt;}&gt;
+      {/* Inner boundary 1: pricing (separate API) */}
+      &lt;DynamicPricing productId={product.id} /&gt;
+    &lt;/Suspense&gt;
+
+    &lt;Suspense fallback={&lt;InventorySkeleton /&gt;}&gt;
+      {/* Inner boundary 2: inventory (separate API) */}
+      &lt;InventoryStatus productId={product.id} /&gt;
+    &lt;/Suspense&gt;
+
+  &lt;/ProductLayout&gt;
+&lt;/Suspense&gt;
+
+// Streaming order:
+// 1. PageSkeleton (immediate)
+// 2. ProductLayout + PriceSkeleton + InventorySkeleton (when product loads)
+// 3. DynamicPricing (when pricing API responds)
+// 4. InventoryStatus (when inventory API responds)
+// Steps 3 and 4 are independent — either can complete first</code></pre>
+
+<h2 id="shell-concept">The Shell Concept</h2>
+
+<p>The "shell" is everything that renders synchronously without hitting a Suspense boundary. It's the first HTML the browser receives and determines the initial visual state of the page.</p>
+
+<div class="diagram">
+Shell vs Streamed Content:
+
+┌─────────────────────────────────────────────┐
+│  &lt;html&gt;                                    │
+│    &lt;head&gt;...&lt;/head&gt;                        │
+│    &lt;body&gt;                                   │
+│      ┌─────────────────────────────────┐    │
+│      │  SHELL (sent immediately)       │    │
+│      │  ├─ &lt;Header /&gt;                  │    │
+│      │  ├─ &lt;Nav /&gt;                     │    │
+│      │  ├─ Suspense fallback 1         │    │
+│      │  ├─ Suspense fallback 2         │    │
+│      │  └─ &lt;Footer /&gt;                  │    │
+│      └─────────────────────────────────┘    │
+│                                             │
+│      ┌─────────────────────────────────┐    │
+│      │  STREAMED (sent as resolved)    │    │
+│      │  ├─ &lt;div hidden id="S:0"&gt;...   │    │
+│      │  │  &lt;script&gt;$RC("B:0","S:0")   │    │
+│      │  ├─ &lt;div hidden id="S:1"&gt;...   │    │
+│      │  │  &lt;script&gt;$RC("B:1","S:1")   │    │
+│      │  └─ Bootstrap scripts           │    │
+│      └─────────────────────────────────┘    │
+│    &lt;/body&gt;                                  │
+│  &lt;/html&gt;                                   │
+└─────────────────────────────────────────────┘
+</div>
+
+<h3>Shell Error vs Boundary Error</h3>
+
+<pre><code>const { pipe, abort } = renderToPipeableStream(&lt;App /&gt;, {
+  onShellReady() {
+    // Shell rendered successfully — start streaming
+    // This is the happy path for real users
+    res.statusCode = 200;
+    pipe(res);
+  },
+
+  onShellError(error) {
+    // Shell FAILED — nothing useful to stream
+    // Send a fallback HTML page (static error page)
+    // This fires when a component outside Suspense throws
+    res.statusCode = 500;
+    res.send(staticErrorPage);
+  },
+
+  onError(error) {
+    // Any error during rendering (shell or boundary)
+    // Use for logging — the error is already handled
+    // by either onShellError or the Suspense error boundary
+    logError(error);
+  }
+});</code></pre>
+
+<h2 id="out-of-order">Out-of-Order Streaming</h2>
+
+<p>React's streaming SSR supports out-of-order completion — Suspense boundaries can resolve and stream in any order, regardless of their position in the document. This is possible because resolved content is injected via JavaScript, not by document order.</p>
+
+<pre><code>// Component tree with different data latencies
+function Dashboard() {
+  return (
+    &lt;div&gt;
+      &lt;Suspense fallback={&lt;ChartSkeleton /&gt;}&gt;
+        &lt;AnalyticsChart /&gt;  {/* 500ms API call */}
+      &lt;/Suspense&gt;
+
+      &lt;Suspense fallback={&lt;TableSkeleton /&gt;}&gt;
+        &lt;DataTable /&gt;  {/* 200ms API call */}
+      &lt;/Suspense&gt;
+
+      &lt;Suspense fallback={&lt;FeedSkeleton /&gt;}&gt;
+        &lt;ActivityFeed /&gt;  {/* 800ms API call */}
+      &lt;/Suspense&gt;
+    &lt;/div&gt;
+  );
+}
+
+// Streaming order (by completion time, NOT document order):
+// t=0ms:   Shell + all three skeletons
+// t=200ms: DataTable content (replaces TableSkeleton)
+// t=500ms: AnalyticsChart content (replaces ChartSkeleton)
+// t=800ms: ActivityFeed content (replaces FeedSkeleton)</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">How Out-of-Order Works</div>
+  <p>Each resolved boundary is sent as a hidden <code>&lt;div&gt;</code> at the end of the document, followed by an inline <code>&lt;script&gt;</code> that moves it to the correct position. The browser executes these scripts as they arrive, swapping fallbacks with real content. This works because HTML parsing is incremental — the browser processes each chunk as it arrives.</p>
+</div>
+
+<h2 id="selective-hydration">Selective Hydration</h2>
+
+<p>Selective hydration is the client-side counterpart to streaming SSR. Instead of hydrating the entire page at once, React hydrates Suspense boundaries independently, prioritizing boundaries the user is interacting with.</p>
+
+<div class="diagram">
+Selective Hydration Priority:
+
+1. Shell hydration (always first)
+2. Suspense boundaries hydrate in completion order
+3. User interaction REPRIORITIZES hydration:
+
+   Before click:  [Shell ✓] [Boundary A: hydrating] [B: waiting] [C: waiting]
+   User clicks C: [Shell ✓] [Boundary A: paused]    [B: waiting] [C: HYDRATING]
+                                                                   ↑ prioritized!
+   After C done:  [Shell ✓] [Boundary A: hydrating] [B: waiting] [C: ✓]
+</div>
+
+<pre><code>// Selective hydration happens automatically with Suspense
+// No special API needed — React detects user interaction
+
+function App() {
+  return (
+    &lt;div&gt;
+      &lt;Header /&gt;  {/* Hydrates first (shell) */}
+
+      &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;
+        &lt;HeavyChart /&gt;  {/* Hydrates when ready */}
+      &lt;/Suspense&gt;
+
+      &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;
+        &lt;Comments /&gt;  {/* If user clicks here, hydrates FIRST */}
+      &lt;/Suspense&gt;
+
+      &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;
+        &lt;Sidebar /&gt;  {/* Hydrates last (no interaction) */}
+      &lt;/Suspense&gt;
+    &lt;/div&gt;
+  );
+}
+
+// React captures the click event during capture phase,
+// synchronously hydrates the target boundary,
+// then replays the event on the now-hydrated component</code></pre>
+
+<h3>Event Replay Mechanism</h3>
+
+<p>When a user clicks on a not-yet-hydrated Suspense boundary, React:</p>
+
+<ol>
+  <li>Captures the event during the capture phase (before it reaches the target)</li>
+  <li>Identifies which Suspense boundary contains the target</li>
+  <li>Synchronously hydrates that boundary (interrupting any in-progress hydration)</li>
+  <li>Replays the captured event on the now-hydrated component</li>
+</ol>
+
+<p>This means the user's click is never lost — it's queued and replayed after hydration completes. From the user's perspective, the click just works (with a slight delay).</p>
+
+<h2 id="backpressure">Backpressure Handling</h2>
+
+<p>Backpressure occurs when the server produces data faster than the client can consume it. In streaming SSR, this happens when the network is slow or the client's TCP receive buffer fills up.</p>
+
+<pre><code>// Node.js streams handle backpressure automatically
+// pipe() respects the writable stream's drain events
+
+const { pipe } = renderToPipeableStream(&lt;App /&gt;, {
+  onShellReady() {
+    pipe(res); // pipe handles backpressure internally
+  }
+});
+
+// Under the hood:
+// 1. Fizz writes chunks to the response stream
+// 2. If res.write() returns false (buffer full), Fizz pauses
+// 3. When 'drain' event fires (client consumed data), Fizz resumes
+// 4. This prevents unbounded memory growth on the server
+
+// Manual backpressure handling (if not using pipe):
+const { pipe } = renderToPipeableStream(&lt;App /&gt;, {
+  onShellReady() {
+    // Don't do this in production — use pipe() instead
+    // This is for illustration only
+    const reader = createReadableFromPipeable(pipe);
+    reader.on('data', (chunk) =&gt; {
+      const canContinue = res.write(chunk);
+      if (!canContinue) {
+        reader.pause();
+        res.once('drain', () =&gt; reader.resume());
+      }
+    });
+  }
+});</code></pre>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Memory Pressure</div>
+  <p>Without proper backpressure handling, a slow client can cause the server to buffer the entire rendered HTML in memory. For large pages (100KB+ HTML), this can cause memory pressure under high concurrency. Always use <code>pipe()</code> rather than manually writing chunks — it handles backpressure correctly.</p>
+</div>
+
+<h2 id="streams-api">Node.js Streams vs Web Streams</h2>
+
+<p>React provides two streaming APIs targeting different runtime environments. Understanding the differences is essential for cross-platform SSR.</p>
+
+<table>
+  <thead>
+    <tr><th>Feature</th><th>Node.js Streams</th><th>Web Streams (WHATWG)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>React API</td><td><code>renderToPipeableStream</code></td><td><code>renderToReadableStream</code></td></tr>
+    <tr><td>Runtime</td><td>Node.js, Bun</td><td>Edge runtimes, Deno, Bun, modern Node.js</td></tr>
+    <tr><td>Backpressure</td><td>Automatic via pipe()</td><td>Built into ReadableStream pull model</td></tr>
+    <tr><td>Error model</td><td>Callbacks (onShellError, onError)</td><td>Promise rejection + AbortSignal</td></tr>
+    <tr><td>Shell ready signal</td><td>onShellReady callback</td><td>Promise resolves when shell is ready</td></tr>
+    <tr><td>All ready signal</td><td>onAllReady callback</td><td>stream.allReady promise</td></tr>
+    <tr><td>Cancellation</td><td>abort() function</td><td>AbortSignal</td></tr>
+    <tr><td>Composability</td><td>pipe() to writable</td><td>pipeTo(), pipeThrough(), TransformStream</td></tr>
+  </tbody>
+</table>
+
+<pre><code>// Web Streams: TransformStream for post-processing
+import { renderToReadableStream } from 'react-dom/server';
+
+async function handleRequest(req) {
+  const stream = await renderToReadableStream(&lt;App /&gt;, {
+    bootstrapScripts: ['/bundle.js'],
+  });
+
+  // Transform the stream (e.g., inject analytics script)
+  const transformedStream = stream.pipeThrough(
+    new TransformStream({
+      transform(chunk, controller) {
+        // Modify chunks as they pass through
+        const text = new TextDecoder().decode(chunk);
+        const modified = text.replace(
+          '&lt;/body&gt;',
+          '&lt;script src="/analytics.js"&gt;&lt;/script&gt;&lt;/body&gt;'
+        );
+        controller.enqueue(new TextEncoder().encode(modified));
+      }
+    })
+  );
+
+  return new Response(transformedStream, {
+    headers: { 'Content-Type': 'text/html' },
+  });
+}</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Insight</div>
+  <p>Web Streams are the future — they're standardized across runtimes and compose better than Node.js streams. However, Node.js streams have a larger ecosystem and better tooling today. For new projects targeting edge deployment, prefer <code>renderToReadableStream</code>. For Node.js-only deployments, <code>renderToPipeableStream</code> has slightly better performance due to less abstraction overhead.</p>
+</div>
+
+<h3>Error Handling in Streams</h3>
+
+<pre><code>// Comprehensive error handling for streaming SSR
+const { pipe, abort } = renderToPipeableStream(&lt;App /&gt;, {
+  onShellReady() {
+    res.statusCode = shellError ? 500 : 200;
+    res.setHeader('Content-Type', 'text/html');
+    pipe(res);
+  },
+
+  onShellError(error) {
+    // Shell failed — can't stream anything useful
+    // Option 1: Send static fallback
+    res.statusCode = 500;
+    res.end(getStaticErrorPage());
+
+    // Option 2: Redirect to CSR fallback
+    // res.redirect('/client-only-fallback');
+  },
+
+  onError(error) {
+    // Fires for ALL errors (shell + boundaries)
+    // Boundary errors are caught by error boundaries
+    // Shell errors trigger onShellError
+    logToErrorService(error);
+  }
+});
+
+// Timeout: abort rendering if it takes too long
+const timeout = setTimeout(() => {
+  abort(); // Sends error boundary fallback for pending boundaries
+}, 10000);
+
+res.on('close', () => clearTimeout(timeout));</code></pre>
+
+<nav class="nav-footer">
+  <a href="02-react-server-components.html">← React Server Components</a>
+  <a href="04-nextjs-architecture.html">Next.js Architecture →</a>
+</nav>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

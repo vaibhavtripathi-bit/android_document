@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Networking — Browser Internals</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Browser Internals</a>
+  <span class="sep">›</span>
+  Networking
+</nav>
+
+<h1>Browser Networking</h1>
+<p class="subtitle">Fetch API, HTTP/2 multiplexing, HTTP/3 QUIC, Service Workers, Cache API, WebSocket, SSE, resource hints, and Priority Hints.</p>
+
+<nav class="nav">
+  <a href="01-rendering-engine.html">Rendering Engine</a>
+  <a href="02-javascript-engine.html">JavaScript Engine</a>
+  <a href="03-event-loop.html">Event Loop</a>
+  <a href="04-dom-apis.html">DOM APIs</a>
+  <a href="06-storage-apis.html">Storage APIs</a>
+  <a href="07-web-workers.html">Web Workers</a>
+  <a href="08-interview-qa.html">Interview Q&amp;A</a>
+</nav>
+
+<h2 id="fetch">Fetch API Internals</h2>
+
+<pre><code>// Fetch API: modern replacement for XMLHttpRequest
+// Returns a Promise that resolves to a Response object
+
+// Basic fetch with error handling
+async function fetchJSON(url, options = {}) {
+  const response = await fetch(url, {
+    headers: { 'Content-Type': 'application/json', ...options.headers },
+    signal: options.signal,
+    ...options,
+  });
+
+  if (!response.ok) {
+    throw new HttpError(response.status, await response.text());
+  }
+
+  return response.json();
+}
+
+// Streaming response body
+async function fetchWithProgress(url, onProgress) {
+  const response = await fetch(url);
+  const contentLength = response.headers.get('Content-Length');
+  const total = parseInt(contentLength, 10);
+  let received = 0;
+
+  const reader = response.body.getReader();
+  const chunks = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    chunks.push(value);
+    received += value.length;
+    onProgress({ received, total, percentage: (received / total) * 100 });
+  }
+
+  const blob = new Blob(chunks);
+  return blob;
+}
+
+// Fetch with timeout and retry
+async function resilientFetch(url, options = {}) {
+  const { timeout = 10000, retries = 3, ...fetchOptions } = options;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    try {
+      const response = await fetch(url, {
+        ...fetchOptions,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (response.ok) return response;
+      if (response.status < 500) throw new HttpError(response.status);
+    } catch (err) {
+      clearTimeout(timeoutId);
+      if (attempt === retries) throw err;
+      await new Promise(r => setTimeout(r, 2 ** attempt * 1000));
+    }
+  }
+}</code></pre>
+
+<h2 id="http2">HTTP/2 Multiplexing</h2>
+
+<div class="diagram">
+HTTP/1.1 vs HTTP/2
+═══════════════════════════════════════════════════════════
+
+HTTP/1.1 (6 connections per origin):
+┌──────────┐
+│ Conn 1   │ ──▶ GET /style.css ──▶ response ──▶ GET /app.js ──▶ ...
+│ Conn 2   │ ──▶ GET /hero.jpg ──▶ response ──▶ GET /logo.png ──▶ ...
+│ Conn 3   │ ──▶ GET /font.woff2 ──▶ response ──▶ idle...
+│ Conn 4   │ ──▶ GET /api/data ──▶ response ──▶ idle...
+│ Conn 5   │ ──▶ idle (waiting)
+│ Conn 6   │ ──▶ idle (waiting)
+└──────────┘
+Problem: head-of-line blocking, connection overhead
+
+HTTP/2 (single connection, multiplexed streams):
+┌──────────┐
+│ Single   │ ──▶ Stream 1: GET /style.css    ◀──▶ frames
+│ TCP      │ ──▶ Stream 3: GET /app.js       ◀──▶ frames
+│ Conn     │ ──▶ Stream 5: GET /hero.jpg     ◀──▶ frames
+│          │ ──▶ Stream 7: GET /font.woff2   ◀──▶ frames
+│          │ ──▶ Stream 9: GET /api/data     ◀──▶ frames
+│          │ ──▶ Stream 11: GET /logo.png    ◀──▶ frames
+└──────────┘
+All requests share one connection, interleaved frames
+No head-of-line blocking at HTTP level
+Server push: server can send resources before client requests them
+</div>
+
+<pre><code>// HTTP/2 implications for frontend:
+// 1. Domain sharding is HARMFUL (prevents multiplexing)
+// 2. Concatenating files is less important (no connection limit)
+// 3. Inlining small resources is less important
+// 4. Server Push can preload critical resources
+
+// HTTP/2 Server Push (via Link header)
+// Server sends: Link: &lt;/style.css&gt;; rel=preload; as=style
+// Browser receives style.css before it even parses HTML
+
+// HTTP/2 priorities (browser sets stream priority)
+// Critical resources (CSS, fonts) get higher priority
+// Images get lower priority
+// This happens automatically based on resource type</code></pre>
+
+<h2 id="http3">HTTP/3 (QUIC)</h2>
+
+<pre><code>// HTTP/3 uses QUIC (UDP-based) instead of TCP
+// Solves HTTP/2's TCP-level head-of-line blocking
+
+// HTTP/2 problem: TCP packet loss blocks ALL streams
+// If one packet is lost, TCP retransmission blocks everything
+
+// HTTP/3 solution: each QUIC stream is independent
+// Packet loss in one stream doesn't affect others
+
+// Key benefits:
+// 1. No TCP head-of-line blocking
+// 2. 0-RTT connection establishment (vs TCP's 1-3 RTT)
+// 3. Connection migration (survives IP changes, e.g., WiFi → cellular)
+// 4. Built-in TLS 1.3 (always encrypted)
+
+// Check if HTTP/3 is being used:
+const response = await fetch('https://example.com');
+// Chrome DevTools → Network → Protocol column shows "h3"
+
+// HTTP/3 is negotiated via Alt-Svc header:
+// Alt-Svc: h3=":443"; ma=86400
+// Browser tries QUIC, falls back to HTTP/2 if unavailable</code></pre>
+
+<h3>Protocol Comparison</h3>
+
+<table>
+<thead>
+<tr><th>Feature</th><th>HTTP/1.1</th><th>HTTP/2</th><th>HTTP/3</th></tr>
+</thead>
+<tbody>
+<tr><td>Transport</td><td>TCP</td><td>TCP</td><td>QUIC (UDP)</td></tr>
+<tr><td>Multiplexing</td><td>No (pipelining, rarely used)</td><td>Yes (streams)</td><td>Yes (independent streams)</td></tr>
+<tr><td>Head-of-line blocking</td><td>Yes (per connection)</td><td>TCP-level only</td><td>No</td></tr>
+<tr><td>Connection setup</td><td>1-3 RTT</td><td>1-3 RTT</td><td>0-1 RTT</td></tr>
+<tr><td>Header compression</td><td>None</td><td>HPACK</td><td>QPACK</td></tr>
+<tr><td>Server Push</td><td>No</td><td>Yes</td><td>Yes (rarely used)</td></tr>
+<tr><td>Connection migration</td><td>No</td><td>No</td><td>Yes</td></tr>
+</tbody>
+</table>
+
+<h2 id="service-workers">Service Workers for Network Interception</h2>
+
+<pre><code>// Service Worker: programmable network proxy
+// Intercepts ALL network requests from the page
+
+// Registration
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js', {
+    scope: '/',
+  });
+}
+
+// sw.js — Service Worker
+const CACHE_NAME = 'app-v1';
+const STATIC_ASSETS = ['/index.html', '/app.js', '/style.css'];
+
+// Install: pre-cache static assets
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then(cache => cache.addAll(STATIC_ASSETS))
+  );
+  self.skipWaiting();
+});
+
+// Activate: clean up old caches
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(
+        keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k))
+      )
+    )
+  );
+  self.clients.claim();
+});
+
+// Fetch: intercept and respond
+self.addEventListener('fetch', (event) => {
+  const { request } = event;
+
+  if (request.destination === 'document') {
+    // Network-first for HTML (always get latest)
+    event.respondWith(networkFirst(request));
+  } else if (STATIC_ASSETS.includes(new URL(request.url).pathname)) {
+    // Cache-first for static assets
+    event.respondWith(cacheFirst(request));
+  } else if (request.url.includes('/api/')) {
+    // Stale-while-revalidate for API calls
+    event.respondWith(staleWhileRevalidate(request));
+  }
+});
+
+async function cacheFirst(request) {
+  const cached = await caches.match(request);
+  return cached || fetch(request);
+}
+
+async function networkFirst(request) {
+  try {
+    const response = await fetch(request);
+    const cache = await caches.open(CACHE_NAME);
+    cache.put(request, response.clone());
+    return response;
+  } catch {
+    return caches.match(request);
+  }
+}
+
+async function staleWhileRevalidate(request) {
+  const cache = await caches.open(CACHE_NAME);
+  const cached = await cache.match(request);
+
+  const fetchPromise = fetch(request).then(response => {
+    cache.put(request, response.clone());
+    return response;
+  });
+
+  return cached || fetchPromise;
+}</code></pre>
+
+<h2 id="websocket">WebSocket Protocol</h2>
+
+<pre><code>// WebSocket: full-duplex communication over a single TCP connection
+// Starts as HTTP upgrade, then switches to WS protocol
+
+class ReconnectingWebSocket {
+  constructor(url, options = {}) {
+    this.url = url;
+    this.maxRetries = options.maxRetries || 10;
+    this.retryDelay = options.retryDelay || 1000;
+    this.retryCount = 0;
+    this.handlers = new Map();
+    this.connect();
+  }
+
+  connect() {
+    this.ws = new WebSocket(this.url);
+
+    this.ws.onopen = () => {
+      this.retryCount = 0;
+      this.handlers.get('open')?.forEach(h => h());
+    };
+
+    this.ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      this.handlers.get(data.type)?.forEach(h => h(data.payload));
+      this.handlers.get('message')?.forEach(h => h(data));
+    };
+
+    this.ws.onclose = (event) => {
+      if (!event.wasClean && this.retryCount < this.maxRetries) {
+        const delay = this.retryDelay * Math.pow(2, this.retryCount);
+        setTimeout(() => {
+          this.retryCount++;
+          this.connect();
+        }, delay);
+      }
+    };
+
+    this.ws.onerror = () => {};
+  }
+
+  on(event, handler) {
+    if (!this.handlers.has(event)) this.handlers.set(event, new Set());
+    this.handlers.get(event).add(handler);
+    return () => this.handlers.get(event).delete(handler);
+  }
+
+  send(type, payload) {
+    if (this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type, payload }));
+    }
+  }
+
+  close() {
+    this.maxRetries = 0;
+    this.ws.close();
+  }
+}</code></pre>
+
+<h2 id="sse">Server-Sent Events</h2>
+
+<pre><code>// SSE: server-to-client streaming over HTTP
+// Simpler than WebSocket for one-way data
+
+function useServerEvents(url) {
+  const [data, setData] = useState(null);
+  const [connected, setConnected] = useState(false);
+
+  useEffect(() => {
+    const source = new EventSource(url);
+
+    source.onopen = () => setConnected(true);
+
+    source.onmessage = (event) => {
+      setData(JSON.parse(event.data));
+    };
+
+    source.addEventListener('notification', (event) => {
+      const notification = JSON.parse(event.data);
+      showNotification(notification);
+    });
+
+    source.onerror = () => {
+      setConnected(false);
+      // EventSource auto-reconnects!
+    };
+
+    return () => source.close();
+  }, [url]);
+
+  return { data, connected };
+}
+
+// Server-side (Node.js/Express):
+// app.get('/events', (req, res) => {
+//   res.writeHead(200, {
+//     'Content-Type': 'text/event-stream',
+//     'Cache-Control': 'no-cache',
+//     'Connection': 'keep-alive',
+//   });
+//
+//   const interval = setInterval(() => {
+//     res.write(`data: ${JSON.stringify({ time: Date.now() })}\n\n`);
+//   }, 1000);
+//
+//   req.on('close', () => clearInterval(interval));
+// });</code></pre>
+
+<h2 id="resource-hints">Resource Hints</h2>
+
+<pre><code>// Preload: fetch resource needed for current page (high priority)
+&lt;link rel="preload" href="/fonts/inter.woff2" as="font" type="font/woff2" crossorigin&gt;
+&lt;link rel="preload" href="/hero.webp" as="image"&gt;
+&lt;link rel="preload" href="/critical.css" as="style"&gt;
+
+// Prefetch: fetch resource needed for NEXT navigation (low priority)
+&lt;link rel="prefetch" href="/next-page.js"&gt;
+&lt;link rel="prefetch" href="/api/next-page-data" as="fetch"&gt;
+
+// Preconnect: establish connection to origin (DNS + TCP + TLS)
+&lt;link rel="preconnect" href="https://api.example.com"&gt;
+&lt;link rel="preconnect" href="https://fonts.googleapis.com"&gt;
+
+// DNS-prefetch: resolve DNS only (cheaper than preconnect)
+&lt;link rel="dns-prefetch" href="https://analytics.example.com"&gt;
+
+// Modulepreload: preload ES modules (includes parsing)
+&lt;link rel="modulepreload" href="/components/Header.js"&gt;
+
+// Priority Hints: fine-tune resource priority
+&lt;img src="hero.jpg" fetchpriority="high"&gt;
+&lt;img src="below-fold.jpg" fetchpriority="low"&gt;
+&lt;script src="analytics.js" fetchpriority="low"&gt;&lt;/script&gt;
+&lt;link rel="stylesheet" href="critical.css" fetchpriority="high"&gt;
+
+// React: programmatic prefetching
+function usePrefetch(url) {
+  useEffect(() => {
+    const link = document.createElement('link');
+    link.rel = 'prefetch';
+    link.href = url;
+    document.head.appendChild(link);
+    return () => document.head.removeChild(link);
+  }, [url]);
+}</code></pre>
+
+<h3>Resource Hint Comparison</h3>
+
+<table>
+<thead>
+<tr><th>Hint</th><th>What It Does</th><th>When to Use</th><th>Priority</th></tr>
+</thead>
+<tbody>
+<tr><td><code>preload</code></td><td>Fetch now, needed soon</td><td>Fonts, critical CSS, hero images</td><td>High</td></tr>
+<tr><td><code>prefetch</code></td><td>Fetch when idle, needed later</td><td>Next page resources</td><td>Low</td></tr>
+<tr><td><code>preconnect</code></td><td>DNS + TCP + TLS</td><td>API origins, CDN origins</td><td>N/A</td></tr>
+<tr><td><code>dns-prefetch</code></td><td>DNS only</td><td>Third-party origins</td><td>N/A</td></tr>
+<tr><td><code>modulepreload</code></td><td>Fetch + parse module</td><td>Critical JS modules</td><td>High</td></tr>
+</tbody>
+</table>
+
+<h2 id="beacon">Beacon API and Background Sync</h2>
+
+<pre><code>// Beacon API: guaranteed delivery of small data
+// Survives page unload (unlike fetch)
+window.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    navigator.sendBeacon('/api/analytics', JSON.stringify({
+      sessionDuration: Date.now() - sessionStart,
+      events: pendingEvents,
+    }));
+  }
+});
+
+// Background Sync (Service Worker API)
+// Retry failed requests when connectivity returns
+// Registration:
+async function saveData(data) {
+  try {
+    await fetch('/api/save', { method: 'POST', body: JSON.stringify(data) });
+  } catch {
+    await saveToIndexedDB('pending-sync', data);
+    const reg = await navigator.serviceWorker.ready;
+    await reg.sync.register('sync-pending-data');
+  }
+}
+
+// In Service Worker:
+self.addEventListener('sync', (event) => {
+  if (event.tag === 'sync-pending-data') {
+    event.waitUntil(syncPendingData());
+  }
+});
+
+async function syncPendingData() {
+  const pending = await getFromIndexedDB('pending-sync');
+  for (const item of pending) {
+    await fetch('/api/save', { method: 'POST', body: JSON.stringify(item) });
+    await removeFromIndexedDB('pending-sync', item.id);
+  }
+}</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">Interview Tip</div>
+  <p>When discussing networking, show depth by connecting APIs to user experience: "I'd use preconnect for the API origin to save 100-300ms on first request. For images below the fold, I'd use fetchpriority='low' and lazy loading. For analytics, I'd use sendBeacon to ensure delivery without blocking navigation. For real-time features, I'd choose SSE over WebSocket for one-way data because it auto-reconnects and multiplexes over HTTP/2." This practical application of platform knowledge is what L6 interviewers want.</p>
+</div>
+
+<div class="nav-footer">
+  <a href="04-dom-apis.html">← DOM APIs</a>
+  <a href="06-storage-apis.html">Storage APIs →</a>
+</div>
+
+</div>
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+  q.addEventListener('click', () => {
+    const answer = q.nextElementSibling;
+    answer.classList.toggle('open');
+  });
+});
+</script>
+</body>
+</html>

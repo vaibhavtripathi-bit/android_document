@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Real-Time Collaboration — Engineering Problems</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Engineering Problems</a>
+  <span class="sep">›</span>
+  Real-Time Collaboration
+</nav>
+
+<h1>Building a Real-Time Collaborative Editor</h1>
+<p class="subtitle">Staff-level treatment of replicated document editing: operational transformation versus conflict-free replicated data types, WebSocket fan-out topologies, presence overlays, and the subtle mechanics of undo under concurrent edits. The goal is not a toy demo but a production-shaped mental model you can defend in system design rounds.</p>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Architect Invariant</div>
+  <p>Pick a <strong>replication contract</strong> before choosing libraries: “Users always converge to the same document state” is necessary but insufficient—you must also specify <em>intention preservation</em> (do concurrent inserts stay ordered sensibly?) and <em>latency semantics</em> (local edits are optimistic; remote edits may arrive out of order).</p>
+</div>
+
+<h2 id="crdt-vs-ot">1. CRDT vs Operational Transformation</h2>
+
+<h3>Operational Transformation (OT)</h3>
+<p>OT assumes operations are transformed against one another so that different orderings of the same logical ops yield identical document states. Classical centralized editors (e.g., early Google Docs) used a server as the sequencer: clients send ops; server assigns a monotonic revision; clients transform in-flight ops when they see replays.</p>
+
+<div class="diagram">
+OT with central server (total order)
+  Client A: Ins(3,"X") ----\
+                           +--> Server (seq) --> broadcast transformed ops
+  Client B: Del(2,1) ----/
+  A transforms pending Ins against incoming Del before applying server order
+</div>
+
+<h3>Conflict-Free Replicated Data Types (CRDTs)</h3>
+<p>CRDTs bake commutativity/associativity/idempotency into the data structure. Text CRDTs (RGA, YATA, etc.) assign stable identifiers to characters so concurrent inserts merge deterministically without a central total order. Metadata (tombstones, anchors) trades space for correctness under partition.</p>
+
+<div class="diagram">
+CRDT merge (two replicas, no central order)
+  Replica 1: [a][b]     + insert "x" after a  -->  [a][x][b]
+  Replica 2: [a][b]     + insert "y" after a  -->  [a][y][b]
+  Merge: same IDs for a,b ; tie-break x vs y by (replicaId, counter) rule
+  Result: [a][x][y][b] OR [a][y][x][b] — deterministic globally
+</div>
+
+<table>
+  <thead>
+    <tr>
+      <th>Dimension</th>
+      <th>OT (classic)</th>
+      <th>CRDT (text)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Ordering assumption</td>
+      <td>Server or sequencer provides total order</td>
+      <td>Partial order; merge function is total on states</td>
+    </tr>
+    <tr>
+      <td>Space</td>
+      <td>O(ops) log with compaction milestones</td>
+      <td>O(content + tombstones); compaction policies matter</td>
+    </tr>
+    <tr>
+      <td>Offline</td>
+      <td>Harder without replay infrastructure</td>
+      <td>Natural fit for op/state sync on reconnect</td>
+    </tr>
+    <tr>
+      <td>Complexity hotspot</td>
+      <td>Transform functions for each op pair</td>
+      <td>Identifier allocation, garbage collection</td>
+    </tr>
+    <tr>
+      <td>React integration</td>
+      <td>Bind editor surface to op log + cursor map</td>
+      <td>Bind Yjs/Automerge doc to editor; subscribe to updates</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Interview Trap</div>
+  <p>Claiming “CRDTs need no server” is misleading at Staff level. You still want <strong>authorization</strong>, <strong>persistence</strong>, <strong>snapshotting</strong>, and <strong>backpressure</strong>. Peer-to-peer CRDTs shift the problem—they do not remove operational concerns.</p>
+</div>
+
+<pre><code><span class="comment">/**
+ * G-Counter CRDT (grow-only counter) — illustrates lattice merge.
+ * Not for rich text, but shows merge commutativity in code.
+ */</span>
+<span class="keyword">type</span> <span class="type">ReplicaId</span> = <span class="keyword">string</span>;
+
+<span class="keyword">export class</span> <span class="type">GCounter</span> {
+  <span class="keyword">private readonly</span> <span class="attr">counts</span> = <span class="keyword">new</span> <span class="type">Map</span>&lt;<span class="type">ReplicaId</span>, <span class="keyword">number</span>&gt;();
+
+  <span class="func">increment</span>(replica: <span class="type">ReplicaId</span>, n = <span class="number">1</span>): <span class="keyword">void</span> {
+    <span class="keyword">this</span>.counts.<span class="func">set</span>(replica, (<span class="keyword">this</span>.counts.<span class="func">get</span>(replica) ?? <span class="number">0</span>) + n);
+  }
+
+  <span class="func">value</span>(): <span class="keyword">number</span> {
+    <span class="keyword">let</span> s = <span class="number">0</span>;
+    <span class="keyword">for</span> (<span class="keyword">const</span> v <span class="keyword">of</span> <span class="keyword">this</span>.counts.<span class="func">values</span>()) s += v;
+    <span class="keyword">return</span> s;
+  }
+
+  <span class="func">merge</span>(other: <span class="type">GCounter</span>): <span class="type">GCounter</span> {
+    <span class="keyword">const</span> out = <span class="keyword">new</span> <span class="type">GCounter</span>();
+    <span class="keyword">const</span> keys = <span class="keyword">new</span> <span class="type">Set</span>([...<span class="keyword">this</span>.counts.<span class="func">keys</span>(), ...other.counts.<span class="func">keys</span>()]);
+    <span class="keyword">for</span> (<span class="keyword">const</span> k <span class="keyword">of</span> keys) {
+      out.counts.<span class="func">set</span>(
+        k,
+        <span class="type">Math</span>.<span class="func">max</span>(<span class="keyword">this</span>.counts.<span class="func">get</span>(k) ?? <span class="number">0</span>, other.counts.<span class="func">get</span>(k) ?? <span class="number">0</span>),
+      );
+    }
+    <span class="keyword">return</span> out;
+  }
+}</code></pre>
+
+<h2 id="websocket-arch">2. WebSocket Architecture for Real-Time Sync</h2>
+<p>At scale, a naive “one giant room per document” WebSocket on a single Node process fails on connection count and GC pressure. Production shapes include: <strong>sticky sessions</strong> with horizontal scale, <strong>Redis Pub/Sub</strong> or NATS for cross-node fan-out, <strong>snapshot + delta</strong> catch-up for reconnects, and <strong>backpressure</strong> via per-connection queues with drop policies for non-critical traffic (typing cursors vs document ops).</p>
+
+<div class="diagram">
+                    +------------------+
+                    |   Load Balancer   |
+                    +--------+---------+
+                             |
+           +-----------------+------------------+
+           v                 v                  v
+      +---------+      +---------+        +---------+
+      | WS Pod  |      | WS Pod  |   ...  | WS Pod  |
+      +----+----+      +----+----+        +----+----+
+           |                |                 |
+           +----------------+-----------------+
+                            v
+                   +--------+---------+
+                   | Pub/Sub backbone |
+                   +--------+---------+
+                            v
+                   +--------+---------+
+                   | Persistence tier |
+                   | (op log / CRDT)  |
+                   +------------------+
+</div>
+
+<div class="callout callout-info">
+  <div class="callout-title">Wire Protocol Hygiene</div>
+  <p>Version your envelopes (<code>v: 2</code>), include <code>docId</code>, <code>seq</code> or <code>hv</code> (hybrid logical clock), and separate <strong>control</strong> (hello, auth, subscribe) from <strong>data</strong> frames. Consider MessagePack or protobuf on the wire if JSON becomes hot path—React does not care, but your gateway CPU will.</p>
+</div>
+
+<pre><code><span class="comment">// Typed WebSocket envelope (client &lt;-&gt; sync service)</span>
+<span class="keyword">type</span> <span class="type">WsEnvelope</span> =
+  | { <span class="keyword">t</span>: <span class="string">'hello'</span>; <span class="keyword">v</span>: <span class="keyword">number</span>; <span class="keyword">capabilities</span>: <span class="keyword">string</span>[] }
+  | { <span class="keyword">t</span>: <span class="string">'sub'</span>; <span class="keyword">docId</span>: <span class="keyword">string</span>; <span class="keyword">fromSeq</span>: <span class="keyword">number</span> }
+  | { <span class="keyword">t</span>: <span class="string">'op'</span>; <span class="keyword">docId</span>: <span class="keyword">string</span>; <span class="keyword">seq</span>: <span class="keyword">number</span>; <span class="keyword">op</span>: <span class="type">EncodedOp</span> }
+  | { <span class="keyword">t</span>: <span class="string">'snap'</span>; <span class="keyword">docId</span>: <span class="keyword">string</span>; <span class="keyword">seq</span>: <span class="keyword">number</span>; <span class="keyword">state</span>: <span class="type">Uint8Array</span> }
+  | { <span class="keyword">t</span>: <span class="string">'ack'</span>; <span class="keyword">clientMutationId</span>: <span class="keyword">string</span>; <span class="keyword">seq</span>: <span class="keyword">number</span> }
+  | { <span class="keyword">t</span>: <span class="string">'err'</span>; <span class="keyword">code</span>: <span class="keyword">string</span>; <span class="keyword">message</span>: <span class="keyword">string</span> };
+
+<span class="keyword">export function</span> <span class="func">encode</span>(e: <span class="type">WsEnvelope</span>): <span class="type">ArrayBuffer</span> {
+  <span class="keyword">return</span> <span class="keyword">new</span> <span class="type">TextEncoder</span>().<span class="func">encode</span>(<span class="type">JSON</span>.<span class="func">stringify</span>(e)).buffer;
+}
+
+<span class="keyword">export function</span> <span class="func">decode</span>(buf: <span class="type">ArrayBuffer</span>): <span class="type">WsEnvelope</span> {
+  <span class="keyword">const</span> text = <span class="keyword">new</span> <span class="type">TextDecoder</span>().<span class="func">decode</span>(buf);
+  <span class="keyword">return</span> <span class="type">JSON</span>.<span class="func">parse</span>(text) <span class="keyword">as</span> <span class="type">WsEnvelope</span>;
+}</code></pre>
+
+<h2 id="conflict">3. Conflict Resolution Strategies</h2>
+<p>Beyond text, collaborative apps embed structured fields (title, metadata). Strategies include: <strong>field-level last-write-wins</strong> with HLC timestamps, <strong>register CRDTs</strong> (multi-value, then resolve), <strong>user-visible merge</strong> (fork + choose), and <strong>locking</strong> for rare high-stakes sections. The Staff move is to separate <em>human meaning</em> from <em>machine merge</em>: CRDTs resolve machine state; product may still show a human merge UI.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Strategy</th>
+      <th>When it works</th>
+      <th>Sharp edge</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>LWW with wall clock</td>
+      <td>Low contention keys</td>
+      <td>Clock skew causes surprise winners</td>
+    </tr>
+    <tr>
+      <td>HLC / hybrid logical time</td>
+      <td>Need causal ordering without tight clock sync</td>
+      <td>Operational complexity in multi-region</td>
+    </tr>
+    <tr>
+      <td>Explicit branch + merge</td>
+      <td>Legal / financial annotations</td>
+      <td>UX cost; not invisible like CRDT</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="presence">4. Cursor Presence</h2>
+<p>Presence (caret, selection, username color) should be <strong>ephemeral</strong> and <strong>loss-tolerant</strong>: use a high-frequency local throttle (e.g., 30–60Hz max), send relative positions or CRDT anchors—not raw pixel coordinates that break on layout. On the React side, isolate fast-moving presence in a subtree that does not rerender the full document.</p>
+
+<pre><code><span class="comment">// React: presence hook sketch (anchors, not pixels)</span>
+<span class="keyword">import</span> { useCallback, useEffect, useRef, useState } <span class="keyword">from</span> <span class="string">'react'</span>;
+
+<span class="keyword">export type</span> <span class="type">Anchor</span> = { <span class="keyword">blockId</span>: <span class="keyword">string</span>; <span class="keyword">offset</span>: <span class="keyword">number</span> };
+
+<span class="keyword">export function</span> <span class="func">useDocPresence</span>(args: {
+  <span class="attr">docId</span>: <span class="keyword">string</span>;
+  <span class="attr">send</span>: (p: { <span class="keyword">userId</span>: <span class="keyword">string</span>; <span class="keyword">anchor</span>: <span class="type">Anchor</span>; <span class="keyword">sel</span>?: <span class="type">Anchor</span> }) => <span class="keyword">void</span>;
+  <span class="attr">userId</span>: <span class="keyword">string</span>;
+}) {
+  <span class="keyword">const</span> [peers, setPeers] = useState&lt;<span class="type">Record</span>&lt;<span class="keyword">string</span>, <span class="type">Anchor</span>&gt;&gt;({});
+  <span class="keyword">const</span> raf = useRef&lt;<span class="keyword">number</span> | <span class="keyword">null</span>&gt;(<span class="keyword">null</span>);
+
+  <span class="keyword">const</span> publishCaret = useCallback(
+    (<span class="attr">anchor</span>: <span class="type">Anchor</span>, <span class="attr">sel</span>?: <span class="type">Anchor</span>) => {
+      <span class="keyword">if</span> (raf.current != <span class="keyword">null</span>) <span class="func">cancelAnimationFrame</span>(raf.current);
+      raf.current = <span class="func">requestAnimationFrame</span>(() => {
+        args.<span class="func">send</span>({ <span class="keyword">userId</span>: args.userId, anchor, sel });
+      });
+    },
+    [args],
+  );
+
+  useEffect(() => () => {
+    <span class="keyword">if</span> (raf.current != <span class="keyword">null</span>) <span class="func">cancelAnimationFrame</span>(raf.current);
+  }, []);
+
+  <span class="keyword">return</span> { peers, publishCaret, setPeers };
+}</code></pre>
+
+<h2 id="undo">5. Undo / Redo Under Concurrency</h2>
+<p>Local undo is not globally invertible when others edit: classic approach is <strong>undo as local operation history</strong> scoped to the user’s causal window (Subtext, Google Docs–style), or <strong>inverse ops</strong> that are transformed against concurrent remote ops before application. CRDT libraries often expose transaction boundaries; Yjs uses undo stacks bound to a shared doc but scoped via captured snapshots.</p>
+
+<div class="diagram">
+Local undo stack vs global log
+  User A: type "hello" -> stack: [Ins*h, Ins*e, ...]
+  Remote: delete first char while A undoes
+  Naive pop would violate intention -> must transform inverse against remote
+  Staff answer: "My undo applies to MY operations in MY causal history"
+</div>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Product + Formalism</div>
+  <p>Interviewers reward stating that <strong>global undo</strong> is ambiguous for collaborative text. Prefer language like “undo last <em>user-visible</em> intent” with clear UX when remote ops interleave: either block undo momentarily, scope undo, or show a non-modal explanation—engineering and design co-own the contract.</p>
+</div>
+
+<h2 id="libraries">6. Yjs vs Automerge</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Topic</th>
+      <th>Yjs</th>
+      <th>Automerge</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Encoding</td>
+      <td>Highly optimized binary updates; mature ecosystem</td>
+      <td>Binary + JSON interop; emphasis on document model</td>
+    </tr>
+    <tr>
+      <td>Rich text story</td>
+      <td>Y.Text with binding to ProseMirror/Quill/etc.</td>
+      <td>Text support evolving; check release for your editor</td>
+    </tr>
+    <tr>
+      <td>Sync helpers</td>
+      <td>y-websocket, y-webrtc providers</td>
+      <td>Repo sync patterns; often custom transport</td>
+    </tr>
+    <tr>
+      <td>React binding</td>
+      <td>Usually external hooks + awareness API</td>
+      <td><code>@automerge/react</code> hooks (modern)</td>
+    </tr>
+    <tr>
+      <td>Staff talking point</td>
+      <td>Operational maturity, provider ecosystem</td>
+      <td>Formal document-oriented CRDT, easier reasoning for structured data</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout callout-info">
+  <div class="callout-title">Testing Matrix</div>
+  <p>Fuzz concurrent schedules: fix a seed, generate random interleavings of insert/delete from N peers, assert convergence and invariants (no lost user-visible characters unless explicitly deleted). Property tests catch transform bugs faster than storybook clicks.</p>
+</div>
+
+<h2 id="react-binding">7. React Binding &amp; Render Isolation</h2>
+<p>Binding a CRDT document to React is deceptively simple: subscribe to updates and call <code>setState</code>. The Staff trap is <strong>main-thread churn</strong>—every keystroke from remote peers can trigger a full React tree reconciliation if you map the entire doc into props. Patterns: (1) keep the editor imperative (ProseMirror/Slate) and treat React as chrome around it; (2) use a tiny <code>useSyncExternalStore</code> shim for read consistency during concurrent rendering; (3) batch remote updates with <code>startTransition</code> so local input stays urgent.</p>
+
+<div class="diagram">
+React layers around an imperative editor
+  +------------------+     +---------------------------+
+  | Toolbar (React)  |     | Comment sidebar (React)   |
+  +------------------+     +---------------------------+
+  | Editor surface (imperative) &lt;---> CRDT doc (Y.Doc)   |
+  |   - applies local ops immediately                    |
+  |   - applies remote ops via plugin / observer         |
+  +------------------------------------------------------+
+  | Awareness (React overlay, memoized by peer id)       |
+  +------------------------------------------------------+
+</div>
+
+<pre><code><span class="comment">// useSyncExternalStore sketch: subscribe to Yjs without tearing in React 18</span>
+<span class="keyword">import</span> { useCallback, useSyncExternalStore } <span class="keyword">from</span> <span class="string">'react'</span>;
+<span class="keyword">import</span> * <span class="keyword">as</span> Y <span class="keyword">from</span> <span class="string">'yjs'</span>;
+
+<span class="keyword">export function</span> <span class="func">useYTextSnapshot</span>(ytext: Y.<span class="type">Text</span>): <span class="keyword">string</span> {
+  <span class="keyword">const</span> subscribe = useCallback(
+    (<span class="attr">onStoreChange</span>: () => <span class="keyword">void</span>) => {
+      <span class="keyword">const</span> obs = () => <span class="func">onStoreChange</span>();
+      ytext.<span class="func">observe</span>(obs);
+      <span class="keyword">return</span> () => ytext.<span class="func">unobserve</span>(obs);
+    },
+    [ytext],
+  );
+  <span class="keyword">const</span> getSnapshot = useCallback(() => ytext.<span class="func">toString</span>(), [ytext]);
+  <span class="keyword">const</span> getServerSnapshot = useCallback(() => ytext.<span class="func">toString</span>(), [ytext]);
+  <span class="keyword">return</span> <span class="func">useSyncExternalStore</span>(subscribe, getSnapshot, getServerSnapshot);
+}</code></pre>
+
+<table>
+  <thead>
+    <tr>
+      <th>Anti-pattern</th>
+      <th>Why it hurts</th>
+      <th>Alternative</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Lift full doc string into React root state</td>
+      <td>O(n) reconciliation per remote op</td>
+      <td>Imperative editor + minimal mirrored state</td>
+    </tr>
+    <tr>
+      <td>Presence in the same store as document ops</td>
+      <td>High-frequency updates invalidate lists</td>
+      <td>Separate awareness channel + memoized overlays</td>
+    </tr>
+    <tr>
+      <td>JSON deep-clone per keystroke for diffing</td>
+      <td>GC pressure, jank on large docs</td>
+      <td>Structural sharing (CRDT) or editor-native transactions</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Backpressure &amp; fairness</h3>
+<p>When one peer pastes a megabyte, others should not starve. Implement per-document queues with <strong>chunked apply</strong> and <code>requestIdleCallback</code> or time-sliced application for non-local updates. Surface a subtle progress indicator if catch-up exceeds a threshold—users tolerate latency if the system is honest.</p>
+
+<h2 id="persistence">8. Persistence &amp; Snapshot Cadence</h2>
+<p>Operational logs grow without bound. Production systems compact into periodic snapshots plus a tail of ops. The Staff detail: snapshotting must be coordinated with in-flight clients—use monotonic <code>seq</code> and teach clients to request <code>snap + fromSeq</code> on gap detection. Store authoritative snapshots in object storage; keep hot tail in Redis or embedded RocksDB depending on your scale story.</p>
+
+<div class="diagram">
+Storage timeline for one document
+  snap@1000 --------+     tail ops 1001..1048 (hot)
+       |            |            |
+       v            v            v
+   S3 / GCS    metadata index   pub/sub fan-out
+</div>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Security: Authorization at Op Level</div>
+  <p>Subscribing to a room must not imply permission to mutate. Validate each op against ACLs (comment-only vs editor). For CRDTs, malicious clients can craft ops—treat the sync service as a policy enforcement point, not a dumb pipe.</p>
+</div>
+
+<h2 id="interview-qa">Interview Q&amp;A</h2>
+
+<div class="qa-section">
+  <div class="qa-item">
+    <div class="qa-question">
+      <span>Why can operational transformation be tricky with arbitrary rich text?</span>
+      <span class="tag tag-l6">L6</span>
+    </div>
+    <div class="qa-answer">
+      <p>OT requires well-defined transforms for every operation pair on your model (split nodes, marks, block structure). Rich text increases the Cartesian product of op types; invariants like TP1/TP2 become hard to maintain. That is why many teams adopt CRDT text or reduce the problem domain (plain text, block-based JSON with limited ops).</p>
+    </div>
+  </div>
+  <div class="qa-item">
+    <div class="qa-question">
+      <span>How do you handle WebSocket authentication without leaking tokens to logs?</span>
+      <span class="tag tag-senior">Senior</span>
+    </div>
+    <div class="qa-answer">
+      <p>Prefer short-lived tokens in the first frame or cookie-based session upgrade with SameSite restrictions. Rotate credentials on reconnect. Never log full URLs with query tokens. On the server, bind socket to principal after auth and reject late unauthorized frames.</p>
+    </div>
+  </div>
+  <div class="qa-item">
+    <div class="qa-question">
+      <span>What metrics prove your collaborative stack is healthy?</span>
+      <span class="tag tag-architect">Architect</span>
+    </div>
+    <div class="qa-answer">
+      <p>Track p95/p99 <strong>apply-to-visible</strong> latency, reconnect catch-up time, op queue depth per document, percentage of ops requiring snapshot fallback, CRDT compaction cadence, and awareness update rates. Correlate with long-task timings in the editor thread.</p>
+    </div>
+  </div>
+  <div class="qa-item">
+    <div class="qa-question">
+      <span>Explain how you would roll out CRDT sync without downtime for existing OT-based clients.</span>
+      <span class="tag tag-l6">L6</span>
+    </div>
+    <div class="qa-answer">
+      <p>Use a <strong>dual-write</strong> or <strong>adapter</strong> phase: server translates incoming OT ops into CRDT ops (or maintains parallel state machines) until all clients are upgraded. Alternatively, snapshot the document into CRDT form at a revision boundary, freeze edits briefly, migrate, resume. The interview win is naming the cutover risk and validation (round-trip tests, shadow reads comparing OT vs CRDT projections).</p>
+    </div>
+  </div>
+  <div class="qa-item">
+    <div class="qa-question">
+      <span>When is WebRTC data channel preferable to WebSocket for collaboration?</span>
+      <span class="tag tag-senior">Senior</span>
+    </div>
+    <div class="qa-answer">
+      <p>WebRTC shines for <strong>mesh/SFU-assisted peer data</strong> when you want to reduce server relay costs for large payloads (e.g., binary assets) or ultra-low latency cursor sharing in LAN-like conditions. Most text collaboration still centralizes through a sync service for persistence and auth; WebRTC is often layered as an optimization, not the sole source of truth.</p>
+    </div>
+  </div>
+</div>
+
+<nav class="nav-footer">
+  <a href="index.html">← Engineering Problems</a>
+  <a href="02-infinite-scroll-virtualization.html">Infinite Scroll &amp; Virtualization →</a>
+</nav>
+
+</div>
+
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+    q.addEventListener('click', () => q.nextElementSibling.classList.toggle('open'));
+});
+</script>
+</body>
+</html>

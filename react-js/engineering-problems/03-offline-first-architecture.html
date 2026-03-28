@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Offline-First Architecture — Engineering Problems</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="breadcrumb">
+  <a href="../index.html">React JS</a>
+  <span class="sep">›</span>
+  <a href="index.html">Engineering Problems</a>
+  <span class="sep">›</span>
+  Offline-First Architecture
+</nav>
+
+<h1>Offline-First Architecture in React</h1>
+<p class="subtitle">Service Worker caching strategies, IndexedDB schema evolution, durable mutation queues, merge policies on reconnect, optimistic UI, Background Sync, and progressive enhancement—framed the way Staff interviewers expect: explicit failure modes, idempotency, and UX contracts when the network is a lie.</p>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Truth You Own</div>
+  <p>Offline-first is not “cache static assets.” It is a <strong>consistency story</strong> between three stores: server, on-device durable store, and React UI state. Name what happens for duplicate retries, partial writes, and version skew after the app sat offline for a week.</p>
+</div>
+
+<h2 id="sw-strategies">1. Service Worker Caching Strategies</h2>
+
+<h3>Cache-first</h3>
+<p>Check cache, fallback to network. Ideal for hashed static assets and app shells. Risk: stale HTML referencing deleted chunks after deploy—mitigate with <strong>versioned entry URLs</strong> or skip caching HTML entirely.</p>
+
+<h3>Network-first</h3>
+<p>Try network, fallback to cache. Useful for API JSON that should be fresh but may degrade offline. Pair with short TTL metadata in cache entries.</p>
+
+<h3>Stale-while-revalidate</h3>
+<p>Return cache immediately, update cache in background for next visit. Great for read-mostly documents; requires careful UI labeling when data might be stale.</p>
+
+<pre><code><span class="comment">// Workbox-style handler sketch (TypeScript)</span>
+<span class="keyword">declare const</span> <span class="attr">caches</span>: <span class="type">CacheStorage</span>;
+
+<span class="keyword">export async function</span> <span class="func">staleWhileRevalidate</span>(req: <span class="type">Request</span>, cacheName: <span class="keyword">string</span>): <span class="type">Promise</span>&lt;<span class="type">Response</span>&gt; {
+  <span class="keyword">const</span> cache = <span class="keyword">await</span> caches.<span class="func">open</span>(cacheName);
+  <span class="keyword">const</span> cached = <span class="keyword">await</span> cache.<span class="func">match</span>(req);
+  <span class="keyword">const</span> networkPromise = <span class="func">fetch</span>(req)
+    .then((res) => {
+      <span class="keyword">if</span> (res.ok) <span class="keyword">void</span> cache.<span class="func">put</span>(req, res.<span class="func">clone</span>());
+      <span class="keyword">return</span> res;
+    })
+    .catch(() => cached);
+
+  <span class="keyword">return</span> cached ?? (await networkPromise);
+}</code></pre>
+
+<div class="diagram">
+Request flow (stale-while-revalidate)
+  SW intercepts GET /doc/42
+       |
+       +---> return cache hit (immediate) --+
+       |                                     |
+       +---> fetch network async ------------> update cache for next time
+</div>
+
+<table>
+  <thead>
+    <tr>
+      <th>Strategy</th>
+      <th>Best for</th>
+      <th>Watch out</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Cache-first</td>
+      <td>Immutable build assets</td>
+      <td>Long-lived HTML shell mismatch</td>
+    </tr>
+    <tr>
+      <td>Network-first</td>
+      <td>Auth-sensitive reads</td>
+      <td>Slow networks feel sluggish without cache fallback</td>
+    </tr>
+    <tr>
+      <td>SWR</td>
+      <td>Dashboards, docs</td>
+      <td>Users may act on stale numbers—surface freshness</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Security</div>
+  <p>Never cache personalized responses under shared cache keys without <code>Vary</code> or user-scoped namespacing. Sensitive GETs should often bypass SW entirely. Pair with strict CSP to reduce SW-tampering blast radius.</p>
+</div>
+
+<h2 id="indexeddb">2. IndexedDB: Schema &amp; Migrations</h2>
+<p>IndexedDB is async, transactional, and horrible when misused. Staff answers specify: <strong>object stores</strong> per aggregate, <strong>indexes</strong> for queue scanning, <strong>versioned migrations</strong> with additive steps, and <strong>compaction</strong> jobs for tombstones.</p>
+
+<pre><code><span class="comment">// Dexie.js migration-style (illustrative)</span>
+<span class="keyword">import</span> Dexie, { <span class="keyword">type</span> <span class="type">Table</span> } <span class="keyword">from</span> <span class="string">'dexie'</span>;
+
+<span class="keyword">export type</span> <span class="type">QueuedMutation</span> = {
+  <span class="attr">id</span>: <span class="keyword">string</span>;
+  <span class="attr">createdAt</span>: <span class="keyword">number</span>;
+  <span class="attr">entity</span>: <span class="keyword">string</span>;
+  <span class="attr">payload</span>: <span class="type">Record</span>&lt;<span class="keyword">string</span>, <span class="keyword">unknown</span>&gt;;
+  <span class="attr">idempotencyKey</span>: <span class="keyword">string</span>;
+  <span class="attr">attempts</span>: <span class="keyword">number</span>;
+  <span class="attr">status</span>: <span class="string">'pending'</span> | <span class="string">'failed'</span>;
+};
+
+<span class="keyword">export class</span> <span class="type">AppDB</span> <span class="keyword">extends</span> Dexie {
+  <span class="attr">mutations</span>!: <span class="type">Table</span>&lt;<span class="type">QueuedMutation</span>, <span class="keyword">string</span>&gt;;
+
+  <span class="func">constructor</span>() {
+    <span class="keyword">super</span>(<span class="string">'offline-demo'</span>);
+    <span class="keyword">this</span>.<span class="func">version</span>(<span class="number">1</span>).<span class="func">stores</span>({
+      mutations: <span class="string">'id, status, createdAt, idempotencyKey'</span>,
+    });
+  }
+}</code></pre>
+
+<h2 id="sync-queue">3. Sync Queue Structure &amp; Retry Logic</h2>
+<p>Queue entries must carry <strong>idempotency keys</strong> the server understands. Retries use exponential backoff with jitter; cap attempts and surface a human-visible “needs attention” state. Order matters for dependent mutations—use a <strong>partial order</strong> or explicit dependency list.</p>
+
+<div class="diagram">
+Queue with dependencies
+  [ createDraft ] --> [ attachFile ] --> [ publish ]
+        |                                    |
+        +---------- on failure, block -------
+</div>
+
+<pre><code><span class="comment">// Retry policy (TypeScript)</span>
+<span class="keyword">export function</span> <span class="func">nextBackoffMs</span>(attempt: <span class="keyword">number</span>): <span class="keyword">number</span> {
+  <span class="keyword">const</span> base = <span class="type">Math</span>.<span class="func">min</span>(<span class="number">60_000</span>, <span class="number">1000</span> * <span class="number">2</span> ** attempt);
+  <span class="keyword">const</span> jitter = <span class="type">Math</span>.<span class="func">random</span>() * <span class="number">250</span>;
+  <span class="keyword">return</span> base + jitter;
+}
+
+<span class="keyword">export async function</span> <span class="func">drainQueue</span>(db: <span class="type">AppDB</span>, send: (<span class="attr">m</span>: <span class="type">QueuedMutation</span>) => <span class="type">Promise</span>&lt;<span class="keyword">void</span>&gt;) {
+  <span class="keyword">const</span> pending = <span class="keyword">await</span> db.mutations.<span class="func">where</span>(<span class="string">'status'</span>).<span class="func">equals</span>(<span class="string">'pending'</span>).<span class="func">sortBy</span>(<span class="string">'createdAt'</span>);
+  <span class="keyword">for</span> (<span class="keyword">const</span> m <span class="keyword">of</span> pending) {
+    <span class="keyword">try</span> {
+      <span class="keyword">await</span> <span class="func">send</span>(m);
+      <span class="keyword">await</span> db.mutations.<span class="func">delete</span>(m.id);
+    } <span class="keyword">catch</span> {
+      <span class="keyword">await</span> db.mutations.<span class="func">update</span>(m.id, { <span class="attr">attempts</span>: m.attempts + <span class="number">1</span>, <span class="attr">status</span>: <span class="string">'failed'</span> });
+      <span class="keyword">await</span> <span class="keyword">new</span> <span class="type">Promise</span>((r) => <span class="func">setTimeout</span>(r, <span class="func">nextBackoffMs</span>(m.attempts)));
+    }
+  }
+}</code></pre>
+
+<h2 id="conflict">4. Conflict Resolution on Reconnect</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Policy</th>
+      <th>Semantics</th>
+      <th>UX note</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Last-write-wins (LWW)</td>
+      <td>Max timestamp wins</td>
+      <td>Silent data loss risk—surface conflicts for critical fields</td>
+    </tr>
+    <tr>
+      <td>Server authority</td>
+      <td>Client rebases on 409 + fresh entity</td>
+      <td>Clear merge UI for edited-while-offline</td>
+    </tr>
+    <tr>
+      <td>CRDT merge</td>
+      <td>Algebraic merge on structured doc</td>
+      <td>Great for notes; harder for relational constraints</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout callout-info">
+  <div class="callout-title">ETags &amp; Preconditions</div>
+  <p>Use <code>If-Match</code> with version vectors or ETags for optimistic locking. On mismatch, fetch server state and run your merge function. React Query and TanStack Query expose patterns for this via <code>meta</code> and custom mutations.</p>
+</div>
+
+<pre><code><span class="comment">// Conflict resolver (functional core)</span>
+<span class="keyword">export type</span> <span class="type">Entity</span> = { <span class="attr">id</span>: <span class="keyword">string</span>; <span class="attr">version</span>: <span class="keyword">number</span>; <span class="attr">title</span>: <span class="keyword">string</span> };
+
+<span class="keyword">export function</span> <span class="func">resolveTitleConflict</span>(local: <span class="type">Entity</span>, remote: <span class="type">Entity</span>): <span class="type">Entity</span> {
+  <span class="keyword">if</span> (local.version === remote.version) <span class="keyword">return</span> remote;
+  <span class="comment">// Example: field-level merge with user prompt hook</span>
+  <span class="keyword">if</span> (local.title !== remote.title) {
+    <span class="keyword">return</span> {
+      ...remote,
+      <span class="attr">title</span>: <span class="func">mergeStringsWithMarker</span>(local.title, remote.title),
+      <span class="attr">version</span>: remote.version + <span class="number">1</span>,
+    };
+  }
+  <span class="keyword">return</span> remote;
+}
+
+<span class="keyword">function</span> <span class="func">mergeStringsWithMarker</span>(a: <span class="keyword">string</span>, b: <span class="keyword">string</span>): <span class="keyword">string</span> {
+  <span class="keyword">return</span> <span class="string">`&lt;&lt;&lt; local\n${a}\n===\n${b}\n&gt;&gt;&gt; remote`</span>;
+}</code></pre>
+
+<h2 id="optimistic">5. Optimistic UI Updates</h2>
+<p>Show pending state immediately: flip a row to “saving”, dim actions, or append a provisional message bubble with a clock icon. Roll back on hard failure; reconcile identifiers when server returns canonical ids. Keep optimistic layers <strong>pure</strong>—derive display state from <code>queue + server snapshot</code> rather than mutating both ad hoc.</p>
+
+<div class="diagram">
+UI state derivation
+  render = f( serverProjection , pendingMutations[] )
+  on ACK: remove matching idempotencyKey from pending
+  on 409: branch to conflict UI
+</div>
+
+<h2 id="background-sync">6. Background Sync API</h2>
+<p><code>registration.sync.register('outbox')</code> lets the browser flush when connectivity returns. Support is Chromium-heavy; iOS Safari limitations mean you still need <strong>foreground retry</strong> on <code>online</code> events and periodic <code>visibilitychange</code> wake-ups. Never rely solely on Background Sync for safety-critical workflows.</p>
+
+<div class="callout callout-warning">
+  <div class="callout-title">Double Submission</div>
+  <p>Users double-tap buttons; SW retries overlap with page retries. Idempotency keys must be generated <strong>once per user intent</strong> and stored before network attempt begins.</p>
+</div>
+
+<h2 id="progressive">7. Progressive Enhancement</h2>
+<p>Baseline: read-only HTML or skeleton with cached public data. Enhanced: full SPA with queue. Measure “time to usable offline” separately from “time to interactive online.” Document which features degrade (search may be local-only with reduced ranking).</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Layer</th>
+      <th>Degraded mode</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Auth</td>
+      <td>Read cached profile only; block writes</td>
+    </tr>
+    <tr>
+      <td>Search</td>
+      <td>FTS on local mirror subset</td>
+    </tr>
+    <tr>
+      <td>Attachments</td>
+      <td>Queue uploads; show size limits</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="react-hook">8. Offline-Aware Hook</h2>
+
+<pre><code><span class="comment">// Combine navigator.onLine + SW ping for smarter status</span>
+<span class="keyword">import</span> { useEffect, useState } <span class="keyword">from</span> <span class="string">'react'</span>;
+
+<span class="keyword">export function</span> <span class="func">useConnectivity</span>() {
+  <span class="keyword">const</span> [online, setOnline] = useState(() => navigator.onLine);
+
+  useEffect(() => {
+    <span class="keyword">const</span> onUp = () => <span class="func">setOnline</span>(<span class="keyword">true</span>);
+    <span class="keyword">const</span> onDown = () => <span class="func">setOnline</span>(<span class="keyword">false</span>);
+    window.<span class="func">addEventListener</span>(<span class="string">'online'</span>, onUp);
+    window.<span class="func">addEventListener</span>(<span class="string">'offline'</span>, onDown);
+    <span class="keyword">return</span> () => {
+      window.<span class="func">removeEventListener</span>(<span class="string">'online'</span>, onUp);
+      window.<span class="func">removeEventListener</span>(<span class="string">'offline'</span>, onDown);
+    };
+  }, []);
+
+  useEffect(() => {
+    <span class="keyword">let</span> cancelled = <span class="keyword">false</span>;
+    <span class="keyword">async function</span> <span class="func">probe</span>() {
+      <span class="keyword">try</span> {
+        <span class="keyword">await</span> <span class="func">fetch</span>(<span class="string">'/api/health'</span>, { <span class="attr">method</span>: <span class="string">'HEAD'</span>, <span class="attr">cache</span>: <span class="string">'no-store'</span> });
+        <span class="keyword">if</span> (!cancelled) <span class="func">setOnline</span>(<span class="keyword">true</span>);
+      } <span class="keyword">catch</span> {
+        <span class="keyword">if</span> (!cancelled) <span class="func">setOnline</span>(<span class="keyword">false</span>);
+      }
+    }
+    <span class="keyword">const</span> id = <span class="func">setInterval</span>(probe, <span class="number">30_000</span>);
+    <span class="keyword">return</span> () => {
+      cancelled = <span class="keyword">true</span>;
+      <span class="func">clearInterval</span>(id);
+    };
+  }, []);
+
+  <span class="keyword">return</span> online;
+}</code></pre>
+
+<div class="callout callout-architect">
+  <div class="callout-title">Staff Follow-Up</div>
+  <p>Be ready to compare <strong>local-first</strong> (ElectricSQL, Replicache-shaped) vs <strong>optimistic SPA</strong>. Local-first pushes replication down-stack; optimistic SPAs keep canonical authority on server with shorter implementation path but weaker multi-tab guarantees unless you add BroadcastChannel coordination.</p>
+</div>
+
+<h2 id="multi-tab">9. Multi-Tab Coordination</h2>
+<p>Two tabs writing the same IndexedDB queue without coordination can duplicate sends. Mitigations: <code>navigator.locks.request</code> around drain, leader election via BroadcastChannel heartbeat, or service worker as single writer. Mention <strong>test matrices</strong> across tabs and profiles.</p>
+
+<div class="diagram">
+Tabs + SW as single flusher
+ Tab A ----\
+ Tab B -----+--> SW: acquire lock -> drainQueue -> release
+ Tab C ----/
+</div>
+
+<h2 id="storage-quotas">10. Storage Quotas &amp; Eviction</h2>
+<p>Browsers may evict your origin under pressure. <code>navigator.storage.estimate()</code> exposes <code>usage</code> and <code>quota</code>—surface warnings in settings when crossing thresholds. Separate <strong>hot</strong> data (queue + recent entities) from <strong>cold</strong> archives users can re-fetch. For Safari PWA, persistence may require user gesture prompts—design UX accordingly.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Signal</th>
+      <th>Action</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Quota &gt; 80% used</td>
+      <td>Pause large media prefetch; prompt cleanup</td>
+    </tr>
+    <tr>
+      <td>Persistent storage denied</td>
+      <td>Degrade to session-only caches; warn on data loss risk</td>
+    </tr>
+    <tr>
+      <td>IndexedDB <code>QuotaExceededError</code></td>
+      <td>Backoff compaction; drop oldest cached pages</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="react-query">11. TanStack Query &amp; Offline Cache</h2>
+<p>Server-state libraries cache normalized responses in memory by default—pair with persisted persisters (IndexedDB) for reload survival. Mutations should write through to the durable queue <em>before</em> firing the network layer so refresh does not lose intent. Configure <code>networkMode: 'offlineFirst'</code> where supported and reconcile <code>refetchOnReconnect</code> with your SW strategy to avoid thundering herds.</p>
+
+<pre><code><span class="comment">// Sketch: mutation writes queue then optimistic cache update</span>
+<span class="keyword">import</span> { useMutation, useQueryClient } <span class="keyword">from</span> <span class="string">'@tanstack/react-query'</span>;
+
+<span class="keyword">export function</span> <span class="func">useOfflineSave</span>(db: <span class="type">AppDB</span>) {
+  <span class="keyword">const</span> qc = <span class="func">useQueryClient</span>();
+  <span class="keyword">return</span> <span class="func">useMutation</span>({
+    <span class="attr">mutationFn</span>: <span class="keyword">async</span> (vars: { <span class="attr">id</span>: <span class="keyword">string</span>; <span class="attr">patch</span>: <span class="type">Record</span>&lt;<span class="keyword">string</span>, <span class="keyword">unknown</span>&gt; }) => {
+      <span class="keyword">const</span> idem = crypto.<span class="func">randomUUID</span>();
+      <span class="keyword">await</span> db.mutations.<span class="func">add</span>({
+        <span class="attr">id</span>: crypto.<span class="func">randomUUID</span>(),
+        <span class="attr">createdAt</span>: <span class="type">Date</span>.<span class="func">now</span>(),
+        <span class="attr">entity</span>: vars.id,
+        <span class="attr">payload</span>: vars.patch,
+        <span class="attr">idempotencyKey</span>: idem,
+        <span class="attr">attempts</span>: <span class="number">0</span>,
+        <span class="attr">status</span>: <span class="string">'pending'</span>,
+      });
+      <span class="keyword">return</span> <span class="func">fetch</span>(<span class="string">`/api/items/${vars.id}`</span>, {
+        <span class="attr">method</span>: <span class="string">'PATCH'</span>,
+        <span class="attr">headers</span>: { <span class="string">'Idempotency-Key'</span>: idem, <span class="string">'Content-Type'</span>: <span class="string">'application/json'</span> },
+        <span class="attr">body</span>: <span class="type">JSON</span>.<span class="func">stringify</span>(vars.patch),
+      });
+    },
+    <span class="attr">onMutate</span>: <span class="keyword">async</span> (vars) => {
+      <span class="keyword">await</span> qc.<span class="func">cancelQueries</span>({ <span class="attr">queryKey</span>: [<span class="string">'item'</span>, vars.id] });
+      <span class="keyword">const</span> prev = qc.<span class="func">getQueryData</span>([<span class="string">'item'</span>, vars.id]);
+      qc.<span class="func">setQueryData</span>([<span class="string">'item'</span>, vars.id], (old: <span class="keyword">any</span>) => ({ ...old, ...vars.patch }));
+      <span class="keyword">return</span> { prev };
+    },
+    <span class="attr">onError</span>: (_e, vars, ctx) => {
+      qc.<span class="func">setQueryData</span>([<span class="string">'item'</span>, vars.id], ctx?.prev);
+    },
+  });
+}</code></pre>
+
+<div class="callout callout-info">
+  <div class="callout-title">Telemetry</div>
+  <p>Log queue depth, time-to-ack histograms, and percentage of mutations that required conflict resolution. Correlate with deploys—schema changes can spike 409 rates if clients ship stale merge logic.</p>
+</div>
+
+<h2 id="interview-qa">Interview Q&amp;A</h2>
+
+<div class="qa-section">
+  <div class="qa-item">
+    <div class="qa-question">
+      <span>How do you test service worker updates without wedging users?</span>
+      <span class="tag tag-l6">L6</span>
+    </div>
+    <div class="qa-answer">
+      <p>Use <code>skipWaiting</code> + <code>clients.claim()</code> only when safe; otherwise prompt users to refresh. Version your caches and delete old names in <code>activate</code>. Canary cohorts validate new SW scripts before full rollout.</p>
+    </div>
+  </div>
+  <div class="qa-item">
+    <div class="qa-question">
+      <span>What is the difference between eventual consistency and causal consistency in offline apps?</span>
+      <span class="tag tag-architect">Architect</span>
+    </div>
+    <div class="qa-answer">
+      <p><strong>Eventual consistency</strong> guarantees all replicas converge if they stop receiving updates—no promise about ordering interleavings users observe meanwhile. <strong>Causal consistency</strong> preserves happens-before relationships: if a user reads a write, later reads cannot observe a state before that write’s causes. Offline note apps sometimes aim for causal+ per document.</p>
+    </div>
+  </div>
+  <div class="qa-item">
+    <div class="qa-question">
+      <span>Why store idempotency keys client-side before the fetch fires?</span>
+      <span class="tag tag-senior">Senior</span>
+    </div>
+    <div class="qa-answer">
+      <p>Crash or kill-tab immediately after network send but before persisting acknowledgment can produce an unknown outcome. If the key was durable first, retry is safe. If not, you may duplicate server-side effects.</p>
+    </div>
+  </div>
+  <div class="qa-item">
+    <div class="qa-question">
+      <span>How does a service worker interact with CORS and credentials?</span>
+      <span class="tag tag-l6">L6</span>
+    </div>
+    <div class="qa-answer">
+      <p>The SW’s <code>fetch</code> inherits the page’s credentials mode when initiated from a controlled client, but opaque responses limit JS inspection. Cross-origin caching requires careful cache keying and may fail for <code>no-cors</code> opaque responses. Prefer same-origin BFF endpoints for sensitive JSON to keep caches inspectable and policy-bound.</p>
+    </div>
+  </div>
+</div>
+
+<nav class="nav-footer">
+  <a href="02-infinite-scroll-virtualization.html">← Infinite Scroll &amp; Virtualization</a>
+  <a href="04-design-system-at-scale.html">Design System at Scale →</a>
+</nav>
+
+</div>
+
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+    q.addEventListener('click', () => q.nextElementSibling.classList.toggle('open'));
+});
+</script>
+</body>
+</html>

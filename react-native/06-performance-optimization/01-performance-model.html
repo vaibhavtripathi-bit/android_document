@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Performance Model — React Native L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Performance Optimization</a><span class="sep">›</span>
+        Performance Model
+    </nav>
+
+    <h1>Performance Model</h1>
+    <p class="subtitle">React Native's performance characteristics are fundamentally different from web React. Understanding the multi-threaded architecture, frame budgets, bridge overhead, and how to identify bottlenecks across JS, native, and bridge layers is the foundation of all performance work at Staff level.</p>
+
+    <nav class="nav">
+        <a href="02-js-thread-optimization.html">JS Thread Optimization</a>
+        <a href="03-rendering-optimization.html">Rendering Optimization</a>
+        <a href="04-memory-optimization.html">Memory Optimization</a>
+    </nav>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#threading">1. Threading Architecture</a></li>
+            <li><a href="#frame-budget">2. 60fps Target and Frame Budget</a></li>
+            <li><a href="#bridge-overhead">3. Bridge Overhead</a></li>
+            <li><a href="#new-arch">4. New Architecture Performance</a></li>
+            <li><a href="#tools">5. Performance Monitoring Tools</a></li>
+            <li><a href="#budgets">6. Performance Budgets</a></li>
+            <li><a href="#bottlenecks">7. Identifying Bottlenecks</a></li>
+            <li><a href="#metrics">8. Key Performance Metrics</a></li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="threading">1. Threading Architecture</h2>
+
+    <div class="diagram">
+React Native Threading Model
+═════════════════════════════
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                                                              │
+  │  JS Thread              Shadow Thread        Main/UI Thread  │
+  │  (Hermes/JSC)           (Yoga Layout)        (Platform UI)   │
+  │  ┌──────────────┐      ┌──────────────┐    ┌──────────────┐│
+  │  │ React render  │      │ Layout calc   │    │ View create  ││
+  │  │ State updates │      │ (Yoga/C++)    │    │ View update  ││
+  │  │ Event handlers│      │ Flexbox       │    │ Animations   ││
+  │  │ Business logic│      │ computation   │    │ Touch events ││
+  │  │ Network calls │      │               │    │ Gestures     ││
+  │  └──────┬───────┘      └──────┬───────┘    └──────┬───────┘│
+  │         │                      │                    │        │
+  │         └──────────────────────┴────────────────────┘        │
+  │                    Bridge / JSI                               │
+  │                                                              │
+  │  NativeModules Thread(s)                                     │
+  │  ┌──────────────────────────────────────────────────────┐   │
+  │  │ Native module method execution                        │   │
+  │  │ File I/O, database, crypto                            │   │
+  │  │ Network request processing                            │   │
+  │  └──────────────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────────┘
+
+  Legacy Architecture:  JS ←→ Bridge (JSON) ←→ Shadow ←→ UI
+  New Architecture:     JS ←→ JSI (C++) ←→ Fabric (C++) ←→ UI
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>The key mental model: React Native has <strong>three frame-critical threads</strong>. If ANY of them takes &gt;16.67ms per frame, you drop frames. The JS thread runs your React code. The shadow thread computes layout. The UI thread renders pixels. In the legacy architecture, these communicate through the bridge (async, serialized). In the New Architecture, they communicate through JSI/Fabric (synchronous, zero-copy). Understanding which thread is the bottleneck determines your optimization strategy.</p>
+    </div>
+
+    <h3>1.1 Thread Responsibilities</h3>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Thread</th>
+                <th>Responsibilities</th>
+                <th>Blocking Impact</th>
+                <th>Common Bottlenecks</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>JS Thread</td>
+                <td>React reconciliation, state updates, event handlers, business logic</td>
+                <td>UI stops responding to interactions, animations driven by JS freeze</td>
+                <td>Heavy computation, excessive re-renders, large JSON parsing</td>
+            </tr>
+            <tr>
+                <td>Shadow Thread</td>
+                <td>Yoga layout calculation (flexbox), view tree diffing</td>
+                <td>Layout changes delayed, views appear in wrong position</td>
+                <td>Deep view hierarchies, frequent layout changes</td>
+            </tr>
+            <tr>
+                <td>UI/Main Thread</td>
+                <td>Native view creation/update, animations, touch handling</td>
+                <td>App appears frozen, ANR on Android, watchdog kill on iOS</td>
+                <td>Too many view operations, synchronous native calls, image decoding</td>
+            </tr>
+            <tr>
+                <td>NativeModules Thread</td>
+                <td>Native module method execution</td>
+                <td>Promise resolution delayed, callbacks delayed</td>
+                <td>Blocking I/O, heavy computation on module thread</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="frame-budget">2. 60fps Target and Frame Budget</h2>
+
+    <div class="diagram">
+Frame Budget at 60fps
+═════════════════════
+
+  Total budget per frame: 16.67ms (1000ms / 60fps)
+  
+  ┌──────────────────────────────────────────────────────┐
+  │                    16.67ms budget                      │
+  │                                                        │
+  │  JS Thread:     ████████░░░░░░░░  ~8ms available      │
+  │  Bridge/JSI:    ██░░░░░░░░░░░░░░  ~2ms overhead       │
+  │  Layout:        ███░░░░░░░░░░░░░  ~3ms for Yoga       │
+  │  UI Thread:     ███░░░░░░░░░░░░░  ~3ms for rendering  │
+  │  Buffer:        ░░░░░░░░░░░░░░░░  ~0.67ms             │
+  └──────────────────────────────────────────────────────┘
+
+  Frame drop scenarios:
+  ─────────────────────
+  JS takes 20ms     → 1 frame dropped (visible jank)
+  JS takes 35ms     → 2 frames dropped (noticeable stutter)
+  JS takes 100ms    → 6 frames dropped (interaction feels broken)
+  JS takes 500ms    → 30 frames dropped (app appears frozen)
+
+  ProMotion displays (120fps): budget = 8.33ms per frame
+    </div>
+
+    <pre><code><span class="comment">// Measuring frame drops programmatically</span>
+<span class="keyword">import</span> { PerformanceObserver } <span class="keyword">from</span> <span class="string">'react-native'</span>;
+
+<span class="comment">// Using the JS frame callback to detect drops</span>
+<span class="keyword">let</span> lastFrameTime = performance.now();
+<span class="keyword">let</span> droppedFrames = 0;
+
+<span class="keyword">function</span> <span class="func">frameCallback</span>() {
+  <span class="keyword">const</span> now = performance.now();
+  <span class="keyword">const</span> delta = now - lastFrameTime;
+
+  <span class="keyword">if</span> (delta > 18) { <span class="comment">// 16.67ms + 1ms tolerance</span>
+    <span class="keyword">const</span> dropped = Math.floor(delta / 16.67) - 1;
+    droppedFrames += dropped;
+    console.warn(<span class="string">`Dropped ${dropped} frames (${delta.toFixed(1)}ms)`</span>);
+  }
+
+  lastFrameTime = now;
+  requestAnimationFrame(frameCallback);
+}
+
+requestAnimationFrame(frameCallback);</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="bridge-overhead">3. Bridge Overhead</h2>
+
+    <pre><code><span class="comment">// Measuring bridge overhead</span>
+<span class="keyword">const</span> start = performance.now();
+<span class="keyword">await</span> NativeModules.MyModule.doWork(<span class="string">'input'</span>);
+<span class="keyword">const</span> end = performance.now();
+console.log(<span class="string">`Bridge round-trip: ${(end - start).toFixed(2)}ms`</span>);
+
+<span class="comment">// Typical bridge overhead breakdown:</span>
+<span class="comment">// JS serialization:     0.5-2ms (depends on payload size)</span>
+<span class="comment">// Queue dispatch:       0-5ms (batching delay)</span>
+<span class="comment">// Native deserialization: 0.5-2ms</span>
+<span class="comment">// Method execution:     varies</span>
+<span class="comment">// Result serialization: 0.5-2ms</span>
+<span class="comment">// Return to JS:         0-5ms (batching delay)</span>
+<span class="comment">// Total overhead:       2-16ms (excluding method execution)</span>
+
+<span class="comment">// Bridge traffic patterns that cause jank:</span>
+<span class="comment">// 1. Scroll events → JS handler → bridge → native update (per frame)</span>
+<span class="comment">// 2. Animation values → bridge → native view update (per frame)</span>
+<span class="comment">// 3. Large data transfer (images, JSON) → serialization spike</span></code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Bridge Flood</div>
+        <p>The most common performance anti-pattern is "bridge flooding" — sending too many messages per frame. Each scroll event, each animation tick, each state update that triggers a native view change crosses the bridge. At 60fps with a complex scroll handler, you can easily generate 100+ bridge messages per second. The bridge batches every 5ms, but serialization of large batches still blocks the JS thread.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="new-arch">4. New Architecture Performance</h2>
+
+    <div class="diagram">
+Performance: Legacy vs New Architecture
+═══════════════════════════════════════
+
+                    Legacy              New Architecture
+                    ──────              ────────────────
+Native call:        1-5ms (bridge)      0.01ms (JSI)
+Layout:             JS thread (Yoga)    C++ thread (Yoga)
+View updates:       Async (batched)     Sync (immediate)
+Animations:         Bridge bottleneck   Native driver / Reanimated
+Startup:            All modules loaded  Lazy TurboModules
+Rendering:          Single-threaded     Concurrent (Fabric)
+
+Improvement areas:
+┌──────────────────────────────────────────────────────┐
+│ Interaction latency:  50-100ms → 16-33ms             │
+│ Scroll performance:   Bridge-bound → Native-bound    │
+│ Animation smoothness: JS-dependent → Native-driven   │
+│ Startup time:         All modules → Lazy loading      │
+│ Memory efficiency:    Duplicate data → Shared C++     │
+└──────────────────────────────────────────────────────┘
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="tools">5. Performance Monitoring Tools</h2>
+
+    <h3>5.1 Flipper</h3>
+    <pre><code><span class="comment">// Flipper — React Native debugger with performance plugins</span>
+<span class="comment">// Built-in plugins:</span>
+<span class="comment">// • React DevTools — component tree, props, state</span>
+<span class="comment">// • Network Inspector — request/response timing</span>
+<span class="comment">// • Layout Inspector — view hierarchy</span>
+<span class="comment">// • Databases — AsyncStorage, SQLite inspection</span>
+<span class="comment">// • Hermes Debugger — JS profiling</span>
+
+<span class="comment">// Custom performance logging via Flipper</span>
+<span class="keyword">import</span> { addPlugin } <span class="keyword">from</span> <span class="string">'react-native-flipper'</span>;
+
+addPlugin({
+  getId: () => <span class="string">'performance-monitor'</span>,
+  onConnect(connection) {
+    <span class="keyword">const</span> observer = <span class="keyword">new</span> PerformanceObserver((list) => {
+      <span class="keyword">for</span> (<span class="keyword">const</span> entry of list.getEntries()) {
+        connection.send(<span class="string">'performanceEntry'</span>, {
+          name: entry.name,
+          duration: entry.duration,
+          startTime: entry.startTime,
+        });
+      }
+    });
+    observer.observe({ entryTypes: [<span class="string">'measure'</span>] });
+  },
+  onDisconnect() {},
+  runInBackground: () => <span class="keyword">false</span>,
+});</code></pre>
+
+    <h3>5.2 Systrace (Android)</h3>
+    <pre><code><span class="comment">// Systrace — system-level tracing for Android</span>
+<span class="comment">// Captures: CPU scheduling, thread activity, bridge traffic</span>
+
+<span class="comment">// Enable in RN:</span>
+<span class="comment">// 1. Dev menu → Start Systrace</span>
+<span class="comment">// 2. Perform the slow interaction</span>
+<span class="comment">// 3. Dev menu → Stop Systrace</span>
+<span class="comment">// 4. Open trace in chrome://tracing</span>
+
+<span class="comment">// Custom trace sections in native code:</span>
+<span class="comment">// Android: Trace.beginSection("MyOperation")</span>
+<span class="comment">//          ... work ...</span>
+<span class="comment">//          Trace.endSection()</span>
+
+<span class="comment">// What to look for in Systrace:</span>
+<span class="comment">// • mqt_js thread — JS execution time per frame</span>
+<span class="comment">// • mqt_native_modules — native module call duration</span>
+<span class="comment">// • UI thread — view creation/update time</span>
+<span class="comment">// • Bridge markers — message serialization/dispatch</span></code></pre>
+
+    <h3>5.3 Xcode Instruments</h3>
+    <pre><code><span class="comment">// Xcode Instruments — iOS profiling</span>
+<span class="comment">// Key instruments for RN:</span>
+<span class="comment">//</span>
+<span class="comment">// Time Profiler:</span>
+<span class="comment">//   • CPU usage per thread</span>
+<span class="comment">//   • Call tree with time attribution</span>
+<span class="comment">//   • Filter by thread: com.facebook.react.JavaScript</span>
+<span class="comment">//</span>
+<span class="comment">// Allocations:</span>
+<span class="comment">//   • Memory allocation tracking</span>
+<span class="comment">//   • Heap growth over time</span>
+<span class="comment">//   • Identify leaking objects</span>
+<span class="comment">//</span>
+<span class="comment">// Core Animation:</span>
+<span class="comment">//   • FPS counter</span>
+<span class="comment">//   • Offscreen rendering detection</span>
+<span class="comment">//   • Blended layers visualization</span>
+<span class="comment">//</span>
+<span class="comment">// Leaks:</span>
+<span class="comment">//   • Retain cycle detection</span>
+<span class="comment">//   • Memory leak identification</span></code></pre>
+
+    <h3>5.4 React DevTools Profiler</h3>
+    <pre><code><span class="comment">// React DevTools Profiler — component-level profiling</span>
+<span class="comment">// Shows: render count, render duration, why component re-rendered</span>
+
+<span class="comment">// Programmatic profiling with &lt;Profiler&gt; component</span>
+<span class="keyword">import</span> { Profiler } <span class="keyword">from</span> <span class="string">'react'</span>;
+
+<span class="keyword">function</span> <span class="func">onRenderCallback</span>(
+  id,            <span class="comment">// "Navigation" — Profiler id</span>
+  phase,         <span class="comment">// "mount" | "update"</span>
+  actualDuration,<span class="comment">// time spent rendering</span>
+  baseDuration,  <span class="comment">// estimated time without memoization</span>
+  startTime,     <span class="comment">// when React began rendering</span>
+  commitTime     <span class="comment">// when React committed changes</span>
+) {
+  <span class="keyword">if</span> (actualDuration > 16) {
+    console.warn(
+      <span class="string">`Slow render: ${id} took ${actualDuration.toFixed(1)}ms`</span>
+    );
+  }
+}
+
+&lt;Profiler id=<span class="string">"FeedList"</span> onRender={onRenderCallback}&gt;
+  &lt;FeedList items={items} /&gt;
+&lt;/Profiler&gt;</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="budgets">6. Performance Budgets</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Metric</th>
+                <th>Target</th>
+                <th>Warning</th>
+                <th>Critical</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td>Cold start (TTI)</td><td>&lt;2s</td><td>2-4s</td><td>&gt;4s</td></tr>
+            <tr><td>Screen transition</td><td>&lt;300ms</td><td>300-500ms</td><td>&gt;500ms</td></tr>
+            <tr><td>FPS during scroll</td><td>60fps</td><td>45-59fps</td><td>&lt;45fps</td></tr>
+            <tr><td>FPS during animation</td><td>60fps</td><td>50-59fps</td><td>&lt;50fps</td></tr>
+            <tr><td>JS thread frame time</td><td>&lt;8ms</td><td>8-16ms</td><td>&gt;16ms</td></tr>
+            <tr><td>Memory (JS heap)</td><td>&lt;150MB</td><td>150-300MB</td><td>&gt;300MB</td></tr>
+            <tr><td>Bundle size (JS)</td><td>&lt;2MB</td><td>2-5MB</td><td>&gt;5MB</td></tr>
+            <tr><td>Bridge calls/frame</td><td>&lt;5</td><td>5-20</td><td>&gt;20</td></tr>
+        </tbody>
+    </table>
+
+    <!-- ============================================================ -->
+    <h2 id="bottlenecks">7. Identifying Bottlenecks</h2>
+
+    <div class="diagram">
+Bottleneck Identification Decision Tree
+════════════════════════════════════════
+
+  Symptom: Jank / dropped frames
+  │
+  ├── Is JS thread busy? (Hermes profiler / Systrace)
+  │   ├── YES → JS bottleneck
+  │   │   ├── Heavy computation? → Offload to native/worker
+  │   │   ├── Too many re-renders? → Memoization, state splitting
+  │   │   ├── Large JSON parsing? → Streaming parse, native parse
+  │   │   └── Slow event handlers? → Debounce, InteractionManager
+  │   │
+  │   └── NO → Check other threads
+  │
+  ├── Is UI thread busy? (Instruments / Android Profiler)
+  │   ├── YES → Native bottleneck
+  │   │   ├── Too many view ops? → View flattening, fewer wrappers
+  │   │   ├── Image decoding? → Resize before display, caching
+  │   │   ├── Complex shadows? → Simplify, use elevation (Android)
+  │   │   └── Sync native calls? → Make async, use TurboModules
+  │   │
+  │   └── NO → Check bridge
+  │
+  └── Is bridge saturated? (Systrace bridge markers)
+      ├── YES → Bridge bottleneck
+      │   ├── Too many calls/frame? → Batch, reduce frequency
+      │   ├── Large payloads? → Reduce data size, use refs
+      │   └── Scroll/animation traffic? → useNativeDriver, Reanimated
+      │
+      └── NO → Check layout (Yoga) or memory pressure
+    </div>
+
+    <pre><code><span class="comment">// Quick bottleneck identification technique</span>
+<span class="comment">// Add this to your app's dev mode</span>
+
+<span class="keyword">function</span> <span class="func">usePerformanceMonitor</span>() {
+  useEffect(() => {
+    <span class="keyword">if</span> (!__DEV__) <span class="keyword">return</span>;
+
+    <span class="keyword">let</span> frameCount = 0;
+    <span class="keyword">let</span> lastCheck = performance.now();
+
+    <span class="keyword">const</span> check = () => {
+      frameCount++;
+      <span class="keyword">const</span> now = performance.now();
+      <span class="keyword">if</span> (now - lastCheck >= 1000) {
+        <span class="keyword">const</span> fps = Math.round(frameCount * 1000 / (now - lastCheck));
+        <span class="keyword">if</span> (fps < 50) {
+          console.warn(<span class="string">`Low FPS: ${fps}`</span>);
+        }
+        frameCount = 0;
+        lastCheck = now;
+      }
+      requestAnimationFrame(check);
+    };
+
+    requestAnimationFrame(check);
+  }, []);
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="metrics">8. Key Performance Metrics</h2>
+
+    <pre><code><span class="comment">// Production performance monitoring</span>
+<span class="keyword">const</span> metrics = {
+  <span class="comment">// Startup metrics</span>
+  coldStartTime: <span class="keyword">null</span>,     <span class="comment">// native launch → first meaningful paint</span>
+  ttInteractive: <span class="keyword">null</span>,     <span class="comment">// launch → first user interaction possible</span>
+  bundleLoadTime: <span class="keyword">null</span>,    <span class="comment">// bundle fetch + parse + execute</span>
+
+  <span class="comment">// Runtime metrics</span>
+  jsFrameTime: [],         <span class="comment">// ms per JS frame (target: &lt;16ms)</span>
+  droppedFrames: 0,        <span class="comment">// total dropped frames in session</span>
+  bridgeCallsPerSecond: 0, <span class="comment">// bridge traffic volume</span>
+
+  <span class="comment">// Memory metrics</span>
+  jsHeapUsed: <span class="keyword">null</span>,        <span class="comment">// Hermes heap usage</span>
+  nativeMemory: <span class="keyword">null</span>,      <span class="comment">// total app memory</span>
+
+  <span class="comment">// Navigation metrics</span>
+  screenTransitionTime: [],<span class="comment">// ms per screen transition</span>
+};
+
+<span class="comment">// Report to analytics</span>
+<span class="keyword">function</span> <span class="func">reportPerformance</span>() {
+  analytics.track(<span class="string">'performance_snapshot'</span>, {
+    avgFps: calculateAvgFps(metrics.jsFrameTime),
+    p95FrameTime: percentile(metrics.jsFrameTime, 95),
+    droppedFrameRate: metrics.droppedFrames / sessionDuration,
+    memoryUsageMB: metrics.jsHeapUsed / (1024 * 1024),
+  });
+}</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Mental Model</div>
+        <p>Performance optimization in React Native is a <strong>multi-dimensional</strong> problem. You cannot optimize by looking at one thread in isolation — a fix on the JS thread (e.g., moving work to native) may create a bottleneck on the native modules thread. The Staff-level approach is: (1) establish performance budgets before writing code, (2) instrument continuously (not just when things are slow), (3) profile before optimizing (measure, don't guess), (4) optimize the bottleneck thread (not the one that's easiest to optimize), and (5) validate that optimizations don't regress other metrics.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="index.html">← Series Index</a>
+        <a href="02-js-thread-optimization.html">Next: JS Thread Optimization →</a>
+    </div>
+</div>
+</body>
+</html>
