@@ -47,6 +47,7 @@
   <a href="05-android-integration.html">05 Android Integration</a>
   <a href="06-concurrency-patterns.html">06 Patterns</a>
   <a href="07-interview-qa.html">07 Interview Q&A</a>
+  <a href="08-sharedflow-deep-dive.html">08 SharedFlow Deep Dive</a>
 </div>
 
 <h1>Flows & Channels</h1>
@@ -137,6 +138,20 @@ viewModelScope.launch {
 <div class="callout warn">
   <div class="callout-label">flowOn Changes Upstream Only</div>
   <p><code>flowOn</code> affects everything <strong>above</strong> it in the chain. It introduces a buffer (channel) between upstream and downstream. You cannot use <code>withContext</code> inside a <code>flow { }</code> builder to change the emission context — that violates context preservation and throws <code>IllegalStateException</code>.</p>
+    Deep Dive: channelFlow
+    If you have a truly complex case where you need to emit from multiple contexts or concurrent coroutines (e.g., listening to multiple sockets at once), you should use channelFlow instead of flow.
+
+    <pre><code>
+    channelFlow is thread-safe and allows for concurrent emissions from different contexts because it uses a Channel under the hood to buffer values back to the collector.
+    val myChannelFlow = channelFlow {
+        launch(Dispatchers.IO) {
+            send(api1.fetch()) // 'send' is used instead of 'emit'
+        }
+        launch(Dispatchers.Default) {
+            send(api2.fetch())
+        }
+    }
+    </code></pre>
 </div>
 
 <h3>Error Handling in Flows</h3>
@@ -385,29 +400,185 @@ sensorDataFlow
 <!-- ============================================================ -->
 <h2>8. Flow Composition</h2>
 
-<pre><code>// combine — emit whenever ANY source emits (latest from each)
-val combined = combine(userFlow, settingsFlow) { user, settings ->
-    UiState(user, settings)
-}
+<p>Flow composition operators fall into two categories: <strong>synchronization operators</strong> that combine multiple streams into one (<code>combine</code>, <code>zip</code>, <code>merge</code>), and <strong>flattening operators</strong> that handle flows-of-flows (<code>flatMapLatest</code>, <code>flatMapConcat</code>, <code>flatMapMerge</code>). Choosing the wrong one is a common source of subtle bugs.</p>
 
-// zip — pair values 1:1 (waits for both)
-val zipped = userFlow.zip(avatarFlow) { user, avatar ->
+<!-- ─── combine vs zip ─── -->
+<h3><code>combine</code> vs <code>zip</code> — Synchronization Logic</h3>
+
+<p>These two operators look similar but solve fundamentally different problems.</p>
+
+<h4><code>combine</code> — The UI State Builder</h4>
+
+<p><strong>Behaviour:</strong> Waits for the first emission from <em>every</em> source flow. After that, whenever <em>any</em> source emits, it re-calculates immediately using the latest values from all others.</p>
+
+<pre><code>// Classic use-case: merging independent data sources into a single ViewState
+val uiState: StateFlow&lt;DashboardState&gt; = combine(
+    userRepository.user,        // Flow&lt;User&gt;
+    settingsRepository.settings, // Flow&lt;Settings&gt;
+    networkStatus               // Flow&lt;Boolean&gt;
+) { user, settings, isOnline ->
+    DashboardState(user, settings, isOnline)
+}.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DashboardState.Loading)</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight</div>
+  <code>combine</code> is the gold standard for MVI/MVVM architectures. Each repository exposes its own <code>StateFlow</code>, and the ViewModel merges them into a single <code>ViewState</code>. Each source is independently updated, independently cached, and independently testable. The UI just collects one stream.
+</div>
+
+<div class="diagram-container">
+<svg viewBox="0 0 760 175" xmlns="http://www.w3.org/2000/svg" font-family="Inter, sans-serif" font-size="11">
+  <defs>
+    <marker id="ca" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#6c9eff"/></marker>
+    <marker id="cg" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#4ade80"/></marker>
+  </defs>
+  <text x="380" y="16" text-anchor="middle" fill="#c084fc" font-weight="700" font-size="12">combine — Re-fires on any upstream change</text>
+
+  <!-- Flow A -->
+  <rect x="20" y="30" width="90" height="28" rx="4" fill="rgba(108,158,255,0.12)" stroke="#6c9eff"/>
+  <text x="65" y="48" text-anchor="middle" fill="#6c9eff" font-weight="600">userFlow</text>
+  <!-- Flow B -->
+  <rect x="20" y="70" width="90" height="28" rx="4" fill="rgba(108,158,255,0.12)" stroke="#6c9eff"/>
+  <text x="65" y="88" text-anchor="middle" fill="#6c9eff" font-weight="600">settingsFlow</text>
+  <!-- Flow C -->
+  <rect x="20" y="110" width="90" height="28" rx="4" fill="rgba(108,158,255,0.12)" stroke="#6c9eff"/>
+  <text x="65" y="128" text-anchor="middle" fill="#6c9eff" font-weight="600">networkFlow</text>
+
+  <!-- Arrows to combine -->
+  <line x1="110" y1="44" x2="230" y2="82" stroke="#6c9eff" stroke-width="1.5" marker-end="url(#ca)"/>
+  <line x1="110" y1="84" x2="230" y2="84" stroke="#6c9eff" stroke-width="1.5" marker-end="url(#ca)"/>
+  <line x1="110" y1="124" x2="230" y2="86" stroke="#6c9eff" stroke-width="1.5" marker-end="url(#ca)"/>
+
+  <!-- Combine block -->
+  <rect x="230" y="62" width="140" height="44" rx="6" fill="rgba(124,58,237,0.12)" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="300" y="81" text-anchor="middle" fill="#7c3aed" font-weight="700">combine { }</text>
+  <text x="300" y="97" text-anchor="middle" fill="#7c3aed" font-size="10">latest values from all</text>
+
+  <!-- Arrow to output -->
+  <line x1="370" y1="84" x2="430" y2="84" stroke="#4ade80" stroke-width="1.5" marker-end="url(#cg)"/>
+
+  <!-- Output -->
+  <rect x="430" y="62" width="150" height="44" rx="6" fill="rgba(74,222,128,0.12)" stroke="#4ade80" stroke-width="1.5"/>
+  <text x="505" y="81" text-anchor="middle" fill="#16803c" font-weight="700">DashboardState</text>
+  <text x="505" y="97" text-anchor="middle" fill="#16803c" font-size="10">re-emits on any change</text>
+
+  <!-- Note -->
+  <text x="380" y="155" text-anchor="middle" fill="#5c6070" font-size="10">If settingsFlow emits a new value → combine fires with latest user + latest network + NEW settings</text>
+</svg>
+</div>
+
+<h4><code>zip</code> — The Strict Pairer</h4>
+
+<p><strong>Behaviour:</strong> Pairs emissions 1-to-1: 1st from A with 1st from B, 2nd from A with 2nd from B. The faster flow waits for the slower one to catch up.</p>
+
+<pre><code>// Good use-case: pairing items that have a strict 1:1 relationship
+val usersWithAvatars = userFlow.zip(avatarFlow) { user, avatar ->
     UserWithAvatar(user, avatar)
-}
+}</code></pre>
 
-// merge — interleave emissions from multiple flows
-val allEvents = merge(clickEvents, scrollEvents, keyEvents)
+<div class="callout danger">
+  <div class="callout-label">The zip Risk</div>
+  If <code>userFlow</code> emits 100 times and <code>avatarFlow</code> emits only 2 times, the zipped flow emits exactly twice. The other 98 values from <code>userFlow</code> sit in an internal buffer waiting for <code>avatarFlow</code> to catch up. If <code>avatarFlow</code> never completes, those 98 values are held in memory indefinitely — a memory leak. Only use <code>zip</code> when you are certain both flows emit at the same rate.
+</div>
 
-// flatMapLatest — switch to new flow on each emission (like switchMap)
-searchQuery
+<table>
+  <tr><th></th><th><code>combine</code></th><th><code>zip</code></th></tr>
+  <tr><td>Fires when</td><td>Any source emits (after initial)</td><td>Both sources have emitted a new pair</td></tr>
+  <tr><td>Uses</td><td>Latest value from each</td><td>Matched value by emission index</td></tr>
+  <tr><td>Speed</td><td>As fast as any source</td><td>As slow as the slowest source</td></tr>
+  <tr><td>Memory risk</td><td>None — always uses latest</td><td>Yes — buffers the faster flow</td></tr>
+  <tr><td>Best for</td><td>UI state from multiple repos</td><td>Strict 1:1 data pairing</td></tr>
+</table>
+
+<!-- ─── merge ─── -->
+<h3><code>merge</code> — The Simple Interleaver</h3>
+
+<p><strong>Behaviour:</strong> Funnels multiple streams into one output without any transformation. Values appear in the output in the order they arrive, regardless of which source emitted them.</p>
+
+<pre><code>// Perfect for Action Streams — multiple buttons that trigger the same command
+val refreshTrigger: Flow&lt;Unit&gt; = merge(
+    pullToRefreshFlow,    // Flow&lt;Unit&gt; from swipe gesture
+    retryButtonFlow,      // Flow&lt;Unit&gt; from error screen button
+    appForegroundFlow     // Flow&lt;Unit&gt; when app returns from background
+)
+
+viewModelScope.launch {
+    refreshTrigger
+        .flatMapLatest { fetchData() }
+        .collect { updateUi(it) }
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Insight</div>
+  <code>merge</code> is the correct tool for <strong>Action Streams</strong>. Instead of three separate listeners each calling <code>viewModel.refresh()</code>, merge their flows and process them in one place. This keeps your ViewModel's logic centralised and eliminates duplicate event handling code.
+</div>
+
+<!-- ─── flatMap trio ─── -->
+<h3>The <code>flatMap</code> Trio — Flattening Strategies</h3>
+
+<p>When each upstream emission triggers a new inner <code>Flow</code> (e.g., a search query triggering an API call that returns a <code>Flow</code>), you need to "flatten" the stream-of-streams. <em>How</em> you flatten changes the behaviour entirely.</p>
+
+<h4><code>flatMapLatest</code> — "Forget the Past"</h4>
+
+<p><strong>Mechanism:</strong> When a new upstream value arrives, it <strong>immediately cancels</strong> the previous inner flow and starts a new one. This prevents race conditions where an old, slow API call delivers its result after a newer, faster one.</p>
+
+<pre><code>// Classic: search-as-you-type
+searchQueryFlow
+    .debounce(300)               // Wait for user to pause typing
+    .distinctUntilChanged()       // Don't re-search the same query
     .flatMapLatest { query ->
-        if (query.isEmpty()) flowOf(emptyList())
-        else searchApi.search(query) // Returns Flow<List<Result>>
+        if (query.isBlank()) flowOf(emptyList())
+        else searchRepository.search(query)   // Previous call cancelled here
     }
-    .collect { results -> showResults(results) }
+    .collect { results -> _uiState.update { it.copy(results = results) } }</code></pre>
 
-// flatMapConcat — process flows sequentially
-// flatMapMerge — process flows concurrently (with concurrency limit)</code></pre>
+<div class="callout">
+  <div class="callout-label">Best For</div>
+  Search-as-you-type, tab switching, any scenario where only the <em>latest request</em> matters and previous in-flight work should be discarded.
+</div>
+
+<h4><code>flatMapConcat</code> — "Wait Your Turn"</h4>
+
+<p><strong>Mechanism:</strong> Waits for the current inner flow to <strong>complete</strong> before starting the next one. Strictly preserves the order of upstream emissions. The slowest and most predictable option.</p>
+
+<pre><code>// Sequential upload: each file must finish before the next begins
+fileList.asFlow()
+    .flatMapConcat { file ->
+        uploadRepository.upload(file)   // Flow&lt;UploadProgress&gt;
+    }
+    .collect { progress -> updateProgressBar(progress) }</code></pre>
+
+<div class="callout">
+  <div class="callout-label">Best For</div>
+  Sequential ordered processing: uploading files one-by-one, running migrations in order, or any pipeline where task N must complete before task N+1 starts.
+</div>
+
+<h4><code>flatMapMerge</code> — "All at Once"</h4>
+
+<p><strong>Mechanism:</strong> Starts all inner flows <strong>immediately and concurrently</strong> as upstream values arrive. Fastest option but results may arrive out of order.</p>
+
+<pre><code>// Fetch details for multiple IDs in parallel
+itemIds.asFlow()
+    .flatMapMerge(concurrency = 3) { id ->   // Max 3 concurrent requests
+        detailRepository.fetchDetail(id)
+    }
+    .collect { detail -> updateItem(detail) }</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Use the concurrency Parameter</div>
+  Without a limit, <code>flatMapMerge</code> starts every inner flow at once. With 1000 IDs, that is 1000 simultaneous network requests. Always set <code>concurrency</code> to a safe ceiling (typically 3–10 for network, higher for CPU-bound tasks).
+</div>
+
+<h3>Composition Operator — Quick Reference</h3>
+
+<table>
+  <tr><th>Need</th><th>Use</th><th>Key Characteristic</th></tr>
+  <tr><td>Reactive UI State from multiple repos</td><td><code>combine</code></td><td>Re-fires whenever any source changes</td></tr>
+  <tr><td>Strict 1:1 emission pairing</td><td><code>zip</code></td><td>Only as fast as the slowest flow; memory risk if mismatched</td></tr>
+  <tr><td>Unified event / action stream</td><td><code>merge</code></td><td>No transformation — just joins multiple sources</td></tr>
+  <tr><td>Search / live query (cancel old work)</td><td><code>flatMapLatest</code></td><td>Cancels the previous inner flow on each new upstream value</td></tr>
+  <tr><td>Sequential ordered tasks</td><td><code>flatMapConcat</code></td><td>Queues inner flows strictly one-by-one</td></tr>
+  <tr><td>Bulk parallel work</td><td><code>flatMapMerge</code></td><td>Fires all concurrently; use <code>concurrency</code> to cap parallelism</td></tr>
+</table>
 
 <!-- ============================================================ -->
 <h2>9. Flow Internals — How Operators Chain</h2>

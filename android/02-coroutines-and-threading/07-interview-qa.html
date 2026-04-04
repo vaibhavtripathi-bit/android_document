@@ -53,6 +53,7 @@
   <a href="05-android-integration.html">05 Android Integration</a>
   <a href="06-concurrency-patterns.html">06 Patterns</a>
   <a class="active" href="07-interview-qa.html">07 Interview Q&A</a>
+  <a href="08-sharedflow-deep-dive.html">08 SharedFlow Deep Dive</a>
 </div>
 
 <h1>Interview Q&A — Coroutines & Threading</h1>
@@ -645,6 +646,106 @@ fun update(function: (T) -> T) {
   </div>
 </div>
 
+<!-- ============ ASYNC FAILURE SEMANTICS (DEEP) ============ -->
+<h2>async + Scope Failure Semantics — The Real Model (Q43–Q45)</h2>
+
+<div class="qa">
+  <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('show')">
+    <span><span class="q-label">Q43</span> Inside <code>coroutineScope { }</code>, when does an <code>async { }</code> failure actually propagate — at throw time or at <code>await()</code>?</span>
+    <span class="difficulty l6plus">L6+</span>
+  </div>
+  <div class="qa-answer">
+    <p><strong>At throw time — immediately.</strong> This is the most common L6 misconception.</p>
+    <p>The popular mental model is: <em>"async defers the exception until you call await()."</em> That is only true inside a <code>supervisorScope</code>. Inside a <code>coroutineScope</code>, the exception propagates <strong>structurally</strong> the moment the child fails:</p>
+    <ol>
+      <li>Child (<code>async</code> block) throws.</li>
+      <li>Exception is immediately propagated <em>up</em> to the parent (<code>coroutineScope</code>).</li>
+      <li>Parent cancels all sibling coroutines.</li>
+      <li>Scope completes exceptionally.</li>
+      <li><code>await()</code> — if it would have been reached — rethrows the stored exception to the caller.</li>
+    </ol>
+    <p>The critical insight: <strong><code>await()</code> is irrelevant to cancellation</strong>. It only controls <em>when you observe</em> the exception, not <em>when it happens</em>. Siblings are cancelled before you ever get a chance to call <code>await()</code>.</p>
+    <pre><code>// coroutineScope = fail-fast system: one async failure kills the whole scope
+coroutineScope {
+    val a = async { fetchUser() }   // throws NetworkException
+    val b = async { fetchFeed() }   // gets cancelled immediately
+    a.await()  // rethrows NetworkException — but b was already dead
+    b.await()  // never reached
+}</code></pre>
+    <div class="junior-miss"><strong>What juniors miss:</strong> They think wrapping calls in <code>async</code> inside a <code>coroutineScope</code> gives independent error handling per-call. It doesn't. You don't control failure timing — the scope does. Use <code>supervisorScope</code> if you need fault isolation.</div>
+    <div class="staff-add"><strong>Staff-level addition:</strong> This is implemented via <code>JobSupport.childCancelled()</code>. When a child completes exceptionally, it calls <code>childCancelled()</code> on its parent Job. A regular <code>Job</code> returns <code>true</code> — "yes, cancel me too." A <code>SupervisorJob</code> overrides this and returns <code>false</code>. The exception is not merely "stored in the Deferred waiting for await()" — it is a structural cancellation signal that propagates through the Job hierarchy immediately, independently of any caller calling await().</div>
+  </div>
+</div>
+
+<div class="qa">
+  <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('show')">
+    <span><span class="q-label">Q44</span> What fundamentally changes in <code>supervisorScope</code> when an <code>async { }</code> child fails?</span>
+    <span class="difficulty l6plus">L6+</span>
+  </div>
+  <div class="qa-answer">
+    <p><strong>Failure becomes data, not a structural event.</strong></p>
+    <p>A <code>supervisorScope</code> changes exactly one rule: a child's failure does <strong>not</strong> propagate upward as cancellation. The exception is captured inside the <code>Deferred</code> and stays there until observed.</p>
+    <table>
+      <tr><th></th><th>coroutineScope</th><th>supervisorScope</th></tr>
+      <tr><td>async throws</td><td>Exception propagates to parent immediately</td><td>Exception stored in Deferred</td></tr>
+      <tr><td>Sibling coroutines</td><td>Cancelled</td><td>Continue normally</td></tr>
+      <tr><td>Scope itself</td><td>Completes exceptionally</td><td>Continues running</td></tr>
+      <tr><td>await()</td><td>Rethrows (scope already failed)</td><td>First observation of exception</td></tr>
+      <tr><td>Never calling await()</td><td>Scope fails anyway</td><td>Exception is silently lost</td></tr>
+    </table>
+    <pre><code>supervisorScope {
+    val a = async { fetchUser() }    // throws NetworkException
+    val b = async { fetchFeed() }    // NOT cancelled — completes normally
+
+    val feed = b.await()             // works fine
+    val user = try {
+        a.await()                    // throws here — first observation
+    } catch (e: NetworkException) {
+        null                         // handled gracefully
+    }
+}</code></pre>
+    <div class="junior-miss"><strong>Critical detail often missed:</strong> If you never call <code>await()</code> on a failed <code>Deferred</code> inside a <code>supervisorScope</code>, the exception is <strong>silently lost</strong> — it will not surface anywhere. Always either <code>await()</code> with a try-catch, or install a <code>CoroutineExceptionHandler</code> on the scope as a safety net.</div>
+    <div class="staff-add"><strong>Staff-level addition:</strong> <code>viewModelScope</code> uses <code>SupervisorJob</code>, making it behave like <code>supervisorScope</code> for all launched coroutines. This is intentional: one ViewModel operation failing should never cancel unrelated operations. The trade-off: you must explicitly handle each coroutine's failure — the scope won't surface it for you.</div>
+  </div>
+</div>
+
+<div class="qa">
+  <div class="qa-question" onclick="this.nextElementSibling.classList.toggle('show')">
+    <span><span class="q-label">Q45</span> What happens to an <code>async</code> coroutine's own children when it fails? Explain the "every coroutine is a mini-scope" model.</span>
+    <span class="difficulty l6plus">L6+</span>
+  </div>
+  <div class="qa-answer">
+    <p>Every coroutine is a <strong>mini scope</strong> for its own children — regardless of what the outer scope is. When an <code>async</code> block's logic throws:</p>
+    <ol>
+      <li>The <code>async</code> coroutine cancels <em>all its own children</em> immediately (always fail-fast within itself).</li>
+      <li>The <code>async</code> coroutine completes exceptionally.</li>
+      <li>It reports failure to its parent.</li>
+      <li>The parent reacts based on its own scope type (<code>coroutineScope</code> = cancel all siblings, <code>supervisorScope</code> = isolate).</li>
+    </ol>
+    <pre><code>supervisorScope {
+    val result = async {
+        val x = launch { step1() }  // child of this async
+        val y = launch { step2() }  // child of this async
+        throw RuntimeException("inner failure")
+        // x and y are cancelled immediately — mini-scope fail-fast
+    }
+    // outer supervisorScope: other siblings of `result` are NOT cancelled
+    val other = async { loadSettings() }  // survives
+}</code></pre>
+    <p>Two independent levels, two independent rules:</p>
+    <ul>
+      <li><strong>Inner children → always cancelled immediately</strong> (the async coroutine is a regular Job for its own children)</li>
+      <li><strong>Outer siblings → determined by parent scope</strong> (coroutineScope = die too, supervisorScope = survive)</li>
+    </ul>
+    <div class="staff-add"><strong>Staff-level addition — the unified model:</strong>
+      <br><br>
+      <strong>The scope decides cancellation behavior, not the coroutine builder.</strong>
+      <br><br>
+      <code>async</code> and <code>launch</code> are just ways to start a coroutine. Whether failure propagates sideways depends entirely on whether the <em>parent Job</em> is a regular <code>Job</code> (fail-fast) or a <code>SupervisorJob</code> (isolate). This is why passing <code>SupervisorJob()</code> into a <code>launch(SupervisorJob()) { }</code> call is an anti-pattern — it detaches the new coroutine from the parent hierarchy entirely rather than providing scoped isolation. Use <code>supervisorScope { }</code> instead.
+    </div>
+  </div>
+</div>
+
 <script>
 document.querySelectorAll('.qa-question').forEach(q => {
   q.addEventListener('keydown', e => { if (e.key === 'Enter') q.click(); });
@@ -655,7 +756,7 @@ document.querySelectorAll('.qa-question').forEach(q => {
 
 <div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border);">
   <h3 style="color: var(--green); margin-bottom: 0.75rem;">Coroutines & Threading — Series Complete</h3>
-  <p style="color: var(--text-dim); font-size: 0.9rem;">7 documents, 42 interview questions covering threading fundamentals, coroutine internals, structured concurrency, Flows, Android integration, concurrency patterns, and deep runtime internals at L6 depth.</p>
+  <p style="color: var(--text-dim); font-size: 0.9rem;">7 documents, 45 interview questions covering threading fundamentals, coroutine internals, structured concurrency, Flows, Android integration, concurrency patterns, deep runtime internals, and async failure semantics at L6 depth.</p>
   <p style="color: var(--text-dim); font-size: 0.85rem; margin-top: 0.5rem;">
     ← <a href="06-concurrency-patterns.html">06 — Concurrency Patterns</a> &nbsp;|&nbsp; <a href="index.html">Back to Index</a>
   </p>

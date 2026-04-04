@@ -51,6 +51,7 @@
   <a href="05-android-integration.html">05 Android Integration</a>
   <a href="06-concurrency-patterns.html">06 Patterns</a>
   <a href="07-interview-qa.html">07 Interview Q&A</a>
+  <a href="08-sharedflow-deep-dive.html">08 SharedFlow Deep Dive</a>
 </div>
 
 <h1>Coroutines Foundations</h1>
@@ -210,6 +211,19 @@ suspend fun fetchLocation(): Location = suspendCancellableCoroutine { cont ->
   <p>Prefer <code>suspendCancellableCoroutine</code> over <code>suspendCoroutine</code>. The cancellable variant integrates with structured concurrency — when the parent scope is cancelled, the continuation is cancelled too. With plain <code>suspendCoroutine</code>, cancellation is ignored and the callback may fire after the coroutine is already dead, causing subtle bugs.</p>
 </div>
 
+<h3>The Mental Model: What is a Continuation?</h3>
+
+<p><strong>A Continuation is a snapshot of your code's progress, carrying a context that acts as the rulebook for where and how that code should resume.</strong></p>
+
+<p>Think of it like this: when your coroutine hits a suspension point (like <code>delay()</code> or <code>httpClient.get()</code>), it doesn't disappear. Instead:</p>
+
+<ul>
+  <li><strong>Suspend saves state:</strong> Your variables, position in code, and context are all frozen in the Continuation.</li>
+  <li><strong>Resume continues it:</strong> When the operation finishes, the runtime calls <code>continuation.resume(result)</code>, and your code picks up right where it left off.</li>
+</ul>
+
+<p>The key: <strong>Coroutines work because Continuation remembers everything.</strong> No threads needed, just state machine callbacks.</p>
+
 <!-- ============================================================ -->
 <h2>4. CoroutineContext — It's a Map</h2>
 
@@ -323,20 +337,41 @@ scope.launch {
   <p>Blocking I/O operations (disk read, JDBC call, synchronous HTTP) hold a thread hostage while waiting. If IO was limited to CPU cores like Default, 8 concurrent blocking calls would exhaust the pool and starve all other coroutines. The 64-thread limit gives headroom for blocking operations. But this is still a limit — if you have 100 concurrent blocking calls, you'll see contention. For truly unbounded blocking (e.g., wrapping a legacy blocking SDK), use <code>Dispatchers.IO.limitedParallelism(n)</code> to create an isolated view that doesn't starve the shared pool.</p>
 </div>
 
-<h3>limitedParallelism() — The Modern Approach</h3>
+<h3>limitedParallelism() — Custom Execution Lanes</h3>
 
-<pre><code>// Create a dispatcher limited to 4 threads (isolated from the shared pool)
+<p><strong>The new standard:</strong> Instead of creating brand-new thread pools with <code>newFixedThreadPoolContext()</code>, use <code>limitedParallelism(n)</code> to create custom "lanes" without the memory overhead or thread leak risk of managing your own thread pool.</p>
+
+<pre><code>// Create a dispatcher limited to 4 threads
 val dbDispatcher = Dispatchers.IO.limitedParallelism(4)
 
-// Create a single-threaded dispatcher (replaces HandlerThread)
+// Create a single-threaded dispatcher (modern replacement for HandlerThread)
 val serialDispatcher = Dispatchers.Default.limitedParallelism(1)
 
-// Use it
+// Use them
 suspend fun queryDb() = withContext(dbDispatcher) {
-    database.query("SELECT * FROM users")
+    database.query("SELECT * FROM users")  // Up to 4 concurrent queries
+}
+
+suspend fun updateCache() = withContext(serialDispatcher) {
+    cache.set(key, value)  // Always single-threaded, no race conditions
 }</code></pre>
 
-<p><code>limitedParallelism()</code> on <code>Dispatchers.IO</code> creates an <strong>additional</strong> pool on top of the 64-thread limit (it can exceed 64). On <code>Dispatchers.Default</code>, it creates a <strong>view</strong> that limits concurrency within the existing pool. This distinction matters for capacity planning.</p>
+<h4>IO vs Default: Key Distinction</h4>
+
+<p>The behavior of <code>limitedParallelism()</code> differs depending on which dispatcher you call it on:</p>
+
+<ul>
+  <li><strong>On Dispatchers.IO:</strong> Creates an <strong>additional</strong> thread pool on top of the 64-thread limit. Can exceed 64 threads. Use this for truly isolated blocking work that shouldn't compete with the shared IO pool.</li>
+  <li><strong>On Dispatchers.Default:</strong> Creates a <strong>view within</strong> the existing CPU-core pool. Never creates new threads, just restricts concurrency. Use this for sequential execution without thread leaks.</li>
+</ul>
+
+<pre><code>// IO: creates additional threads (can exceed 64)
+val iso = Dispatchers.IO.limitedParallelism(100)
+
+// Default: view within the existing pool (never exceeds CPU cores)
+val seq = Dispatchers.Default.limitedParallelism(1)</code></pre>
+
+<p><strong>Production rule:</strong> Use <code>Default.limitedParallelism(1)</code> for serial execution (caches, databases, actor pattern). Use <code>IO.limitedParallelism(n)</code> only when you have truly isolated blocking work that needs its own capacity.</p>
 
 <!-- ============================================================ -->
 <h2>6. Coroutine Builders</h2>
@@ -820,6 +855,50 @@ DebugProbes.uninstall() // Clean up</code></pre>
     <li><strong>Thread name in crash reports:</strong> With debug mode, Crashlytics/Bugsnag captures the coroutine name in the thread name field</li>
   </ol>
   <p>At Google scale, teams add custom <code>ContinuationInterceptor</code> wrappers that inject trace IDs into coroutine contexts for distributed tracing across services.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>Quick Reference — Coroutine Internals at a Glance</h2>
+
+<p>Use this table when you need to recall how coroutines are organized internally:</p>
+
+<table>
+  <tr><th>Concept</th><th>Role</th><th>Key Point</th></tr>
+  <tr>
+    <td><strong>Dispatcher</strong></td>
+    <td>Decides which thread runs the coroutine</td>
+    <td>Intercepts the Continuation callback to route execution to the right thread/queue</td>
+  </tr>
+  <tr>
+    <td><strong>Continuation</strong></td>
+    <td>Holds the state and resume logic</td>
+    <td>Remembers where you suspended, your variables, and your context — essentially a callback with memory</td>
+  </tr>
+  <tr>
+    <td><strong>CoroutineContext</strong></td>
+    <td>Map of execution rules (Dispatcher, Job, CoroutineName, etc.)</td>
+    <td>Passed to every suspension point; determines both where and how the code resumes</td>
+  </tr>
+  <tr>
+    <td><strong>CoroutineScheduler</strong></td>
+    <td>Work-stealing thread pool (backs Default and IO dispatchers)</td>
+    <td>Each thread has a local queue (LIFO), idle threads steal from others (FIFO). Parked threads cost zero CPU.</td>
+  </tr>
+  <tr>
+    <td><strong>Job</strong></td>
+    <td>Tracks coroutine lifetime and manages cancellation</td>
+    <td>Part of CoroutineContext. Hierarchy forms a tree for structured concurrency.</td>
+  </tr>
+  <tr>
+    <td><strong>Suspension Point</strong></td>
+    <td>Where the coroutine pauses (e.g., delay(), network call)</td>
+    <td>Returns COROUTINE_SUSPENDED; the thread is freed to run other coroutines. Resume happens via the Continuation callback.</td>
+  </tr>
+</table>
+
+<div class="callout">
+  <div class="callout-label">Mental Model</div>
+  <p><strong>Dispatcher → picks the thread | Continuation → picks where in the code | Context → picks the rules</strong></p>
 </div>
 
 <div style="margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
