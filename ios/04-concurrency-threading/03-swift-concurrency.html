@@ -29,6 +29,7 @@
             <li><a href="#tasklocal">7. TaskLocal Values</a></li>
             <li><a href="#sendable">8. Sendable Protocol &amp; @Sendable Closures</a></li>
             <li><a href="#architect">9. Architect: Migrating from GCD to Structured Concurrency</a></li>
+            <li><a href="#runtime-internals">10. Runtime Internals: The Swift Concurrency Engine</a></li>
         </ul>
     </div>
 
@@ -721,6 +722,402 @@ Phase 3: Presentation layer
             <li><strong>Mark types as Sendable</strong> progressively — use <code>@unchecked Sendable</code> as a temporary bridge</li>
             <li><strong>Test thoroughly</strong>: async code has different timing characteristics than GCD code</li>
             <li><strong>Keep both APIs during transition</strong>: provide async + callback versions until all callers migrate</li>
+        </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2 id="runtime-internals">10. Runtime Internals: The Swift Concurrency Engine</h2>
+
+    <p>This section goes one level deeper than "how to use" — it explains <em>how the runtime actually works</em>: how the compiler shapes the state machine, what a Job really is, how the cooperative thread pool steals work, and exactly what happens at the machine level when you hit an <code>await</code>. This is the material that separates a Staff-level answer from a Senior-level answer in a deep system design loop.</p>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Must-Know</div>
+        <p>You don't need to memorize Swift Runtime source code. You <em>do</em> need a coherent mental model: async functions are partial functions stitched together by a state machine, scheduled as Jobs on Executors, with their live variables stored in a heap-allocated async frame. That model lets you predict performance, diagnose hangs, explain priority inversion, and defend architectural choices without guessing.</p>
+    </div>
+
+    <!-- ─────────────────────────────────────────── -->
+    <h3>10.1 State Machine Deep Dive: What the Compiler Actually Generates</h3>
+
+    <p>When the Swift compiler processes an <code>async</code> function, it performs a <strong>Continuation Passing Style (CPS) transformation</strong>. The function is split at every <code>await</code> point into <em>partial functions</em> — each one runs synchronously until the next suspension, then installs a callback and returns. The partial functions are unified into a single <strong>state machine function</strong> dispatched via a <code>switch</code> on an integer label.</p>
+
+    <div class="diagram">
+Source code:
+
+  func loadFeed() async throws -> [Post] {
+      let raw   = try await network.fetch("/feed")    // suspend point 0 → 1
+      let posts = try await parser.parse(raw)         // suspend point 1 → 2
+      return posts
+  }
+
+What the compiler generates (conceptually in SIL / IR):
+
+  struct LoadFeedFrame {        // heap-allocated async frame
+      var resumeLabel: Int32    // which partial function to run next
+      var raw:   RawData?       // variable spilled across suspend point 0→1
+      var posts: [Post]?        // variable spilled across suspend point 1→2
+      var continuation: UnsafeRawPointer  // caller's continuation
+  }
+
+  // The single "resume function" — a big switch on resumeLabel
+  func loadFeedResume(_ frame: UnsafeMutablePointer&lt;LoadFeedFrame&gt;) {
+      switch frame.pointee.resumeLabel {
+
+      case 0:   // .entry
+          frame.pointee.resumeLabel = 1
+          network.fetch("/feed",
+              continuation: frame)       // suspend: return control to scheduler
+          return
+
+      case 1:   // resumed after network.fetch
+          guard let raw = frame.pointee.raw else { throw … }
+          frame.pointee.resumeLabel = 2
+          parser.parse(raw,
+              continuation: frame)       // suspend again
+          return
+
+      case 2:   // resumed after parser.parse
+          let posts = frame.pointee.posts!
+          frame.pointee.continuation.resume(returning: posts)
+          // async frame is now deallocated
+      }
+  }
+    </div>
+
+    <p>Key observations from this model:</p>
+    <ul>
+        <li><strong>Variable spilling</strong> — any local variable live across a <code>await</code> is promoted from the stack into the async frame on the heap. Variables that are not live across any suspension stay on the stack. The compiler calculates the <em>maximum required frame size</em> at compile time; the frame is a single allocation.</li>
+        <li><strong>No recursive stack growth</strong> — because each partial function returns before calling the next one, there is no recursive stack build-up. The "call stack" is effectively the task tree in memory, not the thread stack.</li>
+        <li><strong>Synchronous hot path</strong> — if a called async function never actually suspends (e.g., it returns immediately), the state machine transitions happen without scheduling a Job. This is the <em>fast path</em> — no executor hop, no allocation.</li>
+    </ul>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Interview Question: Why are async frames heap-allocated rather than stack-allocated?</div>
+        <p>Stack frames must be freed in LIFO order — you can only pop frames in reverse order of creation. An async function that suspends needs its frame to outlive the current thread's stack (since the thread moves on to other work). The heap has no ordering constraint, so the frame can live until the continuation is eventually resumed, even if that's on a completely different thread hours later. The tradeoff is heap allocation cost, but since async functions only allocate once (not once per <code>await</code>), it is generally negligible.</p>
+    </div>
+
+    <!-- ─────────────────────────────────────────── -->
+    <h3>10.2 Jobs and the Executor Protocol</h3>
+
+    <p>The atomic unit of work in Swift Concurrency is a <strong>Job</strong>. A Job is a small heap-allocated object containing a function pointer (the next partial function to run) and metadata (priority, task reference). When a suspended task is resumed, it becomes a Job enqueued on an Executor.</p>
+
+    <div class="diagram">
+Job structure (conceptual):
+
+  struct Job {
+      var flags: JobFlags         // priority, kind (task vs nonisolated)
+      var function: JobFunction   // pointer to the resume partial function
+      var next: UnsafeMutablePointer&lt;Job&gt;?  // intrusive linked list
+  }
+
+  // Jobs are tiny — typically 32–64 bytes.
+  // The async frame is a SEPARATE, larger allocation pointed to by the Task.
+
+Executor protocol (public Swift ABI):
+
+  public protocol Executor: AnyObject, Sendable {
+      func enqueue(_ job: consuming ExecutorJob)
+  }
+
+  public protocol SerialExecutor: Executor {
+      // Adds: assertIsolated(), preconditionIsolated()
+      // Actors conform to SerialExecutor — one job at a time
+  }
+
+  // The global cooperative pool implements:
+  public protocol TaskExecutor: Executor { }
+    </div>
+
+    <p>When you write <code>await someActor.method()</code>, the runtime:</p>
+    <ol>
+        <li>Suspends the calling task — creates a Job for the <em>resumption</em> (the code after the <code>await</code>)</li>
+        <li>Enqueues that Job on the <strong>calling actor's own executor</strong> (to be run when the actor becomes idle again, after the callee returns)</li>
+        <li>Creates a <em>new</em> Job for executing <code>someActor.method()</code> and enqueues it on <code>someActor</code>'s executor</li>
+        <li>Returns the current thread to the pool — which picks up the next available Job</li>
+    </ol>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Interview Trap: "Does await always context-switch?"</div>
+        <p>No. The runtime has a fast path: if the called async function runs synchronously to completion (no actual suspension), the Job-enqueue/dequeue round-trip is skipped. The function just runs inline as a function call. The <em>potential</em> to suspend is compiled in, but the runtime skips the overhead when suspension doesn't occur. This is why lightweight async functions have very low overhead in practice.</p>
+    </div>
+
+    <!-- ─────────────────────────────────────────── -->
+    <h3>10.3 The Cooperative Thread Pool: How It Actually Works</h3>
+
+    <p>The default executor ("cooperative thread pool") is built on top of <code>libdispatch</code> using a special primitive: <strong><code>dispatch_workloop_t</code></strong>. Unlike a regular <code>dispatch_queue_t</code>, a workloop is a <em>FIFO job queue with work-stealing</em>, designed for high-throughput low-latency scheduling.</p>
+
+    <div class="diagram">
+Cooperative Thread Pool Architecture:
+
+┌───────────────────────────────────────────────────────────────────┐
+│                    Swift Runtime Global Executor                   │
+│                                                                    │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │              dispatch_workloop_t (one per core)               │ │
+│  │                                                              │ │
+│  │  Worker 0   Worker 1   Worker 2   Worker 3   Worker 4  ...  │ │
+│  │  [Job Q]    [Job Q]    [Job Q]    [Job Q]    [Job Q]        │ │
+│  │     │          │                    ▲                        │ │
+│  │     │  steal ──┘                    │  steal                 │ │
+│  │     └──────────────────────────────┘                        │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                          │                                         │
+│              Width = ProcessInfo.processInfo.activeProcessorCount  │
+│              (NOT 64 like GCD — scales with actual hardware)       │
+└───────────────────────────────────────────────────────────────────┘
+
+Work-stealing algorithm:
+1. Each worker thread has its own local deque of Jobs
+2. Worker pops from the BOTTOM of its own deque (LIFO — keeps hot cache)
+3. Idle worker STEALS from the TOP of another worker's deque (FIFO — oldest work)
+4. This keeps all cores busy without contention on a shared queue
+    </div>
+
+    <h3>10.3.1 Width Limit: Why "No Thread Explosion"</h3>
+
+    <p>The cooperative pool creates <strong>exactly one thread per CPU core</strong> at startup and does not create more (unlike GCD which can create up to 64). This is possible because tasks never block their thread — they suspend (yielding the thread) instead of blocking. The mathematical invariant is: <em>if no task ever blocks a thread, N cores needs at most N threads to achieve 100% CPU utilization</em>.</p>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">The Exception: Blocking Calls Break the Model</div>
+        <p>Calling a blocking API (synchronous file I/O, <code>Thread.sleep</code>, a lock held for a long time) from async code is the cardinal sin of Swift Concurrency. A blocked thread cannot run other Jobs. If all N threads block simultaneously, the entire app hangs. The runtime has a mitigation: it can spawn <em>overflow threads</em> when it detects starvation (it tracks pending vs running jobs), but this is a safety valve, not a design target. Always use async APIs or dispatch blocking work to a GCD queue via <code>withCheckedContinuation</code>.</p>
+    </div>
+
+    <pre><code><span class="comment">// ❌ WRONG: blocks a cooperative pool thread</span>
+<span class="keyword">func</span> <span class="func">badLoad</span>() <span class="keyword">async</span> -> <span class="type">Data</span> {
+    <span class="keyword">return</span> <span class="keyword">try</span>! <span class="type">Data</span>(contentsOf: fileURL)  <span class="comment">// Synchronous blocking I/O</span>
+}
+
+<span class="comment">// ✅ CORRECT: move blocking work off the cooperative pool</span>
+<span class="keyword">func</span> <span class="func">goodLoad</span>() <span class="keyword">async throws</span> -> <span class="type">Data</span> {
+    <span class="keyword">return try await</span> <span class="func">withCheckedThrowingContinuation</span> { cont <span class="keyword">in</span>
+        <span class="type">DispatchQueue</span>.global(qos: .utility).<span class="func">async</span> {
+            <span class="keyword">do</span> {
+                <span class="keyword">let</span> data = <span class="keyword">try</span> <span class="type">Data</span>(contentsOf: fileURL)
+                cont.<span class="func">resume</span>(returning: data)
+            } <span class="keyword">catch</span> {
+                cont.<span class="func">resume</span>(throwing: error)
+            }
+        }
+    }
+}
+
+<span class="comment">// ✅ ALSO CORRECT: use async file API (iOS 15+)</span>
+<span class="keyword">func</span> <span class="func">bestLoad</span>() <span class="keyword">async throws</span> -> <span class="type">Data</span> {
+    <span class="keyword">let</span> (data, _) = <span class="keyword">try await</span> <span class="type">URLSession</span>.shared.<span class="func">data</span>(from: fileURL)
+    <span class="keyword">return</span> data
+}</code></pre>
+
+    <!-- ─────────────────────────────────────────── -->
+    <h3>10.4 Continuation Lifecycle: From Suspend to Resume</h3>
+
+    <p>Understanding exactly what happens during a suspension is key to diagnosing hangs and understanding the performance model.</p>
+
+    <div class="diagram">
+Lifecycle of a single await:
+
+  caller task (running on Worker 2)
+       │
+       │  await someAsyncFunc()
+       │
+       ▼
+  [1] Caller creates a Continuation
+      • UnsafeContinuation&lt;T, E&gt; = thin wrapper around a raw AsyncTask pointer
+      • CheckedContinuation adds an atomic "resumed" flag on top
+
+  [2] Caller passes Continuation to someAsyncFunc
+      (which receives it in its withCheckedContinuation block)
+
+  [3] someAsyncFunc registers the continuation with the underlying system
+      (e.g., URLSession stores it, OS event source stores it)
+
+  [4] Caller's state machine sets resumeLabel = "after await"
+      and RETURNS — freeing Worker 2 for other Jobs
+
+  [5] ... time passes, thread does other work ...
+
+  [6] Underlying system completes (network response arrives)
+      Calls continuation.resume(returning: value)
+
+  [7] resume() creates a new Job from the caller's async frame
+      and enqueues it on the caller's original Executor
+
+  [8] A worker thread picks up the Job, loads the async frame,
+      switches resumeLabel, and continues execution
+      (may be a different thread than Worker 2 — doesn't matter)
+    </div>
+
+    <h3>10.4.1 CheckedContinuation's Atomic Guard</h3>
+
+    <p><code>CheckedContinuation</code> wraps <code>UnsafeContinuation</code> and adds an <strong>atomic bitfield</strong> to enforce the "resume exactly once" contract. The atomic has three states: <code>.notYetResumed</code>, <code>.resumed</code>, and <code>.abandoned</code>. A CAS (compare-and-swap) operation gates every <code>resume()</code> call — only the first succeeds; subsequent calls crash in debug or emit a runtime warning. When the <code>CheckedContinuation</code> itself is deallocated without having been resumed, the deinit checks the atomic and triggers the "continuation leaked" warning in debug builds.</p>
+
+    <pre><code><span class="comment">// Conceptual implementation of CheckedContinuation's safety gate:</span>
+<span class="comment">// (not actual Swift runtime source, but accurate mental model)</span>
+
+<span class="keyword">final class</span> <span class="type">CheckedContinuationBox</span>&lt;<span class="type">T</span>, <span class="type">E</span>: <span class="type">Error</span>&gt; {
+    <span class="keyword">private let</span> unsafe: <span class="type">UnsafeContinuation</span>&lt;<span class="type">T</span>, <span class="type">E</span>&gt;
+    <span class="keyword">private let</span> status = <span class="type">Atomic</span>&lt;<span class="type">Status</span>&gt;(.notYetResumed)
+
+    <span class="keyword">enum</span> <span class="type">Status</span> { <span class="keyword">case</span> notYetResumed, resumed, abandoned }
+
+    <span class="keyword">func</span> <span class="func">resume</span>(returning value: <span class="type">T</span>) {
+        <span class="comment">// Atomic CAS: only succeeds if currently .notYetResumed</span>
+        <span class="keyword">guard</span> status.<span class="func">compareExchange</span>(
+            expected: .notYetResumed, desired: .resumed
+        ).exchanged <span class="keyword">else</span> {
+            fatalError(<span class="string">"Continuation already resumed!"</span>)  <span class="comment">// crash in debug</span>
+        }
+        unsafe.<span class="func">resume</span>(returning: value)  <span class="comment">// enqueues the Job</span>
+    }
+
+    <span class="keyword">deinit</span> {
+        <span class="keyword">if</span> status.load() == .notYetResumed {
+            <span class="comment">// Emit runtime warning: continuation abandoned — task will hang</span>
+        }
+    }
+}</code></pre>
+
+    <!-- ─────────────────────────────────────────── -->
+    <h3>10.5 Async Frame Layout and Allocation Strategy</h3>
+
+    <p>The compiler determines the <strong>async frame size at compile time</strong> by computing the maximum storage needed across all suspension points. It does <em>not</em> allocate and free memory at each individual suspension — the entire frame lives for the lifetime of the function call.</p>
+
+    <div class="diagram">
+Async frame for a function with 3 suspension points:
+
+  Suspension    Variables alive             Frame slots used
+  ─────────────────────────────────────────────────────────
+  entry → S0    id: String                 [slot0: String]
+  S0 → S1       id, userData: UserData     [slot0: String, slot1: UserData]
+  S1 → S2       userData, prefs: Prefs     [slot0: -, slot1: UserData, slot2: Prefs]
+                                            ^-- slot0 reused (id is dead)
+  S2 → return   result: Result             [slot0: Result, slot1: -, slot2: -]
+                                            ^-- slots 1,2 reused
+
+  Frame size = max(layout at each point)
+             = max(String, String+UserData, UserData+Prefs, Result)
+             = allocated ONCE, used across all states
+
+  Memory layout:
+  ┌────────────────────────────────────────────────────────┐
+  │  AsyncTask header (priority, flags, refcount — ~64B)   │
+  ├────────────────────────────────────────────────────────┤
+  │  resumeLabel: Int32                                    │
+  │  slot0  (max-size union of: String / Result)           │
+  │  slot1  (max-size union of: UserData)                  │
+  │  slot2  (max-size union of: Prefs)                     │
+  └────────────────────────────────────────────────────────┘
+    </div>
+
+    <p>This means: <strong>a deeply nested chain of async calls does NOT linearly grow memory</strong> the way recursive synchronous calls grow the stack. Each async function has its own separately allocated frame. The "virtual call stack" is a tree of heap allocations, not a contiguous stack region. Stack overflow is not a concern; heap fragmentation from many small allocations is the theoretical concern (in practice, the allocator handles this well).</p>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Allocation Elision: The Compiler Optimization</div>
+        <p>For async functions that <em>never actually suspend</em> (all awaited callees return immediately without scheduling a Job), the Swift compiler and optimizer can sometimes elide the heap allocation entirely and keep the frame on the stack. This is similar to Kotlin's coroutine "direct" fast path. It's an optimization the compiler performs when it can statically prove suspension won't happen — you can't rely on it, but it means simple async wrappers are often cheaper than they appear.</p>
+    </div>
+
+    <!-- ─────────────────────────────────────────── -->
+    <h3>10.6 The @MainActor Executor: How the Main Thread Fits In</h3>
+
+    <p>The main thread is <em>not</em> part of the cooperative thread pool. It runs its own <code>SerialExecutor</code> — the <strong>MainActor executor</strong> — which is backed by the main thread's <code>RunLoop</code> (specifically, a <code>dispatch_main_queue</code> source). Jobs enqueued on the MainActor executor become <code>DispatchQueue.main</code> work items at the libdispatch level.</p>
+
+    <div class="diagram">
+How @MainActor execution is scheduled:
+
+  await MainActor.run { updateUI() }
+         │
+         ▼
+  Creates a Job and calls:
+    MainActor.shared.executor.enqueue(job)
+         │
+         ▼
+  Internally calls:
+    dispatch_async(dispatch_get_main_queue(), { job.run() })
+         │
+         ▼
+  Main RunLoop's next iteration picks it up:
+    CFRunLoop → source0/source1 handlers → drain main queue
+         │
+         ▼
+  job.run() → resumes the partial function on main thread
+
+Performance implication:
+  Every actor hop TO @MainActor = one dispatch_async() call
+  Every actor hop AWAY from @MainActor = one enqueue on the cooperative pool
+  Excessive @MainActor hops (e.g., inside a tight loop) show up as
+  "main thread blocked on dispatch" in Instruments Time Profiler
+    </div>
+
+    <pre><code><span class="comment">// Inefficient: hops to MainActor on every iteration</span>
+<span class="keyword">func</span> <span class="func">badUpdate</span>(items: [<span class="type">Item</span>]) <span class="keyword">async</span> {
+    <span class="keyword">for</span> item <span class="keyword">in</span> items {
+        <span class="keyword">let</span> processed = <span class="keyword">await</span> <span class="func">process</span>(item)      <span class="comment">// background</span>
+        <span class="keyword">await</span> <span class="type">MainActor</span>.<span class="func">run</span> { results.<span class="func">append</span>(processed) }  <span class="comment">// hop per item!</span>
+    }
+}
+
+<span class="comment">// Efficient: batch the main-thread work</span>
+<span class="keyword">func</span> <span class="func">goodUpdate</span>(items: [<span class="type">Item</span>]) <span class="keyword">async</span> {
+    <span class="keyword">var</span> processed: [<span class="type">ProcessedItem</span>] = []
+    <span class="keyword">for</span> item <span class="keyword">in</span> items {
+        processed.<span class="func">append</span>(<span class="keyword">await</span> <span class="func">process</span>(item))   <span class="comment">// background</span>
+    }
+    <span class="keyword">await</span> <span class="type">MainActor</span>.<span class="func">run</span> { results = processed }    <span class="comment">// single hop</span>
+}</code></pre>
+
+    <!-- ─────────────────────────────────────────── -->
+    <h3>10.7 Runtime Internals: Summary Mental Model</h3>
+
+    <div class="diagram">
+Complete picture: what happens when you write "let x = await f()"
+
+  Your code        Compiler           Runtime              libdispatch/OS
+  ─────────        ────────           ───────              ──────────────
+  await f()
+      │
+      │   CPS       state machine
+      │──────────►  partial func 0:
+      │               - save locals to async frame
+      │               - set resumeLabel = 1
+      │               - call f() passing frame as continuation
+      │               - RETURN (free thread)
+      │                                     │
+      │                                     │ f() suspends:
+      │                                     │  - registers continuation
+      │                                     │    with URLSession/OS
+      │                                     │
+      │                                (time passes — thread runs other Jobs)
+      │
+      │                                     │ OS event fires (data arrives)
+      │                                     │  - continuation.resume(returning: x)
+      │                                     │    creates new Job from frame
+      │                                     │    enqueues Job on executor
+      │
+      │                                                     │ worker picks up Job
+      │                                                     │ loads async frame
+      │   partial    state machine
+      │◄──────────   partial func 1:
+      │               - load x from async frame
+      │               - continue with x
+      ▼
+  let x = (result)   ← execution continues here, possibly on different thread
+
+Key invariants:
+  • 1 heap allocation per async function call (the async frame)
+  • 1 Job created per suspension point that actually suspends
+  • Thread pool width = CPU core count (not 64)
+  • Blocking a thread is always wrong — it starves the entire pool
+  • Actor hops are cheap but not free — batch work where possible
+    </div>
+
+    <div class="callout callout-success">
+        <div class="callout-title">Interview Checklist: What a Staff Candidate Should Be Able to Say</div>
+        <ul>
+            <li><strong>State machine</strong>: "The compiler splits async functions at every await into partial functions unified by a switch on a resume label."</li>
+            <li><strong>Async frame</strong>: "Live variables are spilled into a single heap-allocated frame whose size is computed at compile time. No recursive stack growth."</li>
+            <li><strong>Job</strong>: "A Job is a tiny heap object with a function pointer and priority metadata. Suspension = enqueue a Job; resumption = dequeue and run that Job."</li>
+            <li><strong>Cooperative pool</strong>: "N threads for N cores, backed by dispatch_workloop_t with work-stealing. No thread explosion because tasks suspend instead of blocking."</li>
+            <li><strong>Continuation</strong>: "UnsafeContinuation is a raw pointer to the AsyncTask. CheckedContinuation wraps it with an atomic CAS to enforce resume-exactly-once."</li>
+            <li><strong>@MainActor</strong>: "Its executor wraps dispatch_get_main_queue(). Every MainActor hop is a dispatch_async call — batch UI updates to minimize hops."</li>
+            <li><strong>Blocking danger</strong>: "Blocking a cooperative pool thread starves the pool. Always bridge blocking APIs via GCD or use async equivalents."</li>
         </ul>
     </div>
 

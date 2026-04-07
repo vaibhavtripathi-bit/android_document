@@ -1,6 +1,6 @@
 # Android, iOS, React JS & React Native Interview Preparation
 
-A comprehensive collection of deep-dive documentation covering Android, iOS, React JS, and React Native internals for senior-level (L5/L6) interview preparation.
+A comprehensive collection of deep-dive documentation covering Android, iOS, React JS, and React Native internals, plus an Android system design track for senior-level (L5/L6) interview preparation.
 
 ---
 
@@ -21,7 +21,16 @@ android_document/
 │   ├── 10-system-services/
 │   ├── 11-view-system/
 │   ├── 12-modularization-build/
+│   ├── 13-media-streaming/
+│   ├── 14-large-screen-foldables/
+│   ├── 15-on-device-ml/
+│   ├── 16-android-tv/
 │   └── engineering-problems/
+│
+├── android_system_design/        # Android system design prep track
+│   ├── interview-tips/
+│   ├── 00-prep-plan.html
+│   └── 09-case-study-video-player.html
 │
 ├── ios/                          # iOS deep-dive documentation
 │   ├── 01-app-lifecycle/
@@ -100,7 +109,24 @@ android_document/
 | 10 | System Services | AMS, WMS, PMS, Context internals |
 | 11 | View System | Measure/Layout/Draw pass, RecyclerView internals, custom views |
 | 12 | Modularization & Build | Gradle internals, dynamic features, modularization strategies |
+| 13 | Media & Streaming | Media3, HLS/DASH, ABR, Widevine DRM, offline playback |
+| 14 | Large Screen & Foldables | Window size classes, fold postures, adaptive layouts, multi-window |
+| 15 | On-Device ML | TFLite, ML Kit, model optimization, delegates, inference pipelines |
+| 16 | Android TV | Leanback UI, D-pad navigation, TV architecture, playback UX |
 | — | **Engineering Problems** | Rate limiting, module communication, crash resilience, caching, remote config, network-aware uploads, PII protection, multi-process safety, concurrency, product flavors |
+
+---
+
+## Android System Design Track
+
+The `android_system_design/` folder complements the deep-dive topic notes with system design preparation focused on Staff/L6 interviews.
+
+| Area | Focus Areas |
+|---|---|
+| Core Architecture | Architecture patterns, offline-first networking, local storage, SDK/library design |
+| Platform Systems | Media rendering, background work, security/privacy, observability, release engineering |
+| Case Studies | Video player, messaging app, analytics SDK |
+| Interview Prep | Android domain tips, system design tips, coding tips, behavioral preparation |
 
 ---
 

@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kotlin Coroutines Internals — Android L6 Interview Prep</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 1100px; margin: 0 auto; padding: 24px; background: #0d1117; color: #e6edf3; line-height: 1.7; }
+  h1 { color: #58a6ff; border-bottom: 2px solid #21262d; padding-bottom: 12px; }
+  h2 { color: #79c0ff; margin-top: 40px; }
+  h3 { color: #d2a8ff; }
+  h4 { color: #ffa657; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin: 16px 0; }
+  .warning { background: #3d1a1a; border-left: 4px solid #f85149; padding: 16px; border-radius: 4px; margin: 16px 0; }
+  .tip { background: #0d2d1a; border-left: 4px solid #3fb950; padding: 16px; border-radius: 4px; margin: 16px 0; }
+  .interview-script { background: #0c1929; border: 1px solid #1f6feb; border-radius: 8px; padding: 20px; margin: 16px 0; }
+  .interview-script h4 { color: #58a6ff; margin-top: 0; }
+  pre { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 16px; overflow-x: auto; }
+  code { font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 0.875em; }
+  .inline-code { background: #21262d; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 0.875em; }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+  th { background: #21262d; color: #f0f6fc; padding: 12px; text-align: left; }
+  td { border: 1px solid #30363d; padding: 10px 12px; }
+  tr:nth-child(even) { background: #161b22; }
+  .l6-badge { background: #1f6feb; color: white; padding: 2px 8px; border-radius: 12px; font-size: 0.75em; font-weight: bold; }
+  .nav { background: #161b22; padding: 12px 16px; border-radius: 8px; margin-bottom: 24px; }
+  .nav a { color: #58a6ff; text-decoration: none; margin-right: 16px; }
+  .reject-box { background: #3d1a00; border-left: 4px solid #d29922; padding: 16px; border-radius: 4px; margin: 16px 0; }
+  .diagram { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 20px; font-family: monospace; white-space: pre; overflow-x: auto; color: #8b949e; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="00-prep-plan.html">← Prep Plan</a>
+  <a href="11-case-study-analytics-sdk.html">← Analytics SDK</a>
+  <a href="13-testing-strategy.html">Testing Strategy →</a>
+</div>
+
+<h1>Kotlin Coroutines & Structured Concurrency Internals</h1>
+<p><strong>Why this matters at L6:</strong> Google interviewers probe coroutine internals — not just "use <span class="inline-code">viewModelScope.launch</span>". They expect you to explain <em>why</em> coroutines are structured, how cancellation propagates, when to choose each dispatcher, and how to prevent memory leaks and race conditions in production code.</p>
+
+<!-- ============================================================ -->
+<h2>1. The Mental Model: Coroutines Are Not Threads</h2>
+
+<div class="card">
+  <h3>Suspension vs Blocking — The Core Insight</h3>
+  <table>
+    <tr><th>Concept</th><th>Thread</th><th>Coroutine</th></tr>
+    <tr><td>Blocking wait</td><td>Thread sleeps, OS overhead</td><td>Suspends, thread freed immediately</td></tr>
+    <tr><td>Context switch</td><td>OS schedules (~1–5µs overhead)</td><td>Coroutine dispatch (~nanoseconds)</td></tr>
+    <tr><td>Memory</td><td>~1MB stack per thread</td><td>~100–200 bytes per continuation</td></tr>
+    <tr><td>10,000 concurrent</td><td>10GB stack RAM, likely OOM</td><td>~2MB total, trivial</td></tr>
+    <tr><td>Cancel</td><td>interrupt() + flag check</td><td>CancellationException propagation</td></tr>
+  </table>
+  <p><strong>Key insight:</strong> A coroutine is a <em>continuation</em> — a state machine capturing where to resume and what local variables exist. <span class="inline-code">suspend</span> transforms the function at compile time into a state machine with a <span class="inline-code">Continuation&lt;T&gt;</span> parameter.</p>
+</div>
+
+<div class="card">
+  <h3>What the Compiler Does to <span class="inline-code">suspend fun</span></h3>
+  <pre><code>// What you write:
+suspend fun fetchUser(id: String): User {
+    val raw = api.getUser(id)   // suspend point
+    return mapper.map(raw)
+}
+
+// What the compiler generates (simplified):
+fun fetchUser(id: String, continuation: Continuation&lt;User&gt;): Any? {
+    // State machine with label-based switch
+    when (continuation.label) {
+        0 -> {
+            continuation.label = 1
+            val result = api.getUser(id, continuation) // pass continuation down
+            if (result == COROUTINE_SUSPENDED) return COROUTINE_SUSPENDED
+            // fall through if already complete
+        }
+        1 -> {
+            val raw = continuation.result as RawUser
+            return mapper.map(raw)
+        }
+    }
+}</code></pre>
+  <div class="tip"><strong>Say this in interviews:</strong> "The suspend keyword is purely a compile-time transformation. At runtime, there's no magic — just a state machine and a callback (the Continuation). This is why coroutines have near-zero overhead when not suspended."</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Structured Concurrency — The Most Important Concept</h2>
+
+<div class="card">
+  <h3>The Problem Structured Concurrency Solves</h3>
+  <div class="warning">
+    <strong>Pre-structured concurrency (GlobalScope / raw callbacks):</strong>
+    <ul>
+      <li>Coroutines outlive their creator → memory leaks</li>
+      <li>No automatic cancellation → ghost coroutines consuming resources</li>
+      <li>Exceptions silently swallowed → no error propagation</li>
+    </ul>
+  </div>
+  <h4>The Three Guarantees of Structured Concurrency</h4>
+  <pre><code>// 1. PARENT WAITS FOR ALL CHILDREN
+viewModelScope.launch {
+    val a = async { fetchA() }
+    val b = async { fetchB() }
+    // viewModelScope.launch does NOT complete until both a and b are done
+    val result = a.await() + b.await()
+}
+
+// 2. CANCELLATION CASCADES DOWN
+viewModelScope.launch {
+    val job = launch { longRunningWork() }
+    // When viewModelScope is cancelled (ViewModel cleared):
+    // → job is cancelled → longRunningWork() gets CancellationException
+    // Nothing escapes!
+}
+
+// 3. EXCEPTIONS PROPAGATE UP (except in async)
+viewModelScope.launch {
+    launch { throw IOException("fail") }
+    // IOException propagates to viewModelScope's CoroutineExceptionHandler
+    // or crashes the app if no handler
+}</code></pre>
+</div>
+
+<div class="card">
+  <h3>CoroutineScope, Job, and the Parent-Child Tree</h3>
+  <div class="diagram">
+viewModelScope (Job)
+├── launch { ... }  ← Job (child 1)
+│   ├── async { fetchA() }  ← Deferred (grandchild 1)
+│   └── async { fetchB() }  ← Deferred (grandchild 2)
+└── launch { ... }  ← Job (child 2)
+
+Cancel viewModelScope → ALL children + grandchildren cancelled automatically
+Exception in grandchild → propagates to child → propagates to viewModelScope</div>
+  <pre><code>// WRONG: Breaking structured concurrency
+class MyViewModel : ViewModel() {
+    fun load() {
+        GlobalScope.launch { // ❌ No parent! Outlives ViewModel!
+            val data = repo.fetch()
+            _state.value = data
+        }
+    }
+}
+
+// RIGHT: Always use a scope tied to lifecycle
+class MyViewModel : ViewModel() {
+    fun load() {
+        viewModelScope.launch { // ✅ Cancelled when ViewModel cleared
+            val data = repo.fetch()
+            _state.value = data
+        }
+    }
+}</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Dispatcher Selection — Critical for L6</h2>
+
+<div class="card">
+  <table>
+    <tr><th>Dispatcher</th><th>Thread Pool</th><th>Use When</th><th>Anti-patterns</th></tr>
+    <tr><td><span class="inline-code">Dispatchers.Main</span></td><td>Android Main thread (1 thread)</td><td>UI updates, reading StateFlow, starting work</td><td>Any blocking I/O (causes ANR)</td></tr>
+    <tr><td><span class="inline-code">Dispatchers.IO</span></td><td>Up to 64 threads (or CPU count if higher)</td><td>File I/O, Network (OkHttp blocks internally), Room queries</td><td>CPU-heavy work (wastes IO threads)</td></tr>
+    <tr><td><span class="inline-code">Dispatchers.Default</span></td><td>CPU core count threads</td><td>JSON parsing, sorting, image processing, heavy computation</td><td>Blocking I/O (starves CPU tasks)</td></tr>
+    <tr><td><span class="inline-code">Dispatchers.Unconfined</span></td><td>None (runs in caller's thread initially)</td><td>Testing only, specific framework internals</td><td>Never in production Android code</td></tr>
+  </table>
+  <pre><code>// Production pattern: dispatcher injection for testability
+class UserRepository(
+    private val api: UserApi,
+    private val dao: UserDao,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val defaultDispatcher: CoroutineDispatcher = Dispatchers.Default
+) {
+    suspend fun getUsers(): List&lt;User&gt; = withContext(ioDispatcher) {
+        val raw = api.fetchUsers()              // blocking I/O
+        val cached = dao.getAll()               // Room I/O
+        withContext(defaultDispatcher) {
+            mergeAndSort(raw, cached)           // CPU-intensive
+        }
+    }
+}</code></pre>
+  <div class="tip"><strong>L6 signal:</strong> Always inject dispatchers — never hardcode <span class="inline-code">Dispatchers.IO</span> in production classes. This enables instant unit testing without real threads.</div>
+</div>
+
+<div class="card">
+  <h3>withContext vs launch vs async</h3>
+  <table>
+    <tr><th>Builder</th><th>Returns</th><th>Suspends caller?</th><th>Use for</th></tr>
+    <tr><td><span class="inline-code">withContext</span></td><td>T (the result)</td><td>Yes</td><td>Switch dispatcher for a block, return result</td></tr>
+    <tr><td><span class="inline-code">launch</span></td><td>Job (fire and forget)</td><td>No</td><td>Side effects, fire-and-forget operations</td></tr>
+    <tr><td><span class="inline-code">async</span></td><td>Deferred&lt;T&gt;</td><td>No (until await())</td><td>Parallel work where you need results</td></tr>
+    <tr><td><span class="inline-code">coroutineScope</span></td><td>T</td><td>Yes</td><td>Parallel decomposition with structured concurrency</td></tr>
+    <tr><td><span class="inline-code">supervisorScope</span></td><td>T</td><td>Yes</td><td>Parallel decomposition where one failure shouldn't cancel siblings</td></tr>
+  </table>
+  <pre><code>// PARALLEL fetch with coroutineScope (fail-fast)
+suspend fun loadDashboard(): Dashboard = coroutineScope {
+    val user = async { userRepo.getUser() }
+    val feed = async { feedRepo.getFeed() }
+    val ads  = async { adsRepo.getAds() }
+    Dashboard(user.await(), feed.await(), ads.await())
+    // If user.await() throws, feed and ads are cancelled too (fail-fast)
+}
+
+// PARALLEL fetch with supervisorScope (independent failures)
+suspend fun loadDashboard(): Dashboard = supervisorScope {
+    val feed = async { feedRepo.getFeed() }
+    val ads  = async {
+        try { adsRepo.getAds() } catch (e: Exception) { emptyList() }
+    }
+    Dashboard(feed.await(), ads.await())
+    // Ads failing doesn't cancel feed
+}</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Cancellation — Where Bugs Live</h2>
+
+<div class="card">
+  <h3>Cancellation Is Cooperative</h3>
+  <div class="warning">
+    <strong>Common trap:</strong> Cancellation only works if the code checks for it. CPU-bound loops that never call a suspend function will NOT cancel.
+  </div>
+  <pre><code>// BUG: Uncancellable CPU work
+suspend fun processList(items: List&lt;Item&gt;): List&lt;Result&gt; {
+    return items.map { heavyCompute(it) }  // ❌ Never suspends, never cancels!
+}
+
+// FIX option 1: yield() to create cancellation points
+suspend fun processList(items: List&lt;Item&gt;): List&lt;Result&gt; {
+    return items.map {
+        yield()  // ✅ Checks cancellation AND lets other coroutines run
+        heavyCompute(it)
+    }
+}
+
+// FIX option 2: ensureActive() for lighter-weight check
+suspend fun processList(items: List&lt;Item&gt;): List&lt;Result&gt; {
+    return items.mapIndexed { i, item ->
+        if (i % 100 == 0) currentCoroutineContext().ensureActive()
+        heavyCompute(item)
+    }
+}
+
+// FIX option 3: isActive check (doesn't throw, you handle the exit)
+suspend fun processList(items: List&lt;Item&gt;): List&lt;Result&gt; {
+    val results = mutableListOf&lt;Result&gt;()
+    for (item in items) {
+        if (!isActive) break  // ✅ Check cancellation flag
+        results.add(heavyCompute(item))
+    }
+    return results
+}</code></pre>
+</div>
+
+<div class="card">
+  <h3>CancellationException Must Not Be Swallowed</h3>
+  <pre><code>// DEADLY BUG: Catching CancellationException
+suspend fun doWork() {
+    try {
+        delay(1000)
+    } catch (e: Exception) {  // ❌ Catches CancellationException!
+        log("Error: $e")
+        // Silently swallows cancellation → coroutine thinks it finished normally
+        // Parent never gets the cancellation signal → scope hangs forever
+    }
+}
+
+// FIX: Never catch Exception broadly in coroutines
+suspend fun doWork() {
+    try {
+        delay(1000)
+    } catch (e: CancellationException) {
+        throw e  // ✅ Always rethrow cancellation!
+    } catch (e: IOException) {
+        log("Network error: $e")  // Handle only specific exceptions
+    }
+}
+
+// FIX: Or use NonCancellable for cleanup that must complete
+suspend fun doWorkWithCleanup() {
+    try {
+        delay(1000)
+    } finally {
+        withContext(NonCancellable) {
+            // This runs even if coroutine is cancelled
+            // Use for cleanup: closing resources, logging, etc.
+            database.writeCompletionMarker()
+        }
+    }
+}</code></pre>
+  <div class="warning"><strong>L6 exam question:</strong> "Why does wrapping coroutine work in <span class="inline-code">try { } catch(e: Exception) { }</span> break structured concurrency?" — Answer: It swallows <span class="inline-code">CancellationException</span>, preventing cancellation propagation up the scope tree.</div>
+</div>
+
+<div class="card">
+  <h3>Exception Handling: launch vs async</h3>
+  <pre><code>// launch: exception is propagated immediately to parent scope
+viewModelScope.launch {
+    launch {
+        throw IOException("oops")
+        // → IOException propagates to viewModelScope
+        // → viewModelScope's CoroutineExceptionHandler fires (if set)
+        // → Or crashes app if no handler
+    }
+}
+
+// async: exception is stored, thrown at await()
+viewModelScope.launch {
+    val deferred = async {
+        throw IOException("oops")
+        // Exception stored in Deferred, NOT propagated yet
+    }
+    try {
+        deferred.await()  // IOException thrown HERE
+    } catch (e: IOException) {
+        // Handled!
+    }
+}
+
+// Production pattern: CoroutineExceptionHandler for launch
+val handler = CoroutineExceptionHandler { _, throwable ->
+    if (throwable is CancellationException) return@CoroutineExceptionHandler
+    _errorState.value = throwable.toUiError()
+}
+viewModelScope.launch(handler) {
+    // Safe launch with centralized error handling
+}</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Flow — The Reactive Primitive</h2>
+
+<div class="card">
+  <h3>Cold vs Hot Flows</h3>
+  <table>
+    <tr><th>Type</th><th>Cold / Hot</th><th>Replays?</th><th>Use for</th></tr>
+    <tr><td><span class="inline-code">flow { }</span></td><td>Cold</td><td>Full replay per collector</td><td>Database queries, network calls that run per subscription</td></tr>
+    <tr><td><span class="inline-code">StateFlow</span></td><td>Hot</td><td>Latest value only</td><td>UI state (replaces LiveData)</td></tr>
+    <tr><td><span class="inline-code">SharedFlow</span></td><td>Hot</td><td>Configurable (replay cache)</td><td>Events, pub/sub, broadcast</td></tr>
+    <tr><td><span class="inline-code">Channel</span></td><td>Hot</td><td>None (consumed)</td><td>One-to-one communication, task queues</td></tr>
+    <tr><td><span class="inline-code">callbackFlow</span></td><td>Cold</td><td>None</td><td>Wrapping callback-based APIs into Flow</td></tr>
+  </table>
+  <pre><code>// StateFlow: replaces LiveData for UI state
+class FeedViewModel(repo: FeedRepository) : ViewModel() {
+    private val _uiState = MutableStateFlow&lt;FeedUiState&gt;(FeedUiState.Loading)
+    val uiState: StateFlow&lt;FeedUiState&gt; = _uiState.asStateFlow()
+
+    init {
+        viewModelScope.launch {
+            repo.feedFlow()
+                .map { items -> FeedUiState.Success(items) }
+                .catch { e -> emit(FeedUiState.Error(e.message)) }
+                .collect { _uiState.value = it }
+        }
+    }
+}
+
+// SharedFlow: for one-time events (navigation, toasts)
+class MyViewModel : ViewModel() {
+    private val _events = MutableSharedFlow&lt;UiEvent&gt;()
+    val events: SharedFlow&lt;UiEvent&gt; = _events.asSharedFlow()
+
+    fun onButtonClick() {
+        viewModelScope.launch {
+            _events.emit(UiEvent.NavigateToDetail(id = 42))
+        }
+    }
+}
+
+// callbackFlow: wrapping location updates
+fun locationFlow(manager: LocationManager): Flow&lt;Location&gt; = callbackFlow {
+    val listener = LocationListener { location -> trySend(location) }
+    manager.requestUpdates(listener)
+    awaitClose { manager.removeUpdates(listener) }  // ← Critical! Cleanup on cancel
+}</code></pre>
+</div>
+
+<div class="card">
+  <h3>Flow Operators That Interviewers Love Asking About</h3>
+  <pre><code>// flatMapLatest: cancel previous when new value arrives (debounce-like)
+searchQuery
+    .debounce(300)
+    .flatMapLatest { query ->
+        if (query.isBlank()) flowOf(emptyList())
+        else repo.search(query)  // Previous search cancelled when new query arrives
+    }
+    .collect { _results.value = it }
+
+// combine: merge multiple flows
+combine(
+    userFlow,
+    settingsFlow,
+    networkStatusFlow
+) { user, settings, network ->
+    UiState(user, settings, isOffline = !network.isConnected)
+}.stateIn(
+    scope = viewModelScope,
+    started = SharingStarted.WhileSubscribed(5000),  // ← Stay active 5s after last subscriber
+    initialValue = UiState.Loading
+)
+
+// stateIn strategies:
+// Eagerly: starts immediately, always active (wasteful in background)
+// Lazily: starts on first subscriber, never stops
+// WhileSubscribed(5000): starts on first subscriber, stops 5s after last unsubscribes
+// → WhileSubscribed(5000) is the correct choice for ViewModels</code></pre>
+  <div class="tip"><strong>L6 signal:</strong> Explain <em>why</em> <span class="inline-code">WhileSubscribed(5000)</span> — the 5 second delay handles configuration changes (Activity recreation) without restarting the upstream Flow unnecessarily.</div>
+</div>
+
+<div class="card">
+  <h3>collectAsStateWithLifecycle vs collectAsState</h3>
+  <pre><code>// WRONG in Compose (Jetpack Compose):
+val state by viewModel.uiState.collectAsState()
+// ❌ Keeps collecting even when app is in background → battery drain, missed lifecycle
+
+// RIGHT:
+val state by viewModel.uiState.collectAsStateWithLifecycle()
+// ✅ Stops collecting when lifecycle is below STARTED (background)
+// Requires: implementation("androidx.lifecycle:lifecycle-runtime-compose:2.7.0")</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Mutex, Semaphore, and Concurrency Primitives</h2>
+
+<div class="card">
+  <h3>Mutex — Coroutine-Safe Mutual Exclusion</h3>
+  <pre><code>// Thread-safe token refresh without blocking threads
+class AuthManager(private val api: AuthApi) {
+    private val refreshMutex = Mutex()
+    private var cachedToken: String? = null
+    private var tokenExpiry: Long = 0
+
+    suspend fun getValidToken(): String {
+        // Fast path: no lock needed
+        val current = cachedToken
+        if (current != null && System.currentTimeMillis() &lt; tokenExpiry) {
+            return current
+        }
+        // Slow path: only one coroutine refreshes at a time
+        return refreshMutex.withLock {
+            // Double-check after acquiring lock (another coroutine may have refreshed)
+            val afterLock = cachedToken
+            if (afterLock != null && System.currentTimeMillis() &lt; tokenExpiry) {
+                return@withLock afterLock
+            }
+            val newToken = api.refreshToken()
+            cachedToken = newToken.token
+            tokenExpiry = System.currentTimeMillis() + newToken.expiresInMs
+            newToken.token
+        }
+    }
+}
+
+// Semaphore: limit concurrent operations
+val semaphore = Semaphore(permits = 3)
+
+suspend fun downloadAll(urls: List&lt;String&gt;) {
+    urls.map { url ->
+        async {
+            semaphore.withPermit {
+                download(url)  // At most 3 concurrent downloads
+            }
+        }
+    }.awaitAll()
+}</code></pre>
+</div>
+
+<div class="card">
+  <h3>Channel — Task Queuing Pattern</h3>
+  <pre><code>// Producer-consumer with Channel (e.g., analytics event pipeline)
+class EventBus {
+    private val channel = Channel&lt;AnalyticsEvent&gt;(capacity = Channel.BUFFERED) // 64 buffered
+
+    // Producer: non-blocking, drops if buffer full (use trySend)
+    fun enqueue(event: AnalyticsEvent) {
+        channel.trySend(event).also { result ->
+            if (result.isFailure) {
+                log("Event buffer full, dropping event: ${event.name}")
+            }
+        }
+    }
+
+    // Consumer: runs in background
+    suspend fun startProcessing() {
+        for (event in channel) {  // Suspends when empty, auto-cancels with scope
+            processEvent(event)
+        }
+    }
+}
+
+// Actor pattern: serialize mutations to shared state
+@OptIn(ObsoleteCoroutinesApi::class)
+fun CoroutineScope.counterActor() = actor&lt;CounterMsg&gt; {
+    var counter = 0
+    for (msg in channel) {
+        when (msg) {
+            is Increment -> counter++
+            is GetValue -> msg.response.complete(counter)
+        }
+    }
+}</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Common Production Patterns</h2>
+
+<div class="card">
+  <h3>Retry with Exponential Backoff</h3>
+  <pre><code>suspend fun &lt;T&gt; retryWithBackoff(
+    maxAttempts: Int = 3,
+    initialDelayMs: Long = 1000,
+    maxDelayMs: Long = 30_000,
+    factor: Double = 2.0,
+    block: suspend () -> T
+): T {
+    var currentDelay = initialDelayMs
+    repeat(maxAttempts - 1) { attempt ->
+        try {
+            return block()
+        } catch (e: CancellationException) {
+            throw e  // Never retry on cancellation!
+        } catch (e: Exception) {
+            if (e is HttpException && e.code() in 400..499) throw e // Don't retry client errors
+            log("Attempt ${attempt + 1} failed, retrying in ${currentDelay}ms")
+        }
+        delay(currentDelay + Random.nextLong(0, currentDelay / 4)) // Jitter
+        currentDelay = (currentDelay * factor).toLong().coerceAtMost(maxDelayMs)
+    }
+    return block() // Last attempt, let exception propagate
+}</code></pre>
+</div>
+
+<div class="card">
+  <h3>Timeout Handling</h3>
+  <pre><code>// withTimeout: throws TimeoutCancellationException (a CancellationException)
+suspend fun fetchWithTimeout(): User {
+    return withTimeout(5000L) {
+        api.fetchUser()
+    }
+    // TimeoutCancellationException propagates as cancellation to parent!
+}
+
+// withTimeoutOrNull: returns null on timeout (safer)
+suspend fun fetchWithTimeout(): User? {
+    return withTimeoutOrNull(5000L) {
+        api.fetchUser()
+    }
+    // Returns null instead of throwing
+}
+
+// Production: combine timeout + retry
+suspend fun robustFetch(): User {
+    return retryWithBackoff(maxAttempts = 3) {
+        withTimeoutOrNull(5000L) { api.fetchUser() }
+            ?: throw TimeoutException("Fetch timed out after 5s")
+    }
+}</code></pre>
+</div>
+
+<div class="card">
+  <h3>Testing Coroutines with TestCoroutineDispatcher</h3>
+  <pre><code>// Inject dispatchers for testability
+class MyViewModel(
+    private val repo: MyRepository,
+    private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main
+) : ViewModel() {
+    fun load() {
+        viewModelScope.launch(mainDispatcher) { ... }
+    }
+}
+
+// In tests:
+@get:Rule
+val mainDispatcherRule = MainDispatcherRule()
+
+class MainDispatcherRule(
+    val testDispatcher: TestCoroutineDispatcher = TestCoroutineDispatcher()
+) : TestWatcher() {
+    override fun starting(description: Description) {
+        Dispatchers.setMain(testDispatcher)
+    }
+    override fun finished(description: Description) {
+        Dispatchers.resetMain()
+    }
+}
+
+// Testing with runTest (replaces runBlockingTest)
+@Test
+fun `test loading state`() = runTest {
+    val viewModel = FeedViewModel(fakeRepo, testDispatcher)
+    val states = mutableListOf&lt;FeedUiState&gt;()
+
+    val job = launch { viewModel.uiState.toList(states) }
+
+    viewModel.load()
+    advanceUntilIdle()  // Execute all pending coroutines
+
+    assertEquals(FeedUiState.Success(fakeData), states.last())
+    job.cancel()
+}</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. Memory Leaks and Lifecycle Integration</h2>
+
+<div class="card">
+  <h3>The ViewModel Leak Pattern</h3>
+  <pre><code>// Safe: viewModelScope tied to ViewModel lifecycle
+class FeedViewModel : ViewModel() {
+    init {
+        viewModelScope.launch { /* safe */ }
+    }
+    // Cancelled automatically in onCleared()
+}
+
+// LEAK: Collecting in Activity without lifecycle awareness
+class FeedActivity : AppCompatActivity() {
+    override fun onCreate(...) {
+        // ❌ Keeps collecting in background → memory leak + wasted work
+        lifecycleScope.launch {
+            viewModel.uiState.collect { render(it) }
+        }
+    }
+}
+
+// SAFE: repeatOnLifecycle suspends when STARTED, resumes when STARTED again
+class FeedActivity : AppCompatActivity() {
+    override fun onCreate(...) {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                // ✅ Automatically paused when app backgrounds, resumed when foregrounded
+                viewModel.uiState.collect { render(it) }
+            }
+        }
+    }
+}
+
+// In Compose: collectAsStateWithLifecycle does this automatically</code></pre>
+  <div class="warning"><strong>Critical:</strong> <span class="inline-code">lifecycleScope.launch { flow.collect { } }</span> does NOT stop in background. Always use <span class="inline-code">repeatOnLifecycle(STARTED)</span> or <span class="inline-code">flowWithLifecycle(lifecycle)</span>.</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. L6 Rejection Patterns</h2>
+
+<div class="reject-box">
+  <h3>What Gets You Rejected</h3>
+  <ul>
+    <li><strong>GlobalScope usage anywhere:</strong> "I'll use GlobalScope for background work" → instant L4 signal</li>
+    <li><strong>Not knowing why:</strong> Can use coroutines but can't explain state machine transformation or why structured concurrency prevents leaks</li>
+    <li><strong>Swallowing CancellationException:</strong> "I'll catch all exceptions in my coroutine" → shows you haven't hit prod bugs</li>
+    <li><strong>Wrong dispatcher choice:</strong> Running Room queries on Default, JSON parsing on IO</li>
+    <li><strong>Not injecting dispatchers:</strong> "I'll just use Dispatchers.IO directly" → untestable code is an L6 red flag</li>
+    <li><strong>collectAsState in Compose:</strong> Not knowing about collectAsStateWithLifecycle → battery drain in prod</li>
+    <li><strong>Missing WhileSubscribed:</strong> Using Eagerly for ViewModel StateFlows → always-active even when no UI</li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<h2>10. Interview Narration Scripts</h2>
+
+<div class="interview-script">
+  <h4>When asked "How do coroutines work internally?"</h4>
+  <p><em>"Coroutines are compile-time transformations. A suspend function is rewritten into a state machine — a class with a label field and a resumeWith callback. When you hit a suspend point, the state is saved to a heap-allocated Continuation object and the thread is immediately returned to the pool. No thread blocking, no OS context switch. This is why you can run 100,000 concurrent coroutines on 8 threads — each suspended coroutine costs about 100–200 bytes of heap, not a megabyte of stack space like threads.</em></p>
+  <p><em>The key design principle is structured concurrency: every coroutine has a parent Job, forming a tree. Cancellation propagates down — cancel a parent and every child is cancelled. Exceptions propagate up — an unhandled exception in a child cancels the parent and all siblings. This prevents the ghost coroutine problem we had with callbacks."</em></p>
+</div>
+
+<div class="interview-script">
+  <h4>When asked "How do you handle concurrent operations safely?"</h4>
+  <p><em>"The first question I ask is: do these operations share mutable state? If no, I use coroutineScope with parallel async blocks and await all results. If yes, I reach for Mutex.withLock — it's coroutine-aware, so the waiting coroutine suspends instead of blocking a thread.</em></p>
+  <p><em>A concrete example: token refresh. Multiple coroutines can race to refresh an expired token. I use Mutex with double-checked locking — check if the token is still expired after acquiring the lock, because another coroutine may have already refreshed it. I always inject the Mutex and test this with a TestCoroutineScheduler to simulate the race condition explicitly."</em></p>
+</div>
+
+<div class="interview-script">
+  <h4>When asked about Flow collection in the UI layer</h4>
+  <p><em>"There's a subtle but production-critical distinction here. In Compose, I always use collectAsStateWithLifecycle, not collectAsState. The difference is that collectAsStateWithLifecycle stops collecting when the lifecycle drops below STARTED — so when the user backgrounds the app, we're not wasting CPU and battery collecting data nobody's seeing.</em></p>
+  <p><em>On the ViewModel side, for StateFlows created from upstream Flows, I always use WhileSubscribed(5000) rather than Eagerly. The 5-second window handles configuration changes — if the Activity is destroyed and recreated within 5 seconds (rotation), the upstream Flow isn't restarted unnecessarily. This matters for network-backed flows where restarting means an extra API call."</em></p>
+</div>
+
+<div class="nav" style="margin-top: 40px;">
+  <a href="00-prep-plan.html">← Prep Plan</a>
+  <a href="13-testing-strategy.html">Testing Strategy →</a>
+  <a href="14-build-system-app-bundles.html">Build System →</a>
+</div>
+
+</body>
+</html>

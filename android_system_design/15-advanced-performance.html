@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Advanced Performance — Systrace, ART GC, Memory — Android L6 Interview Prep</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 1100px; margin: 0 auto; padding: 24px; background: #0d1117; color: #e6edf3; line-height: 1.7; }
+  h1 { color: #58a6ff; border-bottom: 2px solid #21262d; padding-bottom: 12px; }
+  h2 { color: #79c0ff; margin-top: 40px; }
+  h3 { color: #d2a8ff; }
+  h4 { color: #ffa657; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin: 16px 0; }
+  .warning { background: #3d1a1a; border-left: 4px solid #f85149; padding: 16px; border-radius: 4px; margin: 16px 0; }
+  .tip { background: #0d2d1a; border-left: 4px solid #3fb950; padding: 16px; border-radius: 4px; margin: 16px 0; }
+  .interview-script { background: #0c1929; border: 1px solid #1f6feb; border-radius: 8px; padding: 20px; margin: 16px 0; }
+  .interview-script h4 { color: #58a6ff; margin-top: 0; }
+  pre { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 16px; overflow-x: auto; }
+  code { font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 0.875em; }
+  .inline-code { background: #21262d; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 0.875em; }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+  th { background: #21262d; color: #f0f6fc; padding: 12px; text-align: left; }
+  td { border: 1px solid #30363d; padding: 10px 12px; }
+  tr:nth-child(even) { background: #161b22; }
+  .nav { background: #161b22; padding: 12px 16px; border-radius: 8px; margin-bottom: 24px; }
+  .nav a { color: #58a6ff; text-decoration: none; margin-right: 16px; }
+  .reject-box { background: #3d1a00; border-left: 4px solid #d29922; padding: 16px; border-radius: 4px; margin: 16px 0; }
+  .diagram { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 20px; font-family: monospace; white-space: pre; overflow-x: auto; color: #8b949e; margin: 16px 0; }
+  .metric { font-size: 1.5em; font-weight: bold; color: #58a6ff; }
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="00-prep-plan.html">← Prep Plan</a>
+  <a href="14-build-system-app-bundles.html">← Build System</a>
+  <a href="16-device-fragmentation-accessibility.html">Device & A11y →</a>
+</div>
+
+<h1>Advanced Performance: Systrace, ART GC & Memory Profiling</h1>
+<p><strong>Why this matters at L6:</strong> L6 engineers don't guess at performance problems — they instrument, measure, and diagnose from data. Interviewers expect you to name specific tools, describe what you look for in a trace, and explain the mechanism behind each optimization. "I used the profiler" is L4. Describing what you saw in the Systrace and why it caused jank is L6.</p>
+
+<!-- ============================================================ -->
+<h2>1. The Performance Measurement Stack</h2>
+
+<div class="card">
+  <table>
+    <tr><th>Tool</th><th>Granularity</th><th>When to Use</th><th>Overhead</th></tr>
+    <tr><td>Perfetto / Systrace</td><td>Nanoseconds — system-wide</td><td>Jank investigation, CPU scheduling, binder calls</td><td>~5% CPU, safe for production sampling</td></tr>
+    <tr><td>Android Studio Profiler</td><td>Method-level CPU, heap snapshots</td><td>Memory leaks, allocation hotspots, method timing</td><td>High — debug builds only</td></tr>
+    <tr><td>Macrobenchmark</td><td>Real device, real user journeys</td><td>Startup time, scroll performance regression testing in CI</td><td>None in release mode</td></tr>
+    <tr><td>Microbenchmark</td><td>Microsecond — single function</td><td>Algorithm optimization, serialization, regex</td><td>None in release mode</td></tr>
+    <tr><td>FrameMetricsAggregator</td><td>Per-frame timing breakdown</td><td>Production jank rate, layout/draw time distribution</td><td>~1% — safe in production</td></tr>
+    <tr><td>Firebase Performance</td><td>Network, startup, custom traces</td><td>Fleet-wide performance monitoring</td><td>Minimal — samples ~1% by default</td></tr>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Perfetto / Systrace — Reading a Trace</h2>
+
+<div class="card">
+  <h3>Capturing a Systrace</h3>
+  <pre><code># Capture a 10-second trace during a problematic scroll
+adb shell perfetto \
+  -c - --txt \
+  -o /data/misc/perfetto-traces/trace.perfetto-trace \
+  &lt;&lt;EOF
+buffers: { size_kb: 63488 fill_policy: RING_BUFFER }
+data_sources: { config { name: "linux.ftrace" ftrace_config {
+    ftrace_events: "sched/sched_switch"
+    ftrace_events: "power/suspend_resume"
+    ftrace_events: "sched/sched_wakeup"
+    atrace_categories: "gfx"
+    atrace_categories: "view"
+    atrace_categories: "am"
+    atrace_categories: "wm"
+    atrace_categories: "binder_driver"
+} } }
+duration_ms: 10000
+EOF
+
+# Pull and open in ui.perfetto.dev
+adb pull /data/misc/perfetto-traces/trace.perfetto-trace
+
+# Or use Android Studio: Profiler → CPU → System Trace</code></pre>
+
+  <h3>What to Look for in a Jank Trace</h3>
+  <div class="diagram">Timeline (zoomed to a janky frame):
+
+Main Thread ─────────────────────────────────────────────────────────
+  [Choreographer#doFrame] ← should complete in &lt;16.67ms (60fps)
+  │
+  ├── [measure] ← &lt;2ms expected
+  ├── [layout] ← &lt;2ms expected
+  ├── [draw]   ← &lt;4ms expected — if &gt;16ms here, it's a draw bottleneck
+  │
+  └── [binder call to SurfaceFlinger] ← should be instant
+      ↓ if this is long: CPU contention, system overloaded
+
+RenderThread ────────────────────────────────────────────────────────
+  [DrawFrame] ← GPU execution — if long: overdraw or shader compilation
+
+SurfaceFlinger ──────────────────────────────────────────────────────
+  [onMessageReceived] ← compositor — frame dropped if main thread missed deadline
+
+Key jank patterns to identify:
+  1. Main thread blocked by binder → IPC to another process (ContentProvider, system service)
+  2. Main thread blocked by lock → Mutex or synchronized blocking
+  3. Long GC pause on main thread → allocation pressure
+  4. RecyclerView.onBindViewHolder taking >2ms → heavy bind logic
+  5. Shader compilation jank → first render of new GPU shader program (fix: AGP shader prewarming)</div>
+</div>
+
+<div class="card">
+  <h3>Adding Custom Trace Points</h3>
+  <pre><code>// Instrument your own code in Perfetto traces
+import android.os.Trace
+
+class FeedAdapter : RecyclerView.Adapter&lt;FeedViewHolder&gt;() {
+    override fun onBindViewHolder(holder: FeedViewHolder, position: Int) {
+        Trace.beginSection("FeedAdapter#onBindViewHolder")  // Appears in Perfetto!
+        try {
+            val item = items[position]
+            holder.bind(item)
+        } finally {
+            Trace.endSection()
+        }
+    }
+}
+
+// For coroutines: use the tracing extension
+suspend fun fetchFeed(): List&lt;Post&gt; = withContext(Dispatchers.IO) {
+    trace("FeedRepository#fetchFeed") {  // androidx.tracing:tracing-ktx
+        api.getFeed()
+    }
+}
+
+// Perfetto SDK for more powerful custom events (counters, flows)
+val perfettoTrack = PerfettoTrack.create("MyApp/NetworkRequests")
+PerfettoTrace.instant(perfettoTrack, "request_started", mapOf("url" to url))
+PerfettoTrace.counter(perfettoTrack, "active_requests", activeCount.toLong())</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. ART Garbage Collector — What L6 Knows</h2>
+
+<div class="card">
+  <h3>ART GC Internals</h3>
+  <table>
+    <tr><th>GC Type</th><th>When triggered</th><th>Stop-the-world?</th><th>Pause time</th></tr>
+    <tr><td>Concurrent Copying (CC)</td><td>Young gen full, background</td><td>Short pause at start+end only</td><td>~1–5ms</td></tr>
+    <tr><td>Concurrent Mark-Sweep (CMS)</td><td>Old gen, large objects</td><td>Short pause phases</td><td>~5–15ms</td></tr>
+    <tr><td>Explicit GC (System.gc())</td><td>Manual trigger</td><td>Full stop-the-world</td><td>50–200ms — causes jank!</td></tr>
+    <tr><td>OOM → Full GC</td><td>Allocation failure</td><td>Full stop-the-world</td><td>100–500ms</td></tr>
+  </table>
+
+  <h4>How to Reduce GC Pressure</h4>
+  <pre><code">// 1. AVOID ALLOCATIONS IN HOT PATHS (onDraw, onBindViewHolder, scroll listeners)
+// BAD: Allocating in onDraw
+override fun onDraw(canvas: Canvas) {
+    val paint = Paint()  // ❌ New allocation every frame!
+    val rect = RectF()   // ❌ New allocation every frame!
+    canvas.drawRect(rect, paint)
+}
+
+// GOOD: Pre-allocate, reuse
+private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+private val rect = RectF()
+
+override fun onDraw(canvas: Canvas) {
+    rect.set(0f, 0f, width.toFloat(), height.toFloat())  // Reuse
+    canvas.drawRect(rect, paint)
+}
+
+// 2. OBJECT POOLS for frequent allocations
+class PointPool {
+    private val pool = ArrayDeque&lt;PointF&gt;(capacity = 32)
+
+    fun obtain(): PointF = pool.removeLastOrNull() ?: PointF()
+    fun recycle(point: PointF) {
+        point.set(0f, 0f)
+        if (pool.size &lt; 32) pool.addLast(point)
+    }
+}
+
+// 3. BITMAP REUSE (see 04-media-rendering.html)
+// BitmapFactory.Options.inBitmap — reuse pixel buffer
+
+// 4. AVOID BOXING in performance-critical code
+// BAD: Boxing int to Integer in HashMap
+val counters = HashMap&lt;String, Int&gt;()
+val count = counters["key"] ?: 0  // Boxes/unboxes
+
+// GOOD: SparseIntArray or SparseArray for int/long keys
+val counters = SparseIntArray()
+
+// 5. KOTLIN DATA CLASSES — be careful with copy()
+// copy() allocates a new object even if one field changes
+// In hot paths, consider manual mutation or mutable holders</code></pre>
+</div>
+
+<div class="card">
+  <h3>Reading GC Logs</h3>
+  <pre><code"># Filter logcat for GC events
+adb logcat -s art | grep "GC"
+
+# Example output:
+# I art: Explicit concurrent mark sweep GC freed 24871(1205KB) AllocSpace objects,
+#        0(0B) LOS objects, 39% free, 6MB/10MB, paused 1.585ms total 74.165ms
+
+# What to look for:
+# - "Explicit" → someone called System.gc() — BAD in production
+# - Pause time > 5ms → investigate allocation hotspots
+# - Frequent GC → high allocation rate, find the source
+
+# Heap dump analysis:
+# adb shell am dumpheap &lt;pid&gt; /data/local/tmp/heap.hprof
+# adb pull /data/local/tmp/heap.hprof
+# Open in Android Studio: Profiler → Heap Dump
+
+# Key things to look for in heap dump:
+# 1. Retained size >> Shallow size → something's holding references
+# 2. Unexpected instance counts (10,000 Bitmap objects when you expect 10)
+# 3. Context/Activity in non-UI objects → classic memory leak</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Memory Leak Detection</h2>
+
+<div class="card">
+  <h3>LeakCanary Integration and What It Tells You</h3>
+  <pre><code">// LeakCanary: add to debugImplementation only
+debugImplementation("com.squareup.leakcanary:leakcanary-android:2.14")
+// No code changes needed — it hooks into Activity/Fragment lifecycle automatically
+
+// Common leak patterns LeakCanary catches:
+
+// 1. STATIC REFERENCE TO CONTEXT
+object AppState {
+    var context: Context? = null  // ❌ Static reference leaks Activity!
+}
+
+// 2. INNER CLASS HOLDING OUTER CLASS REFERENCE
+class MyActivity : AppCompatActivity() {
+    private val handler = object : Handler(Looper.getMainLooper()) {
+        override fun handleMessage(msg: Message) {
+            // ❌ Anonymous inner class holds implicit reference to MyActivity
+            updateUI()
+        }
+    }
+    // If handler has pending messages when Activity destroys → leak
+}
+
+// 3. COROUTINE IN WRONG SCOPE
+class MyFragment : Fragment() {
+    fun loadData() {
+        // ❌ GlobalScope keeps reference to fragment's lambda
+        GlobalScope.launch {
+            val data = repo.fetch()
+            view?.let { updateUI(it, data) }  // view might be null, but fragment isn't released
+        }
+    }
+    // Fix: use viewLifecycleOwner.lifecycleScope.launch
+}
+
+// 4. REGISTERED BUT NEVER UNREGISTERED LISTENER
+class MyFragment : Fragment() {
+    override fun onStart() {
+        super.onStart()
+        locationManager.addListener(this)  // ❌ Fragment registered
+    }
+    // Missing: onStop { locationManager.removeListener(this) }
+}
+
+// LeakCanary output tells you:
+// - Which object is leaking (e.g., MyActivity)
+// - What reference chain is preventing collection
+// - Line number of the leak</code></pre>
+</div>
+
+<div class="card">
+  <h3>Memory Monitoring in Production</h3>
+  <pre><code">// Track memory metrics in production (not just development)
+class MemoryMonitor(private val analytics: AnalyticsClient) {
+
+    fun reportMemoryStats() {
+        val runtime = Runtime.getRuntime()
+        val usedMb = (runtime.totalMemory() - runtime.freeMemory()) / 1_048_576L
+        val maxMb = runtime.maxMemory() / 1_048_576L
+        val utilization = usedMb.toFloat() / maxMb
+
+        analytics.track("memory_utilization", mapOf(
+            "used_mb" to usedMb,
+            "max_mb" to maxMb,
+            "utilization_pct" to (utilization * 100).toInt()
+        ))
+
+        // Alert if approaching OOM
+        if (utilization > 0.85f) {
+            analytics.track("memory_pressure_high", mapOf("used_mb" to usedMb))
+            // Proactively evict caches
+            Glide.get(context).clearMemory()
+            imageMemoryCache.evictAll()
+        }
+    }
+
+    // ComponentCallbacks2 — OS signals memory pressure
+    override fun onTrimMemory(level: Int) {
+        when (level) {
+            ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN -> {
+                // App backgrounded: release UI caches
+                imageMemoryCache.evictAll()
+            }
+            ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL,
+            ComponentCallbacks2.TRIM_MEMORY_COMPLETE -> {
+                // System is critically low: release everything possible
+                imageMemoryCache.evictAll()
+                networkCache.evictAll()
+                analytics.track("trim_memory_critical")
+            }
+        }
+    }
+}</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Startup Performance Deep Dive</h2>
+
+<div class="card">
+  <h3>Cold Start Anatomy</h3>
+  <div class="diagram">t=0ms    Process fork (zygote)
+t=50ms   Application.onCreate() starts
+t=100ms  Hilt component graph built (all @Singleton providers)
+t=150ms  ContentProviders initialized (each one adds ~10-30ms!)
+t=200ms  Application.onCreate() complete
+t=250ms  Activity.onCreate() starts
+t=400ms  setContentView / Compose content set
+t=600ms  First measure/layout/draw pass
+t=800ms  First frame rendered (TTID — Time To Initial Display)
+t=1500ms Data loaded, UI fully populated (TTFD — Time To Full Display)
+
+Budget targets (Google's definition of "good"):
+  Cold start TTID: &lt; 1000ms
+  Cold start TTFD: &lt; 2000ms
+  Warm start:      &lt; 500ms
+  Hot start:       &lt; 200ms</div>
+
+  <pre><code">// Measure startup with Macrobenchmark (runs on real device in release mode)
+@RunWith(AndroidJUnit4::class)
+class StartupBenchmark {
+    @get:Rule
+    val benchmarkRule = MacrobenchmarkRule()
+
+    @Test
+    fun coldStart() = benchmarkRule.measureRepeated(
+        packageName = "com.example.app",
+        metrics = listOf(
+            StartupTimingMetric(),   // TTID + TTFD
+            FrameTimingMetric()      // Jank during startup
+        ),
+        iterations = 10,
+        startupMode = StartupMode.COLD  // Kill process before each iteration
+    ) {
+        pressHome()
+        startActivityAndWait()  // Wait until app reports fully drawn
+    }
+}
+
+// Report fully drawn from Activity (critical for TTFD accuracy!)
+class MainActivity : AppCompatActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // ...
+        viewModel.uiState.observe(this) { state ->
+            if (state is UiState.Success) {
+                render(state)
+                reportFullyDrawn()  // ← Signal that content is visible
+            }
+        }
+    }
+}</code></pre>
+</div>
+
+<div class="card">
+  <h3>Startup Optimization Techniques</h3>
+  <table>
+    <tr><th>Technique</th><th>Typical Saving</th><th>How</th></tr>
+    <tr><td>Baseline Profiles</td><td>30–40% cold start</td><td>AOT-compile hot paths, delivered with APK via Play</td></tr>
+    <tr><td>App Startup library</td><td>10–30ms per ContentProvider removed</td><td>Replace N ContentProviders with 1 + Initializer chain</td></tr>
+    <tr><td>Lazy DI initialization</td><td>50–200ms</td><td>Defer heavyweight @Singleton construction until first use</td></tr>
+    <tr><td>Async splash screen work</td><td>Perceived improvement</td><td>SplashScreen API + preload data during splash</td></tr>
+    <tr><td>R8 optimization</td><td>5–15%</td><td>Method inlining reduces call overhead + smaller DEX = faster load</td></tr>
+    <tr><td>Reduce main thread I/O</td><td>Variable (up to 500ms)</td><td>StrictMode to detect then eliminate disk/network on main thread</td></tr>
+  </table>
+
+  <pre><code">// StrictMode in debug builds: catch main thread violations before they ship
+class MyApplication : Application() {
+    override fun onCreate() {
+        if (BuildConfig.DEBUG) {
+            StrictMode.setThreadPolicy(
+                StrictMode.ThreadPolicy.Builder()
+                    .detectAll()
+                    .penaltyLog()
+                    .penaltyDeath()  // Crash on violation in debug — catch it early!
+                    .build()
+            )
+            StrictMode.setVmPolicy(
+                StrictMode.VmPolicy.Builder()
+                    .detectLeakedSqlLiteObjects()
+                    .detectLeakedClosableObjects()
+                    .detectActivityLeaks()
+                    .penaltyLog()
+                    .build()
+            )
+        }
+        super.onCreate()
+    }
+}
+
+// Lazy initialization of heavy singletons
+@Module @InstallIn(SingletonComponent::class)
+object AnalyticsModule {
+    @Provides @Singleton
+    fun provideAnalytics(app: Application): Lazy&lt;AnalyticsClient&gt; {
+        // Returns Hilt's Lazy — only initialized when first used, not at app startup
+        return lazy { AnalyticsClientImpl(app) }
+    }
+}</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Rendering Performance — Beyond the Basics</h2>
+
+<div class="card">
+  <h3>GPU Overdraw Analysis</h3>
+  <pre><code">// Enable overdraw visualization: Developer Options → Debug GPU Overdraw
+// Colors:
+//   True color = no overdraw (ideal)
+//   Blue       = 1x overdraw (acceptable)
+//   Green      = 2x overdraw (investigate)
+//   Pink       = 3x overdraw (problematic)
+//   Red        = 4x+ overdraw (fix this!)
+
+// Common overdraw causes:
+// 1. Window background + Activity background + Fragment background all stacked
+// 2. Custom views drawing opaque children over opaque parents
+
+// Fix: Remove redundant backgrounds
+// In theme: &lt;item name="android:windowBackground"&gt;@null&lt;/item&gt; if you draw your own
+
+// Fix: clipRect in custom views to only draw visible area
+override fun onDraw(canvas: Canvas) {
+    canvas.save()
+    canvas.clipRect(dirtyRect)  // Only draw what's visible
+    drawContent(canvas)
+    canvas.restore()
+}
+
+// Fix: quickReject to skip drawing off-screen elements
+override fun onDraw(canvas: Canvas) {
+    if (canvas.quickReject(elementRect, Canvas.EdgeType.BW)) return
+    drawElement(canvas)
+}</code></pre>
+</div>
+
+<div class="card">
+  <h3>RecyclerView Performance at Scale</h3>
+  <pre><code">// RecyclerView optimizations for large lists
+
+// 1. setHasFixedSize: skip layout recomputation when data changes
+recyclerView.setHasFixedSize(true)
+
+// 2. setItemViewCacheSize: increase off-screen view cache (default=2)
+recyclerView.setItemViewCacheSize(10)  // Cache 10 views beyond visible area
+
+// 3. RecycledViewPool: share pool across multiple RecyclerViews (e.g., ViewPager pages)
+val sharedPool = RecyclerView.RecycledViewPool()
+sharedPool.setMaxRecycledViews(VIEW_TYPE_POST, 20)
+recyclerView1.setRecycledViewPool(sharedPool)
+recyclerView2.setRecycledViewPool(sharedPool)
+
+// 4. DiffUtil with payload: only rebind changed fields, not whole item
+class PostDiffCallback : DiffUtil.ItemCallback&lt;Post&gt;() {
+    override fun areItemsTheSame(old: Post, new: Post) = old.id == new.id
+    override fun areContentsTheSame(old: Post, new: Post) = old == new
+    override fun getChangePayload(old: Post, new: Post): Any? {
+        // Return only what changed — adapter receives this in onBindViewHolder(holder, pos, payloads)
+        val diff = mutableMapOf&lt;String, Any&gt;()
+        if (old.likeCount != new.likeCount) diff["likes"] = new.likeCount
+        if (old.isLiked != new.isLiked) diff["isLiked"] = new.isLiked
+        return if (diff.isNotEmpty()) diff else null
+    }
+}
+
+// In adapter: handle payloads to avoid full rebind
+override fun onBindViewHolder(holder: PostViewHolder, position: Int, payloads: List&lt;Any&gt;) {
+    if (payloads.isEmpty()) {
+        super.onBindViewHolder(holder, position, payloads)
+        return
+    }
+    @Suppress("UNCHECKED_CAST")
+    val diff = payloads[0] as Map&lt;String, Any&gt;
+    diff["likes"]?.let { holder.updateLikeCount(it as Int) }
+    diff["isLiked"]?.let { holder.updateLikeButton(it as Boolean) }
+}
+
+// 5. Prefetch: RecyclerView prefetches in advance of scroll — ensure onCreateViewHolder
+//    and onBindViewHolder are fast (move expensive work to background thread)</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Network Performance Optimization</h2>
+
+<div class="card">
+  <h3>HTTP/2 and HTTP/3 (QUIC)</h3>
+  <table>
+    <tr><th></th><th>HTTP/1.1</th><th>HTTP/2</th><th>HTTP/3 (QUIC)</th></tr>
+    <tr><td>Multiplexing</td><td>No (one request per connection)</td><td>Yes (multiple streams per TCP connection)</td><td>Yes (multiple streams per QUIC connection)</td></tr>
+    <tr><td>Head-of-line blocking</td><td>At request level</td><td>At TCP level (packet loss blocks all streams)</td><td>Eliminated (QUIC handles per-stream)</td></tr>
+    <tr><td>Connection setup</td><td>TCP + TLS = 2-3 RTT</td><td>TCP + TLS = 2-3 RTT</td><td>0-RTT on reconnect (QUIC + TLS 1.3)</td></tr>
+    <tr><td>Network switching</td><td>Connection drops</td><td>Connection drops</td><td>Connection migration (same session, new IP)</td></tr>
+    <tr><td>OkHttp support</td><td>Default</td><td>Automatic if server supports</td><td>Via Cronet (Google's QUIC library)</td></tr>
+  </table>
+
+  <pre><code">// Enable HTTP/3 with Cronet in OkHttp
+val cronetEngine = CronetEngine.Builder(context)
+    .enableQuic(true)
+    .enableHttp2(true)
+    .build()
+
+val okHttpClient = OkHttpClient.Builder()
+    .callFactory(CronetInterceptor.newBuilder(cronetEngine).build())
+    .build()
+
+// Connection pooling (OkHttp default: 5 connections, 5 min keepalive)
+// For high-traffic apps, tune this:
+val connectionPool = ConnectionPool(
+    maxIdleConnections = 10,
+    keepAliveDuration = 10,
+    timeUnit = TimeUnit.MINUTES
+)
+val client = OkHttpClient.Builder()
+    .connectionPool(connectionPool)
+    .build()</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. FrameMetrics in Production</h2>
+
+<div class="card">
+  <pre><code">// Collect per-frame timing in production (low overhead)
+class JankTracker(private val analytics: AnalyticsClient) {
+
+    private val metricsAggregator = FrameMetricsAggregator(
+        FrameMetricsAggregator.TOTAL_DURATION or
+        FrameMetricsAggregator.DRAW_DURATION or
+        FrameMetricsAggregator.LAYOUT_MEASURE_DURATION
+    )
+
+    fun startTracking(activity: Activity) {
+        metricsAggregator.add(activity)
+    }
+
+    fun stopAndReport(screenName: String) {
+        val metrics = metricsAggregator.reset() ?: return
+
+        val totalDurations = metrics[FrameMetricsAggregator.TOTAL_INDEX] ?: return
+
+        var totalFrames = 0
+        var jankFrames = 0   // > 16.67ms
+        var frozenFrames = 0 // > 700ms (ANR risk)
+
+        for (i in 0 until totalDurations.size()) {
+            val durationMs = totalDurations.valueAt(i)
+            val count = totalDurations.get(durationMs)
+            totalFrames += count
+            if (durationMs > 16) jankFrames += count
+            if (durationMs > 700) frozenFrames += count
+        }
+
+        val jankRate = jankFrames.toFloat() / totalFrames
+        analytics.track("frame_metrics", mapOf(
+            "screen" to screenName,
+            "total_frames" to totalFrames,
+            "jank_rate_pct" to (jankRate * 100).toInt(),
+            "frozen_frames" to frozenFrames
+        ))
+
+        // Alert if jank rate exceeds threshold
+        if (jankRate > 0.05f) { // > 5% jank frames
+            analytics.track("jank_threshold_exceeded", mapOf("screen" to screenName, "rate" to jankRate))
+        }
+    }
+}</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. L6 Interview Narration Scripts</h2>
+
+<div class="interview-script">
+  <h4>When asked "How do you diagnose a jank issue in production?"</h4>
+  <p><em>"My process has three phases: detect, diagnose, fix.</em></p>
+  <p><em>For detection, I instrument production with FrameMetricsAggregator to collect per-frame timing and report jank rate (frames over 16.67ms) to our analytics pipeline by screen. This gives me a continuous signal — if a deploy causes a spike in jank rate on the Feed screen, I know within hours.</em></p>
+  <p><em>For diagnosis, I capture a Perfetto trace during the janky scenario. I look at the main thread timeline for frames that exceed the 16.67ms budget and identify what's taking time: is it the layout pass, the draw call, a binder IPC to SurfaceFlinger, or a GC pause? I also check the RenderThread — if the GPU is the bottleneck, I look at overdraw with the GPU overdraw visualizer in Developer Options.</em></p>
+  <p><em>For fixes: if it's layout inflation, I move to Compose which has no inflation overhead. If it's RecyclerView bind time, I add payload diffing so only changed fields rebind. If it's GC, I profile allocations and find objects being allocated in the hot path — onDraw, onBindViewHolder, scroll listeners — and either pre-allocate or use object pools."</em></p>
+</div>
+
+<div class="interview-script">
+  <h4>When asked about startup optimization</h4>
+  <p><em>"The highest-leverage startup optimization today is Baseline Profiles. ART compiles the critical paths — Activity creation, first RecyclerView population, first network request setup — ahead of time based on real usage patterns from a Macrobenchmark. Play delivers the compiled profile alongside the APK. We've seen 30–40% cold start improvements from this alone.</em></p>
+  <p><em>Beyond that, I audit ContentProviders — each one adds 10–30ms synchronously on the main thread. I consolidate them with the App Startup library into a single provider with an Initializer chain, and move heavy initializers to async or lazy. I use StrictMode in debug builds to catch any main thread disk or network I/O before it ships — those are often the 100–500ms startup killers that are easy to miss in development."</em></p>
+</div>
+
+<!-- ============================================================ -->
+<h2>10. Rejection Patterns</h2>
+
+<div class="reject-box">
+  <h3>What Signals L4/L5 on Performance</h3>
+  <ul>
+    <li><strong>"I used the profiler to find the slow method"</strong> — Too vague. L6 names the tool, the trace pattern, the specific metric.</li>
+    <li><strong>Not knowing FrameMetricsAggregator</strong> — Shows no production performance monitoring beyond crash rates</li>
+    <li><strong>"I just avoid doing too much on the main thread"</strong> — Generic advice with no specifics on detection or measurement</li>
+    <li><strong>Not knowing about Baseline Profiles</strong> — Missing the most impactful modern startup optimization</li>
+    <li><strong>Confusing TTID and TTFD</strong> — L6 knows the difference: TTID = first frame, TTFD = content fully loaded</li>
+    <li><strong>No mention of Macrobenchmark</strong> — Performance optimization without reproducible benchmarks isn't engineering, it's guessing</li>
+    <li><strong>"I call System.gc() to free memory"</strong> — This causes a stop-the-world GC pause. Immediate red flag.</li>
+  </ul>
+</div>
+
+<div class="nav" style="margin-top: 40px;">
+  <a href="14-build-system-app-bundles.html">← Build System</a>
+  <a href="16-device-fragmentation-accessibility.html">Device & A11y →</a>
+  <a href="00-prep-plan.html">↑ Prep Plan</a>
+</div>
+
+</body>
+</html>
