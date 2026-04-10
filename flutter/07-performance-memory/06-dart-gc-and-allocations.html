@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 — Dart GC &amp; Allocation Optimization</title>
+<style>
+  :root{--bg:#ffffff;--surface:#f8f9fa;--surface2:#f1f3f5;--border:#e5e7eb;--text:#111827;--text-dim:#6b7280;--accent:#2563eb;--accent-dark:#1d4ed8;--purple:#7c3aed;--green:#166534;--orange:#c2410c;--amber:#92400e;--sky:#0369a1;}
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var(--text);font-size:1.05rem;line-height:1.8;padding:2rem;max-width:920px;margin:0 auto;}
+  h1{font-size:2rem;margin-bottom:.4rem;color:var(--accent);}
+  h2{font-size:1.45rem;margin:2.5rem 0 .85rem;color:var(--accent-dark);border-bottom:2px solid var(--border);padding-bottom:.4rem;}
+  h3{font-size:1.15rem;margin:1.5rem 0 .6rem;color:var(--green);}
+  h4{font-size:1rem;margin:1rem 0 .4rem;color:var(--amber);font-weight:600;}
+  p{margin-bottom:.9rem;}
+  a{color:var(--accent);text-decoration:none;}
+  a:hover{text-decoration:underline;}
+  .subtitle{color:var(--text-dim);font-size:.95rem;margin-bottom:2rem;}
+  .nav{display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:2rem;}
+  .nav a{background:var(--surface2);padding:.3rem .7rem;border-radius:6px;font-size:.82rem;color:var(--text-dim);border:1px solid var(--border);}
+  .nav a.active{background:var(--accent);color:#fff;border-color:var(--accent);}
+  .nav a:hover:not(.active){border-color:var(--accent);color:var(--accent);text-decoration:none;}
+  code{background:var(--surface2);padding:.15rem .4rem;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:.88em;color:#be185d;border:1px solid var(--border);}
+  pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.25rem 1.5rem;overflow-x:auto;margin:1rem 0 1.5rem;font-size:.92rem;line-height:1.7;}
+  pre code{color:#1e293b;background:none;padding:0;border:none;font-size:1em;}
+  table{width:100%;border-collapse:collapse;margin:1rem 0 1.5rem;font-size:.92rem;}
+  th,td{text-align:left;padding:.6rem .9rem;border:1px solid var(--border);vertical-align:top;}
+  th{background:var(--surface2);color:var(--accent-dark);font-weight:600;}
+  td{background:var(--bg);}
+  ul,ol{margin:.5rem 0 1rem 1.5rem;}
+  li{margin-bottom:.4rem;}
+  .callout{border-left:4px solid var(--accent);background:#eff6ff;padding:1rem 1.25rem;border-radius:0 8px 8px 0;margin:1.5rem 0;}
+  .callout.staff{border-left-color:var(--purple);background:#f5f3ff;}
+  .callout.warn{border-left-color:var(--orange);background:#fff7ed;}
+  .callout.tip{border-left-color:var(--sky);background:#f0f9ff;}
+  .callout-label{font-weight:700;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;margin-bottom:.5rem;color:var(--accent);}
+  .callout.staff .callout-label{color:var(--purple);}
+  .callout.warn .callout-label{color:var(--orange);}
+  .callout.tip .callout-label{color:var(--sky);}
+  .footer-nav{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--border);display:flex;gap:1rem;flex-wrap:wrap;font-size:.88rem;}
+</style>
+</head>
+<body>
+
+<h1>06 — Dart GC &amp; Allocation Optimization</h1>
+<p class="subtitle">Generational GC · Scavenger · Mark-sweep · GC pauses · Minimizing allocations</p>
+
+<nav class="nav">
+  <a href="01-devtools-profiling.html">01 DevTools Profiling</a>
+  <a href="02-memory-leaks.html">02 Memory Leaks</a>
+  <a href="03-app-startup-optimization.html">03 App Startup</a>
+  <a href="04-list-performance.html">04 List Performance</a>
+  <a href="05-image-optimization.html">05 Image Optimization</a>
+  <a href="06-dart-gc-and-allocations.html" class="active">06 Dart GC</a>
+  <a href="07-aot-and-tree-shaking.html">07 AOT &amp; Tree Shaking</a>
+  <a href="08-interview-qa.html">08 Interview Q&amp;A</a>
+</nav>
+
+<h2>Dart's Generational GC Model</h2>
+
+<p>Dart uses a <strong>generational garbage collector</strong> based on the empirical observation that most objects die young. The heap is split into two spaces with different collection strategies:</p>
+
+<table>
+  <tr>
+    <th>Space</th>
+    <th>Algorithm</th>
+    <th>Trigger</th>
+    <th>Typical Pause</th>
+    <th>Purpose</th>
+  </tr>
+  <tr>
+    <td>New space (young gen)</td>
+    <td>Semi-space scavenger (copying)</td>
+    <td>New space full (~4 MB)</td>
+    <td>&lt;1 ms</td>
+    <td>Short-lived objects: widget builds, closures, temporaries</td>
+  </tr>
+  <tr>
+    <td>Old space (old gen)</td>
+    <td>Concurrent mark-sweep</td>
+    <td>Old space pressure / threshold</td>
+    <td>1–100 ms (concurrent marking reduces pause)</td>
+    <td>Long-lived objects: singletons, caches, large data</td>
+  </tr>
+</table>
+
+<h2>New Space: Semi-Space Scavenger</h2>
+
+<p>New space is divided into two equal halves: <em>from-space</em> and <em>to-space</em>. All allocations happen in from-space using a bump pointer — just incrementing a pointer, making allocation O(1) and extremely fast (no free-list lookup, no lock contention).</p>
+
+<p>When from-space is full, the scavenger runs:</p>
+<ol>
+  <li><strong>Pause</strong> the Dart isolate (stop-the-world for new-space only)</li>
+  <li><strong>Scan</strong> from GC roots and references from old space (remembered set)</li>
+  <li><strong>Copy</strong> all reachable objects from from-space to to-space (compacting — no fragmentation)</li>
+  <li><strong>Promote</strong> objects that have survived multiple scavenges to old space</li>
+  <li><strong>Swap</strong> from-space and to-space roles; reset bump pointer</li>
+  <li><strong>Resume</strong> the isolate</li>
+</ol>
+
+<div class="callout">
+  <div class="callout-label">Key Insight</div>
+  Because copying GC moves objects, Dart pointers are always managed references — you cannot take the raw address of a Dart object from Dart code. Objects that survive long enough get promoted to old space, which is why long-lived objects should be allocated once and reused, not recreated on every frame.
+</div>
+
+<h2>Old Space: Concurrent Mark-Sweep</h2>
+
+<p>Old space uses a mark-sweep algorithm with concurrent marking to reduce pause times:</p>
+
+<ol>
+  <li><strong>Initial mark</strong> (stop-the-world, very short): Mark GC roots as grey</li>
+  <li><strong>Concurrent mark</strong> (runs alongside Dart code): Trace grey objects, mark reachable objects black. A write barrier tracks any new references created during this phase.</li>
+  <li><strong>Final mark / remark</strong> (stop-the-world, short): Process objects modified during concurrent marking (write barrier log)</li>
+  <li><strong>Sweep</strong> (may be concurrent): Reclaim unmarked (white) objects, build free lists</li>
+  <li><strong>Compact</strong> (optional, stop-the-world): Reduce fragmentation — not always triggered</li>
+</ol>
+
+<h3>GC Pause Impact on Frames</h3>
+<pre><code>// At 60fps, each frame has a 16.7ms budget.
+// At 120fps (high refresh rate devices), budget is 8.3ms.
+
+// New-space GC: typically &lt;1ms — usually within budget
+// Old-space major GC with compaction: can be 10-50ms+ — definitely drops frames
+
+// You can observe GC events in DevTools Timeline:
+// Look for "GC" events in the Dart thread timeline lane
+// Events over 8ms on a 120Hz device indicate GC-induced jank
+
+// From dart:developer — annotate your own timeline to correlate with GC:
+import 'dart:developer' as developer;
+
+void doHeavyWork() {
+  developer.Timeline.startSync('MyHeavyWork');
+  // ... work ...
+  developer.Timeline.finishSync();
+  // In DevTools, you'll see if GC events overlap with MyHeavyWork
+}</code></pre>
+
+<h2>Minimizing Allocations in Hot Paths</h2>
+
+<p>The best way to reduce GC pressure is to allocate less. In Flutter, hot paths include: <code>build()</code>, <code>paint()</code> in <code>CustomPainter</code>, layout callbacks, and animation value listeners.</p>
+
+<h3>1. Reuse Paint, Rect, and Offset in CustomPainter</h3>
+<pre><code>// BAD: allocates new Paint and Rect objects on every paint call
+class BadPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawRect(
+      Rect.fromLTWH(0, 0, size.width, size.height), // new Rect each call
+      Paint()..color = Colors.blue..strokeWidth = 2, // new Paint each call
+    );
+  }
+}
+
+// GOOD: reuse cached instances
+class GoodPainter extends CustomPainter {
+  // Allocated once, reused on every paint call
+  final _paint = Paint()
+    ..color = Colors.blue
+    ..strokeWidth = 2
+    ..style = PaintingStyle.stroke;
+
+  Rect? _cachedRect;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    // Reuse or recreate only when size changes
+    _cachedRect = Rect.fromLTWH(0, 0, size.width, size.height);
+    canvas.drawRect(_cachedRect!, _paint);
+  }
+
+  @override
+  bool shouldRepaint(GoodPainter old) =&gt; false; // or compare relevant data
+}</code></pre>
+
+<h3>2. const Objects</h3>
+<pre><code>// const objects are canonicalized — only one instance exists in the VM
+// Every reference to the same const value shares the same object
+
+// BAD: creates a new EdgeInsets object on every build
+Padding(padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8))
+
+// GOOD: canonical const instance
+Padding(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8))
+
+// BAD: new Color every time
+Container(color: Color(0xFF2563EB))
+
+// GOOD: const or static final
+static const _primaryBlue = Color(0xFF2563EB);
+// or: const Color(0xFF2563EB) inline
+
+// BAD: new TextStyle in build()
+Text('Hello', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold))
+
+// GOOD: declare once
+static const _headingStyle = TextStyle(fontSize: 16, fontWeight: FontWeight.bold);
+Text('Hello', style: _headingStyle)</code></pre>
+
+<h3>3. StringBuffer vs String Concatenation</h3>
+<pre><code>// BAD: O(n^2) allocations — each += creates a new String object
+String buildReport(List&lt;String&gt; lines) {
+  String result = '';
+  for (final line in lines) {
+    result += line + '\n'; // allocates a new String each iteration
+  }
+  return result;
+}
+
+// GOOD: StringBuffer pre-allocates and appends efficiently
+String buildReport(List&lt;String&gt; lines) {
+  final buffer = StringBuffer();
+  for (final line in lines) {
+    buffer.writeln(line); // no intermediate String allocation
+  }
+  return buffer.toString(); // single final allocation
+}
+
+// For short concatenations (2-3 parts), string interpolation is fine:
+final message = 'Hello, $name! You have $count messages.'; // optimized by compiler
+// But in a loop: always use StringBuffer</code></pre>
+
+<h3>4. List.filled vs List.generate vs List.of</h3>
+<pre><code>// Use the right List constructor for the use case:
+
+// Filled: fixed-length list with a single initial value — most efficient
+final zeros = List&lt;int&gt;.filled(1000, 0); // one allocation, no growth
+
+// Generate: fixed-length list with computed values — one allocation
+final squares = List&lt;int&gt;.generate(100, (i) =&gt; i * i);
+
+// of: copies an iterable — use when you need a mutable copy
+final copy = List&lt;String&gt;.of(original);
+
+// BAD in hot paths: growable list with unknown final size
+// Each growth doubles capacity: O(log n) reallocations
+final items = &lt;int&gt;[];
+for (int i = 0; i &lt; 10000; i++) {
+  items.add(i); // may trigger multiple reallocs
+}
+
+// GOOD: pre-size if you know the count
+final items = List&lt;int&gt;.filled(10000, 0, growable: false);
+for (int i = 0; i &lt; 10000; i++) {
+  items[i] = i;
+}</code></pre>
+
+<h3>5. Avoiding Closure Capture in Hot Paths</h3>
+<pre><code>// BAD: creates a new closure object on every animation tick
+animationController.addListener(() {
+  setState(() {}); // new closure created every time addListener is called!
+});
+
+// GOOD: named method reference — no closure allocation
+animationController.addListener(_onAnimationTick);
+
+void _onAnimationTick() {
+  setState(() {});
+}
+
+// BAD: creating closures in itemBuilder (called for every visible item)
+ListView.builder(
+  itemBuilder: (context, index) {
+    return GestureDetector(
+      onTap: () =&gt; _handleTap(index), // new closure per item per rebuild
+      child: ItemWidget(item: items[index]),
+    );
+  },
+)
+
+// GOOD: pass index as data, handle in the widget
+ListView.builder(
+  itemBuilder: (context, index) =&gt; ItemWidget(
+    item: items[index],
+    onTap: _handleTap, // stable reference
+    index: index,
+  ),
+)</code></pre>
+
+<h3>6. Object Pooling Pattern</h3>
+<pre><code>// For objects that are frequently created and destroyed:
+class ParticlePool {
+  final List&lt;Particle&gt; _available = [];
+  int _created = 0;
+  final int maxSize;
+
+  ParticlePool({this.maxSize = 100});
+
+  Particle acquire() {
+    if (_available.isNotEmpty) {
+      return _available.removeLast()..reset(); // reuse existing
+    }
+    _created++;
+    return Particle(); // create new only when pool is empty
+  }
+
+  void release(Particle particle) {
+    if (_available.length &lt; maxSize) {
+      _available.add(particle); // return to pool
+    }
+    // else: let it be GC'd — pool is full
+  }
+}
+
+// Usage in a particle system:
+class _ParticleSystemState extends State&lt;ParticleSystem&gt; {
+  final _pool = ParticlePool(maxSize: 200);
+  final List&lt;Particle&gt; _active = [];
+
+  void _spawnParticle() {
+    _active.add(_pool.acquire());
+  }
+
+  void _update() {
+    _active.removeWhere((p) {
+      if (p.isDead) {
+        _pool.release(p); // return to pool instead of GC
+        return true;
+      }
+      p.update();
+      return false;
+    });
+  }
+}</code></pre>
+
+<h2>DevTools Allocation Tracker</h2>
+
+<p>The Memory tab in Flutter DevTools includes an Allocation Tracker that records every object allocation with a stack trace, allowing you to pinpoint exactly which call site is creating too many objects.</p>
+
+<ol>
+  <li>Open DevTools → Memory tab</li>
+  <li>Click "Track Allocations" (or enable "Allocation Tracking" toggle)</li>
+  <li>Perform the action that causes jank (e.g., scroll a list, run an animation)</li>
+  <li>Stop tracking</li>
+  <li>Sort by "Count" to find the most-allocated types</li>
+  <li>Click a type to see the stack traces of allocation sites</li>
+</ol>
+
+<pre><code>// You can also use dart:developer for programmatic profiling:
+import 'dart:developer';
+
+// Enable allocation tracking for a specific type in tests:
+// (This is lower-level and usually done via DevTools UI)
+
+// Custom timeline events for correlating with allocations:
+void performScroll() {
+  Timeline.startSync('Scroll50Items', arguments: {'itemCount': 50});
+  // ... scroll logic ...
+  Timeline.finishSync();
+}
+
+// The Timeline events appear in DevTools Performance view
+// alongside Memory events, letting you correlate allocation spikes
+// with specific operations</code></pre>
+
+<h2>GC Tuning: Heap Growth Factor</h2>
+
+<p>Dart's GC automatically tunes the old-space collection threshold based on live heap size. You generally don't need to tune this, but understanding the knobs helps for embedded/constrained environments.</p>
+
+<pre><code>// From command line (for Flutter engine in debug/profile mode):
+// --old-gen-heap-size=256  -- limit old space to 256MB
+// --new-gen-semi-max-size=8 -- increase new-space semi-size (8MB each side)
+
+// In FlutterEngineGroup on Android (custom engine args):
+// Generally NOT recommended for production apps.
+// Only relevant for specialized embedded use cases.
+
+// More useful: observe GC behavior via dart:developer ServiceExtension
+// In debug/profile mode, VM service exposes:
+// ext.dart.developer.gc -- trigger GC and observe response time
+// ext.dart.developer.heap -- get current heap statistics</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Interview Angle</div>
+  At L6, the question isn't just "how do you minimize allocations" — it's "how do you ensure this discipline is maintained across a 20-person team?" Key answers: (1) establish allocation budgets per frame via automated performance tests (macrobenchmark frame timing), (2) use DevTools allocation tracker during code review for performance-critical paths, (3) lint rules to flag obvious anti-patterns (e.g., dart_code_metrics for cognitive complexity, which correlates with allocation density), (4) profile-mode CI tests that assert on 99th-percentile frame times, which catch GC-induced jank regressions before they reach production.
+</div>
+
+<div class="footer-nav">
+  <a href="05-image-optimization.html">&larr; 05 Image Optimization</a>
+  <a href="07-aot-and-tree-shaking.html">07 AOT &amp; Tree Shaking &rarr;</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 — State Synchronization Across Isolates</title>
+<style>
+  :root{--bg:#ffffff;--surface:#f8f9fa;--surface2:#f1f3f5;--border:#e5e7eb;--text:#111827;--text-dim:#6b7280;--accent:#2563eb;--accent-dark:#1d4ed8;--purple:#7c3aed;--green:#166534;--orange:#c2410c;--amber:#92400e;--sky:#0369a1;}
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var(--text);font-size:1.05rem;line-height:1.8;padding:2rem;max-width:920px;margin:0 auto;}
+  h1{font-size:2rem;margin-bottom:.4rem;color:var(--accent);}
+  h2{font-size:1.45rem;margin:2.5rem 0 .85rem;color:var(--accent-dark);border-bottom:2px solid var(--border);padding-bottom:.4rem;}
+  h3{font-size:1.15rem;margin:1.5rem 0 .6rem;color:var(--green);}
+  h4{font-size:1rem;margin:1rem 0 .4rem;color:var(--amber);font-weight:600;}
+  p{margin-bottom:.9rem;}
+  a{color:var(--accent);text-decoration:none;}
+  a:hover{text-decoration:underline;}
+  .subtitle{color:var(--text-dim);font-size:.95rem;margin-bottom:2rem;}
+  .nav{display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:2rem;}
+  .nav a{background:var(--surface2);padding:.3rem .7rem;border-radius:6px;font-size:.82rem;color:var(--text-dim);border:1px solid var(--border);}
+  .nav a.active{background:var(--accent);color:#fff;border-color:var(--accent);}
+  .nav a:hover:not(.active){border-color:var(--accent);color:var(--accent);text-decoration:none;}
+  code{background:var(--surface2);padding:.15rem .4rem;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:.88em;color:#be185d;border:1px solid var(--border);}
+  pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.25rem 1.5rem;overflow-x:auto;margin:1rem 0 1.5rem;font-size:.92rem;line-height:1.7;}
+  pre code{color:#1e293b;background:none;padding:0;border:none;font-size:1em;}
+  table{width:100%;border-collapse:collapse;margin:1rem 0 1.5rem;font-size:.92rem;}
+  th,td{text-align:left;padding:.6rem .9rem;border:1px solid var(--border);vertical-align:top;}
+  th{background:var(--surface2);color:var(--accent-dark);font-weight:600;}
+  td{background:var(--bg);}
+  ul,ol{margin:.5rem 0 1rem 1.5rem;}
+  li{margin-bottom:.4rem;}
+  .callout{border-left:4px solid var(--accent);background:#eff6ff;padding:1rem 1.25rem;border-radius:0 8px 8px 0;margin:1.5rem 0;}
+  .callout.staff{border-left-color:var(--purple);background:#f5f3ff;}
+  .callout.warn{border-left-color:var(--orange);background:#fff7ed;}
+  .callout.tip{border-left-color:var(--sky);background:#f0f9ff;}
+  .callout-label{font-weight:700;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;margin-bottom:.5rem;color:var(--accent);}
+  .callout.staff .callout-label{color:var(--purple);}
+  .callout.warn .callout-label{color:var(--orange);}
+  .callout.tip .callout-label{color:var(--sky);}
+  .problem-banner{background:#fef3c7;border:1.5px solid #f59e0b;border-radius:10px;padding:1.25rem 1.5rem;margin:1.5rem 0;}
+  .problem-label{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#92400e;margin-bottom:.4rem;}
+  .problem-title{font-size:1.2rem;font-weight:700;color:#78350f;}
+  .footer-nav{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--border);display:flex;gap:1rem;flex-wrap:wrap;font-size:.88rem;}
+</style>
+</head>
+<body>
+
+<h1>01 — State Synchronization Across Isolates</h1>
+<p class="subtitle">Problem: Heavy computation in background isolate + UI state update</p>
+
+<nav class="nav">
+  <a href="index.html">Index</a>
+  <a href="01-state-sync-across-isolates.html" class="active">01 Isolate Sync</a>
+  <a href="02-custom-scroll-physics.html">02 Scroll Physics</a>
+  <a href="03-plugin-with-platform-state.html">03 Plugin Streaming</a>
+  <a href="04-performance-audit-and-fix.html">04 Perf Audit</a>
+  <a href="05-offline-queue-implementation.html">05 Offline Queue</a>
+  <a href="06-custom-render-object.html">06 RenderObject</a>
+  <a href="07-complex-animation-sequence.html">07 Animation Sequence</a>
+  <a href="08-deep-link-to-authenticated-screen.html">08 Deep Link Auth</a>
+</nav>
+
+<div class="problem-banner">
+  <div class="problem-label">Engineering Problem</div>
+  <div class="problem-title">Heavy JSON parsing and computation must run off the main isolate, with results updating BLoC/Riverpod state on the main isolate — without blocking UI or losing messages.</div>
+</div>
+
+<h2>1. Problem Statement</h2>
+
+<p>Your app receives large JSON payloads (500KB–5MB) from a REST API. Parsing and transforming this data on the main isolate causes frame drops — the JSON <code>decode()</code> call alone can take 40–200ms for large payloads. You need to:</p>
+
+<ul>
+  <li>Move JSON parsing and data transformation to a background isolate</li>
+  <li>Return the result to the main isolate to update a Riverpod <code>AsyncNotifier</code> or BLoC</li>
+  <li>Handle errors thrown in the background isolate</li>
+  <li>Support cancellation of in-flight work when the screen is disposed</li>
+  <li>Maintain result ordering for sequential requests</li>
+</ul>
+
+<h2>2. Option A: Isolate.run() for One-Off Tasks</h2>
+
+<p><code>Isolate.run()</code> (introduced in Dart 2.19) is the simplest API for one-off background computation. It spawns a new isolate, runs the provided closure, returns the result to the caller via a <code>Future</code>, and then terminates the isolate. No manual port management required.</p>
+
+<pre><code>import 'dart:isolate';
+import 'dart:convert';
+
+// The computation function — runs in a fresh isolate
+// Must be a top-level function or static method (closure variables are copied)
+List&lt;ProductModel&gt; _parseProducts(String jsonString) {
+  final List&lt;dynamic&gt; raw = json.decode(jsonString) as List&lt;dynamic&gt;;
+  return raw
+      .map((e) =&gt; ProductModel.fromJson(e as Map&lt;String, dynamic&gt;))
+      .toList();
+}
+
+// In your Riverpod notifier or repository:
+class ProductRepository {
+  Future&lt;List&lt;ProductModel&gt;&gt; fetchProducts() async {
+    // 1. Fetch raw JSON on main isolate (network is async, doesn't block)
+    final response = await http.get(Uri.parse('https://api.example.com/products'));
+    final jsonString = response.body;
+
+    // 2. Offload parsing to a background isolate
+    // Isolate.run creates isolate, sends jsonString (copied), returns result
+    final products = await Isolate.run(
+      () =&gt; _parseProducts(jsonString),
+    );
+
+    return products;
+  }
+}</code></pre>
+
+<div class="callout tip">
+  <div class="callout-label">When to use Isolate.run()</div>
+  Use for one-shot tasks where spawn overhead (2–5ms) is acceptable. Avoid for tasks called frequently (e.g., parsing every scroll position update) or tasks that need to be cancelled — <code>Isolate.run()</code> returns a <code>Future</code> with no cancellation handle.
+</div>
+
+<h2>3. Option B: Long-Lived Worker Isolate with SendPort/ReceivePort</h2>
+
+<p>For repeated heavy operations (e.g., a data processing pipeline that runs dozens of times per session), spawning a new isolate each time is wasteful. A long-lived worker isolate with a message loop avoids repeated spawn overhead and enables request/response patterns with ordering guarantees.</p>
+
+<h3>3.1 Worker Isolate Entry Point</h3>
+
+<pre><code>// Message types for the message loop
+sealed class _IsolateMessage {}
+
+class _ParseRequest extends _IsolateMessage {
+  final int sequenceId; // for ordering guarantee
+  final String jsonString;
+  final SendPort replyPort;
+  _ParseRequest(this.sequenceId, this.jsonString, this.replyPort);
+}
+
+class _ShutdownMessage extends _IsolateMessage {}
+
+// The isolate's entry function — runs in the background isolate
+// mainSendPort: port to send results back to the main isolate
+void _workerEntryPoint(SendPort mainSendPort) {
+  // Create a port for this isolate to receive incoming messages
+  final receivePort = ReceivePort();
+
+  // Send our port to the main isolate so it can send us work
+  mainSendPort.send(receivePort.sendPort);
+
+  // Message loop
+  receivePort.listen((message) {
+    if (message is _ParseRequest) {
+      try {
+        final result = _parseProducts(message.jsonString);
+        message.replyPort.send(_ParseSuccess(message.sequenceId, result));
+      } catch (e, st) {
+        message.replyPort.send(_ParseError(message.sequenceId, e.toString(), st));
+      }
+    } else if (message is _ShutdownMessage) {
+      receivePort.close(); // end the message loop
+    }
+  });
+}
+
+List&lt;ProductModel&gt; _parseProducts(String jsonString) {
+  final raw = json.decode(jsonString) as List&lt;dynamic&gt;;
+  return raw.map((e) =&gt; ProductModel.fromJson(e as Map&lt;String, dynamic&gt;)).toList();
+}</code></pre>
+
+<h3>3.2 Main Isolate Worker Manager</h3>
+
+<pre><code>class IsolateWorker {
+  Isolate? _isolate;
+  SendPort? _workerSendPort;
+  late ReceivePort _receivePort;
+  int _nextSequenceId = 0;
+
+  // Pending completers keyed by sequence ID for ordering guarantee
+  final Map&lt;int, Completer&lt;List&lt;ProductModel&gt;&gt;&gt; _pending = {};
+
+  Future&lt;void&gt; initialize() async {
+    _receivePort = ReceivePort();
+
+    // Spawn the worker isolate, passing our receive port's send port
+    _isolate = await Isolate.spawn(
+      _workerEntryPoint,
+      _receivePort.sendPort,
+      onError: _receivePort.sendPort, // route uncaught errors here too
+    );
+
+    // First message from worker = its SendPort
+    _workerSendPort = await _receivePort.first;
+
+    // Listen for subsequent results
+    _receivePort.skip(1).listen(_handleResult);
+  }
+
+  void _handleResult(dynamic message) {
+    if (message is _ParseSuccess) {
+      _pending[message.sequenceId]?.complete(message.products);
+      _pending.remove(message.sequenceId);
+    } else if (message is _ParseError) {
+      _pending[message.sequenceId]?.completeError(
+        Exception(message.error), message.stackTrace);
+      _pending.remove(message.sequenceId);
+    } else if (message is List) {
+      // Uncaught isolate error (from onError port) — format: [errorStr, stackStr]
+      // Cancel all pending work
+      for (final completer in _pending.values) {
+        completer.completeError(Exception(message[0]));
+      }
+      _pending.clear();
+    }
+  }
+
+  Future&lt;List&lt;ProductModel&gt;&gt; parse(String jsonString) {
+    assert(_workerSendPort != null, 'Call initialize() first');
+    final id = _nextSequenceId++;
+    final completer = Completer&lt;List&lt;ProductModel&gt;&gt;();
+    _pending[id] = completer;
+
+    _workerSendPort!.send(
+      _ParseRequest(id, jsonString, _receivePort.sendPort),
+    );
+
+    return completer.future;
+  }
+
+  void dispose() {
+    _workerSendPort?.send(_ShutdownMessage());
+    _isolate?.kill(priority: Isolate.immediate);
+    _receivePort.close();
+    // Cancel pending completers
+    for (final c in _pending.values) {
+      c.completeError(Exception('Worker disposed'));
+    }
+    _pending.clear();
+  }
+}</code></pre>
+
+<h3>3.3 Sequence ID Ordering Guarantee</h3>
+
+<p>Because the worker processes messages sequentially (it has a single message loop), results arrive in the same order as requests. The sequence ID allows the main isolate to correlate results with their callers via the <code>_pending</code> map — even if you later add parallelism to the worker (e.g., multiple isolates in a pool).</p>
+
+<h2>4. TransferableTypedData: Zero-Copy Large Buffers</h2>
+
+<p>Normally, sending data between isolates copies it — a 5MB JSON string is copied byte-for-byte. For binary data (image buffers, typed arrays), use <code>TransferableTypedData</code> to transfer ownership without copying:</p>
+
+<pre><code>// Sending a large Uint8List without copying
+final bytes = imageData as Uint8List;
+final transferable = TransferableTypedData.fromList([bytes]);
+
+// Send the transferable — original bytes are now invalid in this isolate
+sendPort.send(transferable);
+
+// In the receiving isolate — materialize the bytes
+final received = message as TransferableTypedData;
+final restoredBytes = received.materialize().asUint8List();
+// restoredBytes is a view into the transferred memory (no copy)</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">JSON strings are always copied</div>
+  <code>TransferableTypedData</code> only applies to typed data (Uint8List, Float32List, etc.). Regular Dart strings and objects are always deep-copied when sent between isolates. To minimize copy cost for JSON, consider sending the raw bytes (<code>Uint8List</code>) and decoding in the worker isolate using <code>utf8.decode()</code> before <code>json.decode()</code>.
+</div>
+
+<h2>5. BackgroundIsolateBinaryMessenger for Platform Channels</h2>
+
+<p>If your background isolate needs to call a platform channel (e.g., to read from a native database or use a native crypto library), use <code>BackgroundIsolateBinaryMessenger</code>. This requires passing the root isolate token to the background isolate.</p>
+
+<pre><code>// On the main isolate — capture the token before spawning
+final rootToken = RootIsolateToken.instance!;
+
+// Spawn the isolate, passing the token
+await Isolate.spawn(_workerWithPlatformChannel, {
+  'token': rootToken,
+  'replyPort': replyPort.sendPort,
+});
+
+// In the background isolate entry function
+void _workerWithPlatformChannel(Map&lt;String, dynamic&gt; args) {
+  final token = args['token'] as RootIsolateToken;
+  final replyPort = args['replyPort'] as SendPort;
+
+  // Register this isolate with the binary messenger
+  BackgroundIsolateBinaryMessenger.ensureInitialized(token);
+
+  // Now platform channels work from this isolate
+  const channel = MethodChannel('com.example/crypto');
+  channel.invokeMethod('hash', {'data': 'my data'}).then((result) {
+    replyPort.send(result);
+  });
+}</code></pre>
+
+<h2>6. Error Handling Patterns</h2>
+
+<pre><code>// Pattern 1: Error port on Isolate.spawn
+// Uncaught errors in the isolate are sent to this port as [errorStr, stackStr]
+final errorPort = ReceivePort();
+final isolate = await Isolate.spawn(
+  _entryPoint,
+  args,
+  onError: errorPort.sendPort,
+  onExit: exitPort.sendPort,
+);
+
+errorPort.listen((error) {
+  final list = error as List;
+  final errorString = list[0] as String;
+  final stackString = list[1] as String?;
+  log('Isolate error: $errorString\n$stackString');
+  // Notify state management of the failure
+});
+
+// Pattern 2: try/catch inside the isolate (preferred for expected errors)
+// Catch and serialize exceptions, send as error result objects
+void _safeWorker(SendPort replyPort) {
+  try {
+    final result = _doHeavyWork();
+    replyPort.send({'ok': true, 'result': result});
+  } on FormatException catch (e) {
+    replyPort.send({'ok': false, 'error': 'Invalid JSON: ${e.message}'});
+  } catch (e, st) {
+    replyPort.send({'ok': false, 'error': e.toString(), 'stack': st.toString()});
+  }
+}</code></pre>
+
+<h2>7. Cancellation of In-Flight Work</h2>
+
+<pre><code>// Using a CancelToken pattern over Isolate
+class CancellableIsolateTask&lt;T&gt; {
+  final Completer&lt;T&gt; _completer = Completer&lt;T&gt;();
+  Isolate? _isolate;
+  bool _cancelled = false;
+
+  Future&lt;T&gt; get future =&gt; _completer.future;
+
+  Future&lt;void&gt; start(void Function(SendPort) entry, dynamic args) async {
+    final port = ReceivePort();
+    _isolate = await Isolate.spawn(entry, {
+      'port': port.sendPort,
+      'args': args,
+    });
+
+    port.listen((message) {
+      if (_cancelled) return; // discard result if cancelled
+      if (message is T) {
+        _completer.complete(message);
+      } else {
+        _completer.completeError(Exception(message));
+      }
+      port.close();
+    });
+  }
+
+  void cancel() {
+    _cancelled = true;
+    _isolate?.kill(priority: Isolate.immediate);
+    if (!_completer.isCompleted) {
+      _completer.completeError(Exception('Cancelled'));
+    }
+  }
+}
+
+// Usage in a Riverpod notifier with ref.onDispose
+class ProductNotifier extends AsyncNotifier&lt;List&lt;ProductModel&gt;&gt; {
+  CancellableIsolateTask? _currentTask;
+
+  @override
+  Future&lt;List&lt;ProductModel&gt;&gt; build() async {
+    ref.onDispose(() =&gt; _currentTask?.cancel());
+    return _loadProducts();
+  }
+
+  Future&lt;List&lt;ProductModel&gt;&gt; _loadProducts() async {
+    _currentTask?.cancel(); // cancel previous in-flight task
+    final task = CancellableIsolateTask&lt;List&lt;ProductModel&gt;&gt;();
+    _currentTask = task;
+    // ... start and await task
+    return task.future;
+  }
+}</code></pre>
+
+<h2>8. Integration with Riverpod AsyncNotifier</h2>
+
+<pre><code>// Clean integration: worker is a singleton provider
+final isolateWorkerProvider = Provider&lt;IsolateWorker&gt;((ref) {
+  final worker = IsolateWorker();
+  ref.onDispose(worker.dispose);
+  // Initialize async — worker is ready before first use
+  worker.initialize();
+  return worker;
+});
+
+// Notifier uses the worker
+final productsProvider =
+    AsyncNotifierProvider&lt;ProductsNotifier, List&lt;ProductModel&gt;&gt;(
+        ProductsNotifier.new);
+
+class ProductsNotifier extends AsyncNotifier&lt;List&lt;ProductModel&gt;&gt; {
+  @override
+  Future&lt;List&lt;ProductModel&gt;&gt; build() async {
+    final response =
+        await ref.read(apiClientProvider).get('/products');
+    // Offload parsing to background isolate via the worker
+    return ref.read(isolateWorkerProvider).parse(response.body);
+  }
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">L6 Design Consideration</div>
+  At L6, discuss the tradeoff: <code>Isolate.run()</code> is simpler but spawns a fresh isolate each call (2–5ms overhead + memory). A long-lived worker amortizes that cost but adds complexity (lifecycle management, error recovery, ordering). For a product used at scale, a worker pool (N isolates, work queue distributed across them) is the right answer for high-throughput parsing — similar to a thread pool in Android's <code>Executors.newFixedThreadPool()</code>. Dart's <code>Isolate</code> maps conceptually to a Java thread but without shared memory — all data is copied or transferred.
+</div>
+
+<div class="footer-nav">
+  <a href="index.html">← Engineering Problems Index</a>
+  <a href="02-custom-scroll-physics.html">02 Custom Scroll Physics →</a>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 — Concurrency Patterns & Pitfalls</title>
+<style>
+  :root { --bg:#ffffff;--surface:#f8f9fa;--surface2:#f1f3f5;--border:#e5e7eb;--text:#111827;--text-dim:#6b7280;--accent:#2563eb;--accent-dark:#1d4ed8;--purple:#7c3aed;--purple-dark:#6d28d9;--green:#166534;--orange:#c2410c;--red:#dc2626;--amber:#92400e;--sky:#0369a1; }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);font-size:1.05rem;line-height:1.8;padding:2rem;max-width:920px;margin:0 auto;}
+  h1{font-size:2rem;margin-bottom:.4rem;color:var(--accent);}
+  h2{font-size:1.45rem;margin:2.5rem 0 .85rem;color:var(--accent-dark);border-bottom:2px solid var(--border);padding-bottom:.4rem;}
+  h3{font-size:1.15rem;margin:1.5rem 0 .6rem;color:var(--green);}
+  h4{font-size:1rem;margin:1rem 0 .4rem;color:var(--amber);font-weight:600;}
+  p{margin-bottom:.9rem;}
+  a{color:var(--accent);text-decoration:none;}
+  a:hover{text-decoration:underline;}
+  .subtitle{color:var(--text-dim);font-size:.95rem;margin-bottom:2rem;}
+  .nav{display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:2rem;}
+  .nav a{background:var(--surface2);padding:.3rem .7rem;border-radius:6px;font-size:.82rem;color:var(--text-dim);border:1px solid var(--border);}
+  .nav a.active{background:var(--accent);color:#fff;border-color:var(--accent);}
+  .nav a:hover:not(.active){border-color:var(--accent);color:var(--accent);text-decoration:none;}
+  code{background:var(--surface2);padding:.15rem .4rem;border-radius:4px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:.88em;color:#be185d;border:1px solid var(--border);}
+  pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.25rem 1.5rem;overflow-x:auto;margin:1rem 0 1.5rem;font-size:.92rem;line-height:1.7;}
+  pre code{color:#1e293b;background:none;padding:0;border:none;font-size:1em;}
+  table{width:100%;border-collapse:collapse;margin:1rem 0 1.5rem;font-size:.92rem;}
+  th,td{text-align:left;padding:.6rem .9rem;border:1px solid var(--border);vertical-align:top;}
+  th{background:var(--surface2);color:var(--accent-dark);font-weight:600;}
+  td{background:var(--bg);}
+  ul,ol{margin:.5rem 0 1rem 1.5rem;}
+  li{margin-bottom:.4rem;}
+  .callout{border-left:4px solid var(--accent);background:#eff6ff;padding:1rem 1.25rem;border-radius:0 8px 8px 0;margin:1.5rem 0;}
+  .callout.staff{border-left-color:var(--purple);background:#f5f3ff;}
+  .callout.warn{border-left-color:var(--orange);background:#fff7ed;}
+  .callout.tip{border-left-color:var(--sky);background:#f0f9ff;}
+  .callout-label{font-weight:700;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;margin-bottom:.5rem;color:var(--accent);}
+  .callout.staff .callout-label{color:var(--purple);}
+  .callout.warn .callout-label{color:var(--orange);}
+  .callout.tip .callout-label{color:var(--sky);}
+  .diagram-container{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.5rem;margin:1.5rem 0;overflow-x:auto;}
+  .footer-nav{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--border);display:flex;gap:1rem;flex-wrap:wrap;font-size:.88rem;}
+</style>
+</head>
+<body>
+
+<h1>06 — Concurrency Patterns &amp; Pitfalls</h1>
+<p class="subtitle">Logical races · Async mutex · Debounce · Throttle · CompositeSubscription · Common mistakes</p>
+
+<nav class="nav">
+  <a href="01-event-loop-microtask-queue.html">01 Event Loop</a>
+  <a href="02-futures-async-await.html">02 Futures</a>
+  <a href="03-streams-deep-dive.html">03 Streams</a>
+  <a href="04-isolates.html">04 Isolates</a>
+  <a href="05-compute-and-worker-isolates.html">05 compute()</a>
+  <a href="06-dart-concurrency-patterns.html" class="active">06 Patterns</a>
+  <a href="07-interview-qa.html">07 Q&amp;A</a>
+</nav>
+
+<h2>Logical Race Conditions in Async Dart</h2>
+
+<p>Dart's single-threaded concurrency model prevents data races at the memory level — you cannot have two threads simultaneously writing to the same variable. But logical race conditions are very much possible and common in async Dart code. A logical race is when the sequencing of async operations produces unexpected results even without shared memory mutation.</p>
+
+<h3>The Check-Then-Act Race</h3>
+
+<p>The classic pattern: check a condition, then act on it — but the condition may change between the check and the act because an await released the event loop.</p>
+
+<pre><code>// BUGGY — logical race condition
+class AuthService {
+  bool _isRefreshing = false;
+  String? _cachedToken;
+
+  Future&lt;String&gt; getValidToken() async {
+    // Check if already refreshing
+    if (_isRefreshing) {
+      // Wait a bit and retry — naive, broken approach
+      await Future.delayed(Duration(milliseconds: 100));
+      return _cachedToken!;
+    }
+
+    if (_isTokenExpired()) {
+      _isRefreshing = true;          // Set flag
+
+      // RACE: another call to getValidToken() that arrives here
+      // BETWEEN the _isRefreshing = true and the await below
+      // will see _isRefreshing == true and branch to the wait above
+      // but _cachedToken is still null — NPE!
+      _cachedToken = await _refreshToken(); // await releases event loop
+      _isRefreshing = false;
+    }
+    return _cachedToken!;
+  }
+}
+</code></pre>
+
+<h4>The Double-Tap Race</h4>
+
+<pre><code>// BUGGY — double-tap causes duplicate operations
+class PaymentButton extends StatefulWidget { ... }
+
+class _PaymentButtonState extends State&lt;PaymentButton&gt; {
+  bool _isProcessing = false;
+
+  Future&lt;void&gt; _onTap() async {
+    if (_isProcessing) return; // Check
+    _isProcessing = true;      // Act — but this is NOT atomic with the check!
+
+    // If user taps twice before this line, both taps pass the check
+    // because the event loop hasn't processed the state update yet
+    await _processPayment(); // Duplicate payment!
+    _isProcessing = false;
+  }
+}
+
+// FIX: Use setState to mark processing AND prevent double-triggers
+Future&lt;void&gt; _onTapFixed() async {
+  if (_isProcessing) return;
+  setState(() =&gt; _isProcessing = true); // Synchronous — immediate effect
+
+  try {
+    await _processPayment();
+  } finally {
+    if (mounted) setState(() =&gt; _isProcessing = false);
+  }
+}
+</code></pre>
+
+<h3>Stale Closure Race</h3>
+
+<pre><code>// BUGGY — stale closure captures old value
+class SearchWidget extends StatefulWidget { ... }
+
+class _SearchWidgetState extends State&lt;SearchWidget&gt; {
+  String _query = '';
+  List&lt;Result&gt; _results = [];
+
+  void _onSearchChanged(String query) async {
+    _query = query;
+    final results = await _searchApi.search(query); // User types fast — multiple calls
+
+    // By the time this completes, _query may have changed
+    // We're setting results for an OLD query!
+    setState(() =&gt; _results = results); // BUG: stale results
+  }
+}
+
+// FIX: Capture and compare query at completion time
+void _onSearchChangedFixed(String query) async {
+  _query = query;
+  final results = await _searchApi.search(query);
+
+  // Only update if query hasn't changed since we started this search
+  if (_query == query &amp;&amp; mounted) {
+    setState(() =&gt; _results = results);
+  }
+}
+</code></pre>
+
+<h2>Async Mutex with package:synchronized</h2>
+
+<h3>When You Need Mutual Exclusion</h3>
+
+<p>Sometimes you genuinely need to ensure only one async operation runs at a time for a given resource (e.g., database writes, token refresh, file writes). The <code>synchronized</code> package provides a Dart-native lock:</p>
+
+<pre><code>import 'package:synchronized/synchronized.dart';
+
+class TokenManager {
+  final _lock = Lock();
+  String? _token;
+  DateTime? _expiry;
+
+  /// Thread-safe (in the async sense) token refresh
+  Future&lt;String&gt; getValidToken() async {
+    return _lock.synchronized(() async {
+      // Only ONE caller executes this block at a time
+      // Other callers wait for the lock to release
+      if (_token != null &amp;&amp; _expiry!.isAfter(DateTime.now())) {
+        return _token!; // Still valid — return cached
+      }
+
+      // Refresh needed — only one refresh happens even if many callers arrived
+      final newToken = await _refreshFromServer();
+      _token = newToken.accessToken;
+      _expiry = newToken.expiry;
+      return _token!;
+    });
+  }
+
+  // All callers that arrived during the refresh get the same new token
+  // No duplicate refresh requests — this is the correct pattern
+  Future&lt;TokenResponse&gt; _refreshFromServer() async { /* ... */ }
+}
+</code></pre>
+
+<h3>Reentrant Locks</h3>
+
+<pre><code>// Lock() is NOT reentrant — calling synchronized() from within synchronized() deadlocks
+// Use Lock(reentrant: true) for reentrant scenarios
+
+final _reentrantLock = Lock(reentrant: true);
+
+Future&lt;void&gt; outer() async {
+  await _reentrantLock.synchronized(() async {
+    await inner(); // Safe — reentrant lock allows this
+  });
+}
+
+Future&lt;void&gt; inner() async {
+  await _reentrantLock.synchronized(() async {
+    // This would deadlock with Lock() — fine with reentrant: true
+    print('inner critical section');
+  });
+}
+</code></pre>
+
+<h2>Debounce Pattern</h2>
+
+<h3>Timer-Based Debounce</h3>
+
+<p>Debouncing delays execution until a burst of calls has stopped. Classic use: search-as-you-type — don't fire a network request on every keystroke, only after typing pauses.</p>
+
+<pre><code>import 'dart:async';
+
+class Debouncer {
+  final Duration delay;
+  Timer? _timer;
+
+  Debouncer({required this.delay});
+
+  void call(void Function() action) {
+    _timer?.cancel(); // Cancel any pending timer
+    _timer = Timer(delay, action); // Start fresh timer
+  }
+
+  void dispose() {
+    _timer?.cancel();
+  }
+}
+
+// Usage in StatefulWidget
+class SearchBar extends StatefulWidget { ... }
+
+class _SearchBarState extends State&lt;SearchBar&gt; {
+  final _debouncer = Debouncer(delay: const Duration(milliseconds: 400));
+
+  @override
+  void dispose() {
+    _debouncer.dispose();
+    super.dispose();
+  }
+
+  void _onTextChanged(String query) {
+    _debouncer.call(() {
+      // Only fires 400ms after the user stops typing
+      context.read&lt;SearchCubit&gt;().search(query);
+    });
+  }
+}
+</code></pre>
+
+<h3>Future-Based Debounce</h3>
+
+<pre><code>/// Returns a Future that completes with the debounced result
+class FutureDebouncer&lt;T&gt; {
+  final Duration delay;
+  Timer? _timer;
+  Completer&lt;T&gt;? _completer;
+
+  FutureDebouncer({required this.delay});
+
+  Future&lt;T&gt; call(Future&lt;T&gt; Function() action) {
+    _timer?.cancel();
+    _completer ??= Completer&lt;T&gt;();
+    final completer = _completer!;
+
+    _timer = Timer(delay, () async {
+      try {
+        final result = await action();
+        if (!completer.isCompleted) completer.complete(result);
+      } catch (e, st) {
+        if (!completer.isCompleted) completer.completeError(e, st);
+      }
+      _completer = null;
+    });
+
+    return completer.future;
+  }
+}
+</code></pre>
+
+<h2>Throttle Pattern</h2>
+
+<h3>Flag-Based Throttle</h3>
+
+<p>Throttling limits how frequently an action can execute. Unlike debounce (fires after a pause), throttle fires immediately and then ignores calls for a cooldown period.</p>
+
+<pre><code>class Throttler {
+  final Duration cooldown;
+  bool _isThrottled = false;
+
+  Throttler({required this.cooldown});
+
+  void call(void Function() action) {
+    if (_isThrottled) return; // Ignore calls during cooldown
+
+    action(); // Execute immediately
+    _isThrottled = true;
+    Future.delayed(cooldown, () =&gt; _isThrottled = false);
+  }
+}
+
+// Scroll listener that fires at most once per 200ms
+class ExpensiveScrollWidget extends StatefulWidget { ... }
+
+class _ExpensiveScrollWidgetState extends State&lt;ExpensiveScrollWidget&gt; {
+  final _throttler = Throttler(cooldown: const Duration(milliseconds: 200));
+  final _controller = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    _controller.addListener(() {
+      _throttler.call(_onScroll);
+    });
+  }
+
+  void _onScroll() {
+    // Expensive analytics call — throttled to max 5 calls/second
+    Analytics.logScrollPosition(_controller.offset);
+  }
+}
+</code></pre>
+
+<h2>RxDart Operators: debounceTime and throttleTime</h2>
+
+<pre><code>import 'package:rxdart/rxdart.dart';
+
+class SearchBloc {
+  final _queryController = BehaviorSubject&lt;String&gt;();
+
+  late final Stream&lt;List&lt;Result&gt;&gt; results = _queryController.stream
+      .debounceTime(const Duration(milliseconds: 400)) // Debounce typing
+      .distinct() // Skip duplicate queries
+      .switchMap((query) =&gt; _searchApi.searchStream(query)) // Cancel previous
+      .asBroadcastStream();
+
+  void search(String query) =&gt; _queryController.add(query);
+
+  void dispose() =&gt; _queryController.close();
+}
+
+// Throttle example with RxDart
+final buttonPresses = _buttonController.stream
+    .throttleTime(const Duration(seconds: 2)) // At most one per 2 seconds
+    .listen((_) =&gt; _processPayment());
+</code></pre>
+
+<h2>StreamQueue: Pull-Based Stream Consumption</h2>
+
+<pre><code>import 'package:async/async.dart';
+
+// Traditional stream listener — push-based (events arrive when they want)
+// Problem: hard to coordinate multiple async steps with stream events
+
+// StreamQueue — pull-based (you ask for the next event when you're ready)
+Future&lt;void&gt; processStreamSequentially(Stream&lt;int&gt; stream) async {
+  final queue = StreamQueue(stream);
+
+  // Pull exactly the events you need, in sequence
+  final first = await queue.next;    // Wait for first event
+  final second = await queue.next;   // Wait for second event
+
+  // Or pull a batch
+  final batch = await queue.take(5); // Wait for next 5 events as a List
+
+  // Or peek without consuming
+  final peeked = await queue.peek;
+
+  await queue.cancel();
+}
+
+// Real use case: parsing a binary protocol stream
+Future&lt;void&gt; parseBinaryProtocol(Stream&lt;List&lt;int&gt;&gt; bytes) async {
+  final queue = StreamQueue(bytes);
+
+  while (await queue.hasNext) {
+    // Read 4-byte length prefix
+    final lengthBytes = await queue.take(4);
+    final length = ByteData.view(Uint8List.fromList(lengthBytes.expand((b) =&gt; b).toList()).buffer)
+        .getUint32(0, Endian.big);
+
+    // Read exactly 'length' bytes of payload
+    final payloadChunks = &lt;List&lt;int&gt;&gt;[];
+    var remaining = length;
+    while (remaining &gt; 0) {
+      final chunk = await queue.next;
+      payloadChunks.add(chunk);
+      remaining -= chunk.length;
+    }
+    _processPayload(payloadChunks.expand((b) =&gt; b).toList());
+  }
+}
+</code></pre>
+
+<h2>CompositeSubscription: Managing Multiple Stream Subscriptions</h2>
+
+<pre><code>/// Manually implemented CompositeSubscription for managing lifecycle
+class CompositeSubscription {
+  final List&lt;StreamSubscription&gt; _subscriptions = [];
+  bool _disposed = false;
+
+  void add(StreamSubscription subscription) {
+    if (_disposed) {
+      subscription.cancel();
+      return;
+    }
+    _subscriptions.add(subscription);
+  }
+
+  Future&lt;void&gt; dispose() async {
+    _disposed = true;
+    final futures = _subscriptions.map((s) =&gt; s.cancel());
+    _subscriptions.clear();
+    await Future.wait(futures);
+  }
+}
+
+// Usage in a StatefulWidget
+class _DashboardState extends State&lt;Dashboard&gt; {
+  final _subscriptions = CompositeSubscription();
+
+  @override
+  void initState() {
+    super.initState();
+
+    _subscriptions.add(
+      context.read&lt;UserBloc&gt;().stream.listen(_onUserChanged),
+    );
+    _subscriptions.add(
+      context.read&lt;NetworkBloc&gt;().stream.listen(_onNetworkChanged),
+    );
+    _subscriptions.add(
+      _locationService.positionStream.listen(_onLocationChanged),
+    );
+  }
+
+  @override
+  void dispose() {
+    _subscriptions.dispose(); // Cancels ALL subscriptions at once
+    super.dispose();
+  }
+}
+</code></pre>
+
+<p>RxDart also provides a <code>CompositeSubscription</code> class with the same pattern. If you're already using RxDart, use theirs to avoid the boilerplate above.</p>
+
+<h2>Common Pitfalls</h2>
+
+<h3>1. Unawaited Futures</h3>
+
+<pre><code>// BUGGY — Future returned by _saveData is not awaited
+void _onSave() {
+  _saveData(); // Fire and forget — exceptions are swallowed!
+  Navigator.pop(context); // May execute before save completes
+}
+
+// FIX A: Await the future
+Future&lt;void&gt; _onSave() async {
+  await _saveData(); // Wait for save to complete
+  if (mounted) Navigator.pop(context);
+}
+
+// FIX B: If truly fire-and-forget, handle errors explicitly
+void _onSave() {
+  unawaited(_saveData().catchError((e) =&gt; logger.error('Save failed', e)));
+  Navigator.pop(context);
+}
+
+// Enable linting: add to analysis_options.yaml
+// linter:
+//   rules:
+//     - unawaited_futures
+</code></pre>
+
+<h3>2. Async in initState Anti-Pattern</h3>
+
+<pre><code>// BUGGY — initState is synchronous; async work here is fragile
+@override
+void initState() {
+  super.initState();
+  _loadData(); // This is fine — starts async work
+  // But DON'T await here — initState cannot be async
+}
+
+// WRONG — this won't work:
+@override
+Future&lt;void&gt; initState() async { // Can't override as async!
+  super.initState();
+  await _loadData(); // Dart won't allow this
+}
+
+// CORRECT — start async work in initState, handle results safely
+@override
+void initState() {
+  super.initState();
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    // Runs after first frame — safe to call setState
+    _loadData();
+  });
+}
+
+Future&lt;void&gt; _loadData() async {
+  final data = await _repository.fetchData();
+  if (!mounted) return; // Widget may have been disposed during fetch
+  setState(() =&gt; _data = data);
+}
+</code></pre>
+
+<h3>3. BuildContext After Async Gap</h3>
+
+<pre><code>// BUGGY — context used after async gap without mounted check
+Future&lt;void&gt; _onDelete() async {
+  await _repository.deleteItem(widget.itemId);
+  // User may have navigated away during the delete!
+  Navigator.of(context).pop(); // Throws if widget is unmounted
+  ScaffoldMessenger.of(context).showSnackBar(...); // Same issue
+}
+
+// FIX — always check mounted after any await
+Future&lt;void&gt; _onDeleteFixed() async {
+  await _repository.deleteItem(widget.itemId);
+
+  if (!mounted) return; // Widget was disposed — bail out
+
+  Navigator.of(context).pop();
+  ScaffoldMessenger.of(context).showSnackBar(
+    const SnackBar(content: Text('Item deleted')),
+  );
+}
+
+// ALTERNATIVE — capture before async gap
+Future&lt;void&gt; _onDeleteAlternative() async {
+  final navigator = Navigator.of(context);    // Capture before await
+  final messenger = ScaffoldMessenger.of(context); // Capture before await
+
+  await _repository.deleteItem(widget.itemId);
+
+  // Now safe to use captured references (they don't require mounted check)
+  navigator.pop();
+  messenger.showSnackBar(const SnackBar(content: Text('Item deleted')));
+}
+</code></pre>
+
+<h3>4. setState After Dispose</h3>
+
+<pre><code>// BUGGY — setState called after widget disposal
+class _CountdownState extends State&lt;CountdownWidget&gt; {
+  int _count = 10;
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(Duration(seconds: 1), (_) {
+      setState(() =&gt; _count--); // CRASH if widget is disposed before countdown ends!
+    });
+  }
+
+  @override
+  void dispose() {
+    // Forgot to cancel the timer!
+    super.dispose();
+  }
+}
+
+// FIX — always cancel timers/subscriptions in dispose
+@override
+void dispose() {
+  _timer?.cancel(); // Cancel BEFORE super.dispose()
+  super.dispose();
+}
+
+// OR — check mounted in the callback
+_timer = Timer.periodic(Duration(seconds: 1), (_) {
+  if (!mounted) {
+    _timer?.cancel();
+    return;
+  }
+  setState(() =&gt; _count--);
+});
+</code></pre>
+
+<h3>5. Async Gaps in Loops</h3>
+
+<pre><code>// PROBLEMATIC — state can change between iterations
+Future&lt;void&gt; processAll(List&lt;Item&gt; items) async {
+  for (final item in items) {
+    await _processItem(item); // Each await yields control
+    // Other event loop callbacks may run between iterations
+    // 'items' might be modified by another callback!
+  }
+}
+
+// FIX — snapshot the collection before the loop
+Future&lt;void&gt; processAllFixed(List&lt;Item&gt; items) async {
+  final snapshot = List&lt;Item&gt;.from(items); // Defensive copy
+  for (final item in snapshot) {
+    await _processItem(item);
+  }
+}
+</code></pre>
+
+<h3>6. Zone Error Handling</h3>
+
+<pre><code>import 'dart:async';
+
+// Catching errors in async code that "escapes" try-catch
+// Errors in unawaited futures are NOT caught by surrounding try-catch
+
+void main() {
+  // This does NOT catch errors from unawaited futures
+  try {
+    Future.error('uncaught!'); // Escapes try-catch — goes to Zone handler
+  } catch (e) {
+    print('NOT reached'); // Never called for unawaited Future errors
+  }
+}
+
+// Correct approach: use runZonedGuarded for global async error handling
+void main() {
+  runZonedGuarded(
+    () {
+      runApp(MyApp());
+    },
+    (error, stackTrace) {
+      // Catches ALL unhandled async errors in this zone
+      FirebaseCrashlytics.instance.recordError(error, stackTrace);
+    },
+  );
+}
+
+// Flutter's FlutterError.onError for framework errors
+FlutterError.onError = (details) {
+  FirebaseCrashlytics.instance.recordFlutterFatalError(details);
+};
+</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Insight</div>
+  <p>The most common source of production bugs in Flutter apps is not the architecture pattern (BLoC vs Riverpod vs Provider) — it's async mistakes: unawaited futures swallowing errors, BuildContext after async gap, and setState after dispose. A Staff engineer ensures these patterns are enforced at the team level via analysis_options.yaml rules, code review checklists, and lint rules like <code>unawaited_futures</code>, <code>use_build_context_synchronously</code>, and <code>cancel_subscriptions</code>.</p>
+</div>
+
+<h2>Structured Concurrency Patterns</h2>
+
+<h3>Cancellation Tokens</h3>
+
+<pre><code>/// Simple cancellation token for cooperative cancellation
+class CancellationToken {
+  bool _cancelled = false;
+
+  bool get isCancelled =&gt; _cancelled;
+
+  void cancel() =&gt; _cancelled = true;
+
+  void throwIfCancelled() {
+    if (_cancelled) throw const CancelledException();
+  }
+}
+
+class CancelledException implements Exception {
+  const CancelledException();
+}
+
+// Usage: long-running operation that checks for cancellation
+Future&lt;List&lt;ProcessedItem&gt;&gt; processLargeDataset(
+  List&lt;RawItem&gt; items,
+  CancellationToken token,
+) async {
+  final results = &lt;ProcessedItem&gt;[];
+  for (final item in items) {
+    token.throwIfCancelled(); // Check before each expensive operation
+    final processed = await _processItem(item);
+    results.add(processed);
+  }
+  return results;
+}
+
+// In widget:
+CancellationToken? _token;
+
+void _startProcessing() {
+  _token = CancellationToken();
+  processLargeDataset(items, _token!).then(/* ... */).catchError((e) {
+    if (e is CancelledException) return; // Expected — ignore
+    // Handle real errors
+  });
+}
+
+void _cancelProcessing() {
+  _token?.cancel();
+}
+</code></pre>
+
+<h3>Completer-Based One-Shot Events</h3>
+
+<pre><code>/// Signal a one-time event across async code
+class ReadySignal {
+  final _completer = Completer&lt;void&gt;();
+
+  Future&lt;void&gt; get ready =&gt; _completer.future;
+
+  void markReady() {
+    if (!_completer.isCompleted) _completer.complete();
+  }
+}
+
+// Usage: wait for initialization before proceeding
+class DatabaseService {
+  final _ready = ReadySignal();
+
+  DatabaseService() {
+    _initialize();
+  }
+
+  Future&lt;void&gt; _initialize() async {
+    await _openDatabase();
+    await _runMigrations();
+    _ready.markReady(); // Signal that DB is ready
+  }
+
+  Future&lt;T&gt; query&lt;T&gt;(String sql) async {
+    await _ready.ready; // Wait for initialization if needed
+    return _executeQuery(sql);
+  }
+}
+</code></pre>
+
+<div class="footer-nav">
+  <a href="05-compute-and-worker-isolates.html">← 05 compute()</a>
+  <a href="07-interview-qa.html">07 Interview Q&amp;A →</a>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 — Image Performance &amp; Caching</title>
+<style>
+  :root{--bg:#ffffff;--surface:#f8f9fa;--surface2:#f1f3f5;--border:#e5e7eb;--text:#111827;--text-dim:#6b7280;--accent:#2563eb;--accent-dark:#1d4ed8;--purple:#7c3aed;--green:#166534;--orange:#c2410c;--amber:#92400e;--sky:#0369a1;}
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var(--text);font-size:1.05rem;line-height:1.8;padding:2rem;max-width:920px;margin:0 auto;}
+  h1{font-size:2rem;margin-bottom:.4rem;color:var(--accent);}
+  h2{font-size:1.45rem;margin:2.5rem 0 .85rem;color:var(--accent-dark);border-bottom:2px solid var(--border);padding-bottom:.4rem;}
+  h3{font-size:1.15rem;margin:1.5rem 0 .6rem;color:var(--green);}
+  h4{font-size:1rem;margin:1rem 0 .4rem;color:var(--amber);font-weight:600;}
+  p{margin-bottom:.9rem;}
+  a{color:var(--accent);text-decoration:none;}
+  a:hover{text-decoration:underline;}
+  .subtitle{color:var(--text-dim);font-size:.95rem;margin-bottom:2rem;}
+  .nav{display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:2rem;}
+  .nav a{background:var(--surface2);padding:.3rem .7rem;border-radius:6px;font-size:.82rem;color:var(--text-dim);border:1px solid var(--border);}
+  .nav a.active{background:var(--accent);color:#fff;border-color:var(--accent);}
+  .nav a:hover:not(.active){border-color:var(--accent);color:var(--accent);text-decoration:none;}
+  code{background:var(--surface2);padding:.15rem .4rem;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:.88em;color:#be185d;border:1px solid var(--border);}
+  pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.25rem 1.5rem;overflow-x:auto;margin:1rem 0 1.5rem;font-size:.92rem;line-height:1.7;}
+  pre code{color:#1e293b;background:none;padding:0;border:none;font-size:1em;}
+  table{width:100%;border-collapse:collapse;margin:1rem 0 1.5rem;font-size:.92rem;}
+  th,td{text-align:left;padding:.6rem .9rem;border:1px solid var(--border);vertical-align:top;}
+  th{background:var(--surface2);color:var(--accent-dark);font-weight:600;}
+  td{background:var(--bg);}
+  ul,ol{margin:.5rem 0 1rem 1.5rem;}
+  li{margin-bottom:.4rem;}
+  .callout{border-left:4px solid var(--accent);background:#eff6ff;padding:1rem 1.25rem;border-radius:0 8px 8px 0;margin:1.5rem 0;}
+  .callout.staff{border-left-color:var(--purple);background:#f5f3ff;}
+  .callout.warn{border-left-color:var(--orange);background:#fff7ed;}
+  .callout.tip{border-left-color:var(--sky);background:#f0f9ff;}
+  .callout-label{font-weight:700;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;margin-bottom:.5rem;color:var(--accent);}
+  .callout.staff .callout-label{color:var(--purple);}
+  .callout.warn .callout-label{color:var(--orange);}
+  .callout.tip .callout-label{color:var(--sky);}
+  .footer-nav{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--border);display:flex;gap:1rem;flex-wrap:wrap;font-size:.88rem;}
+</style>
+</head>
+<body>
+
+<h1>05 — Image Performance &amp; Caching</h1>
+<p class="subtitle">ImageCache · precacheImage · ResizeImage · Decoding pipeline · Memory management</p>
+
+<nav class="nav">
+  <a href="01-devtools-profiling.html">01 DevTools Profiling</a>
+  <a href="02-memory-leaks.html">02 Memory Leaks</a>
+  <a href="03-app-startup-optimization.html">03 App Startup</a>
+  <a href="04-list-performance.html">04 List Performance</a>
+  <a href="05-image-optimization.html" class="active">05 Image Optimization</a>
+  <a href="06-dart-gc-and-allocations.html">06 Dart GC</a>
+  <a href="07-aot-and-tree-shaking.html">07 AOT &amp; Tree Shaking</a>
+  <a href="08-interview-qa.html">08 Interview Q&amp;A</a>
+</nav>
+
+<h2>The Flutter Image Pipeline</h2>
+
+<p>Understanding the image pipeline is essential for diagnosing and fixing image-related jank. There are four distinct stages, each running on a different thread:</p>
+
+<ol>
+  <li><strong>Fetch</strong> — HTTP request or asset load. Runs on the IO thread pool. Network images use <code>HttpClient</code>; assets are read from the bundle.</li>
+  <li><strong>Decode</strong> — Compressed bytes (JPEG/PNG/WebP) are decoded to raw RGBA pixel data. Runs on the IO thread pool via <code>dart:ui</code>'s <code>instantiateImageCodec</code>. This is the most CPU-intensive step.</li>
+  <li><strong>Upload</strong> — Decoded RGBA data is uploaded to the GPU as a texture. Runs on the <strong>raster thread</strong> (GPU thread). This step is synchronous and blocks the raster thread — causing jank if the texture is large.</li>
+  <li><strong>Render</strong> — GPU draws the texture. Essentially free once uploaded.</li>
+</ol>
+
+<div class="callout warn">
+  <div class="callout-label">Jank Source</div>
+  GPU texture upload (step 3) cannot be made asynchronous in the current Flutter architecture. A 4K image decoded to ~48 MB of RGBA data causes a raster thread stall of 50–200ms — guaranteed dropped frames. The fix is to decode at display resolution, not original resolution.
+</div>
+
+<h2>ImageCache Internals</h2>
+
+<p><code>PaintingBinding.instance.imageCache</code> is a global LRU (Least Recently Used) cache with two tiers:</p>
+
+<ul>
+  <li><strong>Live images</strong>: Images currently referenced by widgets. Kept in a separate <code>_liveImages</code> map using <code>WeakReference</code>-like tracking. Not subject to the size limit.</li>
+  <li><strong>Cached images</strong>: Images recently used but no longer displayed. Subject to the <code>maximumSize</code> (1000 images) and <code>maximumSizeBytes</code> (100 MB) limits.</li>
+</ul>
+
+<pre><code>// Inspect cache state at runtime
+final cache = PaintingBinding.instance.imageCache;
+
+print('Live images: ${cache.liveImageCount}');
+print('Cached images: ${cache.currentSize} / ${cache.maximumSize}');
+print('Cached bytes: ${cache.currentSizeBytes} / ${cache.maximumSizeBytes}');
+
+// Configure limits in main() or app init:
+void configureImageCache() {
+  final cache = PaintingBinding.instance.imageCache;
+  cache.maximumSize = 200;                  // max 200 images
+  cache.maximumSizeBytes = 50 * 1024 * 1024; // max 50 MB
+}
+
+// Evict a specific image:
+const NetworkImage('https://example.com/avatar.jpg').evict();
+const AssetImage('assets/hero.png').evict();
+
+// Clear all cached (not live) images:
+PaintingBinding.instance.imageCache.clear();
+
+// Clear live images too (more aggressive):
+PaintingBinding.instance.imageCache.clearLiveImages();</code></pre>
+
+<h2>precacheImage: Warming the Cache Before Navigation</h2>
+
+<p><code>precacheImage</code> starts decoding an image and stores the result in the image cache before the widget that displays it is built. This eliminates the visual "pop" where a placeholder shows briefly before the image appears.</p>
+
+<pre><code>// Precache before navigating to a detail screen:
+Future&lt;void&gt; _openProductDetail(Product product) async {
+  // Start decoding hero image while the navigation animation plays
+  await precacheImage(
+    NetworkImage(product.heroImageUrl),
+    context,
+  );
+  if (mounted) {
+    Navigator.push(context, MaterialPageRoute(
+      builder: (_) =&gt; ProductDetailScreen(product: product),
+    ));
+  }
+}
+
+// Precache a list of images (e.g., next page of a gallery):
+Future&lt;void&gt; _prefetchNextPage(List&lt;String&gt; imageUrls) async {
+  await Future.wait(
+    imageUrls.map((url) =&gt; precacheImage(NetworkImage(url), context)),
+  );
+}
+
+// In initState, precache images for the current screen:
+@override
+void initState() {
+  super.initState();
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    precacheImage(const AssetImage('assets/large_background.jpg'), context);
+  });
+}</code></pre>
+
+<div class="callout tip">
+  <div class="callout-label">Tip</div>
+  <code>precacheImage</code> returns a <code>Future</code> but you don't always need to await it. Fire-and-forget is fine when you just want to warm the cache. Await it only when you need the image to be ready before the next screen appears.
+</div>
+
+<h2>ResizeImage: Decode at Display Resolution</h2>
+
+<p><code>ResizeImage</code> wraps any <code>ImageProvider</code> and instructs the codec to decode to a target pixel size. Instead of decoding a 4000×3000 photo to 48 MB of RGBA and then scaling it in the GPU, you decode it directly to (say) 400×300, using 1.44 MB — a 33× memory reduction.</p>
+
+<pre><code>// Without ResizeImage: full 4K decode, 48MB in memory
+Image.network('https://cdn.example.com/photo_4k.jpg')
+
+// With ResizeImage: decode to display size only
+Image(
+  image: ResizeImage(
+    const NetworkImage('https://cdn.example.com/photo_4k.jpg'),
+    width: 400,
+    height: 300,
+    // policy: ResizeImagePolicy.fit or .exact
+    policy: ResizeImagePolicy.fit,
+  ),
+)
+
+// Shorthand via cacheWidth/cacheHeight parameters on Image.network:
+Image.network(
+  'https://cdn.example.com/photo_4k.jpg',
+  cacheWidth: 400,   // decode to this width in pixels
+  cacheHeight: 300,  // decode to this height in pixels
+  fit: BoxFit.cover,
+)
+
+// For assets:
+Image.asset(
+  'assets/large_background.jpg',
+  cacheWidth: 800, // 2x display width for high-DPI screens
+)</code></pre>
+
+<h3>Computing the Right Target Size</h3>
+<pre><code>// Account for device pixel ratio (DPR)
+// A 200x200 logical pixel widget on a 3x DPR screen needs 600x600 physical pixels
+Widget buildOptimizedImage(BuildContext context, String url) {
+  final dpr = MediaQuery.of(context).devicePixelRatio;
+  final displayWidth = 200; // logical pixels
+  final targetPixels = (displayWidth * dpr).round();
+
+  return Image.network(
+    url,
+    width: displayWidth.toDouble(),
+    height: displayWidth.toDouble(),
+    cacheWidth: targetPixels,
+    cacheHeight: targetPixels,
+    fit: BoxFit.cover,
+  );
+}</code></pre>
+
+<h2>flutter_cache_manager: Network Caching with Expiry</h2>
+
+<p>Flutter's built-in <code>NetworkImage</code> does not persist images to disk between app sessions. <code>flutter_cache_manager</code> adds disk caching, expiry, and background refresh.</p>
+
+<pre><code>// pubspec.yaml:
+// dependencies:
+//   flutter_cache_manager: ^3.3.0
+//   cached_network_image: ^3.3.0  (UI widget using cache_manager)
+
+// Basic usage with CachedNetworkImage:
+CachedNetworkImage(
+  imageUrl: 'https://example.com/avatar.jpg',
+  placeholder: (context, url) =&gt; const CircleAvatar(
+    child: Icon(Icons.person),
+  ),
+  errorWidget: (context, url, error) =&gt; const Icon(Icons.error),
+  width: 48,
+  height: 48,
+  memCacheWidth: 96,  // 2x for 2x DPR
+  memCacheHeight: 96,
+)
+
+// Custom cache configuration:
+class ProfileImageCacheManager {
+  static const key = 'profileImageCache';
+  static CacheManager instance = CacheManager(
+    Config(
+      key,
+      stalePeriod: const Duration(days: 7),   // cached for 7 days
+      maxNrOfCacheObjects: 200,               // max 200 files on disk
+      repo: JsonCacheInfoRepository(databaseName: key),
+      fileService: HttpFileService(),
+    ),
+  );
+}
+
+// Using custom manager:
+CachedNetworkImage(
+  imageUrl: user.avatarUrl,
+  cacheManager: ProfileImageCacheManager.instance,
+  cacheKey: 'avatar_${user.id}', // deterministic key for targeted eviction
+)
+
+// Evict a specific file from disk cache:
+await ProfileImageCacheManager.instance.removeFile('avatar_${user.id}');
+
+// Clear entire disk cache:
+await ProfileImageCacheManager.instance.emptyCache();</code></pre>
+
+<h2>Image Format Comparison</h2>
+
+<table>
+  <tr>
+    <th>Format</th>
+    <th>Compression</th>
+    <th>Transparency</th>
+    <th>Animation</th>
+    <th>Decode Speed</th>
+    <th>Flutter Support</th>
+  </tr>
+  <tr>
+    <td>JPEG</td>
+    <td>Lossy, 10:1–20:1</td>
+    <td>No</td>
+    <td>No</td>
+    <td>Fast</td>
+    <td>Native</td>
+  </tr>
+  <tr>
+    <td>PNG</td>
+    <td>Lossless, 2:1–5:1</td>
+    <td>Yes (alpha)</td>
+    <td>No</td>
+    <td>Slower (lossless inflate)</td>
+    <td>Native</td>
+  </tr>
+  <tr>
+    <td>WebP (lossy)</td>
+    <td>Lossy, 25–35% better than JPEG</td>
+    <td>Yes</td>
+    <td>Yes</td>
+    <td>Fast</td>
+    <td>Native (Android/iOS 14+)</td>
+  </tr>
+  <tr>
+    <td>WebP (lossless)</td>
+    <td>Lossless, ~26% better than PNG</td>
+    <td>Yes</td>
+    <td>Yes</td>
+    <td>Moderate</td>
+    <td>Native</td>
+  </tr>
+  <tr>
+    <td>SVG</td>
+    <td>Vector (no pixels)</td>
+    <td>Yes</td>
+    <td>Limited</td>
+    <td>Slow (rasterize at use)</td>
+    <td>Via flutter_svg package</td>
+  </tr>
+  <tr>
+    <td>AVIF</td>
+    <td>Lossy, best quality/size ratio</td>
+    <td>Yes</td>
+    <td>Yes</td>
+    <td>Slow (complex codec)</td>
+    <td>Limited (via package)</td>
+  </tr>
+</table>
+
+<h3>SVG Performance Considerations</h3>
+<pre><code>// flutter_svg rasterizes SVG at the widget's display size
+// For icons shown at multiple sizes, this means multiple rasterization passes
+// Solution 1: Use Flutter's built-in Icon (uses font glyphs, no decode cost)
+// Solution 2: Use SvgPicture with explicit size for caching
+SvgPicture.asset(
+  'assets/logo.svg',
+  width: 48,
+  height: 48,
+  // flutter_svg caches at this exact size
+)
+
+// Solution 3: Pre-rasterize to PNG at build time for frequently used SVGs
+// (flutter pub run flutter_svg:rasterize or custom build script)</code></pre>
+
+<h2>Handling Large Images in Lists</h2>
+
+<pre><code>// Pattern: thumbnail in list, full image on detail
+class PhotoListItem extends StatelessWidget {
+  final Photo photo;
+  const PhotoListItem({required this.photo, super.key});
+
+  @override
+  Widget build(BuildContext context) =&gt; Image.network(
+    photo.thumbnailUrl, // NOT photo.fullResUrl
+    width: 80,
+    height: 80,
+    cacheWidth: 160,   // 2x for high-DPI
+    cacheHeight: 160,
+    fit: BoxFit.cover,
+    // Provide placeholder while loading
+    frameBuilder: (ctx, child, frame, wasSyncLoaded) {
+      if (wasSyncLoaded) return child; // already in cache, show immediately
+      return AnimatedOpacity(
+        opacity: frame == null ? 0 : 1,
+        duration: const Duration(milliseconds: 200),
+        child: frame == null
+            ? Container(color: Colors.grey[200]) // placeholder
+            : child,
+      );
+    },
+  );
+}</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Interview Signal</div>
+  When asked about image performance, demonstrate awareness of the full pipeline and where each bottleneck lives. Key talking points: (1) decode size vs display size mismatch as the root cause of most image memory issues, (2) the raster thread upload bottleneck that cannot be made async without API changes, (3) two-level caching (memory LRU via ImageCache + disk via flutter_cache_manager) and when each layer matters, (4) using CDN-side image resizing (e.g., Cloudinary, Imgix URL params) to avoid sending oversized images over the network entirely, (5) monitoring via <code>imageCache.currentSizeBytes</code> in production via custom metrics.
+</div>
+
+<div class="footer-nav">
+  <a href="04-list-performance.html">&larr; 04 List Performance</a>
+  <a href="06-dart-gc-and-allocations.html">06 Dart GC &rarr;</a>
+</div>
+</body>
+</html>

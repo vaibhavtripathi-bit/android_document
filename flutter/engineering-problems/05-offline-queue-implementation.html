@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 — Robust Offline Mutation Queue</title>
+<style>
+:root{--bg:#fff;--surface:#f8f9fa;--surface2:#f1f3f5;--border:#e5e7eb;--text:#111827;--text-dim:#6b7280;--accent:#2563eb;--accent-dark:#1d4ed8;--purple:#7c3aed;--green:#166534;--orange:#c2410c;--amber:#92400e;--sky:#0369a1;}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var(--text);font-size:1.05rem;line-height:1.8;padding:2rem;max-width:920px;margin:0 auto;}
+h1{font-size:2rem;margin-bottom:.4rem;color:var(--accent);}
+h2{font-size:1.45rem;margin:2.5rem 0 .85rem;color:var(--accent-dark);border-bottom:2px solid var(--border);padding-bottom:.4rem;}
+h3{font-size:1.15rem;margin:1.5rem 0 .6rem;color:var(--green);}
+h4{font-size:1rem;margin:1rem 0 .4rem;color:var(--amber);font-weight:600;}
+p{margin-bottom:.9rem;}
+a{color:var(--accent);text-decoration:none;}
+a:hover{text-decoration:underline;}
+.subtitle{color:var(--text-dim);font-size:.95rem;margin-bottom:2rem;}
+.nav{display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:2rem;}
+.nav a{background:var(--surface2);padding:.3rem .7rem;border-radius:6px;font-size:.82rem;color:var(--text-dim);border:1px solid var(--border);}
+.nav a.active{background:var(--accent);color:#fff;border-color:var(--accent);}
+.nav a:hover:not(.active){border-color:var(--accent);color:var(--accent);text-decoration:none;}
+code{background:var(--surface2);padding:.15rem .4rem;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:.88em;color:#be185d;border:1px solid var(--border);}
+pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.25rem 1.5rem;overflow-x:auto;margin:1rem 0 1.5rem;font-size:.92rem;line-height:1.7;}
+pre code{color:#1e293b;background:none;padding:0;border:none;font-size:1em;}
+table{width:100%;border-collapse:collapse;margin:1rem 0 1.5rem;font-size:.92rem;}
+th,td{text-align:left;padding:.6rem .9rem;border:1px solid var(--border);vertical-align:top;}
+th{background:var(--surface2);color:var(--accent-dark);font-weight:600;}
+td{background:var(--bg);}
+ul,ol{margin:.5rem 0 1rem 1.5rem;}
+li{margin-bottom:.4rem;}
+.callout{border-left:4px solid var(--accent);background:#eff6ff;padding:1rem 1.25rem;border-radius:0 8px 8px 0;margin:1.5rem 0;}
+.callout.staff{border-left-color:var(--purple);background:#f5f3ff;}
+.callout.warn{border-left-color:var(--orange);background:#fff7ed;}
+.callout.tip{border-left-color:var(--sky);background:#f0f9ff;}
+.callout-label{font-weight:700;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;margin-bottom:.5rem;color:var(--accent);}
+.callout.staff .callout-label{color:var(--purple);}
+.callout.warn .callout-label{color:var(--orange);}
+.callout.tip .callout-label{color:var(--sky);}
+.footer-nav{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--border);display:flex;gap:1rem;flex-wrap:wrap;font-size:.88rem;}
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="index.html">Index</a>
+  <a href="01-state-sync-across-isolates.html">01</a>
+  <a href="02-custom-scroll-physics.html">02</a>
+  <a href="03-plugin-with-platform-state.html">03</a>
+  <a href="04-performance-audit-and-fix.html">04</a>
+  <a href="05-offline-queue-implementation.html" class="active">05</a>
+  <a href="06-custom-render-object.html">06</a>
+  <a href="07-complex-animation-sequence.html">07</a>
+  <a href="08-deep-link-to-authenticated-screen.html">08</a>
+</div>
+
+<h1>05 — Robust Offline Mutation Queue</h1>
+<p class="subtitle">Problem: Queue mutations when offline, drain in order when online, survive restarts</p>
+
+<h2>Problem Statement</h2>
+<p>
+  Users can like posts, follow other users, and post comments while offline. These actions must:
+</p>
+<ol>
+  <li>Be reliably delivered to the server once connectivity is restored.</li>
+  <li>Be delivered in the order they were performed.</li>
+  <li>Never be delivered more than once (idempotent delivery).</li>
+  <li>Survive app restarts — a queued action taken yesterday must be sent after a restart today.</li>
+  <li>Apply to the local UI immediately (optimistic updates) with graceful rollback on permanent failure.</li>
+</ol>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Signal</div>
+  The naive version (just retry failed requests in memory) fails on restart. The correct version uses a durable local store as the queue. Be ready to discuss idempotency keys, the difference between transient and permanent errors, and why optimistic UI must be decoupled from the network result.
+</div>
+
+<h2>Architecture Overview</h2>
+<pre><code>User Action
+    │
+    ▼
+[Optimistic Update] ──► Local Drift DB (reactive watch)
+    │                          │
+    ▼                          ▼
+Enqueue PendingOperation   UI updates immediately
+    │
+    ▼
+QueueProcessor
+    │   (on app start + on network reconnect)
+    ▼
+drainQueue()
+    ├── Op success ──► mark completed, keep optimistic state
+    ├── Transient error (5xx, timeout) ──► exponential backoff, retry
+    └── Permanent error (400, 401, 404) ──► mark failed, revert optimistic, show error</code></pre>
+
+<h2>Drift Schema</h2>
+<pre><code>// lib/src/database/pending_operations_table.dart
+
+import 'package:drift/drift.dart';
+
+enum OpStatus { pending, processing, completed, failed }
+enum OpType { like, unlike, follow, unfollow, comment }
+
+class PendingOperations extends Table {
+  IntColumn get id => integer().autoIncrement()();
+
+  // Enum stored as integer index.
+  IntColumn get type => intEnum&lt;OpType&gt;()();
+
+  // JSON-encoded payload. E.g., {"postId":"abc123"} for a like.
+  TextColumn get payload => text()();
+
+  // UUID generated on the client. Sent to server as Idempotency-Key header.
+  // UNIQUE constraint prevents double-enqueue of the same logical action.
+  TextColumn get idempotencyKey => text().unique()();
+
+  // Current queue status.
+  IntColumn get status => intEnum&lt;OpStatus&gt;()();
+
+  // How many times we've tried and failed transiently.
+  IntColumn get retryCount => integer().withDefault(const Constant(0))();
+
+  // Earliest time we're allowed to retry (used for backoff scheduling).
+  DateTimeColumn get retryAfter => dateTime().nullable()();
+
+  // Preserved for ordering — queue is drained in createdAt order.
+  DateTimeColumn get createdAt => dateTime()();
+
+  // Foreign key to the locally-created entity (for optimistic rollback).
+  TextColumn get localEntityId => text().nullable()();
+}
+
+@DriftDatabase(tables: [PendingOperations])
+class AppDatabase extends _$AppDatabase {
+  AppDatabase(QueryExecutor e) : super(e);
+
+  @override
+  int get schemaVersion => 1;
+
+  // Watch all pending operations for the debug overlay.
+  Stream&lt;List&lt;PendingOperation&gt;&gt; watchPending() {
+    return (select(pendingOperations)
+          ..where((t) => t.status.equalsValue(OpStatus.pending))
+          ..orderBy([(t) => OrderingTerm.asc(t.createdAt)]))
+        .watch();
+  }
+}</code></pre>
+
+<h2>Enqueue: Adding Operations</h2>
+<pre><code>// lib/src/queue/queue_repository.dart
+
+class QueueRepository {
+  final AppDatabase _db;
+
+  QueueRepository(this._db);
+
+  Future&lt;void&gt; enqueue({
+    required OpType type,
+    required Map&lt;String, dynamic&gt; payload,
+    String? localEntityId,
+  }) async {
+    final key = const Uuid().v4(); // unique idempotency key per action
+    await _db.into(_db.pendingOperations).insertOnConflictUpdate(
+      PendingOperationsCompanion.insert(
+        type: type,
+        payload: jsonEncode(payload),
+        idempotencyKey: key,
+        status: OpStatus.pending,
+        createdAt: DateTime.now(),
+        localEntityId: Value(localEntityId),
+      ),
+    );
+  }
+
+  Future&lt;List&lt;PendingOperation&gt;&gt; getPendingOps() {
+    return (select(_db.pendingOperations)
+          ..where((t) => t.status.equalsValue(OpStatus.pending)
+              | t.status.equalsValue(OpStatus.processing))
+          ..where((t) => t.retryAfter.isNull()
+              | t.retryAfter.isSmallerOrEqualValue(DateTime.now()))
+          ..orderBy([(t) => OrderingTerm.asc(t.createdAt)]))
+        .get();
+  }
+
+  Future&lt;void&gt; markCompleted(int id) async {
+    await (_db.update(_db.pendingOperations)..where((t) => t.id.equals(id)))
+        .write(const PendingOperationsCompanion(status: Value(OpStatus.completed)));
+  }
+
+  Future&lt;void&gt; markFailed(int id) async {
+    await (_db.update(_db.pendingOperations)..where((t) => t.id.equals(id)))
+        .write(const PendingOperationsCompanion(status: Value(OpStatus.failed)));
+  }
+
+  Future&lt;void&gt; scheduleRetry(int id, int retryCount) async {
+    final backoffSeconds = _backoff(retryCount);
+    await (_db.update(_db.pendingOperations)..where((t) => t.id.equals(id)))
+        .write(PendingOperationsCompanion(
+          retryCount: Value(retryCount + 1),
+          retryAfter: Value(DateTime.now().add(Duration(seconds: backoffSeconds))),
+          status: const Value(OpStatus.pending),
+        ));
+  }
+
+  // Exponential backoff: 1s, 2s, 4s, 8s... capped at 5 minutes.
+  int _backoff(int retryCount) {
+    return (1 &lt;&lt; retryCount).clamp(1, 300);
+  }
+}</code></pre>
+
+<h2>QueueProcessor: Draining the Queue</h2>
+<pre><code>// lib/src/queue/queue_processor.dart
+
+class QueueProcessor {
+  final QueueRepository _queue;
+  final ApiClient _api;
+  final OptimisticStateRepository _optimistic;
+  final ConnectivityStream _connectivity;
+
+  StreamSubscription? _connectivitySub;
+  bool _draining = false;
+
+  QueueProcessor({
+    required QueueRepository queue,
+    required ApiClient api,
+    required OptimisticStateRepository optimistic,
+    required ConnectivityStream connectivity,
+  })  : _queue = queue,
+        _api = api,
+        _optimistic = optimistic,
+        _connectivity = connectivity;
+
+  void start() {
+    // Drain immediately on startup (handles restart recovery).
+    drainQueue();
+
+    // Drain whenever connectivity is restored.
+    _connectivitySub = _connectivity.onConnected.listen((_) {
+      drainQueue();
+    });
+  }
+
+  void stop() {
+    _connectivitySub?.cancel();
+  }
+
+  Future&lt;void&gt; drainQueue() async {
+    // Prevent concurrent drain runs.
+    if (_draining) return;
+    _draining = true;
+
+    try {
+      final ops = await _queue.getPendingOps();
+      for (final op in ops) {
+        await _processOne(op);
+        // Stop draining if we go offline mid-drain.
+        if (!_connectivity.isConnected) break;
+      }
+    } finally {
+      _draining = false;
+    }
+  }
+
+  Future&lt;void&gt; _processOne(PendingOperation op) async {
+    try {
+      await _api.execute(
+        type: op.type,
+        payload: jsonDecode(op.payload) as Map&lt;String, dynamic&gt;,
+        idempotencyKey: op.idempotencyKey,
+      );
+      await _queue.markCompleted(op.id);
+      // Optimistic state was already correct — nothing to revert.
+
+    } on TransientApiException catch (e) {
+      // 5xx, timeout, network error — retry with backoff.
+      await _queue.scheduleRetry(op.id, op.retryCount);
+
+    } on PermanentApiException catch (e) {
+      // 400, 401, 404, 409 — this operation will never succeed.
+      await _queue.markFailed(op.id);
+      // Revert the optimistic update in local DB.
+      if (op.localEntityId != null) {
+        await _optimistic.revert(op.type, op.localEntityId!);
+      }
+      // Bubble up to UI for error display.
+      _errorStream.add(QueueError(op: op, cause: e));
+    }
+  }
+
+  final _errorStream = StreamController&lt;QueueError&gt;.broadcast();
+  Stream&lt;QueueError&gt; get errors =&gt; _errorStream.stream;
+}</code></pre>
+
+<h2>API Client: Idempotency Key Header</h2>
+<pre><code>// lib/src/api/api_client.dart
+
+class ApiClient {
+  final Dio _dio;
+
+  Future&lt;void&gt; execute({
+    required OpType type,
+    required Map&lt;String, dynamic&gt; payload,
+    required String idempotencyKey,
+  }) async {
+    final response = await _dio.post(
+      _endpointFor(type),
+      data: payload,
+      options: Options(headers: {
+        // Server uses this to deduplicate — safe to retry.
+        'Idempotency-Key': idempotencyKey,
+      }),
+    );
+
+    if (response.statusCode! &gt;= 500 || response.statusCode == null) {
+      throw TransientApiException(response.statusCode);
+    }
+    if (response.statusCode! &gt;= 400) {
+      throw PermanentApiException(response.statusCode!, response.data);
+    }
+  }
+
+  String _endpointFor(OpType type) =&gt; switch (type) {
+    OpType.like =&gt; '/posts/like',
+    OpType.unlike =&gt; '/posts/unlike',
+    OpType.follow =&gt; '/users/follow',
+    OpType.unfollow =&gt; '/users/unfollow',
+    OpType.comment =&gt; '/posts/comment',
+  };
+}</code></pre>
+
+<h2>Optimistic UI: Immediate Local Updates</h2>
+<pre><code>// lib/src/features/feed/feed_notifier.dart
+
+class FeedNotifier extends AsyncNotifier&lt;List&lt;Post&gt;&gt; {
+  @override
+  Future&lt;List&lt;Post&gt;&gt; build() async {
+    // Watch Drift DB — UI updates reactively whenever DB changes.
+    ref.watch(feedRepositoryProvider).watchPosts().listen((posts) {
+      state = AsyncData(posts);
+    });
+    return ref.read(feedRepositoryProvider).getPosts();
+  }
+
+  Future&lt;void&gt; likePost(String postId) async {
+    // 1. Apply optimistic update immediately to local DB.
+    await ref.read(feedRepositoryProvider).setLiked(postId, true);
+
+    // 2. Enqueue the network operation.
+    await ref.read(queueRepositoryProvider).enqueue(
+      type: OpType.like,
+      payload: {'postId': postId},
+      localEntityId: postId,
+    );
+
+    // 3. Trigger a drain attempt (no-op if offline, runs if online).
+    ref.read(queueProcessorProvider).drainQueue();
+  }
+}</code></pre>
+
+<h2>Optimistic Rollback</h2>
+<pre><code>// lib/src/queue/optimistic_state_repository.dart
+
+class OptimisticStateRepository {
+  final AppDatabase _db;
+
+  Future&lt;void&gt; revert(OpType type, String entityId) async {
+    switch (type) {
+      case OpType.like:
+        // Server rejected the like — revert to unliked state.
+        await _db.feedDao.setLiked(entityId, false);
+      case OpType.follow:
+        await _db.socialDao.setFollowing(entityId, false);
+      case OpType.comment:
+        // Delete the locally-created comment row.
+        await _db.commentsDao.deleteLocal(entityId);
+      default:
+        break;
+    }
+  }
+}</code></pre>
+
+<h2>Testing</h2>
+<pre><code">// test/queue_processor_test.dart
+
+void main() {
+  late AppDatabase db;
+  late QueueRepository queue;
+  late MockApiClient api;
+  late QueueProcessor processor;
+
+  setUp(() async {
+    // In-memory SQLite — fast, isolated, no file I/O.
+    db = AppDatabase(NativeDatabase.memory());
+    queue = QueueRepository(db);
+    api = MockApiClient();
+    processor = QueueProcessor(
+      queue: queue,
+      api: api,
+      optimistic: MockOptimisticRepo(),
+      connectivity: AlwaysOnlineConnectivity(),
+    );
+  });
+
+  tearDown(() =&gt; db.close());
+
+  test('drains pending ops in createdAt order', () async {
+    // Enqueue 3 ops at slightly different times.
+    await queue.enqueue(type: OpType.like, payload: {'postId': '1'});
+    await Future.delayed(const Duration(milliseconds: 1));
+    await queue.enqueue(type: OpType.follow, payload: {'userId': 'A'});
+    await Future.delayed(const Duration(milliseconds: 1));
+    await queue.enqueue(type: OpType.comment, payload: {'text': 'Hi'});
+
+    await processor.drainQueue();
+
+    verify(api.execute(type: OpType.like, any, any)).called(1);
+    // Verify ordering via captor
+    final callOrder = verify(api.execute(type: captureAny, any, any))
+        .captured
+        .map((t) =&gt; t as OpType)
+        .toList();
+    expect(callOrder, [OpType.like, OpType.follow, OpType.comment]);
+  });
+
+  test('retries transient failures with backoff', () async {
+    when(api.execute(any, any, any)).thenThrow(TransientApiException(503));
+    await queue.enqueue(type: OpType.like, payload: {'postId': '1'});
+
+    await processor.drainQueue();
+
+    final ops = await queue.getPendingOps(); // retryAfter is in the future
+    expect(ops, isEmpty); // not eligible for retry yet
+    final allOps = await db.select(db.pendingOperations).get();
+    expect(allOps.first.retryCount, 1);
+  });
+
+  test('marks permanent failures and does not retry', () async {
+    when(api.execute(any, any, any)).thenThrow(PermanentApiException(400, {}));
+    await queue.enqueue(type: OpType.like, payload: {'postId': '1'});
+
+    await processor.drainQueue();
+
+    final allOps = await db.select(db.pendingOperations).get();
+    expect(allOps.first.status, OpStatus.failed);
+  });
+
+  test('survives restart — pending ops loaded from DB on start', () async {
+    // Enqueue without draining (simulates app killed before online).
+    await queue.enqueue(type: OpType.like, payload: {'postId': 'restart-test'});
+    await db.close();
+
+    // Re-open same DB (simulate app restart with same file).
+    db = AppDatabase(NativeDatabase.memory()); // in real test: use file path
+    queue = QueueRepository(db);
+
+    final pending = await queue.getPendingOps();
+    // In a real scenario with file DB this would be 1; memory DB resets.
+    // Test pattern: use driftTestOptions or a temp file for restart tests.
+  });
+}</code></pre>
+
+<h2>Trade-offs &amp; Design Decisions</h2>
+<table>
+  <tr><th>Decision</th><th>Choice</th><th>Alternative &amp; why rejected</th></tr>
+  <tr><td>Queue storage</td><td>Drift (SQLite)</td><td>SharedPreferences — no ordering guarantees, no atomic updates</td></tr>
+  <tr><td>Idempotency</td><td>Client-generated UUID + server deduplication</td><td>No idempotency key — double-sends on retry cause duplicate likes</td></tr>
+  <tr><td>Error classification</td><td>Transient vs permanent based on HTTP status</td><td>Retry all errors — 400s will never succeed, loop forever</td></tr>
+  <tr><td>Optimistic state</td><td>Immediate local DB write, watched by UI</td><td>In-memory state only — lost on restart, UI inconsistent with DB</td></tr>
+  <tr><td>Drain trigger</td><td>App start + connectivity restored</td><td>Polling timer — wastes battery, misses reconnect events</td></tr>
+  <tr><td>Concurrency</td><td>Serial drain (one op at a time)</td><td>Parallel drain — ordering not guaranteed, server-side conflicts</td></tr>
+</table>
+
+<div class="callout warn">
+  <div class="callout-label">Edge Case: Conflicting Operations</div>
+  If a user likes then unlikes a post while offline, the queue contains both ops. Naive serial execution sends like then unlike — correct. But if the user likes, the app crashes, restarts, and they unlike — the queue only contains unlike (the like was already drained). Server state may be inconsistent. Solution: when enqueueing, check for a pending inverse op and cancel both instead of sending either.
+</div>
+
+<div class="footer-nav">
+  <a href="04-performance-audit-and-fix.html">&larr; 04: Performance Audit</a>
+  <a href="06-custom-render-object.html">06: Custom RenderObject &rarr;</a>
+</div>
+
+</body>
+</html>

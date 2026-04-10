@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 — Production Plugin: Background State Streaming</title>
+<style>
+:root{--bg:#fff;--surface:#f8f9fa;--surface2:#f1f3f5;--border:#e5e7eb;--text:#111827;--text-dim:#6b7280;--accent:#2563eb;--accent-dark:#1d4ed8;--purple:#7c3aed;--green:#166534;--orange:#c2410c;--amber:#92400e;--sky:#0369a1;}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var(--text);font-size:1.05rem;line-height:1.8;padding:2rem;max-width:920px;margin:0 auto;}
+h1{font-size:2rem;margin-bottom:.4rem;color:var(--accent);}
+h2{font-size:1.45rem;margin:2.5rem 0 .85rem;color:var(--accent-dark);border-bottom:2px solid var(--border);padding-bottom:.4rem;}
+h3{font-size:1.15rem;margin:1.5rem 0 .6rem;color:var(--green);}
+h4{font-size:1rem;margin:1rem 0 .4rem;color:var(--amber);font-weight:600;}
+p{margin-bottom:.9rem;}
+a{color:var(--accent);text-decoration:none;}
+a:hover{text-decoration:underline;}
+.subtitle{color:var(--text-dim);font-size:.95rem;margin-bottom:2rem;}
+.nav{display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:2rem;}
+.nav a{background:var(--surface2);padding:.3rem .7rem;border-radius:6px;font-size:.82rem;color:var(--text-dim);border:1px solid var(--border);}
+.nav a.active{background:var(--accent);color:#fff;border-color:var(--accent);}
+.nav a:hover:not(.active){border-color:var(--accent);color:var(--accent);text-decoration:none;}
+code{background:var(--surface2);padding:.15rem .4rem;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:.88em;color:#be185d;border:1px solid var(--border);}
+pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.25rem 1.5rem;overflow-x:auto;margin:1rem 0 1.5rem;font-size:.92rem;line-height:1.7;}
+pre code{color:#1e293b;background:none;padding:0;border:none;font-size:1em;}
+table{width:100%;border-collapse:collapse;margin:1rem 0 1.5rem;font-size:.92rem;}
+th,td{text-align:left;padding:.6rem .9rem;border:1px solid var(--border);vertical-align:top;}
+th{background:var(--surface2);color:var(--accent-dark);font-weight:600;}
+td{background:var(--bg);}
+ul,ol{margin:.5rem 0 1rem 1.5rem;}
+li{margin-bottom:.4rem;}
+.callout{border-left:4px solid var(--accent);background:#eff6ff;padding:1rem 1.25rem;border-radius:0 8px 8px 0;margin:1.5rem 0;}
+.callout.staff{border-left-color:var(--purple);background:#f5f3ff;}
+.callout.warn{border-left-color:var(--orange);background:#fff7ed;}
+.callout.tip{border-left-color:var(--sky);background:#f0f9ff;}
+.callout-label{font-weight:700;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;margin-bottom:.5rem;color:var(--accent);}
+.callout.staff .callout-label{color:var(--purple);}
+.callout.warn .callout-label{color:var(--orange);}
+.callout.tip .callout-label{color:var(--sky);}
+.footer-nav{margin-top:3rem;padding-top:1.25rem;border-top:1px solid var(--border);display:flex;gap:1rem;flex-wrap:wrap;font-size:.88rem;}
+</style>
+</head>
+<body>
+
+<div class="nav">
+  <a href="index.html">Index</a>
+  <a href="01-state-sync-across-isolates.html">01</a>
+  <a href="02-custom-scroll-physics.html">02</a>
+  <a href="03-plugin-with-platform-state.html" class="active">03</a>
+  <a href="04-performance-audit-and-fix.html">04</a>
+  <a href="05-offline-queue-implementation.html">05</a>
+  <a href="06-custom-render-object.html">06</a>
+  <a href="07-complex-animation-sequence.html">07</a>
+  <a href="08-deep-link-to-authenticated-screen.html">08</a>
+</div>
+
+<h1>03 — Production Plugin: Background State Streaming</h1>
+<p class="subtitle">Problem: Stream long-running native upload progress from Android/iOS to Flutter UI</p>
+
+<h2>Problem Statement</h2>
+<p>
+  You are integrating a closed-source native file upload SDK. Build a Flutter plugin that:
+</p>
+<ol>
+  <li>Streams real-time progress (bytes sent, transfer speed, ETA) from the native SDK to the Dart UI.</li>
+  <li>Survives Android Activity recreation (screen rotation) without interrupting the upload.</li>
+  <li>Allows pause, resume, and cancel from Dart.</li>
+  <li>Cleans up all native resources correctly when the Flutter engine is detached (app goes to background and OS kills the engine).</li>
+</ol>
+
+<div class="callout staff">
+  <div class="callout-label">Staff Signal</div>
+  The hard part is not the channel setup — it is the lifecycle correctness. L6 candidates are expected to identify the Activity vs. Service distinction on Android, thread safety for the event sink, and the difference between engine detach and app backgrounding.
+</div>
+
+<h2>Plugin Structure: Federated Architecture</h2>
+<p>
+  Federated plugins separate interface from implementation, allowing platform teams to ship their own implementations independently.
+</p>
+<table>
+  <tr><th>Package</th><th>Responsibility</th></tr>
+  <tr><td><code>file_uploader</code></td><td>App-facing API. Delegates to platform interface.</td></tr>
+  <tr><td><code>file_uploader_platform_interface</code></td><td>Abstract class defining the contract. No platform code.</td></tr>
+  <tr><td><code>file_uploader_android</code></td><td>Android implementation using Kotlin + native SDK.</td></tr>
+  <tr><td><code>file_uploader_ios</code></td><td>iOS implementation using Swift + native SDK.</td></tr>
+</table>
+
+<h2>Channel Design</h2>
+<table>
+  <tr><th>Channel</th><th>Type</th><th>Methods / Events</th></tr>
+  <tr><td><code>file_uploader/control</code></td><td><code>MethodChannel</code></td><td><code>start(params)</code>, <code>pause()</code>, <code>resume()</code>, <code>cancel()</code></td></tr>
+  <tr><td><code>file_uploader/progress</code></td><td><code>EventChannel</code></td><td>Emits <code>UploadProgress</code> maps continuously</td></tr>
+</table>
+
+<div class="callout tip">
+  <div class="callout-label">Design Choice</div>
+  Use <code>EventChannel</code> (not polling via <code>MethodChannel</code>) for progress. <code>EventChannel</code> uses a push model — native calls into Dart — which is far more efficient than Dart polling every 100ms and avoids the complexity of managing timers on both sides.
+</div>
+
+<h2>Dart: Platform Interface</h2>
+<pre><code>// file_uploader_platform_interface/lib/file_uploader_platform_interface.dart
+
+abstract class FileUploaderPlatform {
+  static FileUploaderPlatform _instance = MethodChannelFileUploader();
+
+  static FileUploaderPlatform get instance => _instance;
+
+  static set instance(FileUploaderPlatform instance) {
+    _instance = instance;
+  }
+
+  Future&lt;void&gt; startUpload(UploadParams params);
+  Future&lt;void&gt; pauseUpload();
+  Future&lt;void&gt; resumeUpload();
+  Future&lt;void&gt; cancelUpload();
+  Stream&lt;UploadProgress&gt; get progressStream;
+}
+
+class UploadParams {
+  final String filePath;
+  final String destinationUrl;
+  final Map&lt;String, String&gt; headers;
+
+  const UploadParams({
+    required this.filePath,
+    required this.destinationUrl,
+    this.headers = const {},
+  });
+
+  Map&lt;String, dynamic&gt; toMap() =&gt; {
+    'filePath': filePath,
+    'destinationUrl': destinationUrl,
+    'headers': headers,
+  };
+}
+
+class UploadProgress {
+  final int bytesSent;
+  final int totalBytes;
+  final double speedBytesPerSecond;
+  final Duration eta;
+
+  const UploadProgress({
+    required this.bytesSent,
+    required this.totalBytes,
+    required this.speedBytesPerSecond,
+    required this.eta,
+  });
+
+  double get fraction => totalBytes == 0 ? 0 : bytesSent / totalBytes;
+
+  factory UploadProgress.fromMap(Map&lt;dynamic, dynamic&gt; map) {
+    return UploadProgress(
+      bytesSent: map['bytesSent'] as int,
+      totalBytes: map['totalBytes'] as int,
+      speedBytesPerSecond: (map['speedBytesPerSecond'] as num).toDouble(),
+      eta: Duration(seconds: map['etaSeconds'] as int),
+    );
+  }
+}</code></pre>
+
+<h2>Dart: Method Channel Implementation</h2>
+<pre><code>// file_uploader/lib/src/method_channel_file_uploader.dart
+
+class MethodChannelFileUploader extends FileUploaderPlatform {
+  static const _control = MethodChannel('file_uploader/control');
+  static const _progressChannel = EventChannel('file_uploader/progress');
+
+  // Cache the broadcast stream so multiple listeners work correctly.
+  Stream&lt;UploadProgress&gt;? _progressStream;
+
+  @override
+  Stream&lt;UploadProgress&gt; get progressStream {
+    _progressStream ??= _progressChannel
+        .receiveBroadcastStream()
+        .map((event) =&gt; UploadProgress.fromMap(event as Map));
+    return _progressStream!;
+  }
+
+  @override
+  Future&lt;void&gt; startUpload(UploadParams params) async {
+    await _control.invokeMethod('start', params.toMap());
+  }
+
+  @override
+  Future&lt;void&gt; pauseUpload() async {
+    await _control.invokeMethod('pause');
+  }
+
+  @override
+  Future&lt;void&gt; resumeUpload() async {
+    await _control.invokeMethod('resume');
+  }
+
+  @override
+  Future&lt;void&gt; cancelUpload() async {
+    await _control.invokeMethod('cancel');
+  }
+}</code></pre>
+
+<h2>Kotlin: Android Plugin Implementation</h2>
+
+<h3>Plugin Registration and Lifecycle</h3>
+<pre><code>// FileUploaderPlugin.kt
+
+class FileUploaderPlugin : FlutterPlugin, MethodCallHandler {
+
+  private lateinit var controlChannel: MethodChannel
+  private lateinit var progressChannel: EventChannel
+  private var eventSink: EventChannel.EventSink? = null
+
+  // Upload runs in a Service, decoupled from the Activity lifecycle.
+  private var uploadManager: UploadManager? = null
+
+  // Handler ensures event sink is called on the main thread.
+  private val mainHandler = Handler(Looper.getMainLooper())
+
+  override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+    controlChannel = MethodChannel(binding.binaryMessenger, "file_uploader/control")
+    controlChannel.setMethodCallHandler(this)
+
+    progressChannel = EventChannel(binding.binaryMessenger, "file_uploader/progress")
+    progressChannel.setStreamHandler(object : EventChannel.StreamHandler {
+
+      override fun onListen(arguments: Any?, sink: EventChannel.EventSink) {
+        eventSink = sink
+        // If an upload is already running (e.g., after rotation),
+        // immediately emit the latest known progress.
+        uploadManager?.latestProgress?.let { sink.success(it.toMap()) }
+      }
+
+      override fun onCancel(arguments: Any?) {
+        // Dart side unsubscribed; stop emitting but don't cancel the upload.
+        eventSink = null
+      }
+    })
+  }
+
+  override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+    // Engine is being destroyed. Null out the sink to prevent calls on
+    // a dead messenger. The upload Service continues independently.
+    controlChannel.setMethodCallHandler(null)
+    progressChannel.setStreamHandler(null)
+    eventSink = null
+  }
+
+  override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+    when (call.method) {
+      "start" -&gt; {
+        val params = UploadParams.fromMap(call.arguments as Map&lt;*, *&gt;)
+        uploadManager = UploadManager(params) { progress -&gt;
+          // SDK callback arrives on a background thread.
+          // Post to main thread before touching the event sink.
+          mainHandler.post {
+            eventSink?.success(progress.toMap())
+          }
+        }
+        uploadManager?.start()
+        result.success(null)
+      }
+      "pause" -&gt; { uploadManager?.pause(); result.success(null) }
+      "resume" -&gt; { uploadManager?.resume(); result.success(null) }
+      "cancel" -&gt; { uploadManager?.cancel(); result.success(null) }
+      else -&gt; result.notImplemented()
+    }
+  }
+}</code></pre>
+
+<h3>UploadManager (Android Service wrapper)</h3>
+<pre><code>// UploadManager.kt
+
+class UploadManager(
+  private val params: UploadParams,
+  private val onProgress: (UploadProgress) -&gt; Unit,
+) {
+  // Tracks the most recent progress for reattach scenarios.
+  var latestProgress: UploadProgress? = null
+    private set
+
+  private val sdk = NativeUploadSdk()
+
+  fun start() {
+    sdk.startUpload(
+      filePath = params.filePath,
+      url = params.destinationUrl,
+      progressCallback = { sent, total, speed, eta -&gt;
+        val progress = UploadProgress(
+          bytesSent = sent,
+          totalBytes = total,
+          speedBytesPerSecond = speed,
+          etaSeconds = eta,
+        )
+        latestProgress = progress
+        onProgress(progress)
+      },
+      errorCallback = { e -&gt;
+        // Post errors to the event sink as well using error() method.
+        Handler(Looper.getMainLooper()).post {
+          eventSink?.error("UPLOAD_ERROR", e.message, null)
+        }
+      }
+    )
+  }
+
+  fun pause() = sdk.pause()
+  fun resume() = sdk.resume()
+  fun cancel() { sdk.cancel(); latestProgress = null }
+}</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Critical: Thread Safety</div>
+  The native SDK's progress callback fires on a background thread. The <code>EventChannel.EventSink</code> must only be called from the main thread — calling it from a background thread causes a crash or undefined behavior. Always post through <code>Handler(Looper.getMainLooper())</code> on Android or <code>DispatchQueue.main.async</code> on iOS.
+</div>
+
+<h2>Swift: iOS EventChannel StreamHandler</h2>
+<pre><code>// FileUploaderPlugin.swift
+
+public class FileUploaderPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
+  private var eventSink: FlutterEventSink?
+  private var uploadManager: UploadManager?
+
+  public static func register(with registrar: FlutterPluginRegistrar) {
+    let controlChannel = FlutterMethodChannel(
+      name: "file_uploader/control",
+      binaryMessenger: registrar.messenger()
+    )
+    let progressChannel = FlutterEventChannel(
+      name: "file_uploader/progress",
+      binaryMessenger: registrar.messenger()
+    )
+    let instance = FileUploaderPlugin()
+    registrar.addMethodCallDelegate(instance, channel: controlChannel)
+    progressChannel.setStreamHandler(instance)
+  }
+
+  // MARK: - FlutterStreamHandler
+
+  public func onListen(
+    withArguments arguments: Any?,
+    eventSink events: @escaping FlutterEventSink
+  ) -&gt; FlutterError? {
+    self.eventSink = events
+    // Replay latest progress if upload already running.
+    if let latest = uploadManager?.latestProgress {
+      events(latest.toMap())
+    }
+    return nil
+  }
+
+  public func onCancel(withArguments arguments: Any?) -&gt; FlutterError? {
+    self.eventSink = nil
+    return nil
+  }
+
+  // MARK: - MethodCall handler
+
+  public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    switch call.method {
+    case "start":
+      let args = call.arguments as! [String: Any]
+      uploadManager = UploadManager(params: args) { [weak self] progress in
+        // SDK callback may be on any thread; dispatch to main.
+        DispatchQueue.main.async {
+          self?.eventSink?(progress.toMap())
+        }
+      }
+      uploadManager?.start()
+      result(nil)
+    case "pause":  uploadManager?.pause();  result(nil)
+    case "resume": uploadManager?.resume(); result(nil)
+    case "cancel": uploadManager?.cancel(); result(nil)
+    default:       result(FlutterMethodNotImplemented)
+    }
+  }
+}</code></pre>
+
+<h2>Android Activity Recreation Handling</h2>
+<p>
+  Screen rotation destroys and recreates the Activity. The Flutter engine may or may not be recreated depending on the app's <code>android:configChanges</code> setting. The key insight is:
+</p>
+<ul>
+  <li>The upload must live in a <code>Service</code>, not in the plugin or Activity. Services survive Activity recreation.</li>
+  <li>When the engine reattaches (<code>onAttachedToEngine</code> fires again), the plugin re-registers the event channel and immediately emits the latest progress from <code>uploadManager?.latestProgress</code>.</li>
+  <li>The <code>UploadManager</code> is stored as a singleton or in the <code>Application</code> class — not as a field on the plugin instance, which is recreated with the engine.</li>
+</ul>
+
+<pre><code>// Store UploadManager in Application to survive engine recreation.
+class MyApplication : Application() {
+  var uploadManager: UploadManager? = null
+}
+
+// In plugin:
+override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+  val app = binding.applicationContext as MyApplication
+  uploadManager = app.uploadManager  // Reconnect to existing upload if any
+  // ... channel setup
+}</code></pre>
+
+<h2>Testing</h2>
+<pre><code>// Dart unit test using a mock platform
+class MockFileUploaderPlatform extends FileUploaderPlatform {
+  final _controller = StreamController&lt;UploadProgress&gt;.broadcast();
+
+  @override
+  Stream&lt;UploadProgress&gt; get progressStream =&gt; _controller.stream;
+
+  @override
+  Future&lt;void&gt; startUpload(UploadParams params) async {
+    // Emit synthetic progress events.
+    for (int i = 1; i &lt;= 5; i++) {
+      await Future.delayed(const Duration(milliseconds: 10));
+      _controller.add(UploadProgress(
+        bytesSent: i * 1024,
+        totalBytes: 5120,
+        speedBytesPerSecond: 1024,
+        eta: Duration(seconds: 5 - i),
+      ));
+    }
+  }
+
+  @override Future&lt;void&gt; pauseUpload() async {}
+  @override Future&lt;void&gt; resumeUpload() async {}
+  @override Future&lt;void&gt; cancelUpload() async {}
+}
+
+void main() {
+  test('progress stream emits 5 events and reaches 100%', () async {
+    FileUploaderPlatform.instance = MockFileUploaderPlatform();
+    final uploader = FileUploader();
+
+    final events = &lt;UploadProgress&gt;[];
+    final sub = uploader.progressStream.listen(events.add);
+
+    await uploader.startUpload(UploadParams(
+      filePath: '/tmp/test.mp4',
+      destinationUrl: 'https://upload.example.com',
+    ));
+
+    await Future.delayed(const Duration(milliseconds: 100));
+    await sub.cancel();
+
+    expect(events.length, 5);
+    expect(events.last.fraction, closeTo(1.0, 0.01));
+  });
+}</code></pre>
+
+<h2>Trade-offs Summary</h2>
+<table>
+  <tr><th>Decision</th><th>Choice</th><th>Rationale</th></tr>
+  <tr><td>EventChannel vs polling</td><td>EventChannel push</td><td>Lower latency, no timer management, backpressure from Dart</td></tr>
+  <tr><td>Upload host</td><td>Android Service</td><td>Survives Activity and engine lifecycle changes</td></tr>
+  <tr><td>Thread safety</td><td>Main thread handler/dispatch</td><td>EventSink is not thread-safe</td></tr>
+  <tr><td>Progress replay on reconnect</td><td>Cache <code>latestProgress</code> in manager</td><td>UI recovers after rotation without waiting for next event</td></tr>
+  <tr><td>Federated vs. monolithic plugin</td><td>Federated</td><td>Platform teams can ship fixes independently; cleaner pub.dev API</td></tr>
+</table>
+
+<div class="footer-nav">
+  <a href="02-custom-scroll-physics.html">&larr; 02: Custom Scroll Physics</a>
+  <a href="04-performance-audit-and-fix.html">04: Performance Audit &rarr;</a>
+</div>
+
+</body>
+</html>

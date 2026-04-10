@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>01 — Flutter DevTools: Performance Profiling — Flutter L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Performance &amp; Memory</a><span class="sep">›</span>
+        DevTools: Performance Profiling
+    </nav>
+
+    <h1>01 — Flutter DevTools: Performance Profiling</h1>
+    <p class="subtitle">Timeline · CPU profiler · Memory profiler · Widget inspector · Network profiler</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#devtools-arch">1. DevTools Architecture &amp; VM Service Protocol</a></li>
+            <li><a href="#performance-tab">2. Performance Tab: Frame Chart Anatomy</a></li>
+            <li><a href="#flame-charts">3. Reading Flame Charts</a></li>
+            <li><a href="#cpu-profiler">4. CPU Profiler (Sampling-Based)</a></li>
+            <li><a href="#memory-tab">5. Memory Tab</a></li>
+            <li><a href="#widget-inspector">6. Widget Inspector &amp; Rebuild Tracking</a></li>
+            <li><a href="#network-profiler">7. Network Profiler &amp; Logging Tab</a></li>
+            <li><a href="#cli-usage">8. DevTools from CLI vs IDE</a></li>
+            <li><a href="#rebuild-storms">9. Detecting Rebuild Storms</a></li>
+        </ul>
+    </div>
+
+    <h2 id="devtools-arch">1. DevTools Architecture &amp; VM Service Protocol</h2>
+
+    <p>Flutter DevTools is a browser-based profiling suite built on top of the <strong>Dart VM Service Protocol</strong> — a JSON-RPC over WebSocket interface exposed by the Dart VM at runtime. Understanding this architecture explains why DevTools only connects to debug and profile builds, not release builds (the VM service is stripped in release mode for security and performance).</p>
+
+    <div class="diagram">
+DevTools Architecture
+═════════════════════
+
+┌───────────────────────────────────────────────────────┐
+│              Flutter DevTools (Browser)                │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │
+│  │ Timeline │ │  CPU     │ │ Memory   │ │ Widget   │  │
+│  │  (Perf)  │ │ Profiler │ │ Profiler │ │Inspector │  │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘  │
+└─────────────────────┬─────────────────────────────────┘
+                      │ WebSocket (JSON-RPC 2.0)
+                      │ VM Service Protocol
+                      ▼
+┌───────────────────────────────────────────────────────┐
+│                  Dart VM (Debug/Profile)               │
+│  ┌────────────────┐     ┌────────────────────────┐    │
+│  │ Timeline Events│     │ Sampling Profiler       │    │
+│  │ (dart:developer│     │ (CPU call stacks every  │    │
+│  │  Timeline API) │     │  ~250µs)               │    │
+│  └────────────────┘     └────────────────────────┘    │
+│  ┌────────────────┐     ┌────────────────────────┐    │
+│  │ Heap Snapshot  │     │ Allocation Tracker      │    │
+│  │ (full object   │     │ (per-class allocation   │    │
+│  │  graph dump)   │     │  counts + sizes)        │    │
+│  └────────────────┘     └────────────────────────┘    │
+└───────────────────────────────────────────────────────┘
+    </div>
+
+    <p>The VM service exposes streams: <code>Timeline</code>, <code>GC</code>, <code>Isolate</code>, <code>Debug</code>, <code>Profiler</code>, <code>Logging</code>. DevTools subscribes to these streams and renders them. The protocol is defined at <code>dart.dev/tools/dart-vm-service</code>.</p>
+
+    <h3>1.1 Profile Mode vs Debug Mode</h3>
+
+    <p>Always profile in <strong>profile mode</strong> (<code>flutter run --profile</code>), never debug mode. The differences are significant:</p>
+
+    <table>
+        <thead>
+            <tr><th>Aspect</th><th>Debug</th><th>Profile</th><th>Release</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>Compilation</td><td>JIT (slow, interpreted)</td><td>AOT (fast, machine code)</td><td>AOT (fast)</td></tr>
+            <tr><td>Assertions</td><td>Enabled</td><td>Disabled</td><td>Disabled</td></tr>
+            <tr><td>VM Service</td><td>Enabled</td><td>Enabled</td><td>Disabled</td></tr>
+            <tr><td>DevTools</td><td>Available (skewed perf)</td><td>Available (realistic perf)</td><td>Not available</td></tr>
+            <tr><td>Observatory</td><td>Port 8181</td><td>Port 8181</td><td>None</td></tr>
+            <tr><td>Frame times</td><td>Often 3–5x slower</td><td>Close to real device</td><td>Fastest</td></tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Critical Interview Point</div>
+        <p>Debug builds use JIT compilation which can make frames 3–10x slower than release. Profiling in debug mode leads to wrong conclusions. Always use <code>flutter run --profile</code> when investigating performance issues. On a real device, not a simulator — iOS Simulator and Android Emulator have different CPU/GPU characteristics.</p>
+    </div>
+
+    <h2 id="performance-tab">2. Performance Tab: Frame Chart Anatomy</h2>
+
+    <p>The Performance tab shows a scrollable timeline of frames. Each frame is represented as a pair of colored bars — one for the UI thread (Dart isolate) and one for the raster thread (GPU work). The 16ms and 8.3ms budget lines correspond to 60fps and 120fps targets respectively.</p>
+
+    <div class="diagram">
+Performance Tab — Frame Chart
+══════════════════════════════
+
+ Time →
+ ┌─────────┬─────────┬─────────┬─────────┬──────────────────┐
+ │         │         │ ██████  │         │ ████████████████  │ ← UI Thread
+ │ ██████  │ ██████  │ ██████  │ ██████  │ ████████████████  │   (Dart isolate)
+ └─────────┴─────────┴─────────┴─────────┴──────────────────┘
+ ┌─────────┬─────────┬─────────┬─────────┬──────────────────┐
+ │         │         │         │ ██████  │                   │ ← Raster Thread
+ │ ██████  │ ██████  │ ████    │ ██████  │ ██████            │   (GPU work)
+ └─────────┴─────────┴─────────┴─────────┴──────────────────┘
+   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─16ms line─
+
+ Green  = frame rendered under budget
+ Yellow = approaching budget (>8ms)
+ Red    = over budget (jank frame, >16ms)
+    </div>
+
+    <h3>2.1 Frame Chart Components</h3>
+
+    <ul>
+        <li><strong>UI thread bar</strong> — Time spent in Dart code: widget build, layout, paint recording. A tall UI bar indicates expensive build/layout work.</li>
+        <li><strong>Raster thread bar</strong> — Time spent rasterizing the layer tree to GPU pixels. A tall raster bar indicates expensive shader work, complex layer operations, or first-time shader compilation (shader jank).</li>
+        <li><strong>Frame selector</strong> — Click any frame to see its detailed timeline breakdown below.</li>
+        <li><strong>16ms budget line</strong> — Red dashed horizontal line. Frames above this line caused dropped frames (jank).</li>
+    </ul>
+
+    <pre><code><span class="comment">// How Flutter emits timeline events for the frame chart</span>
+<span class="comment">// (From Flutter framework source — scheduler.dart)</span>
+<span class="keyword">void</span> _handleDrawFrame() {
+  <span class="comment">// This event appears as "Frame" in the timeline</span>
+  Timeline.startSync(<span class="string">'Frame'</span>, arguments: timelineArgumentsIndicatingLandmarkEvent);
+  <span class="keyword">try</span> {
+    _handleBeginFrame(Duration.zero);
+    <span class="comment">// Build phase</span>
+    Timeline.startSync(<span class="string">'Animate'</span>);
+    <span class="keyword">for</span> (<span class="keyword">final</span> callback <span class="keyword">in</span> _persistentCallbacks) {
+      callback(_currentFrameTimeStamp!);
+    }
+    Timeline.finishSync();
+
+    <span class="comment">// Layout + Paint phase</span>
+    Timeline.startSync(<span class="string">'Build'</span>);
+    buildOwner!.buildScope(rootElement!);
+    Timeline.finishSync();
+
+    Timeline.startSync(<span class="string">'Composite'</span>);
+    renderView.compositeFrame();
+    Timeline.finishSync();
+  } <span class="keyword">finally</span> {
+    Timeline.finishSync(); <span class="comment">// End 'Frame'</span>
+  }
+}
+
+<span class="comment">// You can add custom events to the timeline in your own code:</span>
+<span class="keyword">import</span> <span class="string">'dart:developer'</span> <span class="keyword">as</span> developer;
+
+<span class="keyword">void</span> expensiveOperation() {
+  developer.Timeline.startSync(<span class="string">'MyExpensiveOperation'</span>);
+  <span class="keyword">try</span> {
+    <span class="comment">// ... expensive work ...</span>
+  } <span class="keyword">finally</span> {
+    developer.Timeline.finishSync();
+  }
+}</code></pre>
+
+    <h2 id="flame-charts">3. Reading Flame Charts</h2>
+
+    <p>Selecting a specific frame in the frame chart opens a flame chart for that frame. This is a stack trace over time where each horizontal bar represents a function call — its width proportional to the time spent, and its vertical position representing call depth (callers above, callees below).</p>
+
+    <div class="diagram">
+Flame Chart — UI Thread Breakdown (Single Frame)
+══════════════════════════════════════════════════
+
+┌──────────────────────────────────────────────────────┐ ← Frame (16ms total)
+│                  handleDrawFrame                      │
+├──────────────┬───────────────────────────────────────┤
+│  Animate(2ms)│         Build (10ms)                  │
+├──────────────┼─────────────┬─────────────────────────┤
+│              │ buildScope  │   Layout (2ms) │ Paint  │
+│              ├──────┬──────┤                │  (1ms) │
+│              │Dirty1│Dirty2│                │        │
+│              │      │Dirty3│                │        │
+│              ├──────┤      │                │        │
+│              │build │ ...  │                │        │
+└──────────────┴──────┴──────┴────────────────┴────────┘
+
+Width = time spent in that function
+Height = call depth
+Hotspot = widest bar at the bottom of the call tree
+    </div>
+
+    <h3>3.1 UI Thread vs Raster Thread Flame Charts</h3>
+
+    <p>DevTools shows separate flame charts for each thread. They are important to read independently:</p>
+
+    <ul>
+        <li><strong>UI thread flame chart</strong> — Look for wide bars in <code>buildScope</code> (too many widgets rebuilding), <code>performLayout</code> (expensive layout passes), or <code>paint</code> (complex CustomPainter operations).</li>
+        <li><strong>Raster thread flame chart</strong> — Look for wide bars in <code>skia::GrGLGpu</code> calls (GPU pipeline stalls), <code>drawImageRect</code> (image upload), or shader compilation events (appearing as <code>GrGLGpu::flushRenderTarget</code> stalls on first render).</li>
+    </ul>
+
+    <pre><code><span class="comment">// Adding custom timeline events for granular profiling</span>
+<span class="keyword">import</span> <span class="string">'dart:developer'</span>;
+
+<span class="keyword">class</span> <span class="type">ProductListWidget</span> <span class="keyword">extends</span> <span class="type">StatelessWidget</span> {
+  <span class="annotation">@override</span>
+  <span class="type">Widget</span> build(<span class="type">BuildContext</span> context) {
+    <span class="comment">// Mark this build in the timeline for DevTools visibility</span>
+    <span class="keyword">return</span> <span class="type">Timeline</span>.timeSync(
+      <span class="string">'ProductListWidget.build'</span>,
+      () {
+        <span class="keyword">final</span> products = <span class="type">Provider</span>.of&lt;<span class="type">ProductStore</span>&gt;(context).products;
+        <span class="keyword">return</span> <span class="type">ListView</span>.builder(
+          itemCount: products.length,
+          itemBuilder: (ctx, i) => <span class="type">ProductTile</span>(product: products[i]),
+        );
+      },
+      flow: <span class="keyword">null</span>,
+    );
+  }
+}
+
+<span class="comment">// For async operations, use flow events to connect start/end</span>
+<span class="keyword">void</span> loadProductsAsync() {
+  <span class="keyword">final</span> flow = <span class="type">Flow</span>.begin();
+  <span class="type">Timeline</span>.startSync(<span class="string">'LoadProducts.start'</span>, flow: flow);
+  <span class="type">Timeline</span>.finishSync();
+
+  fetchFromNetwork().then((_) {
+    <span class="type">Timeline</span>.startSync(<span class="string">'LoadProducts.end'</span>, flow: <span class="type">Flow</span>.end(flow.id));
+    <span class="type">Timeline</span>.finishSync();
+  });
+}</code></pre>
+
+    <h2 id="cpu-profiler">4. CPU Profiler (Sampling-Based)</h2>
+
+    <p>The CPU profiler uses <strong>sampling profiling</strong>: the VM interrupts execution every ~250 microseconds and records the current call stack. This introduces minimal overhead (~1–3%) compared to instrumentation profiling, making it suitable for production-like measurements. The trade-off is statistical sampling — functions called very briefly may be under-represented.</p>
+
+    <h3>4.1 CPU Profiler Views</h3>
+
+    <table>
+        <thead>
+            <tr><th>View</th><th>Description</th><th>When to Use</th></tr>
+        </thead>
+        <tbody>
+            <tr><td><strong>Bottom Up</strong></td><td>Shows hottest leaf functions first, then their callers going up</td><td>Find which functions consume most CPU time</td></tr>
+            <tr><td><strong>Call Tree</strong></td><td>Shows call hierarchy top-down from roots. Cumulative % includes children.</td><td>Understand the call path to a bottleneck</td></tr>
+            <tr><td><strong>Flame Chart</strong></td><td>Visual timeline with width = CPU time</td><td>Spot which phases (build/layout/paint) dominate</td></tr>
+            <tr><td><strong>Method Table</strong></td><td>Flat list sorted by self time or total time</td><td>Quick ranking of hottest functions</td></tr>
+        </tbody>
+    </table>
+
+    <pre><code><span class="comment">// Profiling a specific function: use dart:developer for annotations</span>
+<span class="keyword">import</span> <span class="string">'dart:developer'</span>;
+
+<span class="keyword">class</span> <span class="type">HeavyComputationWidget</span> <span class="keyword">extends</span> <span class="type">StatelessWidget</span> {
+  <span class="keyword">final</span> <span class="type">List</span>&lt;<span class="type">DataPoint</span>&gt; dataPoints;
+  <span class="keyword">const</span> <span class="type">HeavyComputationWidget</span>({required <span class="keyword">this</span>.dataPoints});
+
+  <span class="comment">// This method's samples will appear in the CPU profiler</span>
+  <span class="type">List</span>&lt;<span class="type">DataPoint</span>&gt; _processData() {
+    <span class="comment">// CPU-intensive transformation — will show in profiler if slow</span>
+    <span class="keyword">return</span> dataPoints
+        .where((p) => p.value > <span class="number">0</span>)
+        .map((p) => p.normalize())
+        .toList();
+  }
+
+  <span class="annotation">@override</span>
+  <span class="type">Widget</span> build(<span class="type">BuildContext</span> context) {
+    <span class="comment">// Wrong: processing data inside build() — runs on UI thread</span>
+    <span class="comment">// This will show up as hot in the profiler under buildScope</span>
+    <span class="keyword">final</span> processed = _processData();
+    <span class="keyword">return</span> <span class="type">DataChart</span>(points: processed);
+  }
+}
+
+<span class="comment">// Correct: move heavy work off the UI thread with compute()</span>
+<span class="keyword">class</span> <span class="type">HeavyComputationWidgetFixed</span> <span class="keyword">extends</span> <span class="type">StatefulWidget</span> {
+  <span class="keyword">const</span> <span class="type">HeavyComputationWidgetFixed</span>({required <span class="keyword">this</span>.dataPoints});
+  <span class="keyword">final</span> <span class="type">List</span>&lt;<span class="type">DataPoint</span>&gt; dataPoints;
+  <span class="annotation">@override</span>
+  <span class="type">State</span>&lt;<span class="type">HeavyComputationWidgetFixed</span>&gt; createState() => _State();
+}
+
+<span class="keyword">class</span> _State <span class="keyword">extends</span> <span class="type">State</span>&lt;<span class="type">HeavyComputationWidgetFixed</span>&gt; {
+  <span class="type">List</span>&lt;<span class="type">DataPoint</span>&gt;? _processed;
+
+  <span class="annotation">@override</span>
+  <span class="keyword">void</span> initState() {
+    <span class="keyword">super</span>.initState();
+    <span class="comment">// Offload to separate isolate; UI thread stays free</span>
+    compute(_processDataIsolate, widget.dataPoints).then((result) {
+      <span class="keyword">if</span> (mounted) setState(() => _processed = result);
+    });
+  }
+
+  <span class="annotation">@override</span>
+  <span class="type">Widget</span> build(<span class="type">BuildContext</span> context) {
+    <span class="keyword">if</span> (_processed == <span class="keyword">null</span>) <span class="keyword">return</span> <span class="keyword">const</span> <span class="type">CircularProgressIndicator</span>();
+    <span class="keyword">return</span> <span class="type">DataChart</span>(points: _processed!);
+  }
+}
+
+<span class="comment">// Top-level function required by compute() (must be isolate-safe)</span>
+<span class="type">List</span>&lt;<span class="type">DataPoint</span>&gt; _processDataIsolate(<span class="type">List</span>&lt;<span class="type">DataPoint</span>&gt; points) {
+  <span class="keyword">return</span> points.where((p) => p.value > <span class="number">0</span>).map((p) => p.normalize()).toList();
+}</code></pre>
+
+    <h2 id="memory-tab">5. Memory Tab</h2>
+
+    <p>The Memory tab provides three complementary views for understanding heap behavior:</p>
+
+    <h3>5.1 Memory Timeline</h3>
+
+    <p>A real-time chart of heap usage over time. Key things to watch:</p>
+    <ul>
+        <li><strong>Steadily growing heap</strong> — indicates a memory leak (objects accumulating without being collected)</li>
+        <li><strong>Sawtooth pattern</strong> — normal GC behavior (allocate → collect → allocate)</li>
+        <li><strong>GC events</strong> — shown as vertical lines, distinguishes new-space vs old-space GC</li>
+        <li><strong>RSS vs Dart Heap</strong> — RSS (Resident Set Size) includes native memory (Skia textures, platform bitmaps); Dart heap is just Dart objects</li>
+    </ul>
+
+    <h3>5.2 Heap Snapshot</h3>
+
+    <p>A point-in-time capture of all live objects in the Dart heap. Triggers a full GC before snapshotting, so the resulting data represents truly live (reachable) objects. Useful for identifying which classes are consuming the most memory and which objects are preventing GC (GC roots analysis).</p>
+
+    <pre><code><span class="comment">// Triggering a heap snapshot programmatically for CI checks</span>
+<span class="keyword">import</span> <span class="string">'dart:developer'</span>;
+
+<span class="keyword">Future</span>&lt;<span class="keyword">void</span>&gt; captureHeapSnapshot() <span class="keyword">async</span> {
+  <span class="comment">// Request a VM service heap snapshot (DevTools does this automatically)</span>
+  <span class="comment">// In tests, use vm_service package directly:</span>
+  <span class="comment">// final vm = await vmServiceConnectUri(wsUri);</span>
+  <span class="comment">// final snapshot = await vm.getHeapSnapshotGraph(isolateId);</span>
+
+  <span class="comment">// For manual GC in tests (forces collection before measurement):</span>
+  <span class="type">VMDeveloper</span>.callExtension(<span class="string">'ext.flutter.evict'</span>, <span class="string">'assets/image.png'</span>);
+}
+
+<span class="comment">// Using the leak_tracker package for automated leak detection in tests</span>
+<span class="comment">// pubspec.yaml: leak_tracker: ^10.0.0</span>
+<span class="keyword">import</span> <span class="string">'package:leak_tracker/leak_tracker.dart'</span>;
+
+<span class="keyword">void</span> main() {
+  <span class="comment">// Enable leak tracking in your test suite</span>
+  <span class="type">LeakTracking</span>.start(
+    config: <span class="type">LeakTrackingConfig</span>(
+      allowAllNotGCed: <span class="keyword">false</span>,
+      allowAllNotDisposed: <span class="keyword">false</span>,
+    ),
+  );
+
+  testWidgets(<span class="string">'no memory leaks in ProductScreen'</span>, (tester) <span class="keyword">async</span> {
+    <span class="keyword">await</span> tester.pumpWidget(<span class="keyword">const</span> <span class="type">ProductScreen</span>());
+    <span class="keyword">await</span> tester.pumpAndSettle();
+
+    <span class="comment">// Dispose the widget tree</span>
+    <span class="keyword">await</span> tester.pumpWidget(<span class="keyword">const</span> <span class="type">SizedBox</span>());
+    <span class="keyword">await</span> tester.pumpAndSettle();
+
+    <span class="comment">// Assert no leaks detected</span>
+    <span class="keyword">final</span> summary = <span class="keyword">await</span> <span class="type">LeakTracking</span>.collectLeaks();
+    expect(summary.total, <span class="number">0</span>);
+  });
+}</code></pre>
+
+    <h3>5.3 Allocation Tracker</h3>
+
+    <p>Records which class constructors are being called and how many bytes they allocate during a recording session. Useful for finding allocation hot spots in animation loops or frequently called methods.</p>
+
+    <h2 id="widget-inspector">6. Widget Inspector &amp; Rebuild Tracking</h2>
+
+    <p>The Widget Inspector provides a live tree of the widget, element, and render object trees. For performance work, the most important features are rebuild tracking and the repaint rainbow.</p>
+
+    <h3>6.1 Rebuild Count Tracking</h3>
+
+    <pre><code><span class="comment">// Enable rebuild tracking in main.dart</span>
+<span class="keyword">void</span> main() {
+  <span class="comment">// debugProfileBuildsEnabled shows rebuild counts in DevTools Widget Inspector</span>
+  debugProfileBuildsEnabled = <span class="keyword">true</span>;
+
+  <span class="comment">// Only enable in profile/debug builds</span>
+  <span class="keyword">assert</span>(() {
+    debugProfileBuildsEnabled = <span class="keyword">true</span>;
+    <span class="keyword">return</span> <span class="keyword">true</span>;
+  }());
+
+  runApp(<span class="keyword">const</span> <span class="type">MyApp</span>());
+}
+
+<span class="comment">// A widget that rebuilds too often — detectable via Inspector</span>
+<span class="keyword">class</span> <span class="type">BadCounterDisplay</span> <span class="keyword">extends</span> <span class="type">StatelessWidget</span> {
+  <span class="annotation">@override</span>
+  <span class="type">Widget</span> build(<span class="type">BuildContext</span> context) {
+    <span class="comment">// Watches entire AppState — rebuilds on ANY AppState change</span>
+    <span class="comment">// Inspector will show this widget rebuilding excessively</span>
+    <span class="keyword">final</span> count = context.watch&lt;<span class="type">AppState</span>&gt;().counter;
+    <span class="keyword">return</span> <span class="type">Text</span>(<span class="string">'Count: </span>$count<span class="string">'</span>);
+  }
+}
+
+<span class="comment">// Fixed: use select() to subscribe to only the counter field</span>
+<span class="keyword">class</span> <span class="type">GoodCounterDisplay</span> <span class="keyword">extends</span> <span class="type">StatelessWidget</span> {
+  <span class="annotation">@override</span>
+  <span class="type">Widget</span> build(<span class="type">BuildContext</span> context) {
+    <span class="keyword">final</span> count = context.select((<span class="type">AppState</span> s) => s.counter);
+    <span class="keyword">return</span> <span class="type">Text</span>(<span class="string">'Count: </span>$count<span class="string">'</span>);
+  }
+}</code></pre>
+
+    <h3>6.2 Repaint Rainbow</h3>
+
+    <p>Enabling <code>debugRepaintRainbowEnabled = true</code> causes each <code>RepaintBoundary</code> to cycle through colors when it repaints. This makes it visually obvious which parts of the screen are being repainted each frame. Ideally, only the changing parts should show color changes — static areas should not repaint.</p>
+
+    <pre><code><span class="comment">// Enable repaint rainbow to visualize repaint regions</span>
+<span class="keyword">void</span> main() {
+  debugRepaintRainbowEnabled = <span class="keyword">true</span>; <span class="comment">// Shows repaint regions in rotating colors</span>
+  debugRepaintTextRainbowEnabled = <span class="keyword">true</span>; <span class="comment">// Also highlights text repaints</span>
+  runApp(<span class="keyword">const</span> <span class="type">MyApp</span>());
+}
+
+<span class="comment">// Adding explicit RepaintBoundary to isolate expensive widgets</span>
+<span class="keyword">class</span> <span class="type">OptimizedScrollView</span> <span class="keyword">extends</span> <span class="type">StatelessWidget</span> {
+  <span class="annotation">@override</span>
+  <span class="type">Widget</span> build(<span class="type">BuildContext</span> context) {
+    <span class="keyword">return</span> <span class="type">ListView</span>.builder(
+      itemCount: <span class="number">100</span>,
+      itemBuilder: (ctx, i) {
+        <span class="comment">// Wrapping complex items in RepaintBoundary prevents them</span>
+        <span class="comment">// from repainting when the scrollview scrolls</span>
+        <span class="keyword">return</span> <span class="type">RepaintBoundary</span>(
+          child: <span class="type">ExpensiveListItem</span>(index: i),
+        );
+      },
+    );
+  }
+}</code></pre>
+
+    <h2 id="network-profiler">7. Network Profiler &amp; Logging Tab</h2>
+
+    <p>The Network profiler intercepts all <code>dart:io</code> HTTP and HTTPS requests made via <code>HttpClient</code>, capturing request/response headers, body size, timing, and status codes. It does not capture requests made through native platform channels (e.g., if you call a native SDK that makes HTTP calls).</p>
+
+    <pre><code><span class="comment">// Network profiler captures dart:io HttpClient traffic automatically.</span>
+<span class="comment">// To also capture http package traffic (which wraps HttpClient), no change needed.</span>
+<span class="comment">// For dio, it also uses HttpClient internally — captured automatically.</span>
+
+<span class="comment">// For structured logging visible in DevTools Logging tab:</span>
+<span class="keyword">import</span> <span class="string">'dart:developer'</span> <span class="keyword">as</span> developer;
+
+<span class="keyword">void</span> logApiCall(<span class="type">String</span> endpoint, <span class="type">Duration</span> latency) {
+  developer.log(
+    <span class="string">'API call to </span>$endpoint<span class="string"> took </span>${latency.inMilliseconds}<span class="string">ms'</span>,
+    name: <span class="string">'network.api'</span>,     <span class="comment">// Channel name shown in DevTools</span>
+    level: <span class="number">800</span>,               <span class="comment">// INFO level (following java.util.logging levels)</span>
+    time: <span class="type">DateTime</span>.now(),
+    error: latency.inMilliseconds > <span class="number">1000</span> ? <span class="string">'SLOW_REQUEST'</span> : <span class="keyword">null</span>,
+  );
+}
+
+<span class="comment">// HTTP timeline events appear in the Performance tab too:</span>
+<span class="comment">// HttpClientRequest.open() → "HTTP" event start</span>
+<span class="comment">// HttpClientResponse.listen() completion → "HTTP" event end</span></code></pre>
+
+    <h2 id="cli-usage">8. DevTools from CLI vs IDE</h2>
+
+    <pre><code><span class="comment"># Launch DevTools from CLI (no IDE required)</span>
+
+<span class="comment"># Method 1: dart devtools (opens browser automatically)</span>
+dart devtools
+
+<span class="comment"># Method 2: flutter run --profile, then connect to displayed port</span>
+flutter run --profile
+<span class="comment"># DevTools available at http://127.0.0.1:9102?uri=ws://127.0.0.1:PORT/xxx</span>
+
+<span class="comment"># Method 3: devtools_server package for CI pipelines</span>
+dart pub global activate devtools
+devtools --machine
+
+<span class="comment"># Capture a CPU profile to a file (for offline analysis)</span>
+dart run --observe my_app.dart &amp;
+<span class="comment"># Then connect DevTools and export the profile as JSON</span>
+
+<span class="comment"># Run with specific DevTools flags</span>
+flutter run --profile \
+  --dart-define=FLUTTER_DEVTOOLS_ENABLED=true \
+  --vmservice-out-file /tmp/vm_service_url.txt</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">CLI Workflow for Production Issues</div>
+        <p>When debugging performance on a specific device without IDE access, use <code>flutter attach --device-id [device-id]</code> to attach DevTools to a profile build already installed on the device. This is especially useful for investigating issues reported by QA on physical hardware.</p>
+    </div>
+
+    <h2 id="rebuild-storms">9. Detecting Rebuild Storms</h2>
+
+    <p>A rebuild storm occurs when a state change triggers an unexpectedly large number of widget rebuilds — often the entire widget tree or a large subtree. This shows up in the CPU profiler as a wide <code>buildScope</code> bar with many nested <code>build</code> calls.</p>
+
+    <pre><code><span class="comment">// Detecting rebuild storms with debugPrintRebuildDirtyWidgets</span>
+<span class="keyword">void</span> main() {
+  debugPrintRebuildDirtyWidgets = <span class="keyword">true</span>; <span class="comment">// Prints each rebuilt widget to console</span>
+  runApp(<span class="keyword">const</span> <span class="type">MyApp</span>());
+}
+<span class="comment">// In console during a state change, you'll see many lines like:</span>
+<span class="comment">// Rebuilt MyApp (4 dirty)</span>
+<span class="comment">// Rebuilt HomeScreen (1 dirty)</span>
+<span class="comment">// Rebuilt ProductGrid (1 dirty)</span>
+<span class="comment">// Rebuilt ProductTile (46 dirty) ← potential rebuild storm</span>
+
+<span class="comment">// Root cause: ChangeNotifier notifying too broadly</span>
+<span class="keyword">class</span> <span class="type">BadCartModel</span> <span class="keyword">extends</span> <span class="type">ChangeNotifier</span> {
+  <span class="keyword">final</span> <span class="type">List</span>&lt;<span class="type">CartItem</span>&gt; items = [];
+
+  <span class="keyword">void</span> updateQuantity(<span class="type">String</span> itemId, <span class="keyword">int</span> qty) {
+    <span class="keyword">final</span> index = items.indexWhere((i) => i.id == itemId);
+    items[index] = items[index].copyWith(quantity: qty);
+    notifyListeners(); <span class="comment">// Rebuilds ALL Consumer&lt;BadCartModel&gt; widgets</span>
+  }
+}
+
+<span class="comment">// Fix: Use fine-grained observability</span>
+<span class="keyword">class</span> <span class="type">GoodCartItem</span> <span class="keyword">extends</span> <span class="type">ChangeNotifier</span> {
+  <span class="keyword">int</span> _quantity;
+  <span class="type">GoodCartItem</span>(<span class="keyword">this</span>._quantity);
+  <span class="keyword">int</span> <span class="keyword">get</span> quantity => _quantity;
+  <span class="keyword">set</span> quantity(<span class="keyword">int</span> v) { _quantity = v; notifyListeners(); }
+}
+
+<span class="keyword">class</span> <span class="type">CartItemWidget</span> <span class="keyword">extends</span> <span class="type">StatelessWidget</span> {
+  <span class="keyword">final</span> <span class="type">GoodCartItem</span> item;
+  <span class="keyword">const</span> <span class="type">CartItemWidget</span>({required <span class="keyword">this</span>.item});
+
+  <span class="annotation">@override</span>
+  <span class="type">Widget</span> build(<span class="type">BuildContext</span> context) {
+    <span class="comment">// Only rebuilds when THIS item's quantity changes</span>
+    <span class="keyword">return</span> <span class="type">AnimatedBuilder</span>(
+      animation: item,
+      builder: (ctx, _) => <span class="type">Text</span>(<span class="string">'Qty: </span>${item.quantity}<span class="string">'</span>),
+    );
+  }
+}</code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Staff-Level Profiling Strategy</div>
+        <p>At L6, the expectation is a systematic profiling methodology: (1) Reproduce the issue in profile mode on a physical device. (2) Use the frame chart to identify whether the bottleneck is UI thread or raster thread. (3) Select the worst frame and use its flame chart to find the hotspot. (4) Cross-reference with the CPU profiler's call tree for aggregate data. (5) If memory-related, take before/after heap snapshots and diff them. Never guess — every optimization should be validated with a measurement before and after.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="index.html">← Section Index</a>
+        <a href="02-memory-leaks.html">Next: Memory Leaks →</a>
+    </div>
+</div>
+
+<script>
+document.querySelectorAll('.qa-question').forEach(q => {
+    q.addEventListener('click', () => {
+        const answer = q.nextElementSibling;
+        answer.classList.toggle('open');
+    });
+});
+</script>
+</body>
+</html>

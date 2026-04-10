@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>01 — Platform Channels Architecture — Flutter L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Platform Integration</a><span class="sep">›</span>
+        Platform Channels Architecture
+    </nav>
+
+    <h1>01 — Platform Channels Architecture</h1>
+    <p class="subtitle">Channel types · Message encoding · Threading model · Binary messenger · Channel registry</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#overview">1. Channel Types Overview</a></li>
+            <li><a href="#binary-messenger">2. BinaryMessenger: The Low-Level Foundation</a></li>
+            <li><a href="#codecs">3. Message Codecs</a></li>
+            <li><a href="#channel-registry">4. Channel Registration Internals</a></li>
+            <li><a href="#threading">5. Threading Model</a></li>
+            <li><a href="#background-isolate">6. BackgroundIsolateBinaryMessenger</a></li>
+            <li><a href="#lifecycle">7. End-to-End Message Lifecycle</a></li>
+        </ul>
+    </div>
+
+    <h2 id="overview">1. Channel Types Overview</h2>
+
+    <p>Flutter provides three channel types to bridge the Dart world and the host platform. Each is built on top of the same <code>BinaryMessenger</code> abstraction but differs in its message flow pattern and intended use case.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Channel</th>
+                <th>Direction</th>
+                <th>Pattern</th>
+                <th>Use Case</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>MethodChannel</strong></td>
+                <td>Bidirectional (RPC-style)</td>
+                <td>Request / Response</td>
+                <td>Call a native API and receive a single result: battery level, camera, file I/O</td>
+            </tr>
+            <tr>
+                <td><strong>EventChannel</strong></td>
+                <td>Native → Dart (one-way stream)</td>
+                <td>Producer / Consumer</td>
+                <td>Continuous native events: location updates, sensors, Bluetooth state</td>
+            </tr>
+            <tr>
+                <td><strong>BasicMessageChannel</strong></td>
+                <td>Bidirectional (raw messages)</td>
+                <td>Send / Reply (optional)</td>
+                <td>Arbitrary message exchange with custom codecs; lower-level than MethodChannel</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="diagram">
+Channel Type Decision Tree
+══════════════════════════
+
+          Need to call a native function and get a result?
+                              │
+                    ┌─────────┴─────────┐
+                   YES                  NO
+                    │                   │
+            MethodChannel        Continuous event stream?
+                                        │
+                              ┌─────────┴─────────┐
+                             YES                  NO
+                              │                   │
+                        EventChannel      BasicMessageChannel
+                                          (custom protocol)
+    </div>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p>All three channels share the same <code>BinaryMessenger</code> plumbing. They differ only in <em>codec</em> and <em>flow conventions</em> layered on top. Understanding BinaryMessenger means you can build your own channel abstraction when none of the three built-in types fits — or when profiling shows the codec overhead is a bottleneck.</p>
+    </div>
+
+    <h2 id="binary-messenger">2. BinaryMessenger: The Low-Level Foundation</h2>
+
+    <p><code>BinaryMessenger</code> is the interface that all three channel types delegate to. It speaks only in <code>ByteData</code> — there is no concept of method names, arguments, or streams at this layer. The engine exposes it to the Dart framework via <code>dart:ui</code>.</p>
+
+    <pre><code><span class="comment">// dart:ui — the raw interface exposed by the engine</span>
+<span class="keyword">abstract class</span> <span class="type">BinaryMessenger</span> {
+  <span class="comment">// Send a ByteData message on [channel] and await a ByteData reply.</span>
+  <span class="type">Future</span>&lt;<span class="type">ByteData</span>?&gt; send(<span class="type">String</span> channel, <span class="type">ByteData</span>? message);
+
+  <span class="comment">// Register a handler that will receive incoming ByteData messages.</span>
+  <span class="keyword">void</span> setMessageHandler(
+    <span class="type">String</span> channel,
+    <span class="type">Future</span>&lt;<span class="type">ByteData</span>?&gt; <span class="type">Function</span>(<span class="type">ByteData</span>? message)? handler,
+  );
+}
+
+<span class="comment">// The concrete implementation used at runtime.</span>
+<span class="comment">// Backed by the engine's Shell and the platform's message loop.</span>
+<span class="keyword">class</span> <span class="type">_DefaultBinaryMessenger</span> <span class="keyword">extends</span> <span class="type">BinaryMessenger</span> {
+  <span class="comment">// Internal map: channel name → handler closure</span>
+  <span class="keyword">final</span> <span class="type">Map</span>&lt;<span class="type">String</span>, <span class="type">MessageHandler</span>&gt; _handlers = {};
+
+  <span class="annotation">@override</span>
+  <span class="type">Future</span>&lt;<span class="type">ByteData</span>?&gt; send(<span class="type">String</span> channel, <span class="type">ByteData</span>? message) {
+    <span class="comment">// Hands the ByteData to the engine via a native call.</span>
+    <span class="comment">// Suspends the current microtask; the engine routes the bytes to</span>
+    <span class="comment">// the platform thread and eventually resumes with the response.</span>
+    <span class="keyword">final</span> <span class="type">Completer</span>&lt;<span class="type">ByteData</span>?&gt; completer = <span class="type">Completer</span>();
+    _sendPlatformMessage(channel, message, completer.complete);
+    <span class="keyword">return</span> completer.future;
+  }
+
+  <span class="annotation">@override</span>
+  <span class="keyword">void</span> setMessageHandler(<span class="type">String</span> channel, <span class="type">MessageHandler</span>? handler) {
+    <span class="keyword">if</span> (handler == <span class="keyword">null</span>) {
+      _handlers.remove(channel);
+      _clearMessageHandler(channel);   <span class="comment">// unregisters in engine</span>
+    } <span class="keyword">else</span> {
+      _handlers[channel] = handler;
+      _setMessageHandler(channel);     <span class="comment">// registers in engine</span>
+    }
+  }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Key Detail</div>
+        <p>The <code>_handlers</code> map lives on the Dart side. When the engine delivers an incoming message on a channel, it calls into Dart, which looks up the handler in this map. There is no separate registration on the platform side — the engine routes by channel name string.</p>
+    </div>
+
+    <h3>2.1 How MethodChannel Wraps BinaryMessenger</h3>
+
+    <pre><code><span class="comment">// Simplified flutter/src/services/platform_channel.dart</span>
+<span class="keyword">class</span> <span class="type">MethodChannel</span> {
+  <span class="keyword">const</span> <span class="type">MethodChannel</span>(<span class="keyword">this</span>.name, [
+    <span class="keyword">this</span>.codec = <span class="keyword">const</span> <span class="type">StandardMethodCodec</span>(),
+    <span class="type">BinaryMessenger</span>? binaryMessenger,
+  ]) : _binaryMessenger = binaryMessenger;
+
+  <span class="keyword">final</span> <span class="type">String</span> name;
+  <span class="keyword">final</span> <span class="type">MethodCodec</span> codec;
+  <span class="keyword">final</span> <span class="type">BinaryMessenger</span>? _binaryMessenger;
+
+  <span class="comment">// Lazily resolves to ServicesBinding.instance.defaultBinaryMessenger</span>
+  <span class="type">BinaryMessenger</span> <span class="keyword">get</span> binaryMessenger =&gt;
+      _binaryMessenger ?? ServicesBinding.instance.defaultBinaryMessenger;
+
+  <span class="type">Future</span>&lt;T?&gt; invokeMethod&lt;T&gt;(<span class="type">String</span> method, [<span class="keyword">dynamic</span> arguments]) async {
+    <span class="comment">// 1. Encode method name + arguments → ByteData</span>
+    <span class="keyword">final</span> ByteData encoded =
+        codec.encodeMethodCall(<span class="type">MethodCall</span>(method, arguments));
+
+    <span class="comment">// 2. Delegate to BinaryMessenger (crosses to platform thread)</span>
+    <span class="keyword">final</span> ByteData? result =
+        await binaryMessenger.send(name, encoded);
+
+    <span class="comment">// 3. null reply → platform returned notImplemented</span>
+    <span class="keyword">if</span> (result == <span class="keyword">null</span>) {
+      <span class="keyword">throw</span> <span class="type">MissingPluginException</span>(...);
+    }
+
+    <span class="comment">// 4. Decode reply → T or throw PlatformException</span>
+    <span class="keyword">return</span> codec.decodeEnvelope(result) <span class="keyword">as</span> T?;
+  }
+}</code></pre>
+
+    <h2 id="codecs">3. Message Codecs</h2>
+
+    <p>Codecs are responsible for encoding/decoding the Dart values to/from the binary wire format. The codec choice affects what types can be transmitted and the serialization cost.</p>
+
+    <h3>3.1 StandardMessageCodec</h3>
+
+    <p>The default codec. Produces a compact binary format using a type-tag byte followed by the payload. Supports a fixed set of Dart types:</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Tag Byte</th>
+                <th>Dart Type</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><code>0x00</code></td>
+                <td><code>null</code></td>
+                <td>0 bytes payload</td>
+            </tr>
+            <tr>
+                <td><code>0x01</code></td>
+                <td><code>true</code></td>
+                <td>0 bytes payload</td>
+            </tr>
+            <tr>
+                <td><code>0x02</code></td>
+                <td><code>false</code></td>
+                <td>0 bytes payload</td>
+            </tr>
+            <tr>
+                <td><code>0x03</code></td>
+                <td><code>int</code> (32-bit)</td>
+                <td>4 bytes LE</td>
+            </tr>
+            <tr>
+                <td><code>0x04</code></td>
+                <td><code>int</code> (64-bit)</td>
+                <td>8 bytes LE</td>
+            </tr>
+            <tr>
+                <td><code>0x06</code></td>
+                <td><code>double</code></td>
+                <td>8 bytes IEEE 754</td>
+            </tr>
+            <tr>
+                <td><code>0x07</code></td>
+                <td><code>Uint8List</code></td>
+                <td>length-prefixed bytes (zero-copy candidate)</td>
+            </tr>
+            <tr>
+                <td><code>0x0c</code></td>
+                <td><code>String</code></td>
+                <td>length-prefixed UTF-8</td>
+            </tr>
+            <tr>
+                <td><code>0x0d</code></td>
+                <td><code>List</code></td>
+                <td>length-prefixed, each element recursively encoded</td>
+            </tr>
+            <tr>
+                <td><code>0x0e</code></td>
+                <td><code>Map</code></td>
+                <td>length-prefixed, key-value pairs recursively encoded</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Performance Pitfall</div>
+        <p>Sending a large <code>Map</code> or nested <code>List</code> over <code>StandardMessageCodec</code> copies every element during encoding and decoding. For high-throughput data (e.g., audio samples, image pixels), prefer <code>Uint8List</code> or <code>Float64List</code> — these map directly to contiguous memory and the codec skips per-element type tags.</p>
+    </div>
+
+    <h3>3.2 JSONMessageCodec</h3>
+
+    <p><code>JSONMessageCodec</code> encodes the message as a JSON string then re-encodes that string as UTF-8 bytes. It supports only JSON-compatible types and is strictly slower than <code>StandardMessageCodec</code> for all value types — avoid it for new code.</p>
+
+    <h3>3.3 StandardMethodCodec</h3>
+
+    <p>Wraps <code>StandardMessageCodec</code> with an envelope format for method calls and replies:</p>
+
+    <pre><code><span class="comment">// Wire format for a MethodCall</span>
+<span class="comment">// ┌─────────────────────┬─────────────────────────────┐</span>
+<span class="comment">// │  method name (String)│         arguments           │</span>
+<span class="comment">// │  (StandardCodec)    │       (StandardCodec)        │</span>
+<span class="comment">// └─────────────────────┴─────────────────────────────┘</span>
+
+<span class="comment">// Wire format for a successful Reply</span>
+<span class="comment">// ┌──────────┬──────────────────────────────────────────┐</span>
+<span class="comment">// │  0x00    │         result (StandardCodec)           │</span>
+<span class="comment">// │ (success)│                                          │</span>
+<span class="comment">// └──────────┴──────────────────────────────────────────┘</span>
+
+<span class="comment">// Wire format for an Error Reply</span>
+<span class="comment">// ┌──────────┬─────────────┬─────────────┬──────────────┐</span>
+<span class="comment">// │  0x01    │  errorCode  │ errorMessage│  errorDetails│</span>
+<span class="comment">// │  (error) │  (String)   │ (String?)   │  (any?)      │</span>
+<span class="comment">// └──────────┴─────────────┴─────────────┴──────────────┘</span>
+
+<span class="comment">// Wire format for notImplemented</span>
+<span class="comment">// ┌──────────┐</span>
+<span class="comment">// │  (empty) │   — zero bytes; BinaryMessenger returns null</span>
+<span class="comment">// └──────────┘</span></code></pre>
+
+    <h2 id="channel-registry">4. Channel Registration Internals</h2>
+
+    <p>On the Dart side, the registry is simply the <code>_handlers</code> map in <code>_DefaultBinaryMessenger</code>. On the platform side, each platform maintains its own equivalent:</p>
+
+    <h3>4.1 Android (Kotlin)</h3>
+
+    <pre><code><span class="comment">// android/src/main/java/io/flutter/plugin/common/BinaryMessenger.java</span>
+<span class="comment">// The engine implementation is DartMessenger.kt</span>
+
+<span class="keyword">class</span> <span class="type">DartMessenger</span>(<span class="keyword">private val</span> flutterJNI: <span class="type">FlutterJNI</span>) : <span class="type">BinaryMessenger</span> {
+    <span class="comment">// Channel name → handler registered by plugin</span>
+    <span class="keyword">private val</span> messageHandlers: <span class="type">MutableMap</span>&lt;<span class="type">String</span>, <span class="type">BinaryMessageHandler</span>&gt; = <span class="func">mutableMapOf</span>()
+
+    <span class="keyword">override fun</span> setMessageHandler(
+        channel: <span class="type">String</span>,
+        handler: <span class="type">BinaryMessageHandler</span>?
+    ) {
+        <span class="keyword">if</span> (handler == <span class="keyword">null</span>) {
+            messageHandlers.remove(channel)
+        } <span class="keyword">else</span> {
+            messageHandlers[channel] = handler
+        }
+    }
+
+    <span class="comment">// Called by FlutterJNI when the engine delivers an incoming message</span>
+    <span class="keyword">fun</span> <span class="func">handleMessageFromDart</span>(channel: <span class="type">String</span>, message: <span class="type">ByteBuffer</span>?, replyId: <span class="type">Int</span>) {
+        <span class="keyword">val</span> handler = messageHandlers[channel]
+        <span class="keyword">if</span> (handler == <span class="keyword">null</span>) {
+            flutterJNI.invokePlatformMessageEmptyResponseCallback(replyId)
+            <span class="keyword">return</span>
+        }
+        handler.onMessage(message) { reply -&gt;
+            flutterJNI.invokePlatformMessageResponseCallback(replyId, reply, reply?.limit() ?: <span class="number">0</span>)
+        }
+    }
+}</code></pre>
+
+    <h3>4.2 iOS (Swift)</h3>
+
+    <pre><code><span class="comment">// FlutterBinaryMessengerRelay.swift (simplified)</span>
+<span class="keyword">class</span> <span class="type">FlutterEngine</span> {
+    <span class="comment">// Registry: channel → handler block</span>
+    <span class="keyword">var</span> messageHandlers: [<span class="type">String</span>: <span class="type">FlutterBinaryMessageHandler</span>] = [:]
+
+    <span class="keyword">func</span> <span class="func">setMessageHandlerOnChannel</span>(
+        _ channel: <span class="type">String</span>,
+        binaryMessageHandler handler: <span class="type">FlutterBinaryMessageHandler</span>?
+    ) {
+        <span class="keyword">if let</span> h = handler {
+            messageHandlers[channel] = h
+        } <span class="keyword">else</span> {
+            messageHandlers.removeValue(forKey: channel)
+        }
+    }
+
+    <span class="comment">// Called from C++ engine when a Dart message arrives</span>
+    <span class="keyword">func</span> <span class="func">handlePlatformMessage</span>(
+        _ channel: <span class="type">String</span>,
+        message: <span class="type">Data</span>?,
+        replyId: <span class="type">Int</span>
+    ) {
+        <span class="keyword">guard let</span> handler = messageHandlers[channel] <span class="keyword">else</span> {
+            <span class="comment">// Send empty reply = notImplemented</span>
+            <span class="func">sendEmptyReply</span>(replyId)
+            <span class="keyword">return</span>
+        }
+        handler(message) { reply <span class="keyword">in</span>
+            <span class="keyword">self</span>.<span class="func">sendReply</span>(replyId, data: reply)
+        }
+    }
+}</code></pre>
+
+    <h2 id="threading">5. Threading Model</h2>
+
+    <div class="diagram">
+Platform Channel Threading
+══════════════════════════
+
+     Dart (UI Thread)               Platform Thread (Main)
+     ────────────────               ──────────────────────
+
+ invokeMethod("getBattery")
+         │
+  encode ByteData (sync)
+         │
+  BinaryMessenger.send()  ─────────▶  DartMessenger.handleMessageFromDart()
+  [suspends Future]                          │
+                                    setMethodCallHandler callback fires
+                                             │
+                                    BatteryManager.getCapacity() (sync OK)
+                                             │
+                                    result.success(level)  ──────────────┐
+                                                                         │
+  Future resumes &lt;──────────────────────────────────────────────────────┘
+  decodeEnvelope() (sync)
+         │
+  T returned to caller
+    </div>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Critical Threading Rule</div>
+        <p>The method call handler on Android runs on the <strong>main (UI) thread</strong> by default. Never perform blocking I/O or long computations there — it will cause ANR. Use a <code>Handler</code> or coroutine to move work to a background thread, then call <code>result.success()</code> from any thread. On iOS, the handler also runs on the main thread; use <code>DispatchQueue.global().async</code> to offload work.</p>
+    </div>
+
+    <h3>5.1 Correct Async Pattern — Android</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">FilePlugin</span> : <span class="type">FlutterPlugin</span>, <span class="type">MethodCallHandler</span> {
+    <span class="keyword">private lateinit var</span> channel: <span class="type">MethodChannel</span>
+    <span class="keyword">private val</span> scope = <span class="type">CoroutineScope</span>(<span class="type">SupervisorJob</span>() + <span class="type">Dispatchers</span>.IO)
+
+    <span class="keyword">override fun</span> <span class="func">onMethodCall</span>(call: <span class="type">MethodCall</span>, result: <span class="type">Result</span>) {
+        <span class="keyword">when</span> (call.method) {
+            <span class="string">"readLargeFile"</span> -&gt; {
+                <span class="comment">// DO: move work off the main thread</span>
+                scope.launch {
+                    <span class="keyword">try</span> {
+                        <span class="keyword">val</span> content = <span class="func">readFileFromDisk</span>(call.argument(<span class="string">"path"</span>)!!)
+                        <span class="comment">// result.success is thread-safe — it posts back to main thread</span>
+                        withContext(<span class="type">Dispatchers</span>.Main) {
+                            result.<span class="func">success</span>(content)
+                        }
+                    } <span class="keyword">catch</span> (e: <span class="type">Exception</span>) {
+                        withContext(<span class="type">Dispatchers</span>.Main) {
+                            result.<span class="func">error</span>(<span class="string">"IO_ERROR"</span>, e.message, <span class="keyword">null</span>)
+                        }
+                    }
+                }
+            }
+            <span class="keyword">else</span> -&gt; result.notImplemented()
+        }
+    }
+}</code></pre>
+
+    <h3>5.2 Correct Async Pattern — iOS (Swift)</h3>
+
+    <pre><code><span class="keyword">class</span> <span class="type">FilePlugin</span>: <span class="type">NSObject</span>, <span class="type">FlutterPlugin</span> {
+    <span class="keyword">func</span> <span class="func">handle</span>(_ call: <span class="type">FlutterMethodCall</span>, result: @escaping <span class="type">FlutterResult</span>) {
+        <span class="keyword">switch</span> call.method {
+        <span class="keyword">case</span> <span class="string">"readLargeFile"</span>:
+            <span class="keyword">guard let</span> path = (call.arguments <span class="keyword">as</span>? [<span class="type">String</span>: <span class="type">Any</span>])?[<span class="string">"path"</span>] <span class="keyword">as</span>? <span class="type">String</span>
+            <span class="keyword">else</span> { result(<span class="type">FlutterError</span>(code: <span class="string">"INVALID_ARG"</span>, message: <span class="keyword">nil</span>, details: <span class="keyword">nil</span>)); <span class="keyword">return</span> }
+
+            <span class="type">DispatchQueue</span>.global(qos: .userInitiated).async {
+                <span class="keyword">do</span> {
+                    <span class="keyword">let</span> content = <span class="keyword">try</span> <span class="type">String</span>(contentsOfFile: path, encoding: .utf8)
+                    <span class="type">DispatchQueue</span>.main.async { result(content) }
+                } <span class="keyword">catch</span> {
+                    <span class="type">DispatchQueue</span>.main.async {
+                        result(<span class="type">FlutterError</span>(code: <span class="string">"IO_ERROR"</span>, message: error.localizedDescription, details: <span class="keyword">nil</span>))
+                    }
+                }
+            }
+        <span class="keyword">default</span>:
+            result(<span class="type">FlutterMethodNotImplemented</span>)
+        }
+    }
+}</code></pre>
+
+    <h2 id="background-isolate">6. BackgroundIsolateBinaryMessenger (Flutter 3.7+)</h2>
+
+    <p>Before Flutter 3.7, platform channels could only be used from the root isolate (the UI thread isolate). Background isolates spawned with <code>Isolate.spawn</code> had no access to <code>ServicesBinding</code> and would crash with <code>MissingPluginException</code>.</p>
+
+    <p>Flutter 3.7 introduced <code>BackgroundIsolateBinaryMessenger</code> and <code>RootIsolateToken</code> to solve this:</p>
+
+    <pre><code><span class="comment">// In the root isolate — capture a token before spawning</span>
+<span class="keyword">final</span> <span class="type">RootIsolateToken</span> token = <span class="type">RootIsolateToken</span>.instance!;
+<span class="keyword">await</span> <span class="type">Isolate</span>.spawn(backgroundWork, token);
+
+<span class="comment">// In the background isolate entry point</span>
+<span class="keyword">void</span> <span class="func">backgroundWork</span>(<span class="type">RootIsolateToken</span> token) {
+  <span class="comment">// Register this isolate with the root messenger infrastructure</span>
+  <span class="type">BackgroundIsolateBinaryMessenger</span>.ensureInitialized(token);
+
+  <span class="comment">// Now platform channels work normally from this isolate</span>
+  <span class="keyword">const</span> channel = <span class="type">MethodChannel</span>(<span class="string">'com.example/file'</span>);
+  <span class="keyword">final</span> result = <span class="keyword">await</span> channel.invokeMethod&lt;<span class="type">String</span>&gt;(<span class="string">'readLargeFile'</span>, {
+    <span class="string">'path'</span>: <span class="string">'/data/some/path'</span>,
+  });
+  <span class="comment">// Use result...</span>
+}
+
+<span class="comment">// ⚠️ Responses are delivered on the background isolate's event loop,</span>
+<span class="comment">// not the UI thread. You must send results back via SendPort or</span>
+<span class="comment">// IsolateNameServer if the UI isolate needs them.</span></code></pre>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Architect Insight</div>
+        <p><code>BackgroundIsolateBinaryMessenger</code> works by routing all messages through the root isolate's engine connection. The background isolate does not have its own engine thread; its channel calls are serialized through the root isolate's shell. This means channel latency from background isolates is slightly higher — they must cross two isolate boundaries. For compute-heavy tasks that also need platform APIs (e.g., background PDF generation + file save), this is still far preferable to polling via the UI isolate.</p>
+    </div>
+
+    <h2 id="lifecycle">7. End-to-End Message Lifecycle</h2>
+
+    <div class="diagram">
+Complete Message Lifecycle (MethodChannel invokeMethod)
+════════════════════════════════════════════════════════
+
+Dart UI Isolate                 Engine (C++)              Android Main Thread
+───────────────                 ────────────              ───────────────────
+
+1. invokeMethod("getBattery")
+2. StandardMethodCodec.encode()
+   → ByteData{0x0c, 0x0a, "getBattery", 0x00}
+3. _DefaultBinaryMessenger.send()
+   → _sendPlatformMessage(JNI)
+                             4. Shell receives ByteData
+                             5. Posts to Platform Task Runner
+                                                   6. DartMessenger.handleMessageFromDart()
+                                                   7. MethodChannel.onMethodCall() fires
+                                                   8. Plugin reads BatteryManager
+                                                   9. result.success(87)
+                                                      → encodes to ByteData
+                                                  10. FlutterJNI.invokePlatformMessageResponseCallback()
+                             11. Shell receives reply ByteData
+                             12. Posts to UI Task Runner
+13. Completer.complete(replyBytes)
+14. StandardMethodCodec.decodeEnvelope()
+    → 87
+15. Future&lt;int&gt; resolves
+    </div>
+
+    <div class="nav-footer">
+        <a href="index.html">← Section Index</a>
+        <a href="02-method-channel-deep-dive.html">Next: MethodChannel Deep Dive →</a>
+    </div>
+</div>
+<script>
+    document.querySelectorAll('.qa-question').forEach(q => {
+        q.addEventListener('click', () => {
+            const answer = q.nextElementSibling;
+            answer.classList.toggle('open');
+        });
+    });
+</script>
+</body>
+</html>

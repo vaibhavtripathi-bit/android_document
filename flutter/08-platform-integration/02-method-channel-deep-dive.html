@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>02 — MethodChannel Deep Dive — Flutter L6 Interview Prep</title>
+    <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<div class="container">
+    <nav class="breadcrumb">
+        <a href="../index.html">Home</a><span class="sep">›</span>
+        <a href="index.html">Platform Integration</a><span class="sep">›</span>
+        MethodChannel Deep Dive
+    </nav>
+
+    <h1>02 — MethodChannel: Deep Dive</h1>
+    <p class="subtitle">MethodCall encoding · Envelope format · Error handling · Async vs sync handlers · Testing</p>
+
+    <div class="toc">
+        <h3>Table of Contents</h3>
+        <ul>
+            <li><a href="#wire-format">1. Wire Format</a></li>
+            <li><a href="#calling-convention">2. Calling Convention</a></li>
+            <li><a href="#native-android">3. Native Handler — Android</a></li>
+            <li><a href="#native-ios">4. Native Handler — iOS</a></li>
+            <li><a href="#error-handling">5. Error Handling</a></li>
+            <li><a href="#bidirectional">6. Calling Dart from Native</a></li>
+            <li><a href="#background-isolate">7. Calling Channels from Background Isolates</a></li>
+            <li><a href="#performance">8. Performance Characteristics</a></li>
+            <li><a href="#testing">9. Testing MethodChannels</a></li>
+        </ul>
+    </div>
+
+    <h2 id="wire-format">1. Wire Format</h2>
+
+    <p>Every <code>MethodChannel</code> message is encoded by <code>StandardMethodCodec</code>, which wraps <code>StandardMessageCodec</code>. A method call is serialized as two consecutive <code>StandardMessageCodec</code> values: the method name string, then the arguments.</p>
+
+    <div class="diagram">
+StandardMethodCodec Wire Format — MethodCall
+═════════════════════════════════════════════
+
+Byte offset   Content
+────────────  ──────────────────────────────────────────────
+0x00          Type tag: 0x0c  (String)
+0x01          Method name length (variable-length integer)
+0x02..N       Method name bytes (UTF-8)
+N+1           Type tag for arguments (0x00=null, 0x0d=List, 0x0e=Map …)
+N+2..end      Encoded argument value
+
+
+Example: invokeMethod("getBattery", null)
+─────────────────────────────────────────
+0c 0a 67 65 74 42 61 74 74 65 72 79 00
+│   │  └──────────────────────────┘  └─ args = null (0x00)
+│   └─ length = 10 (varint)
+└─ String tag
+    </div>
+
+    <h3>1.1 Variable-Length Integer Encoding</h3>
+
+    <pre><code><span class="comment">// StandardMessageCodec uses a custom varint for sizes</span>
+<span class="comment">// Values 0–253 : 1 byte  (the value itself)</span>
+<span class="comment">// Values 254–65535 : 3 bytes (0xFE + 2-byte LE)</span>
+<span class="comment">// Values ≥65536 : 5 bytes (0xFF + 4-byte LE)</span>
+
+<span class="comment">// This means most field names/method names are 1-byte overhead for length.</span>
+<span class="comment">// A String "getBattery" (10 chars) encodes as: 0x0c 0x0a [10 bytes]</span>
+<span class="comment">//                                                tag  len  data</span></code></pre>
+
+    <h2 id="calling-convention">2. Calling Convention</h2>
+
+    <h3>2.1 invokeMethod — Basic Use</h3>
+
+    <pre><code><span class="keyword">const</span> <span class="type">MethodChannel</span> _channel = <span class="type">MethodChannel</span>(<span class="string">'com.example/battery'</span>);
+
+<span class="comment">// Returns null if method not implemented on this platform.</span>
+<span class="comment">// Throws PlatformException on native error.</span>
+<span class="comment">// Throws MissingPluginException if no handler registered.</span>
+<span class="keyword">Future</span>&lt;<span class="type">int</span>&gt; getBatteryLevel() <span class="keyword">async</span> {
+  <span class="keyword">try</span> {
+    <span class="keyword">final</span> level = <span class="keyword">await</span> _channel.invokeMethod&lt;<span class="type">int</span>&gt;(<span class="string">'getBatteryLevel'</span>);
+    <span class="keyword">return</span> level ?? -<span class="number">1</span>;
+  } <span class="keyword">on</span> <span class="type">PlatformException</span> <span class="keyword">catch</span> (e) {
+    <span class="keyword">throw</span> <span class="type">BatteryException</span>(e.code, e.message);
+  } <span class="keyword">on</span> <span class="type">MissingPluginException</span> {
+    <span class="keyword">return</span> -<span class="number">1</span>; <span class="comment">// platform doesn't support this API</span>
+  }
+}</code></pre>
+
+    <h3>2.2 invokeListMethod / invokeMapMethod</h3>
+
+    <pre><code><span class="comment">// Convenience wrappers that cast the return type for you.</span>
+<span class="comment">// invokeListMethod → Future&lt;List&lt;T&gt;?&gt;</span>
+<span class="comment">// invokeMapMethod  → Future&lt;Map&lt;K,V&gt;?&gt;</span>
+
+<span class="keyword">final</span> devices = <span class="keyword">await</span> _channel
+    .invokeListMethod&lt;<span class="type">Map</span>&lt;<span class="type">String</span>, <span class="keyword">dynamic</span>&gt;&gt;(<span class="string">'getBluetoothDevices'</span>);
+
+<span class="comment">// Without the helper you'd need:</span>
+<span class="comment">// final raw = await _channel.invokeMethod('getBluetoothDevices');</span>
+<span class="comment">// final devices = (raw as List).cast&lt;Map&lt;String, dynamic&gt;&gt;();</span></code></pre>
+
+    <h2 id="native-android">3. Native Handler — Android (Kotlin)</h2>
+
+    <pre><code><span class="keyword">class</span> <span class="type">BatteryPlugin</span> : <span class="type">FlutterPlugin</span>, <span class="type">MethodCallHandler</span> {
+    <span class="keyword">private lateinit var</span> channel: <span class="type">MethodChannel</span>
+    <span class="keyword">private lateinit var</span> context: <span class="type">Context</span>
+
+    <span class="comment">// Called when the plugin is attached to a FlutterEngine.</span>
+    <span class="keyword">override fun</span> <span class="func">onAttachedToEngine</span>(binding: <span class="type">FlutterPlugin.FlutterPluginBinding</span>) {
+        context = binding.applicationContext
+        channel = <span class="type">MethodChannel</span>(binding.binaryMessenger, <span class="string">"com.example/battery"</span>)
+        channel.<span class="func">setMethodCallHandler</span>(<span class="keyword">this</span>)
+    }
+
+    <span class="keyword">override fun</span> <span class="func">onMethodCall</span>(call: <span class="type">MethodCall</span>, result: <span class="type">Result</span>) {
+        <span class="keyword">when</span> (call.method) {
+            <span class="string">"getBatteryLevel"</span> -&gt; {
+                <span class="keyword">val</span> level = <span class="func">getBatteryLevel</span>()
+                <span class="keyword">if</span> (level != -<span class="number">1</span>) result.<span class="func">success</span>(level)
+                <span class="keyword">else</span> result.<span class="func">error</span>(
+                    <span class="string">"UNAVAILABLE"</span>,
+                    <span class="string">"Battery level not available"</span>,
+                    <span class="keyword">null</span>  <span class="comment">// optional details — any JSON-serializable object</span>
+                )
+            }
+            <span class="comment">// Accessing typed arguments safely</span>
+            <span class="string">"setThreshold"</span> -&gt; {
+                <span class="keyword">val</span> threshold = call.argument&lt;<span class="type">Int</span>&gt;(<span class="string">"threshold"</span>)
+                    ?: <span class="keyword">return</span> result.<span class="func">error</span>(<span class="string">"MISSING_ARG"</span>, <span class="string">"threshold required"</span>, <span class="keyword">null</span>)
+                <span class="func">applyThreshold</span>(threshold)
+                result.<span class="func">success</span>(<span class="keyword">null</span>)
+            }
+            <span class="keyword">else</span> -&gt; result.notImplemented()
+        }
+    }
+
+    <span class="keyword">override fun</span> <span class="func">onDetachedFromEngine</span>(binding: <span class="type">FlutterPlugin.FlutterPluginBinding</span>) {
+        <span class="comment">// CRITICAL: tear down the channel to prevent memory leaks</span>
+        channel.<span class="func">setMethodCallHandler</span>(<span class="keyword">null</span>)
+    }
+
+    <span class="keyword">private fun</span> <span class="func">getBatteryLevel</span>(): <span class="type">Int</span> {
+        <span class="keyword">val</span> bm = context.<span class="func">getSystemService</span>(<span class="type">BatteryManager</span>::<span class="keyword">class</span>.java)
+        <span class="keyword">return</span> bm?.getIntProperty(<span class="type">BatteryManager</span>.BATTERY_PROPERTY_CAPACITY) ?: -<span class="number">1</span>
+    }
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Plugin Lifecycle</div>
+        <p><code>onAttachedToEngine</code> replaces the deprecated <code>registerWith(Registrar)</code> pattern. Always tear down channel handlers in <code>onDetachedFromEngine</code> — failing to do so leaks the handler closure and can cause crashes when a second engine attaches to the same plugin class.</p>
+    </div>
+
+    <h2 id="native-ios">4. Native Handler — iOS (Swift)</h2>
+
+    <pre><code><span class="keyword">public class</span> <span class="type">BatteryPlugin</span>: <span class="type">NSObject</span>, <span class="type">FlutterPlugin</span> {
+    <span class="keyword">public static func</span> <span class="func">register</span>(with registrar: <span class="type">FlutterPluginRegistrar</span>) {
+        <span class="keyword">let</span> channel = <span class="type">FlutterMethodChannel</span>(
+            name: <span class="string">"com.example/battery"</span>,
+            binaryMessenger: registrar.messenger()
+        )
+        <span class="keyword">let</span> instance = <span class="type">BatteryPlugin</span>()
+        registrar.<span class="func">addMethodCallDelegate</span>(instance, channel: channel)
+        <span class="comment">// registrar.addMethodCallDelegate retains 'instance' weakly.</span>
+        <span class="comment">// The channel itself holds a strong reference.</span>
+    }
+
+    <span class="keyword">public func</span> <span class="func">handle</span>(_ call: <span class="type">FlutterMethodCall</span>, result: @escaping <span class="type">FlutterResult</span>) {
+        <span class="keyword">switch</span> call.method {
+        <span class="keyword">case</span> <span class="string">"getBatteryLevel"</span>:
+            <span class="keyword">let</span> device = <span class="type">UIDevice</span>.current
+            device.isBatteryMonitoringEnabled = <span class="keyword">true</span>
+            <span class="keyword">let</span> level = device.batteryLevel
+            <span class="keyword">if</span> level < <span class="number">0</span> {
+                result(<span class="type">FlutterError</span>(
+                    code: <span class="string">"UNAVAILABLE"</span>,
+                    message: <span class="string">"Battery level not available"</span>,
+                    details: <span class="keyword">nil</span>
+                ))
+            } <span class="keyword">else</span> {
+                result(<span class="type">Int</span>(level * <span class="number">100</span>))
+            }
+
+        <span class="keyword">case</span> <span class="string">"setThreshold"</span>:
+            <span class="keyword">guard let</span> args = call.arguments <span class="keyword">as</span>? [<span class="type">String</span>: <span class="type">Any</span>],
+                  <span class="keyword">let</span> threshold = args[<span class="string">"threshold"</span>] <span class="keyword">as</span>? <span class="type">Int</span>
+            <span class="keyword">else</span> {
+                result(<span class="type">FlutterError</span>(code: <span class="string">"MISSING_ARG"</span>, message: <span class="string">"threshold required"</span>, details: <span class="keyword">nil</span>))
+                <span class="keyword">return</span>
+            }
+            <span class="func">applyThreshold</span>(threshold)
+            result(<span class="keyword">nil</span>)  <span class="comment">// nil = success with null value</span>
+
+        <span class="keyword">default</span>:
+            result(<span class="type">FlutterMethodNotImplemented</span>)
+        }
+    }
+}</code></pre>
+
+    <h2 id="error-handling">5. Error Handling</h2>
+
+    <h3>5.1 Error Flow</h3>
+
+    <div class="diagram">
+Error Propagation Path
+══════════════════════
+
+Native side:   result.error("BATTERY_UNAVAILABLE", "Sensor offline", {"sensor": "bms"})
+                    │
+                    ▼  StandardMethodCodec encodes:
+               [0x01][errorCode String][errorMessage String][details Any]
+                    │
+                    ▼  BinaryMessenger transports bytes
+                    │
+Dart side:     StandardMethodCodec.decodeEnvelope()
+               detects 0x01 tag → throws PlatformException {
+                   code: "BATTERY_UNAVAILABLE"
+                   message: "Sensor offline"
+                   details: {"sensor": "bms"}
+               }
+    </div>
+
+    <h3>5.2 Comprehensive Dart Error Handling</h3>
+
+    <pre><code><span class="keyword">sealed class</span> <span class="type">BatteryResult</span> {}
+<span class="keyword">class</span> <span class="type">BatteryLevel</span> <span class="keyword">extends</span> <span class="type">BatteryResult</span> {
+  <span class="keyword">final int</span> level;
+  <span class="type">BatteryLevel</span>(<span class="keyword">this</span>.level);
+}
+<span class="keyword">class</span> <span class="type">BatteryError</span> <span class="keyword">extends</span> <span class="type">BatteryResult</span> {
+  <span class="keyword">final String</span> code;
+  <span class="keyword">final String</span>? message;
+  <span class="type">BatteryError</span>(<span class="keyword">this</span>.code, <span class="keyword">this</span>.message);
+}
+
+<span class="keyword">Future</span>&lt;<span class="type">BatteryResult</span>&gt; fetchBattery() <span class="keyword">async</span> {
+  <span class="keyword">try</span> {
+    <span class="keyword">final</span> level = <span class="keyword">await</span> _channel
+        .invokeMethod&lt;<span class="type">int</span>&gt;(<span class="string">'getBatteryLevel'</span>)
+        .timeout(
+          <span class="keyword">const</span> <span class="type">Duration</span>(seconds: <span class="number">5</span>),
+          onTimeout: () =&gt; <span class="keyword">throw</span> <span class="type">TimeoutException</span>(<span class="string">'Battery call timed out'</span>),
+        );
+    <span class="keyword">return</span> <span class="type">BatteryLevel</span>(level ?? -<span class="number">1</span>);
+  } <span class="keyword">on</span> <span class="type">PlatformException</span> <span class="keyword">catch</span> (e) {
+    <span class="keyword">return</span> <span class="type">BatteryError</span>(e.code, e.message);
+  } <span class="keyword">on</span> <span class="type">MissingPluginException</span> {
+    <span class="keyword">return</span> <span class="type">BatteryError</span>(<span class="string">'NOT_SUPPORTED'</span>, <span class="string">'Not available on this platform'</span>);
+  } <span class="keyword">on</span> <span class="type">TimeoutException</span> <span class="keyword">catch</span> (e) {
+    <span class="keyword">return</span> <span class="type">BatteryError</span>(<span class="string">'TIMEOUT'</span>, e.message);
+  }
+}</code></pre>
+
+    <div class="callout callout-warning">
+        <div class="callout-title">Common Mistake</div>
+        <p>Platform channels have <strong>no built-in timeout</strong>. If the native side never calls <code>result.success()</code> / <code>result.error()</code>, the Dart <code>Future</code> hangs indefinitely. Always wrap <code>invokeMethod</code> calls with <code>.timeout()</code> for production code, especially for hardware-dependent APIs.</p>
+    </div>
+
+    <h2 id="bidirectional">6. Calling Dart from Native</h2>
+
+    <p>Plugins can invoke methods on the Dart side using the same <code>MethodChannel</code> from native. This is useful for push notifications, lifecycle events, or any native-initiated action.</p>
+
+    <h3>6.1 Android → Dart</h3>
+
+    <pre><code><span class="comment">// In the plugin (Kotlin) — invoked from any thread</span>
+<span class="keyword">class</span> <span class="type">PushPlugin</span> : <span class="type">FlutterPlugin</span> {
+    <span class="keyword">private lateinit var</span> channel: <span class="type">MethodChannel</span>
+    <span class="keyword">private lateinit var</span> uiThreadHandler: <span class="type">Handler</span>
+
+    <span class="keyword">override fun</span> <span class="func">onAttachedToEngine</span>(binding: <span class="type">FlutterPlugin.FlutterPluginBinding</span>) {
+        channel = <span class="type">MethodChannel</span>(binding.binaryMessenger, <span class="string">"com.example/push"</span>)
+        uiThreadHandler = <span class="type">Handler</span>(<span class="type">Looper</span>.getMainLooper())
+        <span class="comment">// Register to receive Dart calls if needed</span>
+        channel.<span class="func">setMethodCallHandler</span> { call, result -&gt;
+            <span class="keyword">if</span> (call.method == <span class="string">"initialize"</span>) result.<span class="func">success</span>(<span class="keyword">null</span>)
+            <span class="keyword">else</span> result.notImplemented()
+        }
+    }
+
+    <span class="comment">// Call from FCM service (background thread) → Dart</span>
+    <span class="keyword">fun</span> <span class="func">sendPushToFlutter</span>(payload: <span class="type">Map</span>&lt;<span class="type">String</span>, <span class="type">Any</span>&gt;) {
+        <span class="comment">// invokeMethod MUST be called on the main thread</span>
+        uiThreadHandler.post {
+            channel.<span class="func">invokeMethod</span>(<span class="string">"onPushReceived"</span>, payload)
+        }
+    }
+}
+
+<span class="comment">// Dart side — listen for incoming native calls</span>
+<span class="keyword">const</span> _channel = <span class="type">MethodChannel</span>(<span class="string">'com.example/push'</span>);
+
+<span class="keyword">void</span> <span class="func">setupPushHandler</span>() {
+  _channel.setMethodCallHandler((call) <span class="keyword">async</span> {
+    <span class="keyword">if</span> (call.method == <span class="string">'onPushReceived'</span>) {
+      <span class="keyword">final</span> payload = call.arguments <span class="keyword">as</span> <span class="type">Map</span>&lt;<span class="type">String</span>, <span class="keyword">dynamic</span>&gt;;
+      <span class="func">handlePush</span>(payload);
+    }
+  });
+}</code></pre>
+
+    <h2 id="background-isolate">7. Calling Channels from Background Isolates</h2>
+
+    <pre><code><span class="comment">// Pattern: root isolate passes token + SendPort to background isolate</span>
+<span class="keyword">void</span> <span class="func">main</span>() <span class="keyword">async</span> {
+  <span class="type">WidgetsFlutterBinding</span>.ensureInitialized();
+
+  <span class="keyword">final</span> port = <span class="type">ReceivePort</span>();
+  <span class="keyword">final</span> token = <span class="type">RootIsolateToken</span>.instance!;
+
+  <span class="keyword">await</span> <span class="type">Isolate</span>.spawn(
+    _backgroundEntry,
+    _IsolateInit(token, port.sendPort),
+  );
+
+  <span class="keyword">await for</span> (<span class="keyword">final</span> result <span class="keyword">in</span> port) {
+    <span class="comment">// Process result on UI thread</span>
+  }
+}
+
+<span class="keyword">class</span> _IsolateInit {
+  <span class="keyword">final</span> <span class="type">RootIsolateToken</span> token;
+  <span class="keyword">final</span> <span class="type">SendPort</span> sendPort;
+  <span class="keyword">const</span> _IsolateInit(<span class="keyword">this</span>.token, <span class="keyword">this</span>.sendPort);
+}
+
+<span class="keyword">void</span> <span class="func">_backgroundEntry</span>(_IsolateInit init) <span class="keyword">async</span> {
+  <span class="type">BackgroundIsolateBinaryMessenger</span>.ensureInitialized(init.token);
+
+  <span class="keyword">const</span> channel = <span class="type">MethodChannel</span>(<span class="string">'com.example/file'</span>);
+  <span class="keyword">final</span> data = <span class="keyword">await</span> channel.invokeMethod&lt;<span class="type">Uint8List</span>&gt;(<span class="string">'readFile'</span>, {<span class="string">'path'</span>: <span class="string">'/some/file'</span>});
+  init.sendPort.send(data);
+}</code></pre>
+
+    <h2 id="performance">8. Performance Characteristics</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Metric</th>
+                <th>Typical Value</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Round-trip latency</td>
+                <td>0.5 – 2 ms</td>
+                <td>Varies by device, payload size, thread contention</td>
+            </tr>
+            <tr>
+                <td>Codec overhead (small Map)</td>
+                <td>~20–50 µs</td>
+                <td>Dominated by Map iteration, not byte copying</td>
+            </tr>
+            <tr>
+                <td>Max safe call frequency</td>
+                <td>~100–200 calls/sec</td>
+                <td>Beyond this, frame budget is at risk on 60 fps displays</td>
+            </tr>
+            <tr>
+                <td>Thread hop cost</td>
+                <td>~0.1–0.3 ms</td>
+                <td>UI → main thread post and return post</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="callout callout-architect">
+        <div class="callout-title">Design Rule</div>
+        <p>Do not use <code>MethodChannel</code> for high-frequency calls — sensor polling, animation ticks, audio frames. At 100+ calls/second the combined serialization + thread-hop overhead will consume a significant fraction of a 16ms frame budget. For high-throughput data, use <code>EventChannel</code> (native-push), <code>Dart FFI</code> (synchronous, zero thread hop), or shared memory via <code>dart:ffi</code> + <code>Uint8List</code>.</p>
+    </div>
+
+    <h2 id="testing">9. Testing MethodChannels</h2>
+
+    <h3>9.1 Mocking in Unit Tests</h3>
+
+    <pre><code><span class="keyword">void</span> <span class="func">main</span>() {
+  <span class="type">TestWidgetsFlutterBinding</span>.ensureInitialized();
+
+  <span class="func">setUp</span>(() {
+    <span class="comment">// Install a fake handler on the channel</span>
+    <span class="type">TestDefaultBinaryMessengerBinding</span>.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+      <span class="keyword">const</span> <span class="type">MethodChannel</span>(<span class="string">'com.example/battery'</span>),
+      (call) <span class="keyword">async</span> {
+        <span class="keyword">switch</span> (call.method) {
+          <span class="keyword">case</span> <span class="string">'getBatteryLevel'</span>: <span class="keyword">return</span> <span class="number">72</span>;
+          <span class="keyword">case</span> <span class="string">'setThreshold'</span>: <span class="keyword">return</span> <span class="keyword">null</span>;
+          <span class="keyword">default</span>: <span class="keyword">throw</span> <span class="type">PlatformException</span>(code: <span class="string">'NOT_IMPL'</span>);
+        }
+      },
+    );
+  });
+
+  <span class="func">tearDown</span>(() {
+    <span class="comment">// Clear mock to avoid leaking state between tests</span>
+    <span class="type">TestDefaultBinaryMessengerBinding</span>.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+      <span class="keyword">const</span> <span class="type">MethodChannel</span>(<span class="string">'com.example/battery'</span>),
+      <span class="keyword">null</span>,
+    );
+  });
+
+  <span class="func">test</span>(<span class="string">'getBattery returns level from platform'</span>, () <span class="keyword">async</span> {
+    <span class="keyword">expect</span>(<span class="keyword">await</span> <span class="func">getBatteryLevel</span>(), <span class="number">72</span>);
+  });
+
+  <span class="func">test</span>(<span class="string">'PlatformException propagates as BatteryError'</span>, () <span class="keyword">async</span> {
+    <span class="comment">// Override mock to return error for this test</span>
+    <span class="type">TestDefaultBinaryMessengerBinding</span>.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+      <span class="keyword">const</span> <span class="type">MethodChannel</span>(<span class="string">'com.example/battery'</span>),
+      (_) <span class="keyword">async</span> =&gt; <span class="keyword">throw</span> <span class="type">PlatformException</span>(code: <span class="string">'UNAVAILABLE'</span>),
+    );
+    <span class="keyword">final</span> result = <span class="keyword">await</span> <span class="func">fetchBattery</span>();
+    <span class="keyword">expect</span>(result, <span class="func">isA</span>&lt;<span class="type">BatteryError</span>&gt;());
+  });
+}</code></pre>
+
+    <h3>9.2 Integration Testing with Real Channels</h3>
+
+    <pre><code><span class="comment">// integration_test/battery_test.dart</span>
+<span class="keyword">void</span> <span class="func">main</span>() {
+  <span class="func">IntegrationTestWidgetsFlutterBinding</span>.ensureInitialized();
+
+  <span class="func">testWidgets</span>(<span class="string">'battery level is between 0 and 100'</span>, (tester) <span class="keyword">async</span> {
+    <span class="keyword">final</span> level = <span class="keyword">await</span> <span class="func">getBatteryLevel</span>();
+    <span class="comment">// Real device: real channel call, no mock</span>
+    <span class="keyword">expect</span>(level, <span class="func">inInclusiveRange</span>(<span class="number">0</span>, <span class="number">100</span>));
+  });
+}</code></pre>
+
+    <div class="callout callout-info">
+        <div class="callout-title">Testing Strategy</div>
+        <p>Use <code>setMockMethodCallHandler</code> for unit tests — fast, no device needed, tests Dart-side logic in isolation. Use integration tests running on a real device or emulator to validate the actual platform implementation. Never use mocks in integration tests — the whole point is to exercise the native code path.</p>
+    </div>
+
+    <div class="nav-footer">
+        <a href="01-platform-channels.html">← Platform Channels Architecture</a>
+        <a href="03-event-channel-and-streams.html">Next: EventChannel &amp; Streams →</a>
+    </div>
+</div>
+</body>
+</html>

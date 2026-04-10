@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 — Streams: Architecture &amp; Internals</title>
+<style>
+  :root {
+    --bg: #ffffff; --surface: #f8f9fa; --surface2: #f1f3f5; --border: #e5e7eb;
+    --text: #111827; --text-dim: #6b7280; --accent: #2563eb; --accent-dark: #1d4ed8;
+    --purple: #7c3aed; --purple-dark: #6d28d9; --green: #166534; --orange: #c2410c;
+    --red: #dc2626; --amber: #92400e; --sky: #0369a1;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); font-size: 1.05rem; line-height: 1.8; padding: 2rem; max-width: 920px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.4rem; color: var(--accent); }
+  h2 { font-size: 1.45rem; margin: 2.5rem 0 0.85rem; color: var(--accent-dark); border-bottom: 2px solid var(--border); padding-bottom: 0.4rem; }
+  h3 { font-size: 1.15rem; margin: 1.5rem 0 0.6rem; color: var(--green); }
+  h4 { font-size: 1rem; margin: 1rem 0 0.4rem; color: var(--amber); font-weight: 600; }
+  p { margin-bottom: 0.9rem; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .subtitle { color: var(--text-dim); font-size: 0.95rem; margin-bottom: 2rem; }
+  .nav { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .nav a { background: var(--surface2); padding: 0.3rem 0.7rem; border-radius: 6px; font-size: 0.82rem; color: var(--text-dim); border: 1px solid var(--border); }
+  .nav a.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .nav a:hover:not(.active) { border-color: var(--accent); color: var(--accent); text-decoration: none; }
+  code { background: var(--surface2); padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 0.88em; color: #be185d; border: 1px solid var(--border); }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem 1.5rem; overflow-x: auto; margin: 1rem 0 1.5rem; font-size: 0.92rem; line-height: 1.7; }
+  pre code { color: #1e293b; background: none; padding: 0; border: none; font-size: 1em; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 1.5rem; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.9rem; border: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--surface2); color: var(--accent-dark); font-weight: 600; }
+  td { background: var(--bg); }
+  ul, ol { margin: 0.5rem 0 1rem 1.5rem; }
+  li { margin-bottom: 0.4rem; }
+  .callout { border-left: 4px solid var(--accent); background: #eff6ff; padding: 1rem 1.25rem; border-radius: 0 8px 8px 0; margin: 1.5rem 0; }
+  .callout.staff { border-left-color: var(--purple); background: #f5f3ff; }
+  .callout.warn { border-left-color: var(--orange); background: #fff7ed; }
+  .callout.tip { border-left-color: var(--sky); background: #f0f9ff; }
+  .callout-label { font-weight: 700; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.5rem; color: var(--accent); }
+  .callout.staff .callout-label { color: var(--purple); }
+  .callout.warn .callout-label { color: var(--orange); }
+  .callout.tip .callout-label { color: var(--sky); }
+  .diagram-container { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; overflow-x: auto; }
+  .footer-nav { margin-top: 3rem; padding-top: 1.25rem; border-top: 1px solid var(--border); display: flex; gap: 1rem; flex-wrap: wrap; font-size: 0.88rem; }
+</style>
+</head>
+<body>
+
+<h1>03 — Streams: Architecture &amp; Internals</h1>
+<p class="subtitle">Stream types &middot; StreamController &middot; Broadcast vs single-subscription &middot; StreamTransformer &middot; Backpressure</p>
+
+<nav class="nav">
+  <a href="index.html">Index</a>
+  <a href="01-event-loop-microtask-queue.html">01 Event Loop</a>
+  <a href="02-futures-async-await.html">02 Futures</a>
+  <a href="03-streams-deep-dive.html" class="active">03 Streams</a>
+  <a href="04-isolates.html">04 Isolates</a>
+  <a href="05-compute-and-worker-isolates.html">05 compute()</a>
+  <a href="06-dart-concurrency-patterns.html">06 Patterns</a>
+  <a href="07-interview-qa.html">07 Q&amp;A</a>
+</nav>
+
+<h2>1. Stream Architecture</h2>
+
+<p>A <code>Stream&lt;T&gt;</code> is a lazy sequence of asynchronous events. Unlike a <code>Future&lt;T&gt;</code> which delivers exactly one value (or error), a Stream delivers zero or more data events, zero or more error events, and exactly one done event. The "lazy" aspect is important: a single-subscription Stream does not start producing events until someone listens.</p>
+
+<div class="diagram-container">
+<pre>
+  Stream event types:
+  ┌──────────────────────────────────────────────────┐
+  │  Stream&lt;T&gt;                                       │
+  │                                                  │
+  │  data event ──── T value ──────────────────────▶ │
+  │  data event ──── T value ──────────────────────▶ │
+  │  error event ─── Object error + StackTrace ────▶ │
+  │  data event ──── T value ──────────────────────▶ │
+  │  done event ──── (stream closed) ──────────────▶ │
+  └──────────────────────────────────────────────────┘
+
+  StreamSubscription&lt;T&gt; — the handle returned by stream.listen():
+  ├── onData(T event)           ← data events
+  ├── onError(Object, StackTrace) ← error events
+  ├── onDone()                  ← done event
+  ├── pause([Future? resume])   ← pause delivery
+  ├── resume()                  ← resume delivery
+  └── cancel() → Future&lt;void&gt;  ← cancel subscription
+</pre>
+</div>
+
+<h3>Stream Internals: _StreamController</h3>
+
+<p>Internally, <code>dart:async</code> implements streams through <code>_StreamController</code> and a family of stream implementation classes. When you call <code>stream.listen()</code>, the following happens:</p>
+
+<ol>
+  <li><code>_StreamController._subscribe()</code> is called, creating a <code>_StreamSubscription</code> object.</li>
+  <li>If the stream has an <code>onListen</code> callback registered (via <code>StreamController</code>), it is called synchronously — this is the trigger for the stream to start producing events.</li>
+  <li>Events added via <code>controller.add()</code> are dispatched through the subscription's data handler, scheduled as microtasks.</li>
+  <li>When the subscription is paused, events are buffered in a <code>_PendingEvents</code> queue.</li>
+</ol>
+
+<pre><code>// Creating a stream with custom logic using StreamController:
+Stream&lt;int&gt; countStream(int max) {
+  late StreamController&lt;int&gt; controller;
+
+  controller = StreamController&lt;int&gt;(
+    onListen: () {
+      // Called when first listener subscribes — start producing
+      int i = 0;
+      Timer.periodic(Duration(milliseconds: 100), (timer) {
+        if (controller.isClosed) { timer.cancel(); return; }
+        if (i &lt; max) {
+          controller.add(i++);
+        } else {
+          timer.cancel();
+          controller.close(); // sends done event
+        }
+      });
+    },
+    onPause: () { /* pause the timer */ },
+    onResume: () { /* resume the timer */ },
+    onCancel: () { /* cleanup */ },
+  );
+
+  return controller.stream;
+}
+</code></pre>
+
+<h2>2. Single-Subscription vs Broadcast Streams</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Property</th>
+      <th>Single-Subscription</th>
+      <th>Broadcast</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Listeners allowed</td>
+      <td>Exactly one at a time</td>
+      <td>Any number simultaneously</td>
+    </tr>
+    <tr>
+      <td>Events before listen</td>
+      <td>Buffered until listened</td>
+      <td>Lost if no current listeners</td>
+    </tr>
+    <tr>
+      <td>Re-listen after cancel</td>
+      <td>Not allowed (throws)</td>
+      <td>Allowed</td>
+    </tr>
+    <tr>
+      <td>Backpressure (pause)</td>
+      <td>Yes — pause() signals producer to slow down</td>
+      <td>No — pause() only buffers for that subscriber</td>
+    </tr>
+    <tr>
+      <td>Typical use cases</td>
+      <td>File reads, HTTP responses, isolate ports</td>
+      <td>UI events, state changes, BLoC streams</td>
+    </tr>
+    <tr>
+      <td>Created by</td>
+      <td><code>StreamController()</code>, async generators</td>
+      <td><code>StreamController.broadcast()</code>, <code>asBroadcastStream()</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<pre><code>// Single-subscription: second listen throws StateError
+final stream = Stream.fromIterable([1, 2, 3]);
+stream.listen(print);
+stream.listen(print); // StateError: Stream has already been listened to
+
+// Converting to broadcast (buffers nothing — late listeners miss past events)
+final broadcast = stream.asBroadcastStream();
+broadcast.listen(print); // fine
+broadcast.listen(print); // fine — second listener
+
+// The buffer behavior of asBroadcastStream:
+// asBroadcastStream() listens to the source once and re-broadcasts.
+// Events that arrive before any broadcast listener are DROPPED.
+// onListen/onCancel are called when broadcast listener count goes 0↔1.
+</code></pre>
+
+<div class="callout warn">
+  <div class="callout-label">Common Mistake</div>
+  Calling <code>asBroadcastStream()</code> on a cold stream (e.g., a network request stream) and then subscribing late will cause missed events. The underlying stream starts immediately when <code>asBroadcastStream()</code> subscribes to it. If you need late subscribers to get buffered events, use <code>StreamController.broadcast()</code> with manual buffering, or use RxDart's <code>ReplaySubject</code>.
+</div>
+
+<h2>3. StreamController In Depth</h2>
+
+<pre><code>// Full StreamController API
+final controller = StreamController&lt;String&gt;(
+  onListen: () =&gt; print('first listener attached'),
+  onCancel: () =&gt; print('last listener cancelled'),
+  onPause: () =&gt; print('listener paused'),
+  onResume: () =&gt; print('listener resumed'),
+  sync: false, // default: async dispatch (microtask); true = synchronous
+);
+
+// Access the stream
+final stream = controller.stream; // Stream&lt;String&gt;
+
+// The sink: an AddSink view of the controller
+// Useful for dependency injection (pass StreamSink instead of full controller)
+final StreamSink&lt;String&gt; sink = controller.sink;
+
+// Adding events
+controller.add('event 1');             // data event
+controller.addError(Exception('oops'), StackTrace.current); // error event
+await controller.addStream(otherStream); // add all events from another stream
+controller.close();                    // done event — controller becomes unusable
+
+// Checking state
+controller.hasListener;   // is anyone listening?
+controller.isPaused;      // is the listener currently paused?
+controller.isClosed;      // has close() been called?
+</code></pre>
+
+<h3>Sync StreamController: The Dangerous Option</h3>
+
+<pre><code>// sync: true means add() dispatches events SYNCHRONOUSLY to listeners
+// instead of scheduling them as microtasks
+
+final syncController = StreamController&lt;int&gt;.broadcast(sync: true);
+
+syncController.stream.listen((v) {
+  print('received $v');
+  // If this listener itself calls syncController.add(), we get re-entrancy!
+});
+
+syncController.add(1); // "received 1" prints BEFORE add() returns
+print('after add');    // prints AFTER "received 1"
+
+// The danger: if a listener triggers another add() on the same sync controller,
+// you get deeply nested calls and potentially a stack overflow.
+// Use sync: true ONLY when you control the listener and know it won't re-add.
+// Flutter's internal streams use sync controllers carefully for performance.
+</code></pre>
+
+<h2>4. StreamTransformer: Composing Stream Operations</h2>
+
+<p>A <code>StreamTransformer&lt;S, T&gt;</code> is a function from <code>Stream&lt;S&gt;</code> to <code>Stream&lt;T&gt;</code>. It is the core abstraction for stream composition. Every operator you know (<code>map</code>, <code>where</code>, <code>asyncMap</code>) is implemented as a <code>StreamTransformer</code>.</p>
+
+<pre><code>// StreamTransformer.fromHandlers: simplest way to create a transformer
+final doubler = StreamTransformer&lt;int, int&gt;.fromHandlers(
+  handleData: (int data, EventSink&lt;int&gt; sink) {
+    sink.add(data * 2);
+  },
+  handleError: (Object error, StackTrace st, EventSink&lt;int&gt; sink) {
+    sink.addError(error, st); // pass errors through
+  },
+  handleDone: (EventSink&lt;int&gt; sink) {
+    sink.close();
+  },
+);
+
+// Apply with transform():
+Stream.fromIterable([1, 2, 3])
+    .transform(doubler)
+    .listen(print); // 2, 4, 6
+
+// Or directly with pipe operator pattern:
+Stream&lt;int&gt; doubled = Stream.fromIterable([1, 2, 3]).transform(doubler);
+</code></pre>
+
+<h3>Building a Custom Rate-Limiting Transformer</h3>
+
+<pre><code>// Custom transformer: throttle — emit at most one event per duration
+StreamTransformer&lt;T, T&gt; throttle&lt;T&gt;(Duration duration) {
+  return StreamTransformer.fromHandlers(
+    handleData: (T data, EventSink&lt;T&gt; sink) {
+      // Implementation note: stateful transformers need a different approach
+      // fromHandlers doesn't maintain state well; use bind() for full control
+      sink.add(data);
+    },
+  );
+}
+
+// For stateful transformers, implement StreamTransformer directly:
+class ThrottleTransformer&lt;T&gt; extends StreamTransformerBase&lt;T, T&gt; {
+  final Duration duration;
+  ThrottleTransformer(this.duration);
+
+  @override
+  Stream&lt;T&gt; bind(Stream&lt;T&gt; stream) {
+    late StreamController&lt;T&gt; controller;
+    StreamSubscription&lt;T&gt;? subscription;
+    bool _throttled = false;
+
+    controller = StreamController&lt;T&gt;(
+      onListen: () {
+        subscription = stream.listen(
+          (data) {
+            if (!_throttled) {
+              controller.add(data);
+              _throttled = true;
+              Future.delayed(duration, () =&gt; _throttled = false);
+            }
+          },
+          onError: controller.addError,
+          onDone: controller.close,
+        );
+      },
+      onPause: () =&gt; subscription?.pause(),
+      onResume: () =&gt; subscription?.resume(),
+      onCancel: () =&gt; subscription?.cancel(),
+    );
+
+    return controller.stream;
+  }
+}
+
+// Usage:
+userSearchQuery
+    .transform(ThrottleTransformer(Duration(milliseconds: 300)))
+    .asyncMap((query) =&gt; searchApi(query))
+    .listen(updateResults);
+</code></pre>
+
+<h3>Built-in Stream Operators</h3>
+
+<table>
+  <thead>
+    <tr><th>Operator</th><th>Behavior</th><th>Async?</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>map(fn)</code></td><td>Transform each event synchronously</td><td>No</td></tr>
+    <tr><td><code>where(test)</code></td><td>Filter events; pass only where test is true</td><td>No</td></tr>
+    <tr><td><code>expand(fn)</code></td><td>Map each event to 0..N events (flatMap, sync)</td><td>No</td></tr>
+    <tr><td><code>asyncMap(fn)</code></td><td>Map to Future; waits for each before next</td><td>Yes — sequential</td></tr>
+    <tr><td><code>asyncExpand(fn)</code></td><td>Map to Stream; subscribes to each in order</td><td>Yes — sequential</td></tr>
+    <tr><td><code>take(n)</code></td><td>Emit first n events then close</td><td>No</td></tr>
+    <tr><td><code>skip(n)</code></td><td>Skip first n events</td><td>No</td></tr>
+    <tr><td><code>distinct()</code></td><td>Skip consecutive duplicates</td><td>No</td></tr>
+    <tr><td><code>debounce(duration)</code></td><td>Not in dart:async — use RxDart</td><td>—</td></tr>
+    <tr><td><code>switchMap(fn)</code></td><td>Not in dart:async — use RxDart</td><td>—</td></tr>
+  </tbody>
+</table>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level Detail: asyncMap Sequencing</div>
+  <code>asyncMap(fn)</code> in <code>dart:async</code> is sequential: it waits for the Future returned by <code>fn</code> to complete before processing the next event. This means if events arrive faster than <code>fn</code> processes them, they are buffered. For concurrent processing, you need a custom transformer or RxDart's <code>flatMap</code>/<code>concatMap</code>/<code>exhaustMap</code>, which provide different concurrency strategies.
+</div>
+
+<h2>5. Backpressure and Buffering</h2>
+
+<h3>Single-Subscription Backpressure</h3>
+
+<p>Single-subscription streams support real backpressure via <code>pause()</code> and <code>resume()</code>. When a subscriber calls <code>subscription.pause()</code>:</p>
+<ol>
+  <li>The stream's <code>onPause</code> callback is called (if registered)</li>
+  <li>Pending events are buffered in a <code>_PendingEvents</code> queue</li>
+  <li>No new events are dispatched until <code>resume()</code> is called</li>
+  <li>The producer should slow down / stop producing (if it respects <code>isPaused</code>)</li>
+</ol>
+
+<pre><code>// Observing backpressure:
+final controller = StreamController&lt;int&gt;(
+  onPause: () =&gt; print('producer: pausing production'),
+  onResume: () =&gt; print('producer: resuming production'),
+);
+
+final subscription = controller.stream.listen(
+  (event) {
+    print('processing $event');
+  },
+);
+
+// Simulate slow consumer:
+subscription.pause(); // signals producer to stop
+// ... do something slow ...
+subscription.resume(); // signals producer to continue
+
+// asyncMap automatically handles pause/resume:
+// It pauses the source while processing each item's Future
+someStream
+    .asyncMap((item) async {
+      await slowProcess(item); // source is paused during this
+    });
+</code></pre>
+
+<h3>Broadcast Streams Have No Real Backpressure</h3>
+
+<pre><code>// Broadcast streams: pause() only affects delivery to THAT subscriber
+// The producer keeps running! Events are buffered for the paused subscriber
+// but other subscribers receive them immediately.
+
+final broadcastController = StreamController&lt;int&gt;.broadcast();
+final stream = broadcastController.stream;
+
+final sub1 = stream.listen((v) =&gt; print('sub1: $v'));
+final sub2 = stream.listen((v) =&gt; print('sub2: $v'));
+
+sub1.pause(); // sub1 is paused, but sub2 still receives events!
+broadcastController.add(42); // sub2 gets it immediately; sub1 buffers it
+sub1.resume(); // sub1 processes buffered events
+</code></pre>
+
+<h3>StreamQueue: Pull-Based Consumption</h3>
+
+<pre><code>import 'package:async/async.dart';
+
+// StreamQueue lets you "pull" events from a stream one at a time
+// instead of push-based listening. Useful for protocol parsers,
+// structured async generators, test utilities.
+
+Future&lt;void&gt; parseProtocol(Stream&lt;String&gt; incoming) async {
+  final queue = StreamQueue&lt;String&gt;(incoming);
+
+  // Pull one event at a time
+  final greeting = await queue.next;       // waits for next event
+  assert(greeting == 'HELLO');
+
+  // Pull multiple
+  final [cmd, arg] = await queue.take(2);  // waits for next 2 events
+
+  // Peek without consuming
+  final nextCmd = await queue.peek;
+
+  // Check if more events exist
+  if (await queue.hasNext) {
+    final last = await queue.next;
+  }
+
+  // IMPORTANT: always cancel to avoid memory leak
+  await queue.cancel();
+}
+
+// StreamQueue in testing: assert exact sequence of events
+test('stream emits correct sequence', () async {
+  final queue = StreamQueue(myStream);
+  expect(await queue.next, equals('first'));
+  expect(await queue.next, equals('second'));
+  await queue.cancel();
+});
+</code></pre>
+
+<h2>6. Dart Streams vs RxDart</h2>
+
+<p><code>dart:async</code> streams provide the fundamental building blocks but lack many operators common in reactive programming. RxDart wraps Dart streams with additional subjects and operators.</p>
+
+<table>
+  <thead>
+    <tr><th>Feature</th><th>dart:async</th><th>RxDart</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Basic stream</td><td><code>Stream&lt;T&gt;</code></td><td><code>ValueStream&lt;T&gt;</code> (has current value)</td></tr>
+    <tr><td>Broadcast with seed</td><td>Not built-in</td><td><code>BehaviorSubject&lt;T&gt;</code></td></tr>
+    <tr><td>Replay past events</td><td>Not built-in</td><td><code>ReplaySubject&lt;T&gt;</code></td></tr>
+    <tr><td>Publish subject</td><td><code>StreamController.broadcast()</code></td><td><code>PublishSubject&lt;T&gt;</code></td></tr>
+    <tr><td>debounce</td><td>Not built-in</td><td><code>debounceTime(duration)</code></td></tr>
+    <tr><td>throttle</td><td>Not built-in</td><td><code>throttleTime(duration)</code></td></tr>
+    <tr><td>switchMap</td><td>Not built-in</td><td><code>switchMap(fn)</code></td></tr>
+    <tr><td>combineLatest</td><td>Not built-in</td><td><code>Rx.combineLatest2(s1, s2, fn)</code></td></tr>
+    <tr><td>zip</td><td>Not built-in</td><td><code>Rx.zip2(s1, s2, fn)</code></td></tr>
+  </tbody>
+</table>
+
+<h3>BehaviorSubject: The Most Important RxDart Type</h3>
+
+<pre><code>import 'package:rxdart/rxdart.dart';
+
+// BehaviorSubject: broadcast stream that caches the LATEST value.
+// New subscribers immediately receive the last emitted value.
+// This is the key difference from a plain broadcast StreamController.
+
+final subject = BehaviorSubject&lt;int&gt;.seeded(0); // initial value: 0
+
+subject.stream.listen((v) =&gt; print('subscriber 1: $v'));
+subject.add(1);
+subject.add(2);
+
+// Late subscriber: immediately receives 2 (the last value)
+subject.stream.listen((v) =&gt; print('subscriber 2: $v')); // prints "subscriber 2: 2"
+
+subject.add(3); // both subscribers receive 3
+
+// Access current value synchronously:
+print(subject.value); // 3 (synchronous access, no await needed)
+print(subject.hasValue); // true
+
+// Common Flutter pattern: BehaviorSubject as ViewModel state
+class UserViewModel {
+  final _userSubject = BehaviorSubject&lt;User?&gt;.seeded(null);
+  Stream&lt;User?&gt; get userStream =&gt; _userSubject.stream;
+  User? get currentUser =&gt; _userSubject.valueOrNull;
+
+  Future&lt;void&gt; loadUser(int id) async {
+    final user = await _repository.fetchUser(id);
+    _userSubject.add(user);
+  }
+
+  void dispose() =&gt; _userSubject.close();
+}
+</code></pre>
+
+<h2>7. StreamSubscription Lifecycle and Memory Leaks</h2>
+
+<p>Every <code>stream.listen()</code> call returns a <code>StreamSubscription&lt;T&gt;</code>. Failing to cancel this subscription when it is no longer needed is the most common source of memory leaks in Flutter applications.</p>
+
+<pre><code>// The leak pattern:
+class BadWidget extends StatefulWidget { ... }
+class _BadWidgetState extends State&lt;BadWidget&gt; {
+  @override
+  void initState() {
+    super.initState();
+    // LEAK: subscription is never cancelled!
+    someService.dataStream.listen((data) {
+      setState(() =&gt; _data = data);
+    });
+  }
+  // No dispose() override, no subscription.cancel()
+  // The subscription holds a reference to this State object,
+  // preventing garbage collection even after the widget is unmounted.
+}
+
+// The correct pattern:
+class GoodWidget extends StatefulWidget { ... }
+class _GoodWidgetState extends State&lt;GoodWidget&gt; {
+  StreamSubscription? _subscription;
+
+  @override
+  void initState() {
+    super.initState();
+    _subscription = someService.dataStream.listen((data) {
+      if (mounted) setState(() =&gt; _data = data);
+    });
+  }
+
+  @override
+  void dispose() {
+    _subscription?.cancel(); // cancel() returns Future&lt;void&gt;
+    // Note: you don't need to await cancel() in dispose(),
+    // but for cleanup-dependent logic, you might want to.
+    super.dispose();
+  }
+}
+</code></pre>
+
+<h3>cancel() Returns a Future</h3>
+
+<pre><code>// StreamSubscription.cancel() returns Future&lt;void&gt;
+// This Future completes when the cancellation is fully processed
+// (including any cleanup in onCancel callback of the StreamController)
+
+final subscription = heavyStream.listen(processData);
+
+// Quick cancel (don't need to wait):
+subscription.cancel(); // fire and forget — fine for most cases
+
+// Awaited cancel (needed when cleanup must complete before proceeding):
+await subscription.cancel();
+// Now guaranteed: no more events will arrive AND onCancel has run
+</code></pre>
+
+<h3>async* Generators: Streams from Generator Functions</h3>
+
+<pre><code>// async* creates a single-subscription Stream using generator syntax
+Stream&lt;int&gt; fibonacci() async* {
+  int a = 0, b = 1;
+  while (true) {
+    yield a;           // emit a data event and suspend
+    final next = a + b;
+    a = b;
+    b = next;
+  }
+}
+
+// Respects backpressure: the generator is suspended at each yield
+// until the listener is ready for the next event.
+// If listener pauses, generator is suspended at its current yield point.
+
+final sub = fibonacci().take(10).listen(print);
+// Prints: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34
+
+// await for: consume a stream like an async iterator
+Future&lt;void&gt; printFirstTen() async {
+  int count = 0;
+  await for (final n in fibonacci()) {
+    print(n);
+    if (++count == 10) break; // break cancels the stream subscription
+  }
+}
+</code></pre>
+
+<div class="callout staff">
+  <div class="callout-label">Staff-Level: Stream Cancellation with await for</div>
+  When you <code>break</code> out of an <code>await for</code> loop, Dart automatically calls <code>subscription.cancel()</code> on the underlying subscription. For <code>async*</code> generators, this causes the generator to receive a <code>GeneratorExit</code>-equivalent: the generator's <code>finally</code> blocks run, then the generator terminates. This is important for resource cleanup in generators.
+</div>
+
+<div class="footer-nav">
+  <a href="02-futures-async-await.html">&larr; 02 — Futures</a>
+  <a href="04-isolates.html">04 — Isolates &rarr;</a>
+</div>
+
+</body>
+</html>
